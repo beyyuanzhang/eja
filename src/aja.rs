@@ -1,5 +1,5 @@
 //! Disposable AJA loop. All effects, including model requests, go through the host.
-use crate::{Assignment, Report, Result};
+use crate::{Assignment, Report, ReportStatus, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -78,6 +78,18 @@ pub(crate) fn receive<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead)
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// A spent budget is a stopping point, not a failed piece of work.
+fn budget_exhausted(reason: &str) -> Report {
+    Report {
+        status: ReportStatus::Blocked,
+        summary: format!("{reason}; continue in a new node"),
+        artifacts: Vec::new(),
+        evidence: Vec::new(),
+        open_questions: vec!["continue in a new node".to_string()],
+        tools: Vec::new(),
+    }
+}
+
 fn request(reader: &mut impl BufRead, writer: &mut impl Write, request: Request) -> Result<Value> {
     send(writer, &request)?;
     receive(reader)
@@ -85,13 +97,18 @@ fn request(reader: &mut impl BufRead, writer: &mut impl Write, request: Request)
 
 fn run(start: Start, reader: &mut impl BufRead, writer: &mut impl Write) -> Result<Report> {
     start.limits.validate()?;
+    let system = format!(
+        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. You have at most {} model turns and {} seconds: budget them, and spend the last turn writing the report instead of calling tools. Return a final JSON report: {{\"status\":\"done|blocked|failed\",\"summary\":\"...\",\"artifacts\":[\"relative work file\"],\"evidence\":[],\"open_questions\":[]}}. A done report is a claim for EJA to inspect. Never claim a tool succeeded when it failed.",
+        start.limits.steps,
+        start.limits.timeout_ms / 1000,
+    );
     let mut messages = vec![
-        json!({"role":"system","content":"You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. Return a final JSON report: {\"status\":\"done|blocked|failed\",\"summary\":\"...\",\"artifacts\":[\"relative work file\"],\"evidence\":[],\"open_questions\":[]}. A done report is a claim for EJA to inspect. Never claim a tool succeeded when it failed."}),
+        json!({"role":"system","content":system}),
         json!({"role":"user","content":start.assignment.objective}),
     ];
     for _ in 0..start.limits.steps {
         if serde_json::to_vec(&messages)?.len() > start.limits.context_bytes {
-            return Err("AJA context limit reached".into());
+            return Ok(budget_exhausted("AJA context budget exhausted"));
         }
         let message = request(
             reader,
@@ -139,7 +156,10 @@ fn run(start: Start, reader: &mut impl BufRead, writer: &mut impl Write) -> Resu
             );
         }
     }
-    Err("AJA step limit reached".into())
+    Ok(budget_exhausted(&format!(
+        "AJA step budget of {} turns exhausted",
+        start.limits.steps
+    )))
 }
 
 /// Private worker mode of the same binary. It receives no credentials or state-log path.

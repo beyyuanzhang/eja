@@ -36,7 +36,7 @@ the run and produce a failed report; tool errors are returned as JSON to the
 model. Every JSON payload is at most 256 KiB, followed by one newline delimiter.
 The loop serializes tool calls in model order and appends their results before
 requesting another response. Malformed reports, incomplete provider responses,
-invalid/duplicate tool calls and exhausted limits fail the node.
+invalid/duplicate tool calls fail the node. A spent budget is not a failure: when the step or context budget is exhausted the node returns a `blocked` report and EJA continues with a new node. The system prompt states the node's turn and time budget so it can plan the last turn for the report.
 
 ## Ownership and termination
 

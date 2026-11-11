@@ -164,6 +164,7 @@ impl NativeWorker {
         node: &Path,
         control: &Control,
         artifacts: &mut HashSet<String>,
+        audit: &mut Vec<crate::ObservedTool>,
     ) -> Result<Report> {
         let definitions = self.tools.definitions(assignment);
         let allowed: HashSet<String> = definitions
@@ -205,17 +206,32 @@ impl NativeWorker {
                 }
                 Request::Tool { name, arguments } => {
                     control.check()?;
-                    if !allowed.contains(&name) {
+                    let mut entry = crate::ObservedTool {
+                        tool: name.clone(),
+                        ok: true,
+                        bytes: 0,
+                    };
+                    let value = if !allowed.contains(&name) {
+                        entry.ok = false;
                         json!({"error":"tool not allowed"})
                     } else {
                         match self.tools.call(&context, &name, &arguments) {
                             Ok(output) => {
                                 artifacts.extend(output.artifacts);
+                                entry.bytes = serde_json::to_vec(&output.value)?.len();
                                 output.value
                             }
-                            Err(error) => json!({"error":error.to_string()}),
+                            Err(error) => {
+                                entry.ok = false;
+                                json!({"error":error.to_string()})
+                            }
                         }
+                    };
+                    // Host-observed record of what the node actually did, for audit only.
+                    if audit.len() < 200 {
+                        audit.push(entry);
                     }
+                    value
                 }
                 Request::Finish { report } => {
                     control.check()?;
@@ -236,6 +252,7 @@ impl NativeWorker {
         assignment: &Assignment,
         mut report: Report,
         paths: HashSet<String>,
+        audit: &[crate::ObservedTool],
     ) -> Result<Report> {
         let mut sealed = Vec::new();
         let output = node.join("artifacts");
@@ -267,6 +284,7 @@ impl NativeWorker {
             }
         }
         report.artifacts = sealed;
+        report.tools = audit.to_vec();
         fs::remove_dir_all(node.join("work"))?;
         let manifest = json!({"assignment":assignment,"report":report,"frozen":true});
         let temp = node.join("node.json.tmp");
@@ -294,6 +312,7 @@ impl Worker for NativeWorker {
                     artifacts: vec![],
                     evidence: vec![],
                     open_questions: vec![],
+                    tools: Vec::new(),
                 };
             }
             if let Err(e) = fs::create_dir(&node) {
@@ -311,13 +330,14 @@ impl Worker for NativeWorker {
             cancelled.clone(),
         );
         let mut paths = HashSet::new();
+        let mut audit = Vec::new();
         let result = fs::create_dir(node.join("work"))
             .map_err(Into::into)
-            .and_then(|_| self.run(assignment, &node, &control, &mut paths));
+            .and_then(|_| self.run(assignment, &node, &control, &mut paths, &mut audit));
         cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything
         let report = result.unwrap_or_else(|e| Report::failed(e.to_string()));
         paths.extend(report.artifacts.iter().cloned());
-        let result = self.seal(&node, assignment, report, paths);
+        let result = self.seal(&node, assignment, report, paths, &audit);
         result.unwrap_or_else(|e| Report::failed(format!("node could not be frozen: {e}")))
     }
 }

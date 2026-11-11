@@ -150,6 +150,25 @@ pub fn render_context(context: &EjaContext) -> String {
             lines.push(format!("  artifacts: {}", report.artifacts.join(", ")));
             lines.push(format!("  evidence: {}", report.evidence.join("; ")));
             lines.push(format!("  questions: {}", report.open_questions.join("; ")));
+            if !report.tools.is_empty() {
+                let names: Vec<&str> = report
+                    .tools
+                    .iter()
+                    .take(8)
+                    .map(|call| call.tool.as_str())
+                    .collect();
+                let more = if report.tools.len() > names.len() {
+                    ", …"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "  observed tools: {} calls — {}{}",
+                    report.tools.len(),
+                    names.join(", "),
+                    more
+                ));
+            }
         }
         if let Some(close) = &task.close {
             lines.push(format!(

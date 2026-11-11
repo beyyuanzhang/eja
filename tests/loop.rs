@@ -70,6 +70,7 @@ fn done_report(summary: &str) -> Report {
         artifacts: vec!["artifact.md".to_string()],
         evidence: vec!["checked".to_string()],
         open_questions: Vec::new(),
+        tools: Vec::new(),
     }
 }
 

@@ -37,6 +37,7 @@ impl Worker for DoneWorker {
             artifacts: Vec::new(),
             evidence: Vec::new(),
             open_questions: Vec::new(),
+            tools: Vec::new(),
         }
     }
 }

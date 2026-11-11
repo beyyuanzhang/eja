@@ -57,6 +57,7 @@ impl Worker for CaptureWorker {
             artifacts: vec![format!("{}.md", assignment.task_id)],
             evidence: vec![],
             open_questions: vec![],
+            tools: Vec::new(),
         }
     }
 }

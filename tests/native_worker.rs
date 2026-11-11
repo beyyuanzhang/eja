@@ -293,19 +293,28 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
         },
     );
     let r = w.execute(&assignment(1));
-    assert_eq!(r.status, ReportStatus::Failed);
-    assert!(r.summary.contains("step limit"));
+    // A spent budget stops the node without calling its work a failure.
+    assert_eq!(r.status, ReportStatus::Blocked, "{}", r.summary);
+    assert!(r.summary.contains("budget"));
     assert_eq!(r.artifacts, vec!["1/artifacts/partial.txt"]);
+    assert_eq!(f.manifest(1)["report"]["status"], "blocked");
+    assert_eq!(
+        f.manifest(1)["report"]["tools"].as_array().unwrap().len(),
+        1
+    );
+    let context_limits = Limits {
+        context_bytes: 16,
+        ..Limits::default()
+    };
+    let context_model = Arc::new(Script::new(vec![]));
+    let w = f.worker(context_model, Arc::new(FileTools), context_limits);
+    let r = w.execute(&assignment(2));
+    assert_eq!(r.status, ReportStatus::Blocked, "{}", r.summary);
+    assert!(r.summary.contains("context budget"), "{}", r.summary);
+    assert_eq!(w.active_count(), 0);
+    assert_eq!(f.manifest(2)["frozen"], true);
+    // Protocol breaches stay failures: they are not a budget the node spent.
     for (id, limits, replies, expected) in [
-        (
-            2,
-            Limits {
-                context_bytes: 16,
-                ..Limits::default()
-            },
-            vec![],
-            "context limit",
-        ),
         (
             3,
             Limits {

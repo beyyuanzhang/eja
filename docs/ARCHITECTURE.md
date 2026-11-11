@@ -21,8 +21,8 @@ S' = commit(S, confirmed actions)
    replaces an active event of the same kind; no phrase matching.
 5. Focus is an explicit task id; recall returns event ids from an adapter.
 6. Identity changes require a proposal and a later confirmation.
-7. A report is a claim. EJA reads artifacts and decides; no external verifier
-   can accept on EJA's behalf.
+7. A report is a claim. EJA decides; nothing else can accept on its behalf.
+   Reading artifacts or the outside world is an option, never a required gate.
 8. A task closes only from `waiting` with `close_task`.
 9. AJA : task = 1:1. The native worker uses one temporary Rust process per
    assignment and one execution slot. Frozen nodes retain data, no running session.

@@ -79,6 +79,7 @@ fn done_report() -> Report {
         artifacts: vec!["out.md".to_string()],
         evidence: vec!["out.md".to_string()],
         open_questions: Vec::new(),
+        tools: Vec::new(),
     }
 }
 

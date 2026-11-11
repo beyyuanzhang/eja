@@ -102,21 +102,21 @@ At the limit, recorded results are retained, `step_limit_reached` is logged and
 reported by the CLI, and no intermediate reply is presented as a final answer.
 Work can continue on the next turn.
 
-## Artifact reading
+## Judgment
 
-EJA reads worker output itself:
+EJA judges worker output itself:
 
 ```
-worker report → artifacts list
-EJA: read_artifact(path)
-  → artifact adapter reads bounded content under the host's node root
-  → core logs ArtifactRead
-  → EJA context gets the content
-  → EJA decides close_task
+worker report (a claim) → EJA decides → close_task { accepted, note }
 ```
 
-There is no separate verifier that can accept or block on EJA's behalf.
-The worker report is a claim; EJA's reading is the evidence.
+`read_artifact` is an optional observation. When a node wrote files, EJA can read
+them; when the work lives in an external system (a connector or a service), the
+artifact list is legitimately empty and EJA decides from the report. Nothing is
+required before `close_task`, and there is no separate verifier.
+
+`node.json` keeps the host-observed tool log of the node in the sealed report
+(`report.tools`), and the current task renders it. It is a record, not a gate.
 
 ## Tasks and typed graph
 
@@ -154,7 +154,10 @@ with `relate {kind: part_of}`; `part_of` is containment;
 - node work areas are independent; project files are read-only through host tools;
 - the runtime kills/reaps the process, joins its IPC reader and revokes the run
   before sealing artifacts and atomically publishing `node.json`;
-- waiting for EJA's acceptance consumes no AJA process; reports remain claims.
+- waiting for EJA's acceptance consumes no AJA process; reports remain claims;
+- the prompt states the node's turn/time budget, and a spent budget returns a
+  `blocked` report for a new node instead of a false failure;
+- `node.json` also freezes a bounded host-observed tool log, for audit only.
 
 ## Recovery
 

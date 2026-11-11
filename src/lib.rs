@@ -203,6 +203,14 @@ pub struct Assignment {
     pub issued_at: i64,
 }
 
+/// One tool call the host actually performed for a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedTool {
+    pub tool: String,
+    pub ok: bool,
+    pub bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     pub status: ReportStatus,
@@ -214,6 +222,10 @@ pub struct Report {
     pub evidence: Vec<String>,
     #[serde(default)]
     pub open_questions: Vec<String>,
+    /// Host-observed tool calls. The host fills this when it seals a node; a node
+    /// cannot set it.
+    #[serde(default)]
+    pub tools: Vec<ObservedTool>,
 }
 
 impl Report {
@@ -224,6 +236,7 @@ impl Report {
             artifacts: Vec::new(),
             evidence: Vec::new(),
             open_questions: Vec::new(),
+            tools: Vec::new(),
         }
     }
 }
