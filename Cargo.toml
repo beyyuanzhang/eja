@@ -8,8 +8,7 @@ description = "EJA/AJA minimal closed loop"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "time", "net", "macros"] }
-
-[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros", "process", "io-util"] }
+rmcp = { version = "3.9", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest"] }
 libc = "0.2"

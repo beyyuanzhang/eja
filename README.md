@@ -205,9 +205,13 @@ symlinks are rejected. Writes are recorded as artifacts, including partial work
 from failed/cancelled nodes. Sealed results cannot be written through this API.
 `FileArtifactReader` gives EJA bounded reads of the resulting files.
 
-External MCP/connector adapters belong behind `ToolGateway`, with credentials
-and connections owned by the host. This version supplies the interface and file
-tools, not an MCP transport implementation or arbitrary command execution.
+`HostTools` combines file tools with optional MCP tools. The host owns the MCP
+configuration, credentials, runtime and connections; all nodes reuse them through
+the same gateway. Both stdio and Streamable HTTP (JSON/SSE) are supported by the
+official Rust SDK. Put `mcp.json` in the chosen `--dir`, or pass
+`--mcp-config FILE`. `eja --dir DIR tools` connects, prints the granted tool catalog
+and closes the connections without needing model credentials. See [MCP setup](docs/MCP.md).
+
 Trusted adapters must honor `Control`, bound outputs, and own/settle any resources
 or operations they create. Ordinary same-user child processes and read-only file
 permissions are not an operating-system security sandbox. Native AJA itself only
@@ -225,12 +229,14 @@ Covers the closed loop, artifact reading, proposals/confirmation, recall by
 event id, recovery, UTC, projection bounds, worker timeout/cancellation/process cleanup,
 the per-node task contract, the native worker IPC and tool loop, bounded/cancelled
 HTTP, frozen artifacts, replay protection, resource cleanup, the waiting-task fast
-path, and the shared model adapter.
+path, and the shared model adapter. MCP integration tests use a local Python 3
+fixture (no Python dependencies), covering stdio/HTTP, cancellation, grants,
+shared connections and process/session cleanup.
 
 ## Not built
 
 - EJA compaction: the log is never summarized; projection is bounded, not compacted.
 - tokenizer/pattern matching in core.
 - separate verifier authority over EJA.
-- parallel workers, multi-writer locks, auth, multi-user, MCP transport adapters.
+- parallel workers, multi-writer locks, auth, multi-user.
 - streaming progress/cancel to the user.

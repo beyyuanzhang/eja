@@ -43,8 +43,9 @@ invalid/duplicate tool calls and exhausted limits fail the node.
 The native node never executes shell commands, reads host configuration, opens
 model connections, starts tool servers or creates child processes. Effects go
 through `Model` and `ToolGateway` in the host. Their implementations are trusted
-and must honor the supplied control and output bounds. External MCP integration
-is a host adapter, not an implicit feature of the node.
+and must honor the supplied control and output bounds. `HostTools` routes granted
+MCP tools through EJA's shared clients. No MCP configuration or connection is
+created inside a node.
 
 The host owns and reaps the worker process and joins its bounded IPC-reader
 thread on every return path. Cancelling a node revokes its control; the HTTP
@@ -61,5 +62,7 @@ Node ids are reserved by creating their directory once. Replays/restarts cannot
 overwrite an existing node. An interrupted, unsealed directory stays reserved
 for inspection; it is never automatically rerun. Continuation creates a new node.
 Freezing is an application lifecycle guarantee, not an OS security sandbox or a
-rollback of remote side effects. A future process-executing connector must own
-and settle its execution domain before its call returns.
+rollback of remote side effects. MCP servers are application resources, retained
+across nodes and killed/reaped on orderly host shutdown (including their ordinary
+process-group descendants on Unix). Cancelling a node cancels its pending MCP
+request; it does not shut down the shared server or undo remote effects.

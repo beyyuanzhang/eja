@@ -1,5 +1,6 @@
 use eja::adapters::{
-    self, FileArtifactReader, FileTools, ModelRetriever, NativeWorker, OpenAiBrain, OpenAiModel,
+    self, FileArtifactReader, HostTools, ModelRetriever, NativeWorker, OpenAiBrain, OpenAiModel,
+    ToolGateway,
 };
 use eja::{project, tasks, turn, NoopRetriever, Retriever, Store, TaskStatus};
 use std::process::ExitCode;
@@ -45,12 +46,13 @@ fn main() -> ExitCode {
     }
     let mut dir = ".eja".to_string();
     let mut focus: Option<u64> = None;
+    let mut mcp_config: Option<std::path::PathBuf> = None;
     let mut mode: Option<String> = None;
     let mut words: Vec<String> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--dir" | "--task" => {
+            "--dir" | "--task" | "--mcp-config" => {
                 if index + 1 >= args.len() {
                     eprintln!("{} requires a value", args[index]);
                     return ExitCode::FAILURE;
@@ -58,6 +60,8 @@ fn main() -> ExitCode {
                 let value = args[index + 1].clone();
                 if args[index] == "--dir" {
                     dir = value;
+                } else if args[index] == "--mcp-config" {
+                    mcp_config = Some(value.into());
                 } else {
                     match value.parse() {
                         Ok(parsed) => focus = Some(parsed),
@@ -80,10 +84,14 @@ fn main() -> ExitCode {
         }
     }
     let Some(mode) = mode else {
-        eprintln!("usage: eja --dir DIR [--task ID] turn|context|tasks|log [text...]");
+        eprintln!("usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn|context|tasks|log|tools [text...]");
         return ExitCode::FAILURE;
     };
     let query = words.join(" ");
+    let mcp_config = mcp_config.or_else(|| {
+        let path = std::path::Path::new(&dir).join("mcp.json");
+        path.exists().then_some(path)
+    });
     let store = match Store::new(&dir) {
         Ok(store) => store,
         Err(error) => {
@@ -106,12 +114,15 @@ fn main() -> ExitCode {
                 match std::env::current_exe()
                     .map_err(|e| e.to_string())
                     .and_then(|binary| {
+                        let project = std::env::current_dir().map_err(|e| e.to_string())?;
+                        let tools = HostTools::new(mcp_config.as_deref(), &project)
+                            .map_err(|e| e.to_string())?;
                         NativeWorker::new(
                             binary,
                             &nodes,
-                            std::env::current_dir().map_err(|e| e.to_string())?,
+                            project,
                             std::sync::Arc::new(model),
-                            std::sync::Arc::new(FileTools),
+                            std::sync::Arc::new(tools),
                         )
                         .map_err(|e| e.to_string())
                     }) {
@@ -160,6 +171,21 @@ fn main() -> ExitCode {
                     .unwrap_or_else(|| "-".to_string())
             );
         }),
+        "tools" => std::env::current_dir()
+            .map_err(Into::into)
+            .and_then(|project| {
+                let tools = HostTools::new(mcp_config.as_deref(), &project)?;
+                let assignment = eja::Assignment {
+                    task_id: focus.unwrap_or(0),
+                    objective: query,
+                    issued_at: eja::now_utc().timestamp(),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&tools.definitions(&assignment))?
+                );
+                Ok(())
+            }),
         "tasks" => store.events().map(|events| {
             for task in tasks(&events) {
                 println!(

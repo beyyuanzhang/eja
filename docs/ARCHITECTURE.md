@@ -50,7 +50,8 @@ S' = commit(S, confirmed actions)
 - `NativeWorker`: host model/tool gateway, node workspace, cancellation, process
   cleanup, artifact sealing and frozen manifest. One run per node id.
 - `ToolGateway`: per-node tool definitions and host execution, with scoped paths
-  and deadline/cancellation control. File tools are the supplied implementation.
+  and deadline/cancellation control. `HostTools` combines file tools and host-owned
+  `McpTools` (stdio / Streamable HTTP). Nodes share connections, not configuration.
 - `recover`: reconcile interrupted assignments.
 - Ports: `Brain`, `Worker`, `Retriever`, `ArtifactReader`.
 
@@ -75,7 +76,7 @@ S' = commit(S, confirmed actions)
 ```
 core/       src/lib.rs
 aja/        src/aja.rs (temporary model/tool loop)
-adapters/   brain, retriever, model, artifact, tools, native
+adapters/   brain, retriever, model, artifact, tools, mcp, native
 app/        src/main.rs
 ```
 
@@ -95,5 +96,5 @@ numbers.
 - lexical recall in core;
 - external verifier authority;
 - parallel workers, retries, multi-user, auth;
-- OS security sandboxing, external MCP adapters, progress streaming and UI cancel.
+- OS security sandboxing, progress streaming and UI cancel.
   NativeWorker exposes a host cancellation API.
