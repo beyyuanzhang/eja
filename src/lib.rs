@@ -1,0 +1,1266 @@
+//! EJA core: a language-free state machine over an append-only log.
+//!
+//! ```text
+//! L' = L + e
+//! S  = fold(L)
+//! C  = project(S, input, focus)
+//! d  = Model(C)          // language lives in the adapter
+//! S' = commit(S, d)
+//! ```
+//!
+//! Core rules:
+//! - text is opaque payload; core never tokenizes or pattern-matches it;
+//! - state changes are typed actions with ids, refs and timestamps;
+//! - a correction targets an event id, not a phrase;
+//! - focus is an explicit task id, not a lexical match;
+//! - the model adapter owns prompts, rendering and language.
+
+pub mod adapters;
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+pub const MAX_CORRECTIONS: usize = 6;
+pub const MAX_DECISIONS: usize = 4;
+pub const MAX_RELATIONSHIPS: usize = 2;
+pub const MAX_TASK_INDEX: usize = 50;
+pub const MAX_COMMITMENTS: usize = 50;
+pub const MAX_ARTIFACT_READS: usize = 4;
+pub const MAX_RELATIONS: usize = 50;
+pub const MAX_TURN_STEPS: usize = 8;
+
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type TaskId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    User,
+    Eja,
+    Goal,
+    Commitment,
+    Correction,
+    Proposal,
+    ProposalConfirmed,
+    ProposalRejected,
+    ArtifactRead,
+    #[serde(rename = "decision")]
+    RecordDecision,
+    Relationship,
+    TaskOpened,
+    TaskRelation,
+    TaskAssigned,
+    WorkerReport,
+    TaskClosed,
+    Read,
+}
+
+impl Kind {
+    pub fn is_closable(self) -> bool {
+        matches!(self, Kind::Goal | Kind::Commitment)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalKind {
+    Goal,
+    Commitment,
+    Correction,
+}
+
+impl ProposalKind {
+    fn event_kind(self) -> Kind {
+        match self {
+            Self::Goal => Kind::Goal,
+            Self::Commitment => Kind::Commitment,
+            Self::Correction => Kind::Correction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalView {
+    pub id: u64,
+    pub kind: ProposalKind,
+    pub target_id: Option<u64>,
+    pub text: String,
+    pub created_at: i64,
+    pub turn: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProposalData {
+    kind: ProposalKind,
+    #[serde(default)]
+    target_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub id: u64,
+    pub at: i64,
+    pub turn: u64,
+    pub scope: String,
+    pub kind: Kind,
+    pub text: String,
+    #[serde(default)]
+    pub closes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventMeta {
+    pub at: i64,
+    pub closes: Option<u64>,
+    pub data: Option<Value>,
+}
+
+impl EventMeta {
+    pub fn new(at: i64) -> Self {
+        Self {
+            at,
+            closes: None,
+            data: None,
+        }
+    }
+
+    pub fn data(at: i64, value: Value) -> Self {
+        Self {
+            at,
+            closes: None,
+            data: Some(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Open,
+    Running,
+    Waiting,
+    Done,
+    Failed,
+}
+
+impl TaskStatus {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Open | TaskStatus::Running | TaskStatus::Waiting
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationKind {
+    PartOf,
+    DependsOn,
+    Continues,
+    RelatesTo,
+    Supersedes,
+    Contradicts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edge {
+    pub from: TaskId,
+    pub to: TaskId,
+    pub kind: RelationKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TaskRelationData {
+    from: TaskId,
+    to: TaskId,
+    kind: RelationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportStatus {
+    Done,
+    Blocked,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assignment {
+    pub task_id: TaskId,
+    pub objective: String,
+    pub issued_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    pub status: ReportStatus,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub open_questions: Vec<String>,
+}
+
+impl Report {
+    pub fn failed(summary: impl Into<String>) -> Self {
+        Self {
+            status: ReportStatus::Failed,
+            summary: summary.into(),
+            artifacts: Vec::new(),
+            evidence: Vec::new(),
+            open_questions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TaskOpen {
+    title: String,
+    request: String,
+    origin: String,
+    acceptance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Close {
+    accepted: bool,
+    note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseOutcome {
+    pub accepted: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactContent {
+    pub path: String,
+    pub text: String,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl ArtifactContent {
+    pub fn failed(path: &str, error: impl Into<String>) -> Self {
+        Self {
+            path: path.to_string(),
+            text: String::new(),
+            truncated: false,
+            error: Some(error.into()),
+        }
+    }
+}
+
+pub trait ArtifactReader {
+    fn read(&self, path: &str) -> ArtifactContent;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Task {
+    pub id: TaskId,
+    pub title: String,
+    pub request: String,
+    pub origin: String,
+    pub acceptance: String,
+    pub status: TaskStatus,
+    pub created_at: i64,
+    pub report_at: Option<i64>,
+    pub closed_at: Option<i64>,
+    pub report: Option<Report>,
+    pub close: Option<CloseOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub id: TaskId,
+    pub title: String,
+    pub status: TaskStatus,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Store {
+    pub log_path: PathBuf,
+    next_id: Arc<AtomicU64>,
+    next_turn: Arc<AtomicU64>,
+}
+
+fn read_events(path: &Path) -> Result<Vec<Event>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path)?;
+    let mut events = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(&line) {
+            Ok(event) => events.push(event),
+            Err(_) => break,
+        }
+    }
+    Ok(events)
+}
+
+impl Store {
+    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        fs::create_dir_all(root.as_ref())?;
+        let log_path = root.as_ref().to_path_buf().join("log.jsonl");
+        let existing = read_events(&log_path)?;
+        let next_id = existing.iter().map(|event| event.id).max().unwrap_or(0) + 1;
+        let next_turn = existing.iter().map(|event| event.turn).max().unwrap_or(0) + 1;
+        Ok(Self {
+            log_path,
+            next_id: Arc::new(AtomicU64::new(next_id)),
+            next_turn: Arc::new(AtomicU64::new(next_turn)),
+        })
+    }
+
+    pub fn events(&self) -> Result<Vec<Event>> {
+        read_events(&self.log_path)
+    }
+
+    pub fn append(
+        &self,
+        kind: Kind,
+        scope: &str,
+        text: &str,
+        turn: u64,
+        meta: EventMeta,
+    ) -> Result<Event> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.next_turn.fetch_max(turn + 1, Ordering::SeqCst);
+        let event = Event {
+            id,
+            at: meta.at,
+            turn,
+            scope: scope.to_string(),
+            kind,
+            text: text.to_string(),
+            closes: meta.closes,
+            data: meta.data,
+        };
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)?;
+        writeln!(file, "{}", serde_json::to_string(&event)?)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(event)
+    }
+
+    pub fn append_simple(&self, kind: Kind, text: &str, turn: u64, at: i64) -> Result<Event> {
+        self.append(kind, "eja", text, turn, EventMeta::new(at))
+    }
+
+    pub fn next_turn(&self) -> Result<u64> {
+        Ok(self.next_turn.load(Ordering::SeqCst))
+    }
+}
+
+pub fn now_utc() -> DateTime<Utc> {
+    Utc::now()
+}
+
+pub fn format_utc(at: i64) -> String {
+    DateTime::<Utc>::from_timestamp(at, 0)
+        .map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| at.to_string())
+}
+
+fn closed_ids(events: &[Event]) -> HashSet<u64> {
+    events
+        .iter()
+        .filter(|event| event.kind.is_closable() || event.kind == Kind::Correction)
+        .filter_map(|event| event.closes)
+        .collect()
+}
+
+pub fn recover(store: &Store, turn: u64, at: i64) -> Result<Vec<TaskId>> {
+    let mut recovered = Vec::new();
+    for task in tasks(&store.events()?) {
+        if task.status != TaskStatus::Running {
+            continue;
+        }
+        let report = Report::failed("worker session interrupted; state unknown");
+        store.append(
+            Kind::WorkerReport,
+            &task_scope(task.id),
+            "",
+            turn,
+            EventMeta::data(at, serde_json::to_value(&report)?),
+        )?;
+        recovered.push(task.id);
+    }
+    Ok(recovered)
+}
+
+fn goal_event(events: &[Event]) -> Option<&Event> {
+    let closed = closed_ids(events);
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == Kind::Goal && !closed.contains(&event.id))
+}
+
+pub fn current_goal(events: &[Event]) -> String {
+    goal_event(events)
+        .map(|event| event.text.clone())
+        .unwrap_or_default()
+}
+
+pub fn open_commitments(events: &[Event]) -> Vec<Event> {
+    let closed = closed_ids(events);
+    events
+        .iter()
+        .filter(|event| event.kind == Kind::Commitment && !closed.contains(&event.id))
+        .cloned()
+        .collect()
+}
+
+pub fn active_identity(events: &[Event]) -> Vec<Event> {
+    let mut chosen = Vec::new();
+    chosen.extend(
+        events
+            .iter()
+            .rev()
+            .filter(|event| event.kind == Kind::Correction)
+            .take(MAX_CORRECTIONS)
+            .cloned(),
+    );
+    chosen.extend(
+        events
+            .iter()
+            .rev()
+            .filter(|event| event.kind == Kind::RecordDecision)
+            .take(MAX_DECISIONS)
+            .cloned(),
+    );
+    chosen.extend(
+        events
+            .iter()
+            .rev()
+            .filter(|event| event.kind == Kind::Relationship)
+            .take(MAX_RELATIONSHIPS)
+            .cloned(),
+    );
+    chosen.sort_by_key(|event| event.id);
+    chosen.dedup_by_key(|event| event.id);
+    chosen
+}
+
+fn task_scope(task_id: TaskId) -> String {
+    format!("task:{task_id}")
+}
+
+fn task_id_in_scope(scope: &str) -> Option<TaskId> {
+    scope.strip_prefix("task:")?.parse().ok()
+}
+
+fn next_task_id(events: &[Event]) -> TaskId {
+    events
+        .iter()
+        .filter_map(|event| task_id_in_scope(&event.scope))
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+pub fn relations(events: &[Event]) -> Vec<Edge> {
+    relations_with_tasks(events, &tasks(events))
+}
+
+fn relations_with_tasks(events: &[Event], tasks: &[Task]) -> Vec<Edge> {
+    let known: std::collections::HashSet<TaskId> = tasks.iter().map(|task| task.id).collect();
+    let mut out = Vec::new();
+    for event in events {
+        if event.kind != Kind::TaskRelation {
+            continue;
+        }
+        if let Some(data) = event
+            .data
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<TaskRelationData>(value.clone()).ok())
+        {
+            if known.contains(&data.from) && known.contains(&data.to) {
+                out.push(Edge {
+                    from: data.from,
+                    to: data.to,
+                    kind: data.kind,
+                });
+            }
+        }
+    }
+    out.sort_by_key(|edge| (edge.from, edge.to, edge.kind));
+    out.dedup();
+    if out.len() > MAX_RELATIONS {
+        out.truncate(MAX_RELATIONS);
+    }
+    out
+}
+
+pub fn tasks(events: &[Event]) -> Vec<Task> {
+    let mut out: Vec<Task> = Vec::new();
+    for event in events {
+        match event.kind {
+            Kind::TaskOpened => {
+                let Some(task_id) = task_id_in_scope(&event.scope) else {
+                    continue;
+                };
+                let Some(open) = event
+                    .data
+                    .as_ref()
+                    .and_then(|value| serde_json::from_value::<TaskOpen>(value.clone()).ok())
+                else {
+                    continue;
+                };
+                out.push(Task {
+                    id: task_id,
+                    title: open.title,
+                    request: open.request,
+                    origin: open.origin,
+                    acceptance: open.acceptance,
+                    status: TaskStatus::Open,
+                    created_at: event.at,
+                    report_at: None,
+                    closed_at: None,
+                    report: None,
+                    close: None,
+                });
+            }
+            Kind::TaskAssigned => {
+                let Some(task_id) = task_id_in_scope(&event.scope) else {
+                    continue;
+                };
+                if event.data.is_some() {
+                    if let Some(task) = out.iter_mut().find(|task| task.id == task_id) {
+                        task.status = TaskStatus::Running;
+                    }
+                }
+            }
+            Kind::WorkerReport => {
+                let Some(task_id) = task_id_in_scope(&event.scope) else {
+                    continue;
+                };
+                let Some(report) = event
+                    .data
+                    .as_ref()
+                    .and_then(|value| serde_json::from_value::<Report>(value.clone()).ok())
+                else {
+                    continue;
+                };
+                if let Some(task) = out.iter_mut().find(|task| task.id == task_id) {
+                    task.report = Some(report);
+                    task.report_at = Some(event.at);
+                    task.status = TaskStatus::Waiting;
+                }
+            }
+            Kind::TaskClosed => {
+                let Some(task_id) = task_id_in_scope(&event.scope) else {
+                    continue;
+                };
+                let Some(close) = event
+                    .data
+                    .as_ref()
+                    .and_then(|value| serde_json::from_value::<Close>(value.clone()).ok())
+                else {
+                    continue;
+                };
+                if let Some(task) = out.iter_mut().find(|task| task.id == task_id) {
+                    task.close = Some(CloseOutcome {
+                        accepted: close.accepted,
+                        note: close.note,
+                    });
+                    task.closed_at = Some(event.at);
+                    task.status = if close.accepted {
+                        TaskStatus::Done
+                    } else {
+                        TaskStatus::Failed
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by_key(|task| task.id);
+    out
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EjaContext {
+    pub now: i64,
+    pub input: String,
+    pub goal: Option<Event>,
+    pub identity: Vec<Event>,
+    pub commitments: Vec<Event>,
+    pub tasks: Vec<TaskSummary>,
+    pub relations: Vec<Edge>,
+    pub focus: Option<Task>,
+    pub recall: Vec<Event>,
+    pub artifacts: Vec<ArtifactContent>,
+    pub proposals: Vec<ProposalView>,
+}
+
+pub fn project(
+    store: &Store,
+    input: &str,
+    focus_task: Option<TaskId>,
+    now: DateTime<Utc>,
+) -> Result<EjaContext> {
+    project_with_recall(store, input, focus_task, now, &[])
+}
+
+pub fn project_with_recall(
+    store: &Store,
+    input: &str,
+    focus_task: Option<TaskId>,
+    now: DateTime<Utc>,
+    recall: &[Event],
+) -> Result<EjaContext> {
+    let events = store.events()?;
+    let all_tasks = tasks(&events);
+    let focus = focus_task.and_then(|id| all_tasks.iter().find(|task| task.id == id).cloned());
+    let mut summaries: Vec<TaskSummary> = all_tasks
+        .iter()
+        .map(|task| TaskSummary {
+            id: task.id,
+            title: task.title.clone(),
+            status: task.status,
+            created_at: task.created_at,
+        })
+        .collect();
+    summaries.sort_by(|a, b| {
+        b.status
+            .is_active()
+            .cmp(&a.status.is_active())
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    summaries.truncate(MAX_TASK_INDEX);
+    Ok(EjaContext {
+        now: now.timestamp(),
+        input: input.to_string(),
+        goal: goal_event(&events).cloned(),
+        identity: active_identity(&events),
+        commitments: {
+            let mut commitments = open_commitments(&events);
+            if commitments.len() > MAX_COMMITMENTS {
+                commitments.drain(0..commitments.len() - MAX_COMMITMENTS);
+            }
+            commitments
+        },
+        tasks: summaries,
+        relations: relations_with_tasks(&events, &all_tasks),
+        focus,
+        recall: recall.to_vec(),
+        artifacts: {
+            let mut artifacts: Vec<ArtifactContent> = events
+                .iter()
+                .rev()
+                .filter(|event| event.kind == Kind::ArtifactRead)
+                .take(MAX_ARTIFACT_READS)
+                .filter_map(|event| {
+                    event
+                        .data
+                        .as_ref()
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                })
+                .collect();
+            artifacts.reverse();
+            artifacts
+        },
+        proposals: pending_proposals(&events),
+    })
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Decision {
+    #[serde(default)]
+    pub reply: String,
+    #[serde(default)]
+    pub actions: Vec<Action>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Action {
+    Propose {
+        kind: ProposalKind,
+        #[serde(default)]
+        target_id: Option<u64>,
+        text: String,
+    },
+    Confirm {
+        proposal_id: u64,
+    },
+    Reject {
+        proposal_id: u64,
+        #[serde(default)]
+        note: String,
+    },
+    #[serde(rename = "decision")]
+    RecordDecision {
+        text: String,
+    },
+    #[serde(rename = "relationship", alias = "record_relationship")]
+    RecordRelationship {
+        text: String,
+    },
+    OpenTask {
+        title: String,
+        request: String,
+        acceptance: String,
+        #[serde(default)]
+        run: bool,
+    },
+    #[serde(rename = "relate")]
+    LinkTasks {
+        from: TaskId,
+        to: TaskId,
+        kind: RelationKind,
+    },
+    Dispatch {
+        task_id: TaskId,
+    },
+    CloseTask {
+        task_id: TaskId,
+        accepted: bool,
+        #[serde(default)]
+        note: String,
+    },
+    ReadTask {
+        task_id: TaskId,
+    },
+    Recall {
+        query: String,
+    },
+    ReadArtifact {
+        path: String,
+    },
+}
+
+pub trait Brain {
+    fn decide(&self, context: &EjaContext) -> Decision;
+}
+
+pub trait Worker {
+    fn execute(&self, assignment: &Assignment) -> Report;
+}
+
+pub trait Retriever {
+    fn retrieve(&self, query: &str, events: &[Event]) -> Result<Vec<u64>>;
+}
+
+pub struct NoopRetriever;
+
+impl Retriever for NoopRetriever {
+    fn retrieve(&self, _query: &str, _events: &[Event]) -> Result<Vec<u64>> {
+        Ok(Vec::new())
+    }
+}
+
+pub struct NoopArtifactReader;
+
+impl ArtifactReader for NoopArtifactReader {
+    fn read(&self, path: &str) -> ArtifactContent {
+        ArtifactContent::failed(path, "no artifact reader configured")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnOutcome {
+    pub reply: String,
+    pub context: EjaContext,
+    pub tasks: Vec<Task>,
+    pub dispatched: Vec<TaskId>,
+    pub reports: Vec<(TaskId, Report)>,
+    pub reads: Vec<TaskId>,
+    pub recalled: Vec<Event>,
+    pub artifacts: Vec<ArtifactContent>,
+    pub decisions: usize,
+    pub worker_ms: u128,
+    pub step_limit_reached: bool,
+}
+
+fn pending_proposals(events: &[Event]) -> Vec<ProposalView> {
+    let resolved: HashSet<u64> = events
+        .iter()
+        .filter(|event| matches!(event.kind, Kind::ProposalConfirmed | Kind::ProposalRejected))
+        .filter_map(|event| {
+            event
+                .data
+                .as_ref()
+                .and_then(|data| data.get("proposal_id"))
+                .and_then(Value::as_u64)
+        })
+        .collect();
+    events
+        .iter()
+        .filter(|event| event.kind == Kind::Proposal && !resolved.contains(&event.id))
+        .filter_map(|event| {
+            let data = event
+                .data
+                .as_ref()
+                .and_then(|value| serde_json::from_value::<ProposalData>(value.clone()).ok())?;
+            Some(ProposalView {
+                id: event.id,
+                kind: data.kind,
+                target_id: data.target_id,
+                text: event.text.clone(),
+                created_at: event.at,
+                turn: event.turn,
+            })
+        })
+        .collect()
+}
+
+fn proposal_event(events: &[Event], proposal_id: u64) -> Option<Event> {
+    events
+        .iter()
+        .find(|event| event.id == proposal_id && event.kind == Kind::Proposal)
+        .cloned()
+}
+
+fn proposal_is_pending(events: &[Event], proposal_id: u64) -> bool {
+    pending_proposals(events)
+        .iter()
+        .any(|proposal| proposal.id == proposal_id)
+}
+
+fn valid_proposal_target(events: &[Event], kind: ProposalKind, target_id: Option<u64>) -> bool {
+    let Some(target_id) = target_id else {
+        return kind != ProposalKind::Correction;
+    };
+    !closed_ids(events).contains(&target_id)
+        && events.iter().any(|event| {
+            event.id == target_id
+                && event.kind.is_closable()
+                && (kind == ProposalKind::Correction || event.kind == kind.event_kind())
+        })
+}
+
+fn propose(
+    store: &Store,
+    kind: ProposalKind,
+    target_id: Option<u64>,
+    text: &str,
+    turn: u64,
+    at: i64,
+) -> Result<()> {
+    let events = store.events()?;
+    if !valid_proposal_target(&events, kind, target_id) {
+        return Ok(());
+    }
+    store.append(
+        Kind::Proposal,
+        "eja",
+        text,
+        turn,
+        EventMeta::data(at, serde_json::to_value(ProposalData { kind, target_id })?),
+    )?;
+    Ok(())
+}
+
+fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Result<()> {
+    let events = store.events()?;
+    if !proposal_is_pending(&events, proposal_id) {
+        return Ok(());
+    }
+    let Some(event) = proposal_event(&events, proposal_id) else {
+        return Ok(());
+    };
+    if event.turn >= turn {
+        return Ok(());
+    }
+    let Some(data) = event
+        .data
+        .as_ref()
+        .and_then(|value| serde_json::from_value::<ProposalData>(value.clone()).ok())
+    else {
+        return Ok(());
+    };
+    if !valid_proposal_target(&events, data.kind, data.target_id) {
+        return Ok(());
+    }
+    // One event both establishes the replacement and closes its predecessor.
+    // A Correction has no replacement: it only withdraws its target.
+    store.append(
+        data.kind.event_kind(),
+        "eja",
+        &event.text,
+        turn,
+        EventMeta {
+            at,
+            closes: data.target_id,
+            data: None,
+        },
+    )?;
+    store.append(
+        Kind::ProposalConfirmed,
+        "eja",
+        "",
+        turn,
+        EventMeta::data(at, serde_json::json!({"proposal_id": proposal_id})),
+    )?;
+    Ok(())
+}
+
+fn reject_proposal(store: &Store, proposal_id: u64, note: &str, turn: u64, at: i64) -> Result<()> {
+    let events = store.events()?;
+    if !proposal_is_pending(&events, proposal_id) {
+        return Ok(());
+    }
+    store.append(
+        Kind::ProposalRejected,
+        "eja",
+        "",
+        turn,
+        EventMeta::data(
+            at,
+            serde_json::json!({"proposal_id": proposal_id, "note": note}),
+        ),
+    )?;
+    Ok(())
+}
+
+fn append_identity(store: &Store, action: &Action, turn: u64, at: i64) -> Result<()> {
+    let (kind, text) = match action {
+        Action::RecordDecision { text } => (Kind::RecordDecision, text),
+        Action::RecordRelationship { text } => (Kind::Relationship, text),
+        _ => return Ok(()),
+    };
+    store.append_simple(kind, text, turn, at)?;
+    Ok(())
+}
+
+struct OpenTaskInput<'a> {
+    title: &'a str,
+    request: &'a str,
+    origin: &'a str,
+    acceptance: &'a str,
+    turn: u64,
+    at: i64,
+}
+
+fn open_task(store: &Store, input: OpenTaskInput<'_>) -> Result<TaskId> {
+    let id = next_task_id(&store.events()?);
+    let data = serde_json::to_value(TaskOpen {
+        title: input.title.to_string(),
+        request: input.request.to_string(),
+        origin: input.origin.to_string(),
+        acceptance: input.acceptance.to_string(),
+    })?;
+    store.append(
+        Kind::TaskOpened,
+        &task_scope(id),
+        input.title,
+        input.turn,
+        EventMeta::data(input.at, data),
+    )?;
+    Ok(id)
+}
+
+fn dispatch_task(ctx: &ActionCtx<'_>, task_id: TaskId, out: &mut TurnOutcome) -> Result<bool> {
+    let Some(task) = tasks(&ctx.store.events()?)
+        .into_iter()
+        .find(|task| task.id == task_id)
+    else {
+        return Ok(false);
+    };
+    if task.status != TaskStatus::Open {
+        return Ok(false);
+    }
+    let objective = if task.origin.trim().is_empty() {
+        task.request.clone()
+    } else {
+        task.origin.clone()
+    };
+    let assignment = Assignment {
+        task_id: task.id,
+        objective,
+        issued_at: ctx.at,
+    };
+    ctx.store.append(
+        Kind::TaskAssigned,
+        &task_scope(task.id),
+        "",
+        ctx.turn,
+        EventMeta::data(ctx.at, serde_json::to_value(&assignment)?),
+    )?;
+    let started = Instant::now();
+    let report = ctx.worker.execute(&assignment);
+    out.worker_ms += started.elapsed().as_millis();
+    ctx.store.append(
+        Kind::WorkerReport,
+        &task_scope(task.id),
+        "",
+        ctx.turn,
+        EventMeta::data(ctx.at, serde_json::to_value(&report)?),
+    )?;
+    out.dispatched.push(task.id);
+    out.reports.push((task.id, report));
+    Ok(true)
+}
+
+fn close_task(
+    store: &Store,
+    task_id: TaskId,
+    accepted: bool,
+    note: &str,
+    turn: u64,
+    at: i64,
+) -> Result<()> {
+    let Some(task) = tasks(&store.events()?)
+        .into_iter()
+        .find(|task| task.id == task_id)
+    else {
+        return Ok(());
+    };
+    if task.status != TaskStatus::Waiting {
+        return Ok(());
+    }
+    let data = serde_json::to_value(Close {
+        accepted,
+        note: note.to_string(),
+    })?;
+    store.append(
+        Kind::TaskClosed,
+        &task_scope(task.id),
+        "",
+        turn,
+        EventMeta::data(at, data),
+    )?;
+    Ok(())
+}
+
+struct ActionCtx<'a> {
+    store: &'a Store,
+    input: &'a str,
+    turn: u64,
+    at: i64,
+    worker: &'a dyn Worker,
+    retriever: &'a dyn Retriever,
+    artifacts: &'a dyn ArtifactReader,
+}
+
+fn apply_actions(
+    actions: &[Action],
+    ctx: &ActionCtx<'_>,
+    out: &mut TurnOutcome,
+    focus: &mut Option<TaskId>,
+) -> Result<bool> {
+    let mut observed = false;
+    for action in actions {
+        match action {
+            Action::RecordDecision { .. } | Action::RecordRelationship { .. } => {
+                append_identity(ctx.store, action, ctx.turn, ctx.at)?
+            }
+            Action::Propose {
+                kind,
+                target_id,
+                text,
+            } => propose(ctx.store, *kind, *target_id, text, ctx.turn, ctx.at)?,
+            Action::Confirm { proposal_id } => {
+                confirm_proposal(ctx.store, *proposal_id, ctx.turn, ctx.at)?
+            }
+            Action::Reject { proposal_id, note } => {
+                reject_proposal(ctx.store, *proposal_id, note, ctx.turn, ctx.at)?
+            }
+            Action::OpenTask {
+                title,
+                request,
+                acceptance,
+                run,
+            } => {
+                let id = open_task(
+                    ctx.store,
+                    OpenTaskInput {
+                        title,
+                        request,
+                        origin: ctx.input,
+                        acceptance,
+                        turn: ctx.turn,
+                        at: ctx.at,
+                    },
+                )?;
+                if *run && dispatch_task(ctx, id, out)? {
+                    *focus = Some(id);
+                    observed = true;
+                }
+            }
+            Action::Dispatch { task_id } => {
+                if dispatch_task(ctx, *task_id, out)? {
+                    *focus = Some(*task_id);
+                    observed = true;
+                }
+            }
+            Action::LinkTasks { from, to, kind } => {
+                let data = serde_json::to_value(TaskRelationData {
+                    from: *from,
+                    to: *to,
+                    kind: *kind,
+                })?;
+                ctx.store.append(
+                    Kind::TaskRelation,
+                    &task_scope(*from),
+                    "",
+                    ctx.turn,
+                    EventMeta::data(ctx.at, data),
+                )?;
+            }
+            Action::CloseTask {
+                task_id,
+                accepted,
+                note,
+            } => close_task(ctx.store, *task_id, *accepted, note, ctx.turn, ctx.at)?,
+            Action::ReadTask { task_id } => {
+                ctx.store.append(
+                    Kind::Read,
+                    "eja",
+                    "",
+                    ctx.turn,
+                    EventMeta::data(ctx.at, serde_json::json!({"task_id": task_id})),
+                )?;
+                out.reads.push(*task_id);
+                *focus = Some(*task_id);
+                observed = true;
+            }
+            Action::Recall { query } => {
+                let events = ctx.store.events()?;
+                let ids = ctx.retriever.retrieve(query, &events).unwrap_or_default();
+                let found: Vec<Event> =
+                    events.into_iter().filter(|e| ids.contains(&e.id)).collect();
+                let ids: Vec<u64> = found.iter().map(|e| e.id).collect();
+                ctx.store.append(
+                    Kind::Read,
+                    "eja",
+                    "",
+                    ctx.turn,
+                    EventMeta::data(ctx.at, serde_json::json!({"queries": [query], "ids": ids})),
+                )?;
+                out.recalled.extend(found);
+                out.recalled.sort_by_key(|e| e.id);
+                out.recalled.dedup_by_key(|e| e.id);
+                observed = true;
+            }
+            Action::ReadArtifact { path } => {
+                let content = ctx.artifacts.read(path);
+                ctx.store.append(
+                    Kind::ArtifactRead,
+                    "eja",
+                    "",
+                    ctx.turn,
+                    EventMeta::data(ctx.at, serde_json::to_value(&content)?),
+                )?;
+                out.artifacts.push(content);
+                observed = true;
+            }
+        }
+    }
+    Ok(observed)
+}
+
+pub fn turn(
+    store: &Store,
+    input: &str,
+    brain: &dyn Brain,
+    worker: &dyn Worker,
+    retriever: &dyn Retriever,
+    artifacts: &dyn ArtifactReader,
+) -> Result<TurnOutcome> {
+    turn_at(store, input, brain, worker, retriever, artifacts, now_utc())
+}
+
+pub fn turn_at(
+    store: &Store,
+    input: &str,
+    brain: &dyn Brain,
+    worker: &dyn Worker,
+    retriever: &dyn Retriever,
+    artifact_reader: &dyn ArtifactReader,
+    now: DateTime<Utc>,
+) -> Result<TurnOutcome> {
+    let at = now.timestamp();
+    let turn_no = store.next_turn()?;
+    recover(store, turn_no, at)?;
+    store.append_simple(Kind::User, input, turn_no, at)?;
+
+    let active: Vec<Task> = tasks(&store.events()?)
+        .into_iter()
+        .filter(|task| task.status.is_active())
+        .collect();
+    let mut focus = if active.len() == 1 && active[0].status == TaskStatus::Waiting {
+        Some(active[0].id)
+    } else {
+        None
+    };
+    let mut out = TurnOutcome {
+        reply: String::new(),
+        context: project(store, input, focus, now)?,
+        tasks: Vec::new(),
+        dispatched: Vec::new(),
+        reports: Vec::new(),
+        reads: Vec::new(),
+        recalled: Vec::new(),
+        artifacts: Vec::new(),
+        decisions: 0,
+        worker_ms: 0,
+        step_limit_reached: false,
+    };
+    let ctx = ActionCtx {
+        store,
+        input,
+        turn: turn_no,
+        at,
+        worker,
+        retriever,
+        artifacts: artifact_reader,
+    };
+    for _ in 0..MAX_TURN_STEPS {
+        out.decisions += 1;
+        let decision = brain.decide(&out.context);
+        let observed = apply_actions(&decision.actions, &ctx, &mut out, &mut focus)?;
+        out.context = project_with_recall(store, input, focus, now, &out.recalled)?;
+        if !observed {
+            out.reply = decision.reply.trim().to_string();
+            break;
+        }
+        // Every observation uses the same continuation path, including AJA reports.
+        // At the limit, retain recorded work without presenting an unevaluated reply.
+        out.step_limit_reached = out.decisions == MAX_TURN_STEPS;
+    }
+    if !out.step_limit_reached && out.reply.is_empty() {
+        out.reply = out
+            .reports
+            .last()
+            .map(|(_, report)| report.summary.trim().to_string())
+            .unwrap_or_default();
+    }
+    let mut meta = EventMeta::new(at);
+    if out.step_limit_reached {
+        meta.data = Some(serde_json::json!({"step_limit_reached": true}));
+    }
+    store.append(Kind::Eja, "eja", &out.reply, turn_no, meta)?;
+    out.context = project_with_recall(store, input, focus, now, &out.recalled)?;
+    out.tasks = tasks(&store.events()?);
+    Ok(out)
+}

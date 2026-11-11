@@ -1,0 +1,94 @@
+use eja::adapters::{render_context, OpenAiBrain};
+use eja::{project_with_recall, Action, Brain, EventMeta, Kind, ProposalKind, Store};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+
+#[test]
+fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
+    let dir = std::env::temp_dir().join(format!("eja-brain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Store::new(&dir).expect("store");
+    let goal = store
+        .append_simple(Kind::Goal, "original goal", 1, 1)
+        .unwrap();
+    let old = store
+        .append(
+            Kind::WorkerReport,
+            "task:1",
+            "recalled report",
+            1,
+            EventMeta::data(
+                1,
+                serde_json::json!({"summary": "recalled structured evidence"}),
+            ),
+        )
+        .unwrap();
+    let context =
+        project_with_recall(&store, "revise the goal", None, eja::now_utc(), &[old]).unwrap();
+    assert!(render_context(&context).contains("CURRENT INPUT"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("POST /chat/completions"));
+        let mut length = None;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+        }
+        let mut body = vec![0; length.expect("content length")];
+        reader.read_exact(&mut body).unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("You are EJA"));
+        let input = request["messages"][1]["content"].as_str().unwrap();
+        assert!(input.contains(&format!("#{} original goal", goal.id)));
+        assert!(input.contains("RECALLED EVENTS"));
+        assert!(input.contains("recalled report"));
+        assert!(input.contains("recalled structured evidence"));
+        let content = serde_json::json!({
+            "reply": "recorded",
+            "actions": [{"op": "propose", "kind": "goal", "target_id": goal.id, "text": "replacement goal"}]
+        })
+        .to_string();
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).expect("write");
+    });
+
+    let brain = OpenAiBrain::new(format!("http://127.0.0.1:{port}"), "test-key", "test-model");
+    let decision = brain.decide(&context);
+    assert_eq!(decision.reply, "recorded");
+    assert_eq!(
+        decision.actions,
+        vec![Action::Propose {
+            kind: ProposalKind::Goal,
+            target_id: Some(goal.id),
+            text: "replacement goal".into(),
+        }]
+    );
+    server.join().expect("server");
+}
