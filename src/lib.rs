@@ -16,6 +16,7 @@
 //! - the model adapter owns prompts, rendering and language.
 
 pub mod adapters;
+pub mod aja;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -989,14 +990,9 @@ fn dispatch_task(ctx: &ActionCtx<'_>, task_id: TaskId, out: &mut TurnOutcome) ->
     if task.status != TaskStatus::Open {
         return Ok(false);
     }
-    let objective = if task.origin.trim().is_empty() {
-        task.request.clone()
-    } else {
-        task.origin.clone()
-    };
     let assignment = Assignment {
         task_id: task.id,
-        objective,
+        objective: task.request.clone(),
         issued_at: ctx.at,
     };
     ctx.store.append(

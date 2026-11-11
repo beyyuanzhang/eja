@@ -1,9 +1,7 @@
 use eja::adapters::{
-    self, FileArtifactReader, MissingWorker, ModelRetriever, OpenAiBrain, PiWorker, SessionWorker,
+    self, FileArtifactReader, FileTools, ModelRetriever, NativeWorker, OpenAiBrain, OpenAiModel,
 };
-use eja::{
-    project, tasks, turn, ArtifactReader, NoopRetriever, Retriever, Store, TaskStatus, Worker,
-};
+use eja::{project, tasks, turn, NoopRetriever, Retriever, Store, TaskStatus};
 use std::process::ExitCode;
 
 fn status_label(status: TaskStatus) -> &'static str {
@@ -39,6 +37,12 @@ fn counts(items: &[eja::Task]) -> String {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--aja-worker"] {
+        return match eja::aja::worker_main() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     let mut dir = ".eja".to_string();
     let mut focus: Option<u64> = None;
     let mut mode: Option<String> = None;
@@ -93,19 +97,36 @@ fn main() -> ExitCode {
                 eprintln!("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)");
                 return ExitCode::FAILURE;
             };
-            let worker: Box<dyn Worker> = if let Some(worker) = PiWorker::from_env() {
-                Box::new(worker)
-            } else if let Some(worker) = SessionWorker::from_env() {
-                Box::new(worker)
-            } else {
-                Box::new(MissingWorker)
+            let Some(model) = OpenAiModel::from_env() else {
+                eprintln!("AJA needs the host model configuration");
+                return ExitCode::FAILURE;
             };
+            let nodes = std::path::Path::new(&dir).join("nodes");
+            let worker =
+                match std::env::current_exe()
+                    .map_err(|e| e.to_string())
+                    .and_then(|binary| {
+                        NativeWorker::new(
+                            binary,
+                            &nodes,
+                            std::env::current_dir().map_err(|e| e.to_string())?,
+                            std::sync::Arc::new(model),
+                            std::sync::Arc::new(FileTools),
+                        )
+                        .map_err(|e| e.to_string())
+                    }) {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
             let retriever: Box<dyn Retriever> = match ModelRetriever::from_env() {
                 Some(retriever) => Box::new(retriever),
                 None => Box::new(NoopRetriever),
             };
-            let artifacts: Box<dyn ArtifactReader> = Box::new(FileArtifactReader::from_env());
-            turn(&store, &query, &brain, &*worker, &*retriever, &*artifacts).map(|outcome| {
+            let artifacts = FileArtifactReader::new(nodes);
+            turn(&store, &query, &brain, &worker, &*retriever, &artifacts).map(|outcome| {
                 println!("eja: {}", outcome.reply);
                 if outcome.step_limit_reached {
                     println!("[turn step limit reached; recorded work can continue next turn]");

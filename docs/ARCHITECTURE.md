@@ -24,16 +24,14 @@ S' = commit(S, confirmed actions)
 7. A report is a claim. EJA reads artifacts and decides; no external verifier
    can accept on EJA's behalf.
 8. A task closes only from `waiting` with `close_task`.
-9. One AJA session runs at a time, in its own process group, bounded by a
-   timeout; the whole group is terminated on exit or timeout. EJA may own many
-   AJA sessions over time (AJAS); EJA : AJA = 1:n. An AJA is the task point:
-   AJA : task = 1:1. A retry/continuation is a new AJA node, not a second AJA
-   under the same task.
+9. AJA : task = 1:1. The native worker uses one temporary Rust process per
+   assignment and one execution slot. Frozen nodes retain data, no running session.
+   Retries/continuations are new linked nodes.
 10. Language, prompts, retrieval and artifact reading live in adapters.
 11. A crashed `running` task is reconciled to `waiting` with an interrupted
     failed report; no automatic duplicate dispatch.
-12. The worker receives the raw user task (`origin`), not EJA's acceptance or
-    evidence text.
+12. The worker receives its node's `request`; the original input stays in EJA
+    as `origin`. Acceptance remains EJA's responsibility.
 13. If exactly one active task is waiting, the turn starts with that task as
     focus, avoiding one redundant initial model call.
 14. All actions execute in list order. Observations continue through one loop,
@@ -48,9 +46,11 @@ S' = commit(S, confirmed actions)
   focus, recall, artifact reads, pending proposals, now).
 - `turn_at`: one bounded project/decide/act loop for typed actions and observations;
   reports `decisions`, `worker_ms` and `step_limit_reached`.
-- `PiWorker`: direct session box. It does not re-author the task or pass EJA
-  acceptance into the session. It reports files changed during the session as
-  artifacts.
+- `aja`: bounded disposable loop and framed IPC, no external effects.
+- `NativeWorker`: host model/tool gateway, node workspace, cancellation, process
+  cleanup, artifact sealing and frozen manifest. One run per node id.
+- `ToolGateway`: per-node tool definitions and host execution, with scoped paths
+  and deadline/cancellation control. File tools are the supplied implementation.
 - `recover`: reconcile interrupted assignments.
 - Ports: `Brain`, `Worker`, `Retriever`, `ArtifactReader`.
 
@@ -74,7 +74,8 @@ S' = commit(S, confirmed actions)
 
 ```
 core/       src/lib.rs
-adapters/   brain, retriever, artifact, worker
+aja/        src/aja.rs (temporary model/tool loop)
+adapters/   brain, retriever, model, artifact, tools, native
 app/        src/main.rs
 ```
 
@@ -94,4 +95,5 @@ numbers.
 - lexical recall in core;
 - external verifier authority;
 - parallel workers, retries, multi-user, auth;
-- worker sandboxing, progress streaming, user-visible cancel.
+- OS security sandboxing, external MCP adapters, progress streaming and UI cancel.
+  NativeWorker exposes a host cancellation API.

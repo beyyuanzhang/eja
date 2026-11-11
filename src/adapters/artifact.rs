@@ -1,4 +1,5 @@
 use crate::{ArtifactContent, ArtifactReader};
+use std::io::Read;
 
 pub struct FileArtifactReader {
     root: std::path::PathBuf,
@@ -13,11 +14,6 @@ impl FileArtifactReader {
         }
     }
 
-    pub fn from_env() -> Self {
-        let root = std::env::var("EJA_ARTIFACT_ROOT").unwrap_or_else(|_| ".".to_string());
-        Self::new(root)
-    }
-
     pub fn with_limit(root: impl Into<std::path::PathBuf>, max_bytes: usize) -> Self {
         Self {
             root: root.into(),
@@ -28,16 +24,17 @@ impl FileArtifactReader {
 
 impl ArtifactReader for FileArtifactReader {
     fn read(&self, path: &str) -> ArtifactContent {
-        let relative = std::path::Path::new(path);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            return ArtifactContent::failed(path, "rejected path");
-        }
-        let full = self.root.join(relative);
-        let bytes = match std::fs::read(&full) {
+        let bytes = match (|| -> crate::Result<Vec<u8>> {
+            let full = super::tools::relative_file(&self.root, path)?;
+            let file = std::fs::File::open(full)?;
+            if !file.metadata()?.is_file() {
+                return Err("not a regular file".into());
+            }
+            let mut bytes = Vec::new();
+            file.take(self.max_bytes.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })() {
             Ok(bytes) => bytes,
             Err(error) => return ArtifactContent::failed(path, error.to_string()),
         };

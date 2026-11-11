@@ -26,9 +26,11 @@ S' = commit(S, confirmed actions)
 | retriever adapter | semantic query + graph/time expansion → event ids | write state |
 | artifact adapter | bounded read of worker output | decide acceptance |
 | worker adapter | assignment → AJA session → report | write identity |
+| AJA loop | local transcript, model/tool continuation, final report | access host state or configuration directly |
 
 ```
 core/       domain, fold, project, turn, ports
+aja/        disposable model/tool loop
 adapters/   brain, retriever, artifact, worker
 app/        CLI and wiring
 ```
@@ -107,7 +109,7 @@ EJA reads worker output itself:
 ```
 worker report → artifacts list
 EJA: read_artifact(path)
-  → artifact adapter reads bounded content under EJA_ARTIFACT_ROOT
+  → artifact adapter reads bounded content under the host's node root
   → core logs ArtifactRead
   → EJA context gets the content
   → EJA decides close_task
@@ -144,14 +146,15 @@ with `relate {kind: part_of}`; `part_of` is containment;
 `depends_on`/`continues` are execution order; `relates_to`/`supersedes`/
 `contradicts` are association edges.
 
-- one AJA session per assignment, timeout `EJA_AJA_TIMEOUT_SECS`;
-- `PiWorker` starts Pi directly with the **raw user task**, the configured system
-  prompt, cwd and budget; no wrapper prompt;
-- the worker gets the **raw user task**, not EJA's acceptance/evidence text;
-- the session runs in its own process group; on exit or timeout the whole group
-  is terminated, so background children cannot mutate artifacts;
-- EJA must be able to read artifacts before accepting;
-- no automatic acceptance from a report.
+- one native Rust AJA process per node, started through the same executable;
+- the host sends only the node assignment and limits, with an empty environment;
+- the node's `request` is its work instruction; `origin` stays in EJA as provenance;
+- model access and tools are injected through host IPC; the node has no credentials,
+  plugin discovery, MCP client, shell executor, or state-log access;
+- node work areas are independent; project files are read-only through host tools;
+- the runtime kills/reaps the process, joins its IPC reader and revokes the run
+  before sealing artifacts and atomically publishing `node.json`;
+- waiting for EJA's acceptance consumes no AJA process; reports remain claims.
 
 ## Recovery
 
@@ -163,20 +166,12 @@ with `relate {kind: part_of}`; `part_of` is containment;
 ## Run
 
 ```bash
-export LNA_BASE_URL=...
+export LNA_BASE_URL=https://your-provider/v1
 export LNA_API_KEY=...
 export LNA_MODEL=...
-# direct Pi session box (preferred)
-export EJA_PI_MODEL='lna/deepseek-v4.1-flash-1017'
-# optional: export EJA_PI_BIN=pi
-export EJA_PI_SYSTEM_PROMPT_FILE=/path/to/worker-system-prompt.txt
-export EJA_AJA_WORKSPACE=/tmp/eja-work
-export EJA_AJA_TIMEOUT_SECS=300
-
-# generic command fallback (assignment JSON on stdin)
-# export EJA_AJA_COMMAND='sh examples/aja-template.sh'
-
-export EJA_ARTIFACT_ROOT=/tmp/eja-artifacts
+# Optional separate model for work nodes and recall:
+# export EJA_AJA_MODEL=...
+# export LNA_RETRIEVER_MODEL=...
 
 cargo run -- --dir /tmp/eja turn "write a release checklist"
 cargo run -- --dir /tmp/eja tasks
@@ -184,10 +179,40 @@ cargo run -- --dir /tmp/eja --task 1 context
 cargo run -- --dir /tmp/eja log
 ```
 
-`LNA_RETRIEVER_MODEL` optionally selects a different model for recall.
+The current directory is the read-only project input. A node writes only its
+private `<dir>/nodes/<id>/work` area. On completion, work is removed and artifacts
+are copied into `<dir>/nodes/<id>/artifacts`; returned references are relative to
+`<dir>/nodes`. A node id is reserved once and cannot be rerun or overwritten.
+Interrupted directories remain reserved; continuation uses a new linked node.
 
-`PiWorker` reports the files changed during the session as artifacts so EJA can
-read and verify them.
+`NativeWorker` has one execution slot. Historical nodes are files, not sessions,
+processes or threads. `Limits` defaults to 300 seconds, 16 model steps, 256 KiB
+serialized context/frame, and 64 KiB model/tool output. A sealed artifact is at
+most 256 KiB. `with_limits` and `cancel(node_id)` are host APIs; cancellation is
+also checked during HTTP requests. These are byte/step limits, not exact model
+token limits.
+
+## Tools and connectors
+
+`ToolGateway` is the single host interface. Its per-assignment tool definitions
+are snapshotted for a run and checked again on invocation. The gateway receives
+the bound node id, work/project roots and cancellation/deadline control. A node
+cannot select another id or expand its own grants.
+
+The supplied `FileTools` implements `read_file` and `write_file`. Project reads
+exclude the private state directory; absolute paths, parent traversal and
+symlinks are rejected. Writes are recorded as artifacts, including partial work
+from failed/cancelled nodes. Sealed results cannot be written through this API.
+`FileArtifactReader` gives EJA bounded reads of the resulting files.
+
+External MCP/connector adapters belong behind `ToolGateway`, with credentials
+and connections owned by the host. This version supplies the interface and file
+tools, not an MCP transport implementation or arbitrary command execution.
+Trusted adapters must honor `Control`, bound outputs, and own/settle any resources
+or operations they create. Ordinary same-user child processes and read-only file
+permissions are not an operating-system security sandbox. Native AJA itself only
+performs IPC and has no tool-created descendants; its pipe closes when the host
+exits. External side effects require the connector's own cancellation semantics.
 
 ## Tests
 
@@ -197,14 +222,15 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Covers the closed loop, artifact reading, proposals/confirmation, recall by
-event id, recovery, UTC, projection bounds, worker timeout/process-group cleanup,
-the raw-task worker contract, the direct Pi session worker, the waiting-task fast
-path, the OpenAI adapter and the command worker.
+event id, recovery, UTC, projection bounds, worker timeout/cancellation/process cleanup,
+the per-node task contract, the native worker IPC and tool loop, bounded/cancelled
+HTTP, frozen artifacts, replay protection, resource cleanup, the waiting-task fast
+path, and the shared model adapter.
 
 ## Not built
 
 - EJA compaction: the log is never summarized; projection is bounded, not compacted.
 - tokenizer/pattern matching in core.
 - separate verifier authority over EJA.
-- parallel workers, multi-writer locks, auth, multi-user, MCP/skills.
+- parallel workers, multi-writer locks, auth, multi-user, MCP transport adapters.
 - streaming progress/cancel to the user.

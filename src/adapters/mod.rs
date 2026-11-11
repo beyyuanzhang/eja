@@ -4,13 +4,17 @@
 
 mod artifact;
 mod brain;
+mod model;
+mod native;
 mod retriever;
-mod worker;
+mod tools;
 
 pub use artifact::FileArtifactReader;
 pub use brain::{parse_decision, render_context, OpenAiBrain, SYSTEM_PROMPT};
+pub use model::{Control, Model, OpenAiModel};
+pub use native::NativeWorker;
 pub use retriever::ModelRetriever;
-pub use worker::{MissingWorker, PiWorker, SessionWorker};
+pub use tools::{FileTools, ToolContext, ToolGateway, ToolOutput};
 
 use crate::{Kind, TaskStatus};
 

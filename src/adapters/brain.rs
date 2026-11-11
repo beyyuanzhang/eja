@@ -1,8 +1,8 @@
 use crate::{format_utc, Brain, Decision, EjaContext};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::time::Duration;
 
-use super::{label, llm_env, status};
+use super::{label, llm_env, status, Control, OpenAiModel};
 
 fn relation(kind: crate::RelationKind) -> &'static str {
     match kind {
@@ -242,10 +242,7 @@ pub fn parse_decision(raw: &str) -> Decision {
 }
 
 pub struct OpenAiBrain {
-    base: String,
-    key: String,
-    model: String,
-    client: reqwest::blocking::Client,
+    model: OpenAiModel,
 }
 
 impl OpenAiBrain {
@@ -253,17 +250,9 @@ impl OpenAiBrain {
         let (base, key, model) = llm_env()?;
         Some(Self::new(base, key, model))
     }
-
     pub fn new(base: impl Into<String>, key: impl Into<String>, model: impl Into<String>) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(180))
-            .build()
-            .expect("build llm client");
         Self {
-            base: base.into(),
-            key: key.into(),
-            model: model.into(),
-            client,
+            model: OpenAiModel::new(base, key, model),
         }
     }
 }
@@ -271,37 +260,26 @@ impl OpenAiBrain {
 impl Brain for OpenAiBrain {
     fn decide(&self, context: &EjaContext) -> Decision {
         let messages = vec![
-            json!({"role": "system", "content": SYSTEM_PROMPT}),
-            json!({"role": "user", "content": render_context(context)}),
+            json!({"role":"system","content":SYSTEM_PROMPT}),
+            json!({"role":"user","content":render_context(context)}),
         ];
-        let body = json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-        });
-        let response = self
-            .client
-            .post(format!(
-                "{}/chat/completions",
-                self.base.trim_end_matches('/')
-            ))
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
-            .and_then(|response| response.error_for_status())
-            .and_then(|response| response.json::<Value>());
-        match response {
-            Ok(value) => {
-                let raw = value
+        let control = Control::new(
+            Duration::from_secs(180),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        match self
+            .model
+            .request(&messages, &[], crate::aja::FRAME_LIMIT, &control)
+        {
+            Ok(value) => parse_decision(
+                value
                     .pointer("/choices/0/message/content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                parse_decision(raw)
-            }
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            ),
             Err(error) => Decision {
                 reply: format!("[EJA model error] {error}"),
-                actions: Vec::new(),
+                actions: vec![],
             },
         }
     }

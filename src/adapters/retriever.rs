@@ -2,32 +2,24 @@ use crate::{format_utc, Event, Result, Retriever};
 use serde_json::Value;
 use std::time::Duration;
 
-use super::{label, llm_env};
+use super::{label, llm_env, Control, OpenAiModel};
 
 pub struct ModelRetriever {
-    base: String,
-    key: String,
-    model: String,
-    client: reqwest::blocking::Client,
+    model: OpenAiModel,
 }
 
 impl ModelRetriever {
     pub fn from_env() -> Option<Self> {
         let (base, key, model) = llm_env()?;
-        let model = std::env::var("LNA_RETRIEVER_MODEL").unwrap_or(model);
-        Some(Self::new(base, key, model))
+        Some(Self::new(
+            base,
+            key,
+            std::env::var("LNA_RETRIEVER_MODEL").unwrap_or(model),
+        ))
     }
-
     pub fn new(base: impl Into<String>, key: impl Into<String>, model: impl Into<String>) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .expect("build retriever client");
         Self {
-            base: base.into(),
-            key: key.into(),
-            model: model.into(),
-            client,
+            model: OpenAiModel::new(base, key, model),
         }
     }
 
@@ -83,25 +75,17 @@ impl Retriever for ModelRetriever {
             "Relevant event ids for the query. Return ONLY JSON {{\"ids\":[1,2]}}.\n\nQUERY:\n{query}\n\nEVENTS:\n{}",
             Self::index(events)
         );
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are a retrieval function. Select only ids from the supplied events. Never invent ids. Return JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.0,
-        });
+        let messages = vec![
+            serde_json::json!({"role":"system","content":"Select relevant event ids from the supplied events. Return ONLY JSON {\"ids\":[1,2]}. Never invent ids."}),
+            serde_json::json!({"role":"user","content":prompt}),
+        ];
+        let control = Control::new(
+            Duration::from_secs(120),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let response = self
-            .client
-            .post(format!(
-                "{}/chat/completions",
-                self.base.trim_end_matches('/')
-            ))
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
-            .and_then(|response| response.error_for_status())
-            .and_then(|response| response.json::<Value>())?;
+            .model
+            .request(&messages, &[], crate::aja::FRAME_LIMIT, &control)?;
         let raw = response
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
