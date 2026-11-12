@@ -52,6 +52,15 @@ impl Control {
     }
 }
 
+/// Attempts per model call, including the first one.
+const MODEL_ATTEMPTS: usize = 4;
+const MODEL_RETRY_BASE_MS: u64 = 250;
+
+fn retry_delay(attempt: usize) -> Duration {
+    let factor = 1u64 << (attempt - 1).min(5);
+    Duration::from_millis((MODEL_RETRY_BASE_MS * factor).min(8_000))
+}
+
 pub trait Model: Send + Sync {
     /// Implementations must respect the host's cancellation/deadline and response cap.
     fn complete(
@@ -100,24 +109,47 @@ impl OpenAiModel {
         }
         control.wait(async {
             let client = reqwest::Client::builder().timeout(timeout).build()?;
-            let mut response = client
-                .post(format!(
-                    "{}/chat/completions",
-                    self.base.trim_end_matches('/')
-                ))
-                .bearer_auth(&self.key)
-                .json(&body)
-                .send()
-                .await?
-                .error_for_status()?;
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await? {
-                if chunk.len() > cap.saturating_sub(bytes.len()) {
-                    return Err("model response limit reached".into());
+            let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
+            // A provider hiccup (429, 5xx, a dropped connection) is not EJA's
+            // error. Retry a few times with backoff; the run deadline still
+            // bounds the whole call.
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let sent = client
+                    .post(&url)
+                    .bearer_auth(&self.key)
+                    .json(&body)
+                    .send()
+                    .await;
+                let mut response = match sent {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if attempt < MODEL_ATTEMPTS {
+                            tokio::time::sleep(retry_delay(attempt)).await;
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                let status = response.status();
+                if !status.is_success() {
+                    let transient = status.as_u16() == 429 || status.is_server_error();
+                    if transient && attempt < MODEL_ATTEMPTS {
+                        tokio::time::sleep(retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(format!("model request failed: HTTP {status}").into());
                 }
-                bytes.extend_from_slice(&chunk);
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response.chunk().await? {
+                    if chunk.len() > cap.saturating_sub(bytes.len()) {
+                        return Err("model response limit reached".into());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                return Ok(serde_json::from_slice(&bytes)?);
             }
-            Ok(serde_json::from_slice(&bytes)?)
         })
     }
 }
