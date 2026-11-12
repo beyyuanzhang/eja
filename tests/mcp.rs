@@ -515,3 +515,17 @@ fn cli_catalog_uses_owned_default_config_and_fails_explicit_missing_path() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+#[test]
+fn host_declared_read_only_tools_are_observable() {
+    let _lock = LOCK.lock().unwrap();
+    let f = Fixture::new();
+    let mut config = f.stdio("fixture", "descendant");
+    config["read_only"] = json!(["echo"]);
+    let path = f.config(json!({"mcpServers":{"fixture":config}}));
+    let host = HostTools::new(Some(&path), &f.0).unwrap();
+    let value = eja::Observer::observe(&host, "mcp__fixture__echo", &json!({"text":"probe"}))
+        .expect("declared read-only tool is observable");
+    assert!(value.to_string().contains("probe") || !value.is_null());
+    assert!(eja::Observer::observe(&host, "mcp__fixture__fail", &json!({})).is_err());
+}

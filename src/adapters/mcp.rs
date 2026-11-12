@@ -52,6 +52,9 @@ struct ServerConfig {
     #[serde(default)]
     headers: BTreeMap<String, String>,
     tools: Option<Vec<String>>,
+    /// Server tool names the host declares read-only for EJA's observation.
+    #[serde(default)]
+    read_only: Vec<String>,
     #[serde(default = "enabled")]
     enabled: bool,
     #[serde(default = "timeout")]
@@ -155,9 +158,17 @@ pub struct McpTools {
     connections: Vec<Connection>,
     children: Vec<LocalServer>,
     tools: BTreeMap<String, RemoteTool>,
+    read_only: HashSet<String>,
 }
 
 impl McpTools {
+    /// A tool is observable when the server says so or the host declares it.
+    pub fn is_read_only(&self, public: &str) -> bool {
+        self.tools
+            .get(public)
+            .is_some_and(|remote| remote.read_only || self.read_only.contains(remote.name.as_str()))
+    }
+
     /// Explicit host config only; no home/project auto-discovery or shell expansion.
     pub fn load(path: &Path, project: &Path) -> Result<Self> {
         let mut bytes = Vec::new();
@@ -179,6 +190,7 @@ impl McpTools {
             connections: vec![],
             children: vec![],
             tools: BTreeMap::new(),
+            read_only: HashSet::new(),
         };
         for (name, config) in config.servers {
             if !config.enabled {
@@ -353,6 +365,17 @@ impl McpTools {
                 )
                 .into());
             }
+            if config
+                .read_only
+                .iter()
+                .any(|declared| !available.contains(declared))
+            {
+                return Err(format!(
+                    "MCP {name}: read_only tool is absent from the server catalog"
+                )
+                .into());
+            }
+            host.read_only.extend(config.read_only.iter().cloned());
             for tool in listed {
                 if requested
                     .as_ref()
@@ -510,7 +533,7 @@ impl Observer for HostTools {
     /// EJA may look at the world through read-only connector tools; it may not act.
     fn observe(&self, tool: &str, arguments: &Value) -> Result<Value> {
         let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
-        if !mcp.tools.get(tool).is_some_and(|remote| remote.read_only) {
+        if !mcp.is_read_only(tool) {
             return Err("EJA may only observe read-only connector tools".into());
         }
         let control = Control::new(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));

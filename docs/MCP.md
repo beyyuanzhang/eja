@@ -73,6 +73,8 @@ resource browser or prompt registry.
   an MCP cancellation notification for a pending call.
 - Results retain MCP `content`, `structuredContent` and `isError`; remote resource
   references stay data and are not automatically fetched or made local artifacts.
+- `read_only` lists server tool names the host declares safe for EJA to observe.
+  EJA can also observe any tool the server itself annotated `readOnlyHint`.
 - An expired session is reinitialized and that request retried once, because a
   rejected session means the request did not execute. Other HTTP failures are
   never replayed.
