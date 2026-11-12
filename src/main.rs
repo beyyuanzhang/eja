@@ -2,7 +2,7 @@ use eja::adapters::{
     self, FileArtifactReader, HostTools, ModelRetriever, NativeWorker, OpenAiBrain, OpenAiModel,
     ToolGateway,
 };
-use eja::{project, tasks, turn, NoopRetriever, Retriever, Store, TaskStatus};
+use eja::{project, tasks, turn_observed, NoopRetriever, Retriever, Store, TaskStatus};
 use std::process::ExitCode;
 
 fn status_label(status: TaskStatus) -> &'static str {
@@ -127,20 +127,40 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             };
             let nodes = std::path::Path::new(&dir).join("nodes");
+            let project = match std::env::current_dir() {
+                Ok(project) => project,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let tools = match HostTools::new(mcp_config.as_deref(), &project) {
+                Ok(tools) => std::sync::Arc::new(tools),
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let worker =
                 match std::env::current_exe()
                     .map_err(|e| e.to_string())
                     .and_then(|binary| {
-                        let project = std::env::current_dir().map_err(|e| e.to_string())?;
-                        let tools = HostTools::new(mcp_config.as_deref(), &project)
-                            .map_err(|e| e.to_string())?;
+                        let mut limits = eja::aja::Limits::default();
+                        if let Ok(raw) = std::env::var("EJA_NODE_STEPS") {
+                            limits.steps = raw.parse().map_err(|_| "invalid EJA_NODE_STEPS")?;
+                        }
+                        if let Ok(raw) = std::env::var("EJA_NODE_TIMEOUT_MS") {
+                            limits.timeout_ms =
+                                raw.parse().map_err(|_| "invalid EJA_NODE_TIMEOUT_MS")?;
+                        }
                         NativeWorker::new(
                             binary,
                             &nodes,
-                            project,
+                            project.clone(),
                             std::sync::Arc::new(model),
-                            std::sync::Arc::new(tools),
+                            tools.clone() as std::sync::Arc<dyn ToolGateway>,
                         )
+                        .and_then(|worker| worker.with_limits(limits))
                         .map_err(|e| e.to_string())
                     }) {
                     Ok(worker) => worker,
@@ -154,7 +174,15 @@ fn main() -> ExitCode {
                 None => Box::new(NoopRetriever),
             };
             let artifacts = FileArtifactReader::new(nodes);
-            let result = turn(&store, &query, &brain, &worker, &*retriever, &artifacts);
+            let result = turn_observed(
+                &store,
+                &query,
+                &brain,
+                &worker,
+                &*retriever,
+                &artifacts,
+                &*tools,
+            );
             if eja::adapters::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
                 eprintln!("interrupted; the node was stopped and its run is recorded");
                 return ExitCode::FAILURE;

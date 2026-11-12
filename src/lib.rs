@@ -29,14 +29,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub const MAX_CORRECTIONS: usize = 6;
-pub const MAX_DECISIONS: usize = 4;
-pub const MAX_RELATIONSHIPS: usize = 2;
-pub const MAX_TASK_INDEX: usize = 50;
-pub const MAX_COMMITMENTS: usize = 50;
-pub const MAX_ARTIFACT_READS: usize = 4;
-pub const MAX_RELATIONS: usize = 50;
-
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub type TaskId = u64;
 
@@ -61,6 +53,7 @@ pub enum Kind {
     WorkerReport,
     TaskClosed,
     Read,
+    Observed,
 }
 
 impl Kind {
@@ -285,6 +278,27 @@ pub trait ArtifactReader {
     fn read(&self, path: &str) -> ArtifactContent;
 }
 
+/// Read-only observation of an external system. EJA may look; it never acts.
+pub trait Observer: Send + Sync {
+    fn observe(&self, tool: &str, arguments: &Value) -> Result<Value>;
+}
+
+pub struct NoopObserver;
+
+impl Observer for NoopObserver {
+    fn observe(&self, _: &str, _: &Value) -> Result<Value> {
+        Err("no observer is configured".into())
+    }
+}
+
+/// One read-only look at an external system, kept in the log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Observation {
+    pub tool: String,
+    pub arguments: Value,
+    pub result: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -458,7 +472,6 @@ pub fn active_identity(events: &[Event]) -> Vec<Event> {
             .iter()
             .rev()
             .filter(|event| event.kind == Kind::Correction)
-            .take(MAX_CORRECTIONS)
             .cloned(),
     );
     chosen.extend(
@@ -466,7 +479,6 @@ pub fn active_identity(events: &[Event]) -> Vec<Event> {
             .iter()
             .rev()
             .filter(|event| event.kind == Kind::RecordDecision)
-            .take(MAX_DECISIONS)
             .cloned(),
     );
     chosen.extend(
@@ -474,7 +486,6 @@ pub fn active_identity(events: &[Event]) -> Vec<Event> {
             .iter()
             .rev()
             .filter(|event| event.kind == Kind::Relationship)
-            .take(MAX_RELATIONSHIPS)
             .cloned(),
     );
     chosen.sort_by_key(|event| event.id);
@@ -526,9 +537,6 @@ fn relations_with_tasks(events: &[Event], tasks: &[Task]) -> Vec<Edge> {
     }
     out.sort_by_key(|edge| (edge.from, edge.to, edge.kind));
     out.dedup();
-    if out.len() > MAX_RELATIONS {
-        out.truncate(MAX_RELATIONS);
-    }
     out
 }
 
@@ -630,6 +638,7 @@ pub struct EjaContext {
     pub relations: Vec<Edge>,
     pub focus: Option<Task>,
     pub recall: Vec<Event>,
+    pub observations: Vec<Observation>,
     pub artifacts: Vec<ArtifactContent>,
     pub proposals: Vec<ProposalView>,
 }
@@ -668,36 +677,63 @@ pub fn project_with_recall(
             .cmp(&a.status.is_active())
             .then_with(|| b.id.cmp(&a.id))
     });
-    summaries.truncate(MAX_TASK_INDEX);
     Ok(EjaContext {
         now: now.timestamp(),
         input: input.to_string(),
         goal: goal_event(&events).cloned(),
         identity: active_identity(&events),
-        commitments: {
-            let mut commitments = open_commitments(&events);
-            if commitments.len() > MAX_COMMITMENTS {
-                commitments.drain(0..commitments.len() - MAX_COMMITMENTS);
-            }
-            commitments
-        },
+        commitments: open_commitments(&events),
         tasks: summaries,
         relations: relations_with_tasks(&events, &all_tasks),
         focus,
         recall: recall.to_vec(),
+        // A view of the current world, not of every look: the newest look per
+        // (tool, arguments) is what matters, so repeating it changes nothing.
+        observations: {
+            let mut seen = HashSet::new();
+            let mut observations: Vec<Observation> = Vec::new();
+            for event in events
+                .iter()
+                .rev()
+                .filter(|event| event.kind == Kind::Observed)
+            {
+                let Some(data) = event.data.as_ref() else {
+                    continue;
+                };
+                let Some(tool) = data.get("tool").and_then(Value::as_str) else {
+                    continue;
+                };
+                let arguments = data.get("arguments").cloned().unwrap_or(Value::Null);
+                if !seen.insert((tool.to_string(), arguments.to_string())) {
+                    continue;
+                }
+                observations.push(Observation {
+                    tool: tool.to_string(),
+                    arguments,
+                    result: data.get("result").cloned().unwrap_or(Value::Null),
+                });
+            }
+            observations.reverse();
+            observations
+        },
         artifacts: {
-            let mut artifacts: Vec<ArtifactContent> = events
+            let mut seen = HashSet::new();
+            let mut artifacts: Vec<ArtifactContent> = Vec::new();
+            for event in events
                 .iter()
                 .rev()
                 .filter(|event| event.kind == Kind::ArtifactRead)
-                .take(MAX_ARTIFACT_READS)
-                .filter_map(|event| {
-                    event
-                        .data
-                        .as_ref()
-                        .and_then(|value| serde_json::from_value(value.clone()).ok())
-                })
-                .collect();
+            {
+                let Some(content) = event.data.as_ref().and_then(|value| {
+                    serde_json::from_value::<ArtifactContent>(value.clone()).ok()
+                }) else {
+                    continue;
+                };
+                if !seen.insert(content.path.clone()) {
+                    continue;
+                }
+                artifacts.push(content);
+            }
             artifacts.reverse();
             artifacts
         },
@@ -768,6 +804,11 @@ pub enum Action {
     },
     ReadArtifact {
         path: String,
+    },
+    Observe {
+        tool: String,
+        #[serde(default)]
+        arguments: Value,
     },
 }
 
@@ -1068,6 +1109,7 @@ struct ActionCtx<'a> {
     worker: &'a dyn Worker,
     retriever: &'a dyn Retriever,
     artifacts: &'a dyn ArtifactReader,
+    observer: &'a dyn Observer,
 }
 
 fn apply_actions(
@@ -1182,6 +1224,28 @@ fn apply_actions(
                 out.artifacts.push(content);
                 observed = true;
             }
+            Action::Observe { tool, arguments } => {
+                let (result, error) = match ctx.observer.observe(tool, arguments) {
+                    Ok(value) => (value, None),
+                    Err(error) => (Value::Null, Some(error.to_string())),
+                };
+                ctx.store.append(
+                    Kind::Observed,
+                    "eja",
+                    "",
+                    ctx.turn,
+                    EventMeta::data(
+                        ctx.at,
+                        serde_json::json!({
+                            "tool": tool,
+                            "arguments": arguments,
+                            "result": result,
+                            "error": error,
+                        }),
+                    ),
+                )?;
+                observed = true;
+            }
         }
     }
     Ok(observed)
@@ -1214,6 +1278,50 @@ pub fn turn_at(
     worker: &dyn Worker,
     retriever: &dyn Retriever,
     artifact_reader: &dyn ArtifactReader,
+    now: DateTime<Utc>,
+) -> Result<TurnOutcome> {
+    turn_observed_at(
+        store,
+        input,
+        brain,
+        worker,
+        retriever,
+        artifact_reader,
+        &NoopObserver,
+        now,
+    )
+}
+
+pub fn turn_observed(
+    store: &Store,
+    input: &str,
+    brain: &dyn Brain,
+    worker: &dyn Worker,
+    retriever: &dyn Retriever,
+    artifacts: &dyn ArtifactReader,
+    observer: &dyn Observer,
+) -> Result<TurnOutcome> {
+    turn_observed_at(
+        store,
+        input,
+        brain,
+        worker,
+        retriever,
+        artifacts,
+        observer,
+        now_utc(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn turn_observed_at(
+    store: &Store,
+    input: &str,
+    brain: &dyn Brain,
+    worker: &dyn Worker,
+    retriever: &dyn Retriever,
+    artifact_reader: &dyn ArtifactReader,
+    observer: &dyn Observer,
     now: DateTime<Utc>,
 ) -> Result<TurnOutcome> {
     let at = now.timestamp();
@@ -1251,6 +1359,7 @@ pub fn turn_at(
         worker,
         retriever,
         artifacts: artifact_reader,
+        observer,
     };
     let mut seen = HashSet::new();
     seen.insert(fingerprint(&out.context));

@@ -1,11 +1,12 @@
-use eja::{project, EventMeta, Kind, Store, MAX_COMMITMENTS};
+use eja::adapters::{render_context, render_context_within};
+use eja::{project, EventMeta, Kind, Store};
 
 #[test]
-fn projection_bounds_open_commitments_without_compacting_the_log() {
+fn projection_keeps_every_recorded_commitment_and_says_so() {
     let dir = std::env::temp_dir().join(format!("eja-projection-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::new(&dir).expect("store");
-    for index in 0..(MAX_COMMITMENTS + 10) {
+    for index in 0..210 {
         store
             .append(
                 Kind::Commitment,
@@ -17,6 +18,20 @@ fn projection_bounds_open_commitments_without_compacting_the_log() {
             .expect("append");
     }
     let context = project(&store, "check", None, chrono::Utc::now()).expect("project");
-    assert_eq!(context.commitments.len(), MAX_COMMITMENTS);
-    assert_eq!(store.events().expect("events").len(), MAX_COMMITMENTS + 10);
+    assert_eq!(context.commitments.len(), 210);
+    assert_eq!(store.events().expect("events").len(), 210);
+
+    // Nothing is silently cut: an unbudgeted view shows everything.
+    let full = render_context(&context);
+    let at = full.find("OPEN COMMITMENTS").unwrap_or(0);
+    assert!(
+        full.contains("OPEN COMMITMENTS (210):"),
+        "{}",
+        &full[at..(at + 220).min(full.len())]
+    );
+
+    // A budgeted view reports how many it kept and how many exist.
+    let tight = render_context_within(&context, 400);
+    assert!(tight.contains("OPEN COMMITMENTS ("));
+    assert!(tight.contains("of 210"));
 }

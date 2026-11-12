@@ -1,6 +1,6 @@
 //! Shared, host-owned MCP clients. No connector state is passed to AJA.
-use super::{FileTools, ToolContext, ToolGateway, ToolOutput};
-use crate::{aja::FRAME_LIMIT, Assignment, Result};
+use super::{Control, FileTools, ToolContext, ToolGateway, ToolOutput};
+use crate::{aja::FRAME_LIMIT, Assignment, Observer, Result};
 use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, ClientCapabilities, ClientConfig, ClientRequest,
@@ -21,6 +21,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 use tokio::{
@@ -140,6 +141,7 @@ struct RemoteTool {
     server: usize,
     name: String,
     definition: Value,
+    read_only: bool,
 }
 struct Connection {
     name: String,
@@ -375,6 +377,11 @@ impl McpTools {
                             server: index,
                             name: tool.name.to_string(),
                             definition,
+                            read_only: tool
+                                .annotations
+                                .as_ref()
+                                .and_then(|annotations| annotations.read_only_hint)
+                                .unwrap_or(false),
                         },
                     )
                     .is_some()
@@ -469,11 +476,13 @@ impl Drop for McpTools {
 /// The application's one tool entry point. Shared MCP servers outlive nodes.
 pub struct HostTools {
     mcp: Option<McpTools>,
+    project: PathBuf,
 }
 impl HostTools {
     pub fn new(config: Option<&Path>, project: &Path) -> Result<Self> {
         Ok(Self {
             mcp: config.map(|p| McpTools::load(p, project)).transpose()?,
+            project: project.to_path_buf(),
         })
     }
 }
@@ -494,5 +503,24 @@ impl ToolGateway for HostTools {
         } else {
             FileTools.call(ctx, name, args)
         }
+    }
+}
+
+impl Observer for HostTools {
+    /// EJA may look at the world through read-only connector tools; it may not act.
+    fn observe(&self, tool: &str, arguments: &Value) -> Result<Value> {
+        let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
+        if !mcp.tools.get(tool).is_some_and(|remote| remote.read_only) {
+            return Err("EJA may only observe read-only connector tools".into());
+        }
+        let control = Control::new(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));
+        let context = ToolContext {
+            node_id: 0,
+            work: &self.project,
+            project: &self.project,
+            private: &self.project,
+            control: &control,
+        };
+        Ok(mcp.call(&context, tool, arguments)?.value)
     }
 }

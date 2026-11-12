@@ -305,10 +305,10 @@ fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
     )
     .unwrap();
     assert!(out.stalled);
-    // Four distinct artifact windows, then the same window again.
-    assert_eq!(out.decisions, 5);
+    // The same read twice: the second look carries no new information.
+    assert_eq!(out.decisions, 2);
     assert!(out.reply.is_empty());
-    assert_eq!(out.artifacts.len(), 5);
+    assert_eq!(out.artifacts.len(), 2);
     assert!(out.context.artifacts.iter().all(|a| a.error.is_some()));
     let events = store.events().unwrap();
     assert_eq!(

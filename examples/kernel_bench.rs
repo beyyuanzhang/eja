@@ -126,9 +126,8 @@ fn bench_project(root: &Path, events: usize, iterations: usize) -> (f64, f64, us
     let mut samples = Vec::new();
     for _ in 0..iterations {
         let start = Instant::now();
-        let context = project(&store, "benchmark", None, now()).expect("project");
+        let _context = project(&store, "benchmark", None, now()).expect("project");
         samples.push(start.elapsed());
-        assert!(context.commitments.len() <= eja::MAX_COMMITMENTS);
     }
     let size = fs::metadata(dir.join("log.jsonl")).expect("metadata").len() as usize;
     (pct(&samples, 0.5), pct(&samples, 0.95), size)
