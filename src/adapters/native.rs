@@ -20,6 +20,9 @@ use std::{
     time::Duration,
 };
 
+/// Set by the host on SIGINT: cancellation is a host capability, not a model action.
+pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 struct Process {
     child: Child,
     input: Option<ChildStdin>,
@@ -71,6 +74,9 @@ impl Process {
     fn next(&self, control: &Control) -> Result<Request> {
         loop {
             control.check()?;
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                return Err("AJA interrupted".into());
+            }
             match self
                 .receiver
                 .as_ref()
@@ -309,6 +315,9 @@ impl Worker for NativeWorker {
         // Reserve once. Restart or replay cannot overwrite an existing node, even after failure.
         if assignment.task_id == 0 {
             return Report::failed("invalid node id");
+        }
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            return Report::failed("interrupted before the node started");
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         {

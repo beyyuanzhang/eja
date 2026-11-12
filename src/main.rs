@@ -36,8 +36,25 @@ fn counts(items: &[eja::Task]) -> String {
     }
 }
 
+extern "C" fn on_sigint(_: libc::c_int) {
+    eja::adapters::INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("usage: eja --dir DIR [--task ID] [--mcp-config FILE] MODE [text...]");
+        println!();
+        println!("  turn      one interaction: project, decide, act, record");
+        println!("  context   print the projection for the next decision");
+        println!("  tasks     list task nodes");
+        println!("  log       print the append-only event log as JSONL");
+        println!("  tools     print model-visible file and MCP tool schemas");
+        return ExitCode::SUCCESS;
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
+    }
     if args.as_slice() == ["--aja-worker"] {
         return match eja::aja::worker_main() {
             Ok(()) => ExitCode::SUCCESS,
@@ -137,7 +154,12 @@ fn main() -> ExitCode {
                 None => Box::new(NoopRetriever),
             };
             let artifacts = FileArtifactReader::new(nodes);
-            turn(&store, &query, &brain, &worker, &*retriever, &artifacts).map(|outcome| {
+            let result = turn(&store, &query, &brain, &worker, &*retriever, &artifacts);
+            if eja::adapters::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("interrupted; the node was stopped and its run is recorded");
+                return ExitCode::FAILURE;
+            }
+            result.map(|outcome| {
                 println!("eja: {}", outcome.reply);
                 if outcome.stalled {
                     println!("[turn stalled: the model repeated a state with no new observation]");

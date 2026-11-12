@@ -221,7 +221,7 @@ impl McpTools {
                         .kill_on_drop(true)
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
-                        .stderr(Stdio::null());
+                        .stderr(Stdio::inherit());
                     for key in ["PATH", "HOME", "TMPDIR", "TMP", "LANG", "SYSTEMROOT"] {
                         if let Some(value) = std::env::var_os(key) {
                             command.env(key, value);
@@ -292,7 +292,7 @@ impl McpTools {
                                     .max_sse_event_size(FRAME_LIMIT)
                                     .max_concurrent_requests(1)
                                     .control_request_timeout(Duration::from_millis(500))
-                                    .reinit_on_expired_session(false),
+                                    .reinit_on_expired_session(true),
                             );
                             tokio::time::timeout(timeout, client.serve(transport)).await
                         })?

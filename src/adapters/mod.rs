@@ -14,7 +14,7 @@ pub use artifact::FileArtifactReader;
 pub use brain::{parse_decision, render_context, OpenAiBrain, SYSTEM_PROMPT};
 pub use mcp::{HostTools, McpTools};
 pub use model::{Control, Model, OpenAiModel};
-pub use native::NativeWorker;
+pub use native::{NativeWorker, INTERRUPTED};
 pub use retriever::ModelRetriever;
 pub use tools::{FileTools, ToolContext, ToolGateway, ToolOutput};
 

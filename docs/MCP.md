@@ -40,7 +40,7 @@ Stdio programs run directly, without a shell. The default working directory is
 the project; optional `cwd` is absolute or relative to the config file. Only
 `PATH`, `HOME`, `TMPDIR`, `TMP`, `LANG`, `SYSTEMROOT` and explicit `env` are passed.
 Only `env` values and HTTP header values expand `${VARIABLE}`; missing variables
-are errors. Arguments and commands are literal. Server stderr is discarded;
+are errors. Arguments and commands are literal. Server stderr is inherited by the host;
 stdout must contain MCP JSON lines only.
 
 HTTP uses Streamable HTTP, accepts JSON and SSE responses, and supports configured
@@ -73,7 +73,9 @@ resource browser or prompt registry.
   an MCP cancellation notification for a pending call.
 - Results retain MCP `content`, `structuredContent` and `isError`; remote resource
   references stay data and are not automatically fetched or made local artifacts.
-- Calls are not automatically replayed after HTTP failures or expired sessions.
+- An expired session is reinitialized and that request retried once, because a
+  rejected session means the request did not execute. Other HTTP failures are
+  never replayed.
 - Shutdown closes HTTP sessions and kills/waits for owned stdio processes. On
   Unix, ordinary descendants in their server's process group are killed too.
   Initialization failures clean up servers already started.

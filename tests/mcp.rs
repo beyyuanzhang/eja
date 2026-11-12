@@ -289,7 +289,7 @@ fn http(f: &Fixture) -> (HttpServer, String) {
 }
 
 #[test]
-fn streamable_http_json_sse_headers_session_cleanup_and_no_replay() {
+fn streamable_http_json_sse_headers_session_reinit_once_and_no_replay() {
     let _lock = LOCK.lock().unwrap();
     let f = Fixture::new();
     let (_server, url) = http(&f);
@@ -391,14 +391,16 @@ fn streamable_http_json_sse_headers_session_cleanup_and_no_replay() {
             json!({"text":"expired"})
         )
         .is_err());
+    // An expired session means the request did not execute: reinitialize once and
+    // retry that request exactly once.
     assert_eq!(
         f.events("http")
             .iter()
             .filter(|e| e["method"] == "initialize")
             .count(),
-        inits
+        inits + 1
     );
-    assert_eq!(f.events("http").iter().filter(|e| e["method"] == "tools/call" && e["params"]["arguments"]["text"] == "expired").count(),1);
+    assert_eq!(f.events("http").iter().filter(|e| e["method"] == "tools/call" && e["params"]["arguments"]["text"] == "expired").count(),2);
 }
 
 struct ConnectorModel;
