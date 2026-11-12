@@ -177,7 +177,10 @@ with `relate {kind: part_of}`; `part_of` is containment;
 - waiting for EJA's acceptance consumes no AJA process; reports remain claims;
 - the prompt states the node's turn/time budget, and a spent budget returns a
   `blocked` report for a new node instead of a false failure;
-- `node.json` also freezes a bounded host-observed tool log, for audit only.
+- `node.json` also freezes the node's complete context (`context.jsonl`: the start
+  messages, every assistant turn, every tool call with arguments and result, and
+  the final report), read-only. A task that runs through several nodes is audited
+  end to end with `eja audit <task>`; one frozen record with `eja node <id>`.
 
 ## Recovery
 

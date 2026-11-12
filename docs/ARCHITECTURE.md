@@ -25,8 +25,10 @@ S' = commit(S, confirmed actions)
    Reading artifacts or the outside world is an option, never a required gate.
 8. A task closes only from `waiting` with `close_task`.
 9. AJA : task = 1:1. The native worker uses one temporary Rust process per
-   assignment and one execution slot. Frozen nodes retain data, no running session.
-   Retries/continuations are new linked nodes.
+   assignment and one execution slot. Finishing a node freezes its complete
+   context: the manifest, the assignment, the start messages, every assistant
+   turn, every tool call with arguments and result, and the report, all read-only.
+   No session survives; retries/continuations are new linked nodes.
 10. Language, prompts, retrieval and artifact reading live in adapters.
 11. A crashed `running` task is reconciled to `waiting` with an interrupted
     failed report; no automatic duplicate dispatch.

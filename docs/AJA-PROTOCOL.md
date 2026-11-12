@@ -54,7 +54,10 @@ terminates the native loop. No idle session or process is retained.
 
 The host then copies validated artifacts into the node's artifact directory,
 marks files read-only, removes work, and publishes `node.json` by atomic rename.
-The manifest includes the assignment, report and `frozen: true`. Invalid artifact
+The manifest includes the assignment, report, `context: "context.jsonl"`, the
+frozen context size and `frozen: true`. The context file is the complete node
+record as the host saw it: start messages, assistant turns, tool calls with
+arguments and results, and the final report. Invalid artifact
 claims produce a failed report; valid partial writes remain inspectable. EJA's
 acceptance is a later log event and never keeps the process alive.
 

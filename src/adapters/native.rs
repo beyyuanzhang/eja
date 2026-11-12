@@ -4,11 +4,11 @@ use crate::{
     aja::{self, Limits, Request, Start},
     Assignment, Report, Result, Worker,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::BufReader,
+    io::{BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -19,6 +19,35 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
+
+/// The node's complete context, appended as it happens and frozen with the node.
+/// The host sees every model response and tool call, so freezing the record never
+/// depends on the node cooperating.
+struct ContextLog {
+    file: fs::File,
+    started: bool,
+}
+
+impl ContextLog {
+    fn create(node: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(node.join("context.jsonl"))?;
+        Ok(Self {
+            file,
+            started: false,
+        })
+    }
+
+    fn record(&mut self, entry: Value) -> Result<()> {
+        let mut line = serde_json::to_vec(&entry)?;
+        line.push(b'\n');
+        self.file.write_all(&line)?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
 
 /// Set by the host on SIGINT: cancellation is a host capability, not a model action.
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -179,6 +208,7 @@ impl NativeWorker {
         control: &Control,
         artifacts: &mut HashSet<String>,
         audit: &mut Vec<crate::ObservedTool>,
+        log: &mut ContextLog,
     ) -> Result<Report> {
         let definitions = self.tools.definitions(assignment);
         let allowed: HashSet<String> = definitions
@@ -204,6 +234,10 @@ impl NativeWorker {
         loop {
             let response = match process.next(control)? {
                 Request::Model { messages } => {
+                    if !log.started {
+                        log.started = true;
+                        log.record(json!({"kind": "start", "messages": messages}))?;
+                    }
                     steps += 1;
                     if self.limits.steps.is_some_and(|limit| steps > limit)
                         || serde_json::to_vec(&messages)?.len() > self.limits.context_bytes
@@ -216,6 +250,13 @@ impl NativeWorker {
                     if serde_json::to_vec(&value)?.len() > self.limits.response_bytes {
                         return Err("AJA model output limit reached".into());
                     }
+                    log.record(json!({
+                        "kind": "assistant",
+                        "message": value
+                            .pointer("/choices/0/message")
+                            .cloned()
+                            .unwrap_or_else(|| value.clone()),
+                    }))?;
                     value
                 }
                 Request::Tool { name, arguments } => {
@@ -241,6 +282,12 @@ impl NativeWorker {
                             }
                         }
                     };
+                    log.record(json!({
+                        "kind": "tool",
+                        "name": name,
+                        "arguments": arguments,
+                        "result": value,
+                    }))?;
                     // Host-observed record of what the node actually did, for audit only.
                     if audit.len() < 200 {
                         audit.push(entry);
@@ -300,7 +347,21 @@ impl NativeWorker {
         report.artifacts = sealed;
         report.tools = audit.to_vec();
         fs::remove_dir_all(node.join("work"))?;
-        let manifest = json!({"assignment":assignment,"report":report,"frozen":true});
+        let context = node.join("context.jsonl");
+        if let Ok(file) = fs::OpenOptions::new().write(true).open(&context) {
+            file.sync_all()?;
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&context, permissions)?;
+        }
+        let context_bytes = fs::metadata(&context).map(|m| m.len()).unwrap_or(0);
+        let manifest = json!({
+            "assignment": assignment,
+            "report": report,
+            "context": "context.jsonl",
+            "context_bytes": context_bytes,
+            "frozen": true,
+        });
         let temp = node.join("node.json.tmp");
         fs::write(&temp, serde_json::to_vec_pretty(&manifest)?)?;
         fs::File::open(&temp)?.sync_all()?;
@@ -348,11 +409,21 @@ impl Worker for NativeWorker {
         );
         let mut paths = HashSet::new();
         let mut audit = Vec::new();
+        let mut log = match ContextLog::create(&node) {
+            Ok(log) => log,
+            Err(error) => return Report::failed(format!("node context is unavailable: {error}")),
+        };
         let result = fs::create_dir(node.join("work"))
             .map_err(Into::into)
-            .and_then(|_| self.run(assignment, &node, &control, &mut paths, &mut audit));
+            .and_then(|_| {
+                self.run(
+                    assignment, &node, &control, &mut paths, &mut audit, &mut log,
+                )
+            });
         cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything
         let report = result.unwrap_or_else(|e| Report::failed(e.to_string()));
+        let _ = log.record(json!({"kind": "report", "report": &report}));
+        drop(log);
         paths.extend(report.artifacts.iter().cloned());
         let result = self.seal(&node, assignment, report, paths, &audit);
         result.unwrap_or_else(|e| Report::failed(format!("node could not be frozen: {e}")))

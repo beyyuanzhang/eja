@@ -163,6 +163,15 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     );
     assert!(!f.0.join(".eja/nodes/1/work").exists());
     assert_eq!(f.manifest(1)["frozen"], true);
+    assert_eq!(f.manifest(1)["context"], "context.jsonl");
+    let context = std::fs::read_to_string(f.0.join(".eja/nodes/1/context.jsonl")).unwrap();
+    for kind in ["start", "assistant", "tool", "report"] {
+        assert!(
+            context.contains(&format!("\"kind\":\"{kind}\"")),
+            "context is missing {kind}: {context}"
+        );
+    }
+    assert!(context.contains("node result"));
     let seen = model.seen.lock().unwrap();
     assert_eq!(seen[0][1]["content"], "node 1 work");
     assert_eq!(seen[1][3]["role"], "tool");

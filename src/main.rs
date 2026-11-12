@@ -50,6 +50,8 @@ fn main() -> ExitCode {
         println!("  tasks     list task nodes");
         println!("  log       print the append-only event log as JSONL");
         println!("  tools     print model-visible file and MCP tool schemas");
+        println!("  node ID   print one frozen node: manifest and context size");
+        println!("  audit ID  print the node chain of a task through continues edges");
         return ExitCode::SUCCESS;
     }
     unsafe {
@@ -239,6 +241,116 @@ fn main() -> ExitCode {
                 );
                 Ok(())
             }),
+        "node" => (|| -> eja::Result<()> {
+            let id: u64 = query.trim().parse().map_err(|_| "node takes one task id")?;
+            let base = std::path::Path::new(&dir)
+                .join("nodes")
+                .join(id.to_string());
+            let manifest = std::fs::read_to_string(base.join("node.json"))?;
+            println!("{manifest}");
+            let context = base.join("context.jsonl");
+            match std::fs::metadata(&context) {
+                Ok(meta) => println!("[context: {} bytes — {}]", meta.len(), context.display()),
+                Err(_) => println!("[no frozen context]"),
+            }
+            Ok(())
+        })(),
+        "audit" => (|| -> eja::Result<()> {
+            let start: u64 = query
+                .trim()
+                .parse()
+                .map_err(|_| "audit takes one task id")?;
+            let events = store.events()?;
+            let mut edges: Vec<(u64, u64)> = Vec::new();
+            for event in &events {
+                if event.kind != eja::Kind::TaskRelation {
+                    continue;
+                }
+                let Some(data) = event.data.as_ref() else {
+                    continue;
+                };
+                if data["kind"].as_str() != Some("continues") {
+                    continue;
+                }
+                if let (Some(from), Some(to)) = (data["from"].as_u64(), data["to"].as_u64()) {
+                    edges.push((from, to));
+                }
+            }
+            let mut chain = vec![start];
+            let mut index = 0;
+            while index < chain.len() {
+                let current = chain[index];
+                index += 1;
+                for (from, to) in &edges {
+                    let next = if *from == current {
+                        Some(*to)
+                    } else if *to == current {
+                        Some(*from)
+                    } else {
+                        None
+                    };
+                    if let Some(next) = next {
+                        if !chain.contains(&next) {
+                            chain.push(next);
+                        }
+                    }
+                }
+            }
+            chain.sort_unstable();
+            let all = tasks(&events);
+            // A continuation is a new task; when EJA did not write an explicit
+            // `continues` edge, tasks opened from the same input are still one job.
+            let mut same_origin: Vec<u64> = Vec::new();
+            if let Some(start_task) = all.iter().find(|task| task.id == start) {
+                for task in &all {
+                    if task.origin == start_task.origin && !chain.contains(&task.id) {
+                        same_origin.push(task.id);
+                    }
+                }
+            }
+            same_origin.sort_unstable();
+            println!("task chain: {} node(s)", chain.len());
+            for id in &chain {
+                let Some(task) = all.iter().find(|task| task.id == *id) else {
+                    println!("#{id} (missing task)");
+                    continue;
+                };
+                println!(
+                    "#{} [{}] {}",
+                    task.id,
+                    status_label(task.status),
+                    task.title
+                );
+                if let Some(report) = &task.report {
+                    println!("  report: {:?} — {}", report.status, report.summary);
+                }
+                let context = std::path::Path::new(&dir)
+                    .join("nodes")
+                    .join(id.to_string())
+                    .join("context.jsonl");
+                match std::fs::metadata(&context) {
+                    Ok(meta) => println!("  context: {} bytes", meta.len()),
+                    Err(_) => println!("  context: (none)"),
+                }
+            }
+            if !same_origin.is_empty() {
+                println!(
+                    "same input, no continues edge: {} task(s)",
+                    same_origin.len()
+                );
+                for id in &same_origin {
+                    if let Some(task) = all.iter().find(|task| task.id == *id) {
+                        println!(
+                            "#{} [{}] {}",
+                            task.id,
+                            status_label(task.status),
+                            task.title
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })(),
         "tasks" => store.events().map(|events| {
             for task in tasks(&events) {
                 println!(
