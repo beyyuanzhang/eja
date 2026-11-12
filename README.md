@@ -96,6 +96,10 @@ A look creates one `Observed` event and one EVIDENCE entry. Evidence belongs to
 the turn that asked for it; the log keeps every look forever. `focus {task_id}`
 is navigation, not reading: it chooses the task the turn is about.
 
+A look has no item cap. The model adapter declares how much context it can take,
+and the renderer fills the view in priority order; a record that does not fit is
+cut where the budget ends and the cut is stated with counts.
+
 ## Turn loop
 
 Each decision's actions execute in order through one loop:

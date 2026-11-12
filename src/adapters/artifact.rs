@@ -32,9 +32,6 @@ impl FileArtifactReader {
         if !metadata.is_file() {
             return Err("not a regular file".into());
         }
-        if metadata.len() > 8 * 1024 * 1024 {
-            return Err("file is too large to select a passage from".into());
-        }
         Ok(std::fs::read(&full).map(|bytes| String::from_utf8_lossy(&bytes).to_string())?)
     }
 }
@@ -111,9 +108,6 @@ impl ArtifactReader for FileArtifactReader {
                         .map(|(offset, line)| json!({"line": start + offset, "text": line}))
                         .collect();
                     matches.push(json!({"line": index, "context": context}));
-                    if matches.len() >= 20 {
-                        break;
-                    }
                 }
                 Ok(json!({
                     "path": path,

@@ -183,12 +183,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                 }
             }
         } else {
-            let mut text = format!("    {}", observation.result);
-            if text.len() > 2000 {
-                text.truncate(2000);
-                text.push('…');
-            }
-            item.push(text);
+            item.push(format!("    {}", observation.result));
         }
         evidence_items.push(item);
     }
@@ -284,51 +279,33 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     fit_sections(&sections, budget)
 }
 
-fn fit_sections(sections: &[Section], budget: usize) -> String {
-    let sizes: Vec<Vec<usize>> = sections
-        .iter()
-        .map(|section| {
-            section
-                .items
-                .iter()
-                .map(|item| item.iter().map(|line| line.len() + 1).sum())
-                .collect()
-        })
-        .collect();
-    let mut keep: Vec<usize> = sections.iter().map(|section| section.items.len()).collect();
-    let mut total: usize = sections
-        .iter()
-        .enumerate()
-        .map(|(index, section)| section.title.len() + sizes[index].iter().sum::<usize>() + 2)
-        .sum();
-    while total > budget {
-        let Some(index) = (0..keep.len()).rev().find(|&index| keep[index] > 0) else {
-            break;
-        };
-        keep[index] -= 1;
-        total = total.saturating_sub(sizes[index][keep[index]]);
-    }
-    let mut text = join_sections(sections, &keep);
-    let mut rounds = 0;
-    while text.len() > budget && rounds < 16 {
-        rounds += 1;
-        let Some(index) = (0..keep.len()).rev().find(|&index| keep[index] > 0) else {
-            break;
-        };
-        keep[index] -= 1;
-        text = join_sections(sections, &keep);
-    }
-    text
+fn item_size(item: &[String]) -> usize {
+    item.iter().map(|line| line.len() + 1).sum::<usize>() + 1
 }
 
-fn join_sections(sections: &[Section], keep: &[usize]) -> String {
+/// Assemble the view in priority order. The declared budget is the only limit:
+/// a record that does not fit is cut where the budget ends and the cut is
+/// stated, with counts, instead of being silently shortened.
+fn fit_sections(sections: &[Section], budget: usize) -> String {
     let mut out = String::new();
-    for (section, &shown) in sections.iter().zip(keep) {
+    for section in sections {
         let total = section.items.len();
-        let header = match (section.counted, shown >= total) {
-            (false, _) => format!("{}:", section.title),
-            (true, true) => format!("{} ({}):", section.title, total),
-            (true, false) => format!("{} ({} of {}):", section.title, shown, total),
+        let mut shown = 0usize;
+        let mut remaining = budget.saturating_sub(out.len());
+        for item in &section.items {
+            let size = item_size(item);
+            if size <= remaining {
+                shown += 1;
+                remaining = remaining.saturating_sub(size);
+            } else {
+                break;
+            }
+        }
+        let header = match (section.counted, total == 0, shown >= total) {
+            (false, _, _) => format!("{}:", section.title),
+            (true, true, _) => format!("{} (0):", section.title),
+            (true, false, true) => format!("{} ({}):", section.title, total),
+            (true, false, false) => format!("{} ({} of {}):", section.title, shown, total),
         };
         out.push_str(&header);
         out.push('\n');
@@ -343,7 +320,25 @@ fn join_sections(sections: &[Section], keep: &[usize]) -> String {
             }
         }
         if shown < total {
-            out.push_str(&format!("  … {} more\n", total - shown));
+            for line in &section.items[shown] {
+                if out.len() + line.len() < budget {
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
+                let left = budget.saturating_sub(out.len());
+                if left > 8 {
+                    out.push_str(cut_at(&line.clone(), left - 4));
+                    out.push('…');
+                    out.push('\n');
+                }
+                break;
+            }
+            let rest = total - shown;
+            out.push_str(&format!(
+                "  … view budget reached: {} of {} records fit, {} more stay in the log or the frozen record\n",
+                shown, total, rest
+            ));
         }
         out.push('\n');
     }
@@ -433,4 +428,16 @@ fn source_label(source: LookSource) -> &'static str {
         LookSource::Node => "node",
         LookSource::World => "world",
     }
+}
+
+/// Cut a line at a byte budget without splitting a character.
+fn cut_at(line: &str, limit: usize) -> &str {
+    let mut end = 0;
+    for (index, _) in line.char_indices() {
+        if index > limit {
+            break;
+        }
+        end = index;
+    }
+    &line[..end]
 }

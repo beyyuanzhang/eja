@@ -180,3 +180,25 @@ fn node_files_answer_a_range_and_a_match() {
         .expect("match");
     assert!(none["matches"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn a_match_returns_every_hit_and_the_view_budget_is_the_only_limit() {
+    use eja::adapters::FileArtifactReader;
+    let dir = std::env::temp_dir().join(format!("eja-match-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let body: String = (0..30).map(|n| format!("hit {n}\n")).collect();
+    std::fs::write(dir.join("note.txt"), body).expect("write");
+    let reader = FileArtifactReader::new(&dir);
+    let hit = reader
+        .slice(
+            "note.txt",
+            &Selector::Match {
+                text: "hit".to_string(),
+                before: 0,
+                after: 0,
+            },
+        )
+        .expect("match");
+    assert_eq!(hit["matches"].as_array().unwrap().len(), 30);
+}
