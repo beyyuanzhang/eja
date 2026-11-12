@@ -105,3 +105,23 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
     );
     server.join().expect("server");
 }
+
+#[test]
+fn one_unreadable_action_does_not_discard_the_rest() {
+    let raw = r#"{"reply":"go","actions":[{"op":"focus","task_id":1},{"op":"look","source":"node","target":"3","selector":{"select":"last"}}]}"#;
+    let decision = eja::adapters::parse_decision(raw);
+    assert_eq!(decision.actions.len(), 1, "{:?}", decision.actions);
+    assert!(
+        decision.reply.contains("not understood"),
+        "{}",
+        decision.reply
+    );
+    assert!(decision.reply.starts_with("go"));
+}
+
+#[test]
+fn a_plain_reply_is_still_a_finished_decision() {
+    let decision = eja::adapters::parse_decision("nothing left to do");
+    assert!(decision.actions.is_empty());
+    assert_eq!(decision.reply, "nothing left to do");
+}

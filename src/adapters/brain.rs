@@ -1,4 +1,4 @@
-use crate::{format_utc, Brain, Decision, EjaContext, LookSource, Selector};
+use crate::{format_utc, Action, Brain, Decision, EjaContext, LookSource, Selector};
 use serde_json::json;
 use std::time::Duration;
 
@@ -360,13 +360,48 @@ pub fn parse_decision(raw: &str) -> Decision {
         (Some(start), Some(end)) if end > start => &stripped[start..=end],
         _ => stripped,
     };
-    match serde_json::from_str::<Decision>(candidate) {
-        Ok(decision) => decision,
-        Err(_) => Decision {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) else {
+        // Not a decision object: a plain reply is a legitimate answer.
+        return Decision {
             reply: trimmed.to_string(),
             actions: Vec::new(),
-        },
+        };
+    };
+    if !value.is_object() {
+        return Decision {
+            reply: trimmed.to_string(),
+            actions: Vec::new(),
+        };
     }
+    let mut reply = value
+        .get("reply")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut actions = Vec::new();
+    let mut notes = Vec::new();
+    match value.get("actions").map(|actions| actions.as_array()) {
+        Some(Some(list)) => {
+            // One unreadable action does not discard the rest of the decision:
+            // the readable actions still run and the loss is recorded in the reply.
+            for item in list {
+                match serde_json::from_value::<Action>(item.clone()) {
+                    Ok(action) => actions.push(action),
+                    Err(error) => notes.push(format!("{error}: {item}")),
+                }
+            }
+        }
+        Some(None) => notes.push("actions was not a list".to_string()),
+        None => {}
+    }
+    if !notes.is_empty() {
+        reply.push_str(&format!(
+            "\n[decision: {} action(s) not understood: {}]",
+            notes.len(),
+            notes.join("; ")
+        ));
+    }
+    Decision { reply, actions }
 }
 
 /// Conservative adapter-level guard: large enough for normal sessions, small
