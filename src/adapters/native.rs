@@ -205,7 +205,7 @@ impl NativeWorker {
             let response = match process.next(control)? {
                 Request::Model { messages } => {
                     steps += 1;
-                    if steps > self.limits.steps
+                    if self.limits.steps.is_some_and(|limit| steps > limit)
                         || serde_json::to_vec(&messages)?.len() > self.limits.context_bytes
                     {
                         return Err("AJA model budget exceeded".into());

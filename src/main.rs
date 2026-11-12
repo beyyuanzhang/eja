@@ -134,20 +134,22 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let tools = match HostTools::new(mcp_config.as_deref(), &project) {
-                Ok(tools) => std::sync::Arc::new(tools),
-                Err(error) => {
-                    eprintln!("{error}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            let tools =
+                match HostTools::new(mcp_config.as_deref(), &project, std::path::Path::new(&dir)) {
+                    Ok(tools) => std::sync::Arc::new(tools),
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
             let worker =
                 match std::env::current_exe()
                     .map_err(|e| e.to_string())
                     .and_then(|binary| {
                         let mut limits = eja::aja::Limits::default();
                         if let Ok(raw) = std::env::var("EJA_NODE_STEPS") {
-                            limits.steps = raw.parse().map_err(|_| "invalid EJA_NODE_STEPS")?;
+                            limits.steps =
+                                Some(raw.parse::<usize>().map_err(|_| "invalid EJA_NODE_STEPS")?);
                         }
                         if let Ok(raw) = std::env::var("EJA_NODE_TIMEOUT_MS") {
                             limits.timeout_ms =
@@ -224,7 +226,8 @@ fn main() -> ExitCode {
         "tools" => std::env::current_dir()
             .map_err(Into::into)
             .and_then(|project| {
-                let tools = HostTools::new(mcp_config.as_deref(), &project)?;
+                let tools =
+                    HostTools::new(mcp_config.as_deref(), &project, std::path::Path::new(&dir))?;
                 let assignment = eja::Assignment {
                     task_id: focus.unwrap_or(0),
                     objective: query,

@@ -18,10 +18,8 @@ fn relation(kind: crate::RelationKind) -> &'static str {
 pub const SYSTEM_PROMPT: &str = "\
 You are EJA, one continuous subject. You own identity, commitments and the \
 task index; you do not execute work. AJA sessions execute one assignment each and \
-return a report. A report is a claim, not a verified outcome: only close a task \
-when the report satisfies its acceptance criteria, otherwise reject it or ask \
-the user. EJA has no execution tools and no fallback executor: never offer to do \
-the work yourself. A correction targets an explicit event id; never invent one. Identity changes \
+return a report. A report is a claim, not a verified outcome; the decision and its reason \
+are yours and are recorded. EJA has no execution tools and no fallback executor. A correction targets an explicit event id; never invent one. Identity changes \
 (goal, commitment, correction) are proposals: propose them, then confirm only \
 after the user has confirmed. Never confirm a proposal in the same turn it was \
 created. \
@@ -31,9 +29,8 @@ of the same kind. Use correction with target_id only to withdraw that event. \
 The proposal text is the replacement content, or the withdrawal reason. \
 Actions execute in their listed order. Reading a task, recalling history, reading \
 an artifact, observing a read-only connector tool or dispatching an AJA returns \
-observations for your next decision. Inspect those observations before deciding \
-acceptance. A continuation is a new task: when a report says the work is \
-unfinished, open the next task and relate it to the old one with \
+observations for your next decision. A continuation is represented as a new \
+task related to the previous one with \
 {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
 To finish, return your final reply with no observation-producing actions. \
 Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes: \
@@ -132,7 +129,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                     ""
                 };
                 task_lines.push(format!(
-                    "  observed tools: {} calls — {}{}",
+                    "  host-observed tools: {} calls — {}{}",
                     report.tools.len(),
                     names.join(", "),
                     more
@@ -160,6 +157,65 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         task_lines.push("  (none)".to_string());
     }
     sections.push(section("CURRENT TASK", false, vec![task_lines]));
+
+    // Evidence sits before the index: when a budget forces a trim, the newest
+    // observations survive and old index entries are dropped first.
+    let mut observation_items = Vec::new();
+    for observation in &context.observations {
+        let mut text = format!("    {}", observation.result);
+        if text.len() > 2000 {
+            text.truncate(2000);
+            text.push('…');
+        }
+        observation_items.push(vec![
+            format!("  {} {}", observation.tool, observation.arguments),
+            text,
+        ]);
+    }
+    sections.push(section("OBSERVATIONS", true, observation_items));
+
+    let mut artifact_items = Vec::new();
+    for artifact in &context.artifacts {
+        let mut item = vec![format!(
+            "  {} ({} bytes{})",
+            artifact.path,
+            artifact.text.len(),
+            if artifact.truncated {
+                ", truncated"
+            } else {
+                ""
+            }
+        )];
+        if let Some(error) = &artifact.error {
+            item.push(format!("    error: {error}"));
+        } else {
+            for line in artifact.text.lines() {
+                item.push(format!("    {line}"));
+            }
+        }
+        artifact_items.push(item);
+    }
+    sections.push(section("ARTIFACT READS", true, artifact_items));
+
+    let mut recall_items = Vec::new();
+    for event in &context.recall {
+        let mut item = vec![format!(
+            "  #{} [{}] {} scope={}: {}",
+            event.id,
+            label(event.kind),
+            format_utc(event.at),
+            event.scope,
+            event.text
+        )];
+        if let Some(target) = event.closes {
+            item.push(format!("    closes: #{target}"));
+        }
+        if let Some(data) = &event.data {
+            item.push(format!("    data: {data}"));
+        }
+        recall_items.push(item);
+    }
+    sections.push(section("RECALLED EVENTS", true, recall_items));
 
     sections.push(section(
         "ACTIVE IDENTITY",
@@ -194,41 +250,6 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             })
             .collect(),
     ));
-
-    let mut recall_items = Vec::new();
-    for event in &context.recall {
-        let mut item = vec![format!(
-            "  #{} [{}] {} scope={}: {}",
-            event.id,
-            label(event.kind),
-            format_utc(event.at),
-            event.scope,
-            event.text
-        )];
-        if let Some(target) = event.closes {
-            item.push(format!("    closes: #{target}"));
-        }
-        if let Some(data) = &event.data {
-            item.push(format!("    data: {data}"));
-        }
-        recall_items.push(item);
-    }
-    sections.push(section("RECALLED EVENTS", true, recall_items));
-
-    let mut observation_items = Vec::new();
-    for observation in &context.observations {
-        let mut text = format!("    {}", observation.result);
-        if text.len() > 2000 {
-            text.truncate(2000);
-            text.push('…');
-        }
-        observation_items.push(vec![
-            format!("  {} {}", observation.tool, observation.arguments),
-            text,
-        ]);
-    }
-    sections.push(section("OBSERVATIONS", true, observation_items));
-
     sections.push(section(
         "PENDING PROPOSALS",
         true,
@@ -283,44 +304,41 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
 
-    let mut artifact_items = Vec::new();
-    for artifact in &context.artifacts {
-        let mut item = vec![format!(
-            "  {} ({} bytes{})",
-            artifact.path,
-            artifact.text.len(),
-            if artifact.truncated {
-                ", truncated"
-            } else {
-                ""
-            }
-        )];
-        if let Some(error) = &artifact.error {
-            item.push(format!("    error: {error}"));
-        } else {
-            for line in artifact.text.lines() {
-                item.push(format!("    {line}"));
-            }
-        }
-        artifact_items.push(item);
-    }
-    sections.push(section("ARTIFACT READS", true, artifact_items));
-
     fit_sections(&sections, budget)
 }
 
 fn fit_sections(sections: &[Section], budget: usize) -> String {
+    let sizes: Vec<Vec<usize>> = sections
+        .iter()
+        .map(|section| {
+            section
+                .items
+                .iter()
+                .map(|item| item.iter().map(|line| line.len() + 1).sum())
+                .collect()
+        })
+        .collect();
     let mut keep: Vec<usize> = sections.iter().map(|section| section.items.len()).collect();
-    let mut text = join_sections(sections, &keep);
-    while text.len() > budget {
+    let mut total: usize = sections
+        .iter()
+        .enumerate()
+        .map(|(index, section)| section.title.len() + sizes[index].iter().sum::<usize>() + 2)
+        .sum();
+    while total > budget {
         let Some(index) = (0..keep.len()).rev().find(|&index| keep[index] > 0) else {
             break;
         };
-        if text.len() > budget.saturating_mul(2) && keep[index] > 1 {
-            keep[index] = 0;
-        } else {
-            keep[index] -= 1;
-        }
+        keep[index] -= 1;
+        total = total.saturating_sub(sizes[index][keep[index]]);
+    }
+    let mut text = join_sections(sections, &keep);
+    let mut rounds = 0;
+    while text.len() > budget && rounds < 16 {
+        rounds += 1;
+        let Some(index) = (0..keep.len()).rev().find(|&index| keep[index] > 0) else {
+            break;
+        };
+        keep[index] -= 1;
         text = join_sections(sections, &keep);
     }
     text
@@ -376,6 +394,11 @@ pub fn parse_decision(raw: &str) -> Decision {
     }
 }
 
+/// Conservative adapter-level guard: large enough for normal sessions, small
+/// enough that a pathological log does not hit a provider limit. Override with
+/// `EJA_CONTEXT_BYTES`.
+const DEFAULT_CONTEXT_BYTES: usize = 200_000;
+
 pub struct OpenAiBrain {
     model: OpenAiModel,
     context_budget: usize,
@@ -391,7 +414,7 @@ impl OpenAiBrain {
         let context_budget = std::env::var("EJA_CONTEXT_BYTES")
             .ok()
             .and_then(|raw| raw.parse().ok())
-            .unwrap_or(usize::MAX);
+            .unwrap_or(DEFAULT_CONTEXT_BYTES);
         Self {
             model: OpenAiModel::new(base, key, model),
             context_budget,

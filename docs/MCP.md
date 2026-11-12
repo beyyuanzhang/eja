@@ -74,7 +74,9 @@ resource browser or prompt registry.
 - Results retain MCP `content`, `structuredContent` and `isError`; remote resource
   references stay data and are not automatically fetched or made local artifacts.
 - `read_only` lists server tool names the host declares safe for EJA to observe.
-  EJA can also observe any tool the server itself annotated `readOnlyHint`.
+  EJA can also observe any tool the server itself annotated `readOnlyHint`. The
+  host is the authority here: declare only tools that cannot change state, because
+  EJA will call them on its own.
 - An expired session is reinitialized and that request retried once, because a
   rejected session means the request did not execute. Other HTTP failures are
   never replayed.

@@ -500,12 +500,14 @@ impl Drop for McpTools {
 pub struct HostTools {
     mcp: Option<McpTools>,
     project: PathBuf,
+    private: PathBuf,
 }
 impl HostTools {
-    pub fn new(config: Option<&Path>, project: &Path) -> Result<Self> {
+    pub fn new(config: Option<&Path>, project: &Path, private: &Path) -> Result<Self> {
         Ok(Self {
             mcp: config.map(|p| McpTools::load(p, project)).transpose()?,
             project: project.to_path_buf(),
+            private: private.to_path_buf(),
         })
     }
 }
@@ -530,20 +532,27 @@ impl ToolGateway for HostTools {
 }
 
 impl Observer for HostTools {
-    /// EJA may look at the world through read-only connector tools; it may not act.
+    /// EJA may look at the world; it may never act. Files are readable only from
+    /// the project, connector tools only when declared read-only.
     fn observe(&self, tool: &str, arguments: &Value) -> Result<Value> {
+        let control = Control::new(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));
+        let context = ToolContext {
+            node_id: 0,
+            work: &self.private,
+            project: &self.project,
+            private: &self.private,
+            control: &control,
+        };
+        if tool == "read_file" {
+            if arguments.get("area").and_then(Value::as_str) != Some("project") {
+                return Err("EJA may only read files from the project area".into());
+            }
+            return Ok(FileTools.call(&context, tool, arguments)?.value);
+        }
         let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
         if !mcp.is_read_only(tool) {
             return Err("EJA may only observe read-only connector tools".into());
         }
-        let control = Control::new(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));
-        let context = ToolContext {
-            node_id: 0,
-            work: &self.project,
-            project: &self.project,
-            private: &self.project,
-            control: &control,
-        };
         Ok(mcp.call(&context, tool, arguments)?.value)
     }
 }

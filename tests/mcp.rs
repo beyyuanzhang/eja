@@ -120,7 +120,7 @@ fn stdio_discovery_grants_results_and_owned_process_group() {
     config["env"] = json!({"MCP_MARKER":"${PATH}"});
     config["tools"] = json!(["echo", "fail", "a.b"]);
     let path = f.config(json!({"mcpServers":{"fixture":config, "disabled":{"enabled":false,"command":"does-not-exist"}}}));
-    let host = HostTools::new(Some(&path), &f.0).unwrap();
+    let host = HostTools::new(Some(&path), &f.0, &f.0).unwrap();
     assert_eq!(
         tool_names(&host),
         [
@@ -435,7 +435,7 @@ fn native_nodes_share_one_host_connection_and_freeze_independently() {
     let _lock = LOCK.lock().unwrap();
     let f = Fixture::new();
     let path = f.config(json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
-    let tools = Arc::new(HostTools::new(Some(&path), &f.0).unwrap());
+    let tools = Arc::new(HostTools::new(Some(&path), &f.0, &f.0).unwrap());
     let pid = f.pid("fixture", "pid");
     let root = f.0.join("nodes");
     let worker = NativeWorker::new(
@@ -523,7 +523,7 @@ fn host_declared_read_only_tools_are_observable() {
     let mut config = f.stdio("fixture", "descendant");
     config["read_only"] = json!(["echo"]);
     let path = f.config(json!({"mcpServers":{"fixture":config}}));
-    let host = HostTools::new(Some(&path), &f.0).unwrap();
+    let host = HostTools::new(Some(&path), &f.0, &f.0).unwrap();
     let value = eja::Observer::observe(&host, "mcp__fixture__echo", &json!({"text":"probe"}))
         .expect("declared read-only tool is observable");
     assert!(value.to_string().contains("probe") || !value.is_null());

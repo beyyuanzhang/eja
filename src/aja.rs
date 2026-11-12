@@ -9,7 +9,7 @@ pub const FRAME_LIMIT: usize = 256 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limits {
     pub timeout_ms: u64,
-    pub steps: usize,
+    pub steps: Option<usize>,
     pub context_bytes: usize,
     pub response_bytes: usize,
 }
@@ -18,7 +18,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             timeout_ms: 300_000,
-            steps: 16,
+            steps: None,
             context_bytes: FRAME_LIMIT,
             response_bytes: 64 * 1024,
         }
@@ -28,7 +28,7 @@ impl Default for Limits {
 impl Limits {
     pub fn validate(&self) -> Result<()> {
         if self.timeout_ms == 0
-            || self.steps == 0
+            || self.steps == Some(0)
             || self.context_bytes == 0
             || self.context_bytes > FRAME_LIMIT
             || self.response_bytes == 0
@@ -97,16 +97,30 @@ fn request(reader: &mut impl BufRead, writer: &mut impl Write, request: Request)
 
 fn run(start: Start, reader: &mut impl BufRead, writer: &mut impl Write) -> Result<Report> {
     start.limits.validate()?;
+    let budget = match start.limits.steps {
+        Some(steps) => format!(
+            "You have at most {steps} model turns and {} seconds.",
+            start.limits.timeout_ms / 1000
+        ),
+        None => format!("You have {} seconds.", start.limits.timeout_ms / 1000),
+    };
     let system = format!(
-        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. You have at most {} model turns and {} seconds: budget them, and spend the last turn writing the report instead of calling tools. Return a final JSON report: {{\"status\":\"done|blocked|failed\",\"summary\":\"...\",\"artifacts\":[\"relative work file\"],\"evidence\":[],\"open_questions\":[]}}. A done report is a claim for EJA to inspect. Never claim a tool succeeded when it failed.",
-        start.limits.steps,
-        start.limits.timeout_ms / 1000,
+        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. {budget} Return a final JSON report: {{\"status\":\"done|blocked|failed\",\"summary\":\"...\",\"artifacts\":[\"relative work file\"],\"evidence\":[],\"open_questions\":[]}}. A done report is a claim for EJA to inspect. Never claim a tool succeeded when it failed.",
     );
     let mut messages = vec![
         json!({"role":"system","content":system}),
         json!({"role":"user","content":start.assignment.objective}),
     ];
-    for _ in 0..start.limits.steps {
+    let mut turns = 0usize;
+    loop {
+        if let Some(limit) = start.limits.steps {
+            if turns >= limit {
+                return Ok(budget_exhausted(&format!(
+                    "AJA step budget of {limit} turns exhausted"
+                )));
+            }
+        }
+        turns += 1;
         if serde_json::to_vec(&messages)?.len() > start.limits.context_bytes {
             return Ok(budget_exhausted("AJA context budget exhausted"));
         }
@@ -156,10 +170,6 @@ fn run(start: Start, reader: &mut impl BufRead, writer: &mut impl Write) -> Resu
             );
         }
     }
-    Ok(budget_exhausted(&format!(
-        "AJA step budget of {} turns exhausted",
-        start.limits.steps
-    )))
 }
 
 /// Private worker mode of the same binary. It receives no credentials or state-log path.

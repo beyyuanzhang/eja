@@ -121,10 +121,22 @@ worker report (a claim) → EJA decides → close_task { accepted, note }
 `read_artifact` is an optional observation. When a node wrote files, EJA can read
 them; when the work lives in an external system (a connector or a service), the
 artifact list is legitimately empty and EJA decides from the report. Nothing is
-required before `close_task`, and there is no separate verifier.
+required before `close_task`, and there is no separate verifier. `observe` is the
+other optional look: a read-only connector tool or a project file, recorded as an
+OBSERVATIONS entry, so EJA can check a claim against the world when the host
+grants that view. EJA never gets an effect tool.
 
 `node.json` keeps the host-observed tool log of the node in the sealed report
 (`report.tools`), and the current task renders it. It is a record, not a gate.
+
+## Prompt and strategy
+
+The model prompt carries protocol only: the action vocabulary, the budget and the
+meaning of a report. It does not carry task tactics. What EJA learns about how to
+work is recorded in its own identity events — goal, commitment, decision,
+correction — and projected back into the next decision. The harness generalizes by
+never encoding a per-task hint: if a strategy is worth keeping, EJA writes it down
+as identity.
 
 ## Tasks and typed graph
 

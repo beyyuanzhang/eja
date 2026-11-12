@@ -288,7 +288,7 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
         model.clone(),
         Arc::new(FileTools),
         Limits {
-            steps: 1,
+            steps: Some(1),
             ..Limits::default()
         },
     );

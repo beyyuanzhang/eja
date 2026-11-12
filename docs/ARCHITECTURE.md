@@ -38,6 +38,9 @@ S' = commit(S, confirmed actions)
     ends at a fixpoint: a decision that observes nothing, or a projection that
     repeats. Recorded results are always retained and a stalled turn is reported
     explicitly; pure state-writing actions can finish.
+15. Prompts carry protocol only: actions, limits and what a report means. Task
+    strategy is not written in code or prompt text; it is what EJA records in its
+    own identity events (goal, commitment, decision, correction).
 
 ## Core API
 

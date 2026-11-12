@@ -4,6 +4,7 @@ version = "0.10.1"
 edition = "2021"
 description = "EJA/AJA minimal closed loop"
 repository = "https://github.com/beyyuanzhang/eja"
+license = "MIT"
 readme = "README.md"
 
 [dependencies]
