@@ -86,6 +86,13 @@ query → retriever adapter (semantic selection + graph/time expansion)
 
 No text matching in core.
 
+## Observation
+
+`observe(tool, arguments)` is an action. It reaches only connector tools the
+server itself declared read-only (`readOnlyHint`), and the result is appended as
+an `Observed` event and rendered as OBSERVATIONS in the next projection. EJA can
+check a claim against the world; it never gains an effect tool.
+
 ## Turn loop
 
 Each decision's actions execute in order through one loop:
@@ -94,8 +101,8 @@ Each decision's actions execute in order through one loop:
 project → decide → act → append results → project
 ```
 
-Reading tasks, recalling events, reading artifacts and receiving AJA reports all
-continue through that loop, in any order. A final reply with only state-writing
+Reading tasks, recalling events, reading artifacts, observing read-only connector
+tools and receiving AJA reports all continue through that loop, in any order. A final reply with only state-writing
 actions (or no actions) ends the turn. Task focus and recalled evidence remain
 available across steps. A turn ends when a decision observes nothing, or when the
 projection stops changing: repeated observations that carry no new information are
@@ -141,7 +148,7 @@ aja   -continues-> previous aja
 task  -relates_to|supersedes|contradicts-> task
 ```
 
-The graph is a **projection** of the same event log, bounded by `MAX_RELATIONS`.
+The graph is a **projection** of the same event log.
 There is no graph database, scheduler, or worker pool. Containment is added
 with `relate {kind: part_of}`; `part_of` is containment;
 `depends_on`/`continues` are execution order; `relates_to`/`supersedes`/
@@ -239,7 +246,8 @@ shared connections and process/session cleanup.
 
 ## Not built
 
-- EJA compaction: the log is never summarized; projection is bounded, not compacted.
+- EJA compaction: the log is never summarized; the projection is complete and the
+  renderer fits a byte budget the model adapter declares, reporting what it kept.
 - tokenizer/pattern matching in core.
 - separate verifier authority over EJA.
 - parallel workers, multi-writer locks, auth, multi-user.

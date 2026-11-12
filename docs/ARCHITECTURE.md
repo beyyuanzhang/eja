@@ -71,6 +71,7 @@ S' = commit(S, confirmed actions)
 | `read_task {task_id}` | structured task focus |
 | `recall {query}` | retriever adapter → event ids |
 | `read_artifact {path}` | artifact adapter → bounded content in EJA context |
+| `observe {tool, arguments}` | read-only connector tool → `Observed` event and OBSERVATIONS view |
 
 ## Modules
 
