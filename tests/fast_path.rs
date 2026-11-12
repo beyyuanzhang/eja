@@ -164,5 +164,7 @@ fn multiple_active_tasks_do_not_use_the_fast_path() {
         eja::now_utc(),
     )
     .expect("close");
-    assert_eq!(*focus.lock().expect("focus"), vec![None]);
+    // Closing an open task is refused; the refusal re-opens one decision so EJA
+    // can read the note in its projection, then the turn ends.
+    assert_eq!(*focus.lock().expect("focus"), vec![None, None]);
 }

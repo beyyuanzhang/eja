@@ -317,6 +317,7 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
             },
         ]),
         step(vec![Action::Confirm { proposal_id: 2 }]),
+        step(vec![]),
     ]);
     let out = turn(
         &store,
@@ -330,7 +331,10 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
         },
     )
     .unwrap();
-    assert_eq!(out.decisions, 2);
+    // The refused confirmation is told once, so EJA gets one more decision.
+    assert_eq!(out.decisions, 3);
+    assert_eq!(out.refused.len(), 1, "{:?}", out.refused);
+    assert!(out.refused[0].contains("created this turn"));
     assert_eq!(out.context.proposals.len(), 1);
     assert!(out.context.commitments.is_empty());
     assert!(!store

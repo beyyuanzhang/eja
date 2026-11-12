@@ -1308,15 +1308,26 @@ pub fn turn_at(
     };
     let mut seen = HashSet::new();
     seen.insert(fingerprint(&out.context));
+    let mut refused_this_turn: Vec<String> = Vec::new();
     loop {
         out.decisions += 1;
         let decision = brain.decide(&out.context);
         let notes = out.refused.len();
         out.refused.extend(decision.refused.iter().cloned());
-        let observed = apply_actions(&decision.actions, &ctx, &mut out, &mut focus)?;
+        let acted = apply_actions(&decision.actions, &ctx, &mut out, &mut focus)?;
+        // A refusal is information, not a no-op: it tells EJA what the state did
+        // not allow. A new note re-opens the projection so EJA can decide again;
+        // a repeated note changes nothing and the fixpoint ends the turn.
+        let mut told = false;
         for note in &out.refused[notes..] {
+            if refused_this_turn.contains(note) {
+                continue;
+            }
             store.append(Kind::Refused, "eja", note, ctx.turn, EventMeta::new(at))?;
+            refused_this_turn.push(note.clone());
+            told = true;
         }
+        let observed = acted || told;
         out.context = project_with_evidence(store, input, focus, now, &out.evidence)?;
         if !observed {
             out.reply = decision.reply.trim().to_string();
