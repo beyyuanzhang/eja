@@ -206,3 +206,43 @@ fn a_match_returns_every_hit_and_the_view_budget_is_the_only_limit() {
         .expect("match");
     assert_eq!(hit["matches"].as_array().unwrap().len(), 30);
 }
+
+#[test]
+fn list_dir_reads_the_project_and_reports_what_it_hid() {
+    use eja::adapters::{FileTools, ToolContext, ToolGateway};
+    use std::io::Write;
+    let root = std::env::temp_dir().join(format!("eja-list-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    let private = root.join("private");
+    std::fs::create_dir_all(project.join("docs")).unwrap();
+    std::fs::create_dir_all(&private).unwrap();
+    let mut file = std::fs::File::create(project.join("README.md")).unwrap();
+    file.write_all(b"hello").unwrap();
+    let control = eja::adapters::Control::new(
+        std::time::Duration::from_secs(5),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let ctx = ToolContext {
+        node_id: 1,
+        work: &project,
+        project: &project,
+        private: &private,
+        control: &control,
+    };
+    let listing = FileTools
+        .call(
+            &ctx,
+            "list_dir",
+            &serde_json::json!({"path": ".", "area": "project"}),
+        )
+        .unwrap()
+        .value;
+    let entries = listing["entries"].as_array().unwrap();
+    assert!(entries
+        .iter()
+        .any(|e| e.as_str().unwrap().starts_with("README.md")));
+    assert!(entries.iter().any(|e| e.as_str().unwrap() == "docs/"));
+    assert_eq!(listing["truncated"], false);
+    let _ = std::fs::remove_dir_all(&root);
+}

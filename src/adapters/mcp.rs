@@ -534,9 +534,9 @@ impl Observer for HostTools {
             private: &self.private,
             control: &control,
         };
-        if tool == "read_file" {
+        if tool == "read_file" || tool == "list_dir" {
             if arguments.get("area").and_then(Value::as_str) != Some("project") {
-                return Err("EJA may only read files from the project area".into());
+                return Err("EJA may only read the project area".into());
             }
             return Ok(FileTools.call(&context, tool, arguments)?.value);
         }

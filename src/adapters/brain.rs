@@ -48,6 +48,8 @@ Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes:
 {\"op\":\"look\",\"source\":\"node\",\"target\":\"1/artifacts/out.md\"}; \
 {\"op\":\"look\",\"source\":\"node\",\"target\":\"3/context.jsonl\",\"selector\":{\"select\":\"match\",\"text\":\"PO-1010\",\"before\":2,\"after\":4}}; \
 {\"op\":\"look\",\"source\":\"node\",\"target\":\"1/artifacts/out.md\",\"selector\":{\"select\":\"range\",\"from\":0,\"lines\":40}}; \
+{\"op\":\"look\",\"source\":\"world\",\"target\":\"list_dir\",\"arguments\":{\"path\":\".\",\"area\":\"project\"}}; \
+{\"op\":\"look\",\"source\":\"world\",\"target\":\"read_file\",\"arguments\":{\"path\":\"README.md\",\"area\":\"project\"}}; \
 {\"op\":\"look\",\"source\":\"world\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
 Preconditions: dispatch runs only a task in open state; a task that has a node \
 record is waiting for your judgment, so close it or open a new task for more \

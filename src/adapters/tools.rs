@@ -56,6 +56,7 @@ impl ToolGateway for FileTools {
     fn definitions(&self, _: &crate::Assignment) -> Vec<Value> {
         vec![
             json!({"type":"function","function":{"name":"read_file","description":"Read a UTF-8 file from work or the read-only project. Large files are truncated.","parameters":{"type":"object","properties":{"path":{"type":"string"},"area":{"type":"string","enum":["work","project"]}},"required":["path","area"],"additionalProperties":false}}}),
+            json!({"type":"function","function":{"name":"list_dir","description":"List one directory level from work or the read-only project: names, kind and size. Bounded by the output frame, reporting how many entries were kept.","parameters":{"type":"object","properties":{"path":{"type":"string"},"area":{"type":"string","enum":["work","project"]}},"required":["path","area"],"additionalProperties":false}}}),
             json!({"type":"function","function":{"name":"write_file","description":"Write UTF-8 content in this node's private work area. The file will be sealed as an artifact.","parameters":{"type":"object","properties":{"path":{"type":"string"},"text":{"type":"string"}},"required":["path","text"],"additionalProperties":false}}}),
         ]
     }
@@ -83,6 +84,42 @@ impl ToolGateway for FileTools {
                 bytes.truncate(FRAME_LIMIT);
                 (
                     json!({"text":String::from_utf8_lossy(&bytes),"truncated":truncated}),
+                    vec![],
+                )
+            }
+            "list_dir" => {
+                let root = match args["area"].as_str() {
+                    Some("work") => ctx.work,
+                    Some("project") => ctx.project,
+                    _ => return Err("area must be work or project".into()),
+                };
+                let full = if path == "." {
+                    root.to_path_buf()
+                } else {
+                    relative_file(root, path)?
+                };
+                let mut entries: Vec<String> = Vec::new();
+                let mut shown = 0usize;
+                let mut bytes = 0usize;
+                let listing: Vec<_> = fs::read_dir(&full)?.collect::<std::io::Result<Vec<_>>>()?;
+                let total = listing.len();
+                for entry in listing {
+                    let metadata = entry.metadata()?;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let line = if metadata.is_dir() {
+                        format!("{name}/")
+                    } else {
+                        format!("{name} ({} bytes)", metadata.len())
+                    };
+                    bytes += line.len() + 1;
+                    if bytes > FRAME_LIMIT {
+                        break;
+                    }
+                    entries.push(line);
+                    shown += 1;
+                }
+                (
+                    json!({"path":path,"area":args["area"],"entries":entries,"showing":shown,"total":total,"truncated":shown < total}),
                     vec![],
                 )
             }
