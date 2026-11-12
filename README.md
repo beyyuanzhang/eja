@@ -97,10 +97,11 @@ project → decide → act → append results → project
 Reading tasks, recalling events, reading artifacts and receiving AJA reports all
 continue through that loop, in any order. A final reply with only state-writing
 actions (or no actions) ends the turn. Task focus and recalled evidence remain
-available across steps. One turn permits at most `MAX_TURN_STEPS` (8) decisions.
-At the limit, recorded results are retained, `step_limit_reached` is logged and
-reported by the CLI, and no intermediate reply is presented as a final answer.
-Work can continue on the next turn.
+available across steps. A turn ends when a decision observes nothing, or when the
+projection stops changing: repeated observations that carry no new information are
+not spun into an arbitrary cap. Recorded results are always retained, a stalled
+turn is logged (`stalled`) and reported by the CLI, and no intermediate reply is
+presented as a final answer.
 
 ## Judgment
 

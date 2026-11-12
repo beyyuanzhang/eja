@@ -36,7 +36,6 @@ pub const MAX_TASK_INDEX: usize = 50;
 pub const MAX_COMMITMENTS: usize = 50;
 pub const MAX_ARTIFACT_READS: usize = 4;
 pub const MAX_RELATIONS: usize = 50;
-pub const MAX_TURN_STEPS: usize = 8;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub type TaskId = u64;
@@ -812,7 +811,7 @@ pub struct TurnOutcome {
     pub artifacts: Vec<ArtifactContent>,
     pub decisions: usize,
     pub worker_ms: u128,
-    pub step_limit_reached: bool,
+    pub stalled: bool,
 }
 
 fn pending_proposals(events: &[Event]) -> Vec<ProposalView> {
@@ -1188,6 +1187,15 @@ fn apply_actions(
     Ok(observed)
 }
 
+/// A turn ends at a fixpoint: a repeated projection carries no new information.
+fn fingerprint(context: &EjaContext) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let bytes = serde_json::to_vec(context).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub fn turn(
     store: &Store,
     input: &str,
@@ -1233,7 +1241,7 @@ pub fn turn_at(
         artifacts: Vec::new(),
         decisions: 0,
         worker_ms: 0,
-        step_limit_reached: false,
+        stalled: false,
     };
     let ctx = ActionCtx {
         store,
@@ -1244,7 +1252,9 @@ pub fn turn_at(
         retriever,
         artifacts: artifact_reader,
     };
-    for _ in 0..MAX_TURN_STEPS {
+    let mut seen = HashSet::new();
+    seen.insert(fingerprint(&out.context));
+    loop {
         out.decisions += 1;
         let decision = brain.decide(&out.context);
         let observed = apply_actions(&decision.actions, &ctx, &mut out, &mut focus)?;
@@ -1254,10 +1264,14 @@ pub fn turn_at(
             break;
         }
         // Every observation uses the same continuation path, including AJA reports.
-        // At the limit, retain recorded work without presenting an unevaluated reply.
-        out.step_limit_reached = out.decisions == MAX_TURN_STEPS;
+        // An observation that leaves the projection unchanged carries no new
+        // information: the turn is over, instead of stopping at an arbitrary count.
+        if !seen.insert(fingerprint(&out.context)) {
+            out.stalled = true;
+            break;
+        }
     }
-    if !out.step_limit_reached && out.reply.is_empty() {
+    if !out.stalled && out.reply.is_empty() {
         out.reply = out
             .reports
             .last()
@@ -1265,8 +1279,8 @@ pub fn turn_at(
             .unwrap_or_default();
     }
     let mut meta = EventMeta::new(at);
-    if out.step_limit_reached {
-        meta.data = Some(serde_json::json!({"step_limit_reached": true}));
+    if out.stalled {
+        meta.data = Some(serde_json::json!({"stalled": true}));
     }
     store.append(Kind::Eja, "eja", &out.reply, turn_no, meta)?;
     out.context = project_with_recall(store, input, focus, now, &out.recalled)?;

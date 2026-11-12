@@ -34,9 +34,10 @@ S' = commit(S, confirmed actions)
     as `origin`. Acceptance remains EJA's responsibility.
 13. If exactly one active task is waiting, the turn starts with that task as
     focus, avoiding one redundant initial model call.
-14. All actions execute in list order. Observations continue through one loop,
-    bounded by `MAX_TURN_STEPS`. Exhaustion retains recorded results for a later
-    turn and is reported explicitly; pure state-writing actions can finish.
+14. All actions execute in list order. Observations continue through one loop that
+    ends at a fixpoint: a decision that observes nothing, or a projection that
+    repeats. Recorded results are always retained and a stalled turn is reported
+    explicitly; pure state-writing actions can finish.
 
 ## Core API
 
@@ -44,8 +45,8 @@ S' = commit(S, confirmed actions)
 - `current_goal`, `open_commitments`, `active_identity`, `tasks`, `relations`.
 - `project`: structured context (goal, identity, commitments, task index,
   focus, recall, artifact reads, pending proposals, now).
-- `turn_at`: one bounded project/decide/act loop for typed actions and observations;
-  reports `decisions`, `worker_ms` and `step_limit_reached`.
+- `turn_at`: one project/decide/act loop for typed actions and observations; it
+  ends at a fixpoint and reports `decisions`, `worker_ms` and `stalled`.
 - `aja`: bounded disposable loop and framed IPC, no external effects.
 - `NativeWorker`: host model/tool gateway, node workspace, cancellation, process
   cleanup, artifact sealing and frozen manifest. One run per node id.

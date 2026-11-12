@@ -139,8 +139,8 @@ fn main() -> ExitCode {
             let artifacts = FileArtifactReader::new(nodes);
             turn(&store, &query, &brain, &worker, &*retriever, &artifacts).map(|outcome| {
                 println!("eja: {}", outcome.reply);
-                if outcome.step_limit_reached {
-                    println!("[turn step limit reached; recorded work can continue next turn]");
+                if outcome.stalled {
+                    println!("[turn stalled: the model repeated a state with no new observation]");
                 }
                 println!(
                     "[{} | focus #{} | dispatched {} | reads {} | decisions {} | worker {}ms | log {}]",

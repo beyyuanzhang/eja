@@ -1,7 +1,7 @@
 use eja::{
     turn, Action, ArtifactContent, ArtifactReader, Assignment, Brain, Decision, EjaContext, Event,
     Kind, NoopArtifactReader, NoopRetriever, ProposalKind, Report, ReportStatus, Result, Retriever,
-    Store, TaskStatus, Worker, MAX_TURN_STEPS,
+    Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -150,9 +150,6 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         step(vec![Action::ReadArtifact {
             path: "first.md".into(),
         }]),
-        step(vec![Action::Recall {
-            query: "old fact again".into(),
-        }]),
         step(vec![Action::ReadArtifact {
             path: "second.md".into(),
         }]),
@@ -167,9 +164,9 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         &Reader,
     )
     .unwrap();
-    assert_eq!(out.decisions, 6);
+    assert_eq!(out.decisions, 5);
     assert_eq!(out.reply, "final answer");
-    assert!(!out.step_limit_reached);
+    assert!(!out.stalled);
     assert_eq!(out.reads, vec![1]);
     assert_eq!(out.context.focus.as_ref().unwrap().id, 1);
     assert_eq!(out.recalled.len(), 1);
@@ -183,7 +180,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         assert_eq!(context.recall.len(), 1);
         assert!(eja::adapters::render_context(context).contains(&fact.text));
     }
-    assert!(seen[5]
+    assert!(seen[4]
         .artifacts
         .iter()
         .any(|a| a.text == "content of second.md"));
@@ -216,7 +213,6 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
         step(vec![Action::Recall {
             query: "old evidence".into(),
         }]),
-        step(vec![Action::ReadTask { task_id: 1 }]),
         step(vec![Action::ReadArtifact {
             path: "1.md".into(),
         }]),
@@ -239,7 +235,7 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
     )
     .unwrap();
     assert_eq!(out.reply, "both accepted");
-    assert_eq!(out.decisions, 7);
+    assert_eq!(out.decisions, 6);
     assert_eq!(out.dispatched, vec![1, 2]);
     assert_eq!(out.reports.len(), 2);
     assert!(out.tasks.iter().all(|task| task.status == TaskStatus::Done));
@@ -247,7 +243,7 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
     assert_eq!(seen[1].focus.as_ref().unwrap().status, TaskStatus::Waiting);
     assert_eq!(seen[5].focus.as_ref().unwrap().id, 2);
     assert_eq!(seen[5].recall[0].id, fact.id);
-    assert!(seen[6].artifacts.iter().any(|a| a.path == "2.md"));
+    assert!(seen[5].artifacts.iter().any(|a| a.path == "2.md"));
     assert_eq!(worker.0.lock().unwrap().len(), 2);
 }
 
@@ -287,10 +283,10 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
 }
 
 #[test]
-fn repeated_observations_stop_at_the_limit_without_a_false_final_reply() {
+fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
     let store = store();
     let brain = Script::new(
-        (0..MAX_TURN_STEPS)
+        (0..10)
             .map(|_| {
                 step(vec![Action::ReadArtifact {
                     path: "missing.md".into(),
@@ -308,30 +304,38 @@ fn repeated_observations_stop_at_the_limit_without_a_false_final_reply() {
         &NoopArtifactReader,
     )
     .unwrap();
-    assert!(out.step_limit_reached);
-    assert_eq!(out.decisions, MAX_TURN_STEPS);
+    assert!(out.stalled);
+    // Four distinct artifact windows, then the same window again.
+    assert_eq!(out.decisions, 5);
     assert!(out.reply.is_empty());
-    assert_eq!(out.artifacts.len(), MAX_TURN_STEPS);
+    assert_eq!(out.artifacts.len(), 5);
     assert!(out.context.artifacts.iter().all(|a| a.error.is_some()));
     let events = store.events().unwrap();
     assert_eq!(
-        events.last().unwrap().data.as_ref().unwrap()["step_limit_reached"],
+        events.last().unwrap().data.as_ref().unwrap()["stalled"],
         true
     );
     assert!(events.last().unwrap().text.is_empty());
 }
 
 #[test]
-fn report_at_the_limit_survives_restart_and_is_not_dispatched_again() {
+fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     let store = store();
-    let mut steps: Vec<Decision> = (1..MAX_TURN_STEPS)
-        .map(|_| {
-            step(vec![Action::ReadArtifact {
-                path: "background.md".into(),
-            }])
-        })
-        .collect();
-    steps.push(step(vec![open(true)]));
+    let mut steps: Vec<Decision> = vec![
+        step(vec![Action::ReadArtifact {
+            path: "background.md".into(),
+        }]),
+        step(vec![Action::ReadArtifact {
+            path: "second.md".into(),
+        }]),
+        step(vec![open(true)]),
+    ];
+    // Keep observing the same artifact until the view stops changing.
+    steps.extend((0..8).map(|_| {
+        step(vec![Action::ReadArtifact {
+            path: "same.md".into(),
+        }])
+    }));
     let worker = CaptureWorker::default();
     let out = turn(
         &store,
@@ -342,7 +346,7 @@ fn report_at_the_limit_survives_restart_and_is_not_dispatched_again() {
         &Reader,
     )
     .unwrap();
-    assert!(out.step_limit_reached);
+    assert!(out.stalled);
     assert!(out.reply.is_empty());
     assert_eq!(out.tasks[0].status, TaskStatus::Waiting);
     assert_eq!(out.reports.len(), 1);
@@ -365,7 +369,7 @@ fn report_at_the_limit_survives_restart_and_is_not_dispatched_again() {
         &Reader,
     )
     .unwrap();
-    assert!(!resumed.step_limit_reached);
+    assert!(!resumed.stalled);
     assert_eq!(resumed.tasks[0].status, TaskStatus::Done);
     assert_eq!(brain.seen.lock().unwrap()[0].focus.as_ref().unwrap().id, 1);
     assert_eq!(worker.0.lock().unwrap().len(), 1);
