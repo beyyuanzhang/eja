@@ -178,7 +178,12 @@ mod tests {
     #[test]
     fn the_index_fills_the_declared_budget_and_keeps_text_intact() {
         let events: Vec<Event> = (1..=50)
-            .map(|id| event(id, &format!("event {id} with a long body {}", "x".repeat(200))))
+            .map(|id| {
+                event(
+                    id,
+                    &format!("event {id} with a long body {}", "x".repeat(200)),
+                )
+            })
             .collect();
         let roomy = ModelRetriever::index(&events, 10_000_000);
         assert_eq!(roomy.lines().count(), 50);
