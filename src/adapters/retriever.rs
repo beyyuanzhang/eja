@@ -51,7 +51,7 @@ impl ModelRetriever {
             if used + need > budget {
                 let left = budget.saturating_sub(used);
                 if left > 8 {
-                    let cut = cut_chars(&line, left - 2);
+                    let cut = cut_chars(&line, left.saturating_sub(4));
                     newest_first.push(format!("{cut}…"));
                 }
                 break;
@@ -155,4 +155,50 @@ fn budget() -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(crate::aja::FRAME_LIMIT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Kind;
+
+    fn event(id: u64, text: &str) -> Event {
+        Event {
+            id,
+            at: 1,
+            turn: 1,
+            scope: "task:1".into(),
+            kind: Kind::RecordDecision,
+            text: text.into(),
+            closes: None,
+            data: None,
+        }
+    }
+
+    #[test]
+    fn the_index_fills_the_declared_budget_and_keeps_text_intact() {
+        let events: Vec<Event> = (1..=50)
+            .map(|id| event(id, &format!("event {id} with a long body {}", "x".repeat(200))))
+            .collect();
+        let roomy = ModelRetriever::index(&events, 10_000_000);
+        assert_eq!(roomy.lines().count(), 50);
+        assert!(roomy.contains("event 1 with a long body"));
+        assert!(roomy.contains(&"x".repeat(200)));
+        let tight = ModelRetriever::index(&events, 2_000);
+        let shown = tight.lines().count();
+        assert!(shown < 50, "a small budget shows fewer events, got {shown}");
+        assert!(tight.contains("event 50"), "the newest events fit first");
+        assert!(!tight.contains("event 1 with"), "the oldest are omitted");
+    }
+
+    #[test]
+    fn a_long_event_is_cut_at_the_budget_not_at_a_fixed_width() {
+        let events = vec![event(1, &"y".repeat(1_000))];
+        let short = ModelRetriever::index(&events, 300);
+        let cut = short.lines().next().unwrap();
+        assert!(cut.len() <= 300, "{}", cut.len());
+        assert!(cut.ends_with('…'));
+        let full = ModelRetriever::index(&events, 10_000);
+        assert!(full.len() > 1_000);
+    }
 }
