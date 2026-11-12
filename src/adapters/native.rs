@@ -95,7 +95,10 @@ struct Lease<'a> {
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
         self.flag.store(true, Ordering::SeqCst);
-        self.active.lock().expect("active nodes").remove(&self.id);
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
 }
 
@@ -147,7 +150,12 @@ impl NativeWorker {
         Ok(self)
     }
     pub fn cancel(&self, node_id: u64) -> bool {
-        if let Some(flag) = self.active.lock().expect("active nodes").get(&node_id) {
+        if let Some(flag) = self
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node_id)
+        {
             flag.store(true, Ordering::SeqCst);
             true
         } else {
@@ -155,7 +163,7 @@ impl NativeWorker {
         }
     }
     pub fn active_count(&self) -> usize {
-        self.active.lock().expect("active nodes").len()
+        self.active.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     fn run(
@@ -304,7 +312,7 @@ impl Worker for NativeWorker {
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         {
-            let mut active = self.active.lock().expect("active nodes");
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
             if !active.is_empty() {
                 return Report {
                     status: crate::ReportStatus::Blocked,
