@@ -23,7 +23,6 @@ impl FileArtifactReader {
             max_bytes,
         }
     }
-
 }
 
 impl FileArtifactReader {

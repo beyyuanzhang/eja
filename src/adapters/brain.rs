@@ -371,6 +371,9 @@ pub fn parse_decision(raw: &str) -> Decision {
 /// `EJA_CONTEXT_BYTES`.
 const DEFAULT_CONTEXT_BYTES: usize = 200_000;
 
+/// One decision may not outlive this; it is a host resource, not a result cap.
+const DECIDE_TIMEOUT: Duration = Duration::from_secs(180);
+
 pub struct OpenAiBrain {
     model: OpenAiModel,
     context_budget: usize,
@@ -401,7 +404,7 @@ impl Brain for OpenAiBrain {
             json!({"role":"user","content":render_context_within(context, self.context_budget)}),
         ];
         let control = Control::new(
-            Duration::from_secs(180),
+            DECIDE_TIMEOUT,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         match self

@@ -30,7 +30,6 @@ use tokio::{
     runtime::Runtime,
 };
 
-
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -406,14 +405,14 @@ impl McpTools {
                 }
             }
             if serde_json::to_vec(
-                    &host
-                        .tools
-                        .values()
-                        .map(|t| &t.definition)
-                        .collect::<Vec<_>>(),
-                )?
-                .len()
-                    > FRAME_LIMIT
+                &host
+                    .tools
+                    .values()
+                    .map(|t| &t.definition)
+                    .collect::<Vec<_>>(),
+            )?
+            .len()
+                > FRAME_LIMIT
             {
                 return Err("MCP tool definitions exceed limit".into());
             }

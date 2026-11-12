@@ -105,7 +105,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    // One view verb: `eja show <target>`. Old names are not accepted.
+    // One view verb: `eja show <target>`; old names are not accepted.
     if mode != "show" && mode != "turn" {
         eprintln!(
             "usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn [text...] | show TARGET"
