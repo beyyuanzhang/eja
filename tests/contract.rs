@@ -1,8 +1,5 @@
 use eja::adapters::Ports;
-use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, Report, ReportStatus, Store,
-    TaskStatus, Worker,
-};
+use eja::{turn_at, Action, Assignment, Brain, Decision, EjaContext, Store, TaskStatus, Worker};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -28,15 +25,12 @@ struct CaptureWorker {
 }
 
 impl Worker for CaptureWorker {
-    fn execute(&self, assignment: &Assignment) -> Report {
+    fn execute(&self, assignment: &Assignment) -> String {
         self.seen.lock().expect("seen").push(assignment.clone());
-        Report {
-            status: ReportStatus::Done,
-            summary: "done".to_string(),
-            artifacts: Vec::new(),
-            evidence: Vec::new(),
-            open_questions: Vec::new(),
-        }
+        format!(
+            "1 steps, 1 tool calls, 0 artifacts, ended: message\n{}",
+            "done"
+        )
     }
 }
 

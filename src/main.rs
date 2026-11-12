@@ -340,8 +340,8 @@ fn main() -> ExitCode {
                     status_label(task.status),
                     task.title
                 );
-                if let Some(report) = &task.report {
-                    println!("  report: {:?} — {}", report.status, report.summary);
+                if let Some(digest) = &task.digest {
+                    println!("  record: {}", digest.lines().next().unwrap_or(""));
                 }
                 let context = std::path::Path::new(&dir)
                     .join("nodes")
@@ -386,14 +386,16 @@ fn main() -> ExitCode {
                 println!("  origin: {}", task.origin);
                 println!("  request: {}", task.request);
                 println!("  acceptance: {}", task.acceptance);
-                if let Some(report) = &task.report {
+                if let Some(digest) = &task.digest {
                     println!(
-                        "  report at: {}",
-                        task.report_at
+                        "  record at: {}",
+                        task.digest_at
                             .map(eja::format_utc)
                             .unwrap_or_else(|| "-".to_string())
                     );
-                    println!("  report: {:?} — {}", report.status, report.summary);
+                    for line in digest.lines() {
+                        println!("  record: {line}");
+                    }
                 }
                 if let Some(close) = &task.close {
                     println!(

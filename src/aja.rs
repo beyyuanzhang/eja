@@ -1,5 +1,5 @@
 //! Disposable AJA loop. All effects, including model requests, go through the host.
-use crate::{Assignment, Report, ReportStatus, Result};
+use crate::{Assignment, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -51,7 +51,7 @@ pub(crate) struct Start {
 pub(crate) enum Request {
     Model { messages: Vec<Value> },
     Tool { name: String, arguments: Value },
-    Finish { report: Report },
+    Finish { text: String, reason: String },
 }
 
 pub(crate) fn send(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
@@ -79,14 +79,8 @@ pub(crate) fn receive<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead)
 }
 
 /// A spent budget is a stopping point, not a failed piece of work.
-fn budget_exhausted(reason: &str) -> Report {
-    Report {
-        status: ReportStatus::Blocked,
-        summary: format!("{reason}; continue in a new node"),
-        artifacts: Vec::new(),
-        evidence: Vec::new(),
-        open_questions: vec!["continue in a new node".to_string()],
-    }
+fn stopped(reason: &str) -> (String, String) {
+    (format!("{reason}; continue in a new node"), "budget".into())
 }
 
 fn request(reader: &mut impl BufRead, writer: &mut impl Write, request: Request) -> Result<Value> {
@@ -94,7 +88,11 @@ fn request(reader: &mut impl BufRead, writer: &mut impl Write, request: Request)
     receive(reader)
 }
 
-fn run(start: Start, reader: &mut impl BufRead, writer: &mut impl Write) -> Result<Report> {
+fn run(
+    start: Start,
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+) -> Result<(String, String)> {
     start.limits.validate()?;
     let budget = match start.limits.steps {
         Some(steps) => format!(
@@ -104,7 +102,7 @@ fn run(start: Start, reader: &mut impl BufRead, writer: &mut impl Write) -> Resu
         None => format!("You have {} seconds.", start.limits.timeout_ms / 1000),
     };
     let system = format!(
-        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. {budget} Return a final JSON report: {{\"status\":\"done|blocked|failed\",\"summary\":\"...\",\"artifacts\":[\"relative work file\"],\"evidence\":[],\"open_questions\":[]}}. A done report is a claim for EJA to inspect. Never claim a tool succeeded when it failed.",
+        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. {budget} When the work is done, stop calling tools; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
     );
     let mut messages = vec![
         json!({"role":"system","content":system}),
@@ -114,14 +112,14 @@ fn run(start: Start, reader: &mut impl BufRead, writer: &mut impl Write) -> Resu
     loop {
         if let Some(limit) = start.limits.steps {
             if turns >= limit {
-                return Ok(budget_exhausted(&format!(
+                return Ok(stopped(&format!(
                     "AJA step budget of {limit} turns exhausted"
                 )));
             }
         }
         turns += 1;
         if serde_json::to_vec(&messages)?.len() > start.limits.context_bytes {
-            return Ok(budget_exhausted("AJA context budget exhausted"));
+            return Ok(stopped("AJA context budget exhausted"));
         }
         let message = request(
             reader,
@@ -136,15 +134,14 @@ fn run(start: Start, reader: &mut impl BufRead, writer: &mut impl Write) -> Resu
             .cloned()
             .unwrap_or_default();
         if calls.is_empty() {
+            // The node's last message is text, never a schema: EJA reads it as
+            // the node's account and judges it with the record of its calls.
             let text = message
                 .get("content")
                 .and_then(Value::as_str)
-                .ok_or("missing AJA report")?;
-            let report: Report = serde_json::from_str(text)?;
-            if report.summary.trim().is_empty() {
-                return Err("empty AJA report".into());
-            }
-            return Ok(report);
+                .unwrap_or("")
+                .to_string();
+            return Ok((text, "message".into()));
         }
         messages.push(message);
         for call in calls {
@@ -176,9 +173,9 @@ pub fn worker_main() -> Result<()> {
     let mut reader = std::io::BufReader::new(std::io::stdin().lock());
     let mut writer = std::io::stdout().lock();
     let start: Start = receive(&mut reader)?;
-    let report =
-        run(start, &mut reader, &mut writer).unwrap_or_else(|e| Report::failed(e.to_string()));
-    send(&mut writer, &Request::Finish { report })
+    let (text, reason) =
+        run(start, &mut reader, &mut writer).unwrap_or_else(|e| (e.to_string(), "error".into()));
+    send(&mut writer, &Request::Finish { text, reason })
 }
 
 #[cfg(test)]

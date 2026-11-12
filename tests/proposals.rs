@@ -1,7 +1,7 @@
 use eja::adapters::Ports;
 use eja::{
     open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind,
-    Report, Store, Worker,
+    Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -34,8 +34,11 @@ impl Brain for QueueBrain {
 struct NoWorker;
 
 impl Worker for NoWorker {
-    fn execute(&self, _assignment: &Assignment) -> Report {
-        Report::failed("no worker")
+    fn execute(&self, _assignment: &Assignment) -> String {
+        format!(
+            "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+            "no worker"
+        )
     }
 }
 

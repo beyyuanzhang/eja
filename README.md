@@ -25,8 +25,8 @@ S' = commit(S, confirmed actions)
 | brain adapter | language, prompt, proposal JSON | write state directly |
 | retriever adapter | semantic query + graph/time expansion → event ids | write state |
 | artifact adapter | bounded read of worker output | decide acceptance |
-| worker adapter | assignment → AJA session → report | write identity |
-| AJA loop | local transcript, model/tool continuation, final report | access host state or configuration directly |
+| worker adapter | assignment → AJA session → its record | write identity |
+| AJA loop | local transcript, model/tool continuation, last message | access host state or configuration directly |
 
 ```
 core/       domain, fold, project, turn, ports
@@ -108,7 +108,7 @@ Each decision's actions execute in order through one loop:
 project → decide → act → append results → project
 ```
 
-Every look and every AJA report continue through that loop, in any order. A final reply with only state-writing
+Every look and every AJA dispatch continue through that loop, in any order. A final reply with only state-writing
 actions (or no actions) ends the turn. Task focus and recalled evidence remain
 available across steps. A turn ends when a decision observes nothing, or when the
 projection stops changing: repeated observations that carry no new information are
@@ -121,24 +121,25 @@ presented as a final answer.
 EJA judges worker output itself:
 
 ```
-worker report (a claim) → EJA decides → close_task { accepted, note }
+node record (what the host saw it do) → EJA decides → close_task { accepted, note }
 ```
 
-A look is optional. When a node wrote files, EJA can read them; when the work
-lives in an external system, the artifact list is legitimately empty and EJA
-decides from the report. Nothing is required before `close_task`, and there is no
-separate verifier. A look at a read-only connector tool lets EJA check a claim
-against the world when the host grants that view; it never gets an effect tool.
+A dispatch returns the host's digest of the node's record — steps, tool calls,
+sealed artifacts, how it ended, and the node's last message. A look is optional:
+EJA can read the node's whole record, the artifacts or the world, and decide for
+itself. Nothing is required before `close_task`, and there is no separate
+verifier. A look at a read-only connector tool lets EJA check the work against
+the world when the host grants that view; it never gets an effect tool.
 
-`node.json` keeps the assignment and the report; the node's whole record — the
+`node.json` keeps the assignment and the digest; the node's whole record — the
 start messages, every assistant turn, every tool call with arguments and result,
-and the report — is frozen next to it as `context.jsonl`. The report is the
-claim; the frozen context is what the host saw. Neither is a gate.
+and its last message — is frozen next to it as `context.jsonl`. The digest is
+what the host saw; the last message is the node's own account. Neither is a gate.
 
 ## Prompt and strategy
 
-The model prompt carries protocol only: the action vocabulary, the budget and the
-meaning of a report. It does not carry task tactics. What EJA learns about how to
+The model prompt carries protocol only: the action vocabulary, the budget and what
+a node record means. It does not carry task tactics. What EJA learns about how to
 work is recorded in its own identity events — goal, commitment, decision,
 correction — and projected back into the next decision. The harness generalizes by
 never encoding a per-task hint: if a strategy is worth keeping, EJA writes it down
@@ -180,19 +181,19 @@ with `relate {kind: part_of}`; `part_of` is containment;
 - node work areas are independent; project files are read-only through host tools;
 - the runtime kills/reaps the process, joins its IPC reader and revokes the run
   before sealing artifacts and atomically publishing `node.json`;
-- waiting for EJA's acceptance consumes no AJA process; reports remain claims;
-- the prompt states the node's turn/time budget, and a spent budget returns a
-  `blocked` report for a new node instead of a false failure;
+- waiting for EJA's acceptance consumes no AJA process; records remain evidence;
+- the prompt states the node's turn/time budget, and a spent budget ends the
+  record with `ended: budget` for a new node instead of a false failure;
 - `node.json` also freezes the node's complete context (`context.jsonl`: the start
   messages, every assistant turn, every tool call with arguments and result, and
-  the final report), read-only. A task that runs through several nodes is audited
+  the finish entry), read-only. A task that runs through several nodes is audited
   end to end with `eja audit <task>`; one frozen record with `eja node <id>`.
 
 ## Recovery
 
 - every append is flushed and `sync_all`'d;
 - a torn tail is ignored by the reader;
-- on each turn, tasks left `running` by a crash get an interrupted failed report;
+- on each turn, tasks left `running` by a crash get an interrupted record;
 - they are not re-dispatched automatically.
 
 ## Run

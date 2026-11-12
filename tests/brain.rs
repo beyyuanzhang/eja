@@ -18,7 +18,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         .append(
             Kind::WorkerReport,
             "task:1",
-            "recalled report",
+            "recalled digest",
             1,
             EventMeta::data(
                 1,
@@ -73,7 +73,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         let input = request["messages"][1]["content"].as_str().unwrap();
         assert!(input.contains(&format!("#{} original goal", goal.id)));
         assert!(input.contains("EVIDENCE"));
-        assert!(input.contains("recalled report"));
+        assert!(input.contains("recalled digest"));
         assert!(input.contains("recalled structured evidence"));
         let content = serde_json::json!({
             "reply": "recorded",

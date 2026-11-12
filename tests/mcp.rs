@@ -1,7 +1,7 @@
 use eja::{
     adapters::{Control, HostTools, McpTools, Model, NativeWorker, ToolContext, ToolGateway},
     aja::Limits,
-    Assignment, ReportStatus, Result, Worker,
+    Assignment, Result, Worker,
 };
 use serde_json::{json, Value};
 use std::{
@@ -453,8 +453,8 @@ fn native_nodes_share_one_host_connection_and_freeze_independently() {
     };
     let fds = fs::read_dir(fd_dir).unwrap().count();
     for id in 1..=12 {
-        let report = worker.execute(&assignment(id));
-        assert_eq!(report.status, ReportStatus::Done, "{}", report.summary);
+        let digest = worker.execute(&assignment(id));
+        assert!(digest.contains("ended: message"), "{digest}");
         assert_eq!(worker.active_count(), 0);
         assert!(!root.join(format!("{id}/work")).exists());
         let manifest: Value =

@@ -1,7 +1,6 @@
 use eja::adapters::{Observer, Ports};
 use eja::{
-    turn, Action, Brain, Decision, EjaContext, Kind, LookSource, Report, Result, Selector, Store,
-    Worker,
+    turn, Action, Brain, Decision, EjaContext, Kind, LookSource, Result, Selector, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -21,8 +20,11 @@ impl Brain for Script {
 struct EmptyWorker;
 
 impl Worker for EmptyWorker {
-    fn execute(&self, _: &eja::Assignment) -> Report {
-        Report::failed("no work expected")
+    fn execute(&self, _: &eja::Assignment) -> String {
+        format!(
+            "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+            "no work expected"
+        )
     }
 }
 

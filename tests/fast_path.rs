@@ -1,8 +1,5 @@
 use eja::adapters::Ports;
-use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, Report, ReportStatus, Store,
-    TaskStatus, Worker,
-};
+use eja::{turn_at, Action, Assignment, Brain, Decision, EjaContext, Store, TaskStatus, Worker};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -31,14 +28,11 @@ impl Brain for CountingBrain {
 struct DoneWorker;
 
 impl Worker for DoneWorker {
-    fn execute(&self, _assignment: &Assignment) -> Report {
-        Report {
-            status: ReportStatus::Done,
-            summary: "done".to_string(),
-            artifacts: Vec::new(),
-            evidence: Vec::new(),
-            open_questions: Vec::new(),
-        }
+    fn execute(&self, _assignment: &Assignment) -> String {
+        format!(
+            "1 steps, 1 tool calls, 0 artifacts, ended: message\n{}",
+            "done"
+        )
     }
 }
 

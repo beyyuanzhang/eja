@@ -180,44 +180,11 @@ struct TaskRelationData {
     kind: RelationKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReportStatus {
-    Done,
-    Blocked,
-    Failed,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assignment {
     pub task_id: TaskId,
     pub objective: String,
     pub issued_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Report {
-    pub status: ReportStatus,
-    #[serde(default)]
-    pub summary: String,
-    #[serde(default)]
-    pub artifacts: Vec<String>,
-    #[serde(default)]
-    pub evidence: Vec<String>,
-    #[serde(default)]
-    pub open_questions: Vec<String>,
-}
-
-impl Report {
-    pub fn failed(summary: impl Into<String>) -> Self {
-        Self {
-            status: ReportStatus::Failed,
-            summary: summary.into(),
-            artifacts: Vec::new(),
-            evidence: Vec::new(),
-            open_questions: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,9 +237,9 @@ pub struct Task {
     pub acceptance: String,
     pub status: TaskStatus,
     pub created_at: i64,
-    pub report_at: Option<i64>,
+    pub digest_at: Option<i64>,
     pub closed_at: Option<i64>,
-    pub report: Option<Report>,
+    pub digest: Option<String>,
     pub close: Option<CloseOutcome>,
 }
 
@@ -391,13 +358,12 @@ pub fn recover(store: &Store, turn: u64, at: i64) -> Result<Vec<TaskId>> {
         if task.status != TaskStatus::Running {
             continue;
         }
-        let report = Report::failed("worker session interrupted; state unknown");
         store.append(
             Kind::WorkerReport,
             &task_scope(task.id),
-            "",
+            "worker session interrupted; state unknown",
             turn,
-            EventMeta::data(at, serde_json::to_value(&report)?),
+            EventMeta::new(at),
         )?;
         recovered.push(task.id);
     }
@@ -521,9 +487,9 @@ pub fn tasks(events: &[Event]) -> Vec<Task> {
                     acceptance: open.acceptance,
                     status: TaskStatus::Open,
                     created_at: event.at,
-                    report_at: None,
+                    digest_at: None,
                     closed_at: None,
-                    report: None,
+                    digest: None,
                     close: None,
                 });
             }
@@ -541,16 +507,9 @@ pub fn tasks(events: &[Event]) -> Vec<Task> {
                 let Some(task_id) = task_id_in_scope(&event.scope) else {
                     continue;
                 };
-                let Some(report) = event
-                    .data
-                    .as_ref()
-                    .and_then(|value| serde_json::from_value::<Report>(value.clone()).ok())
-                else {
-                    continue;
-                };
                 if let Some(task) = out.iter_mut().find(|task| task.id == task_id) {
-                    task.report = Some(report);
-                    task.report_at = Some(event.at);
+                    task.digest = Some(event.text.clone());
+                    task.digest_at = Some(event.at);
                     task.status = TaskStatus::Waiting;
                 }
             }
@@ -795,7 +754,9 @@ pub trait Brain {
 }
 
 pub trait Worker {
-    fn execute(&self, assignment: &Assignment) -> Report;
+    /// Run one node and return the host's fold of its record: what it did, how
+    /// it ended and what it said last. EJA reads this and may look deeper.
+    fn execute(&self, assignment: &Assignment) -> String;
 }
 
 #[derive(Debug, Clone)]
@@ -804,7 +765,6 @@ pub struct TurnOutcome {
     pub context: EjaContext,
     pub tasks: Vec<Task>,
     pub dispatched: Vec<TaskId>,
-    pub reports: Vec<(TaskId, Report)>,
     pub reads: Vec<TaskId>,
     pub evidence: Vec<Observation>,
     pub decisions: usize,
@@ -1013,17 +973,16 @@ fn dispatch_task(ctx: &ActionCtx<'_>, task_id: TaskId, out: &mut TurnOutcome) ->
         EventMeta::data(ctx.at, serde_json::to_value(&assignment)?),
     )?;
     let started = Instant::now();
-    let report = ctx.worker.execute(&assignment);
+    let digest = ctx.worker.execute(&assignment);
     out.worker_ms += started.elapsed().as_millis();
     ctx.store.append(
         Kind::WorkerReport,
         &task_scope(task.id),
-        "",
+        &digest,
         ctx.turn,
-        EventMeta::data(ctx.at, serde_json::to_value(&report)?),
+        EventMeta::new(ctx.at),
     )?;
     out.dispatched.push(task.id);
-    out.reports.push((task.id, report));
     Ok(true)
 }
 
@@ -1239,7 +1198,6 @@ pub fn turn_at(
         context: project(store, input, focus, now)?,
         tasks: Vec::new(),
         dispatched: Vec::new(),
-        reports: Vec::new(),
         reads: Vec::new(),
         evidence: Vec::new(),
         decisions: 0,
@@ -1272,13 +1230,6 @@ pub fn turn_at(
             out.stalled = true;
             break;
         }
-    }
-    if !out.stalled && out.reply.is_empty() {
-        out.reply = out
-            .reports
-            .last()
-            .map(|(_, report)| report.summary.trim().to_string())
-            .unwrap_or_default();
     }
     let mut meta = EventMeta::new(at);
     if out.stalled {

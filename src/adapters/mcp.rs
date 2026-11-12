@@ -202,7 +202,7 @@ impl McpTools {
                         .into(),
                 );
             }
-            if config.timeout_ms == 0 || config.timeout_ms > 300_000 {
+            if config.timeout_ms == 0 {
                 return Err(format!("invalid MCP timeout for {name}").into());
             }
             let timeout = Duration::from_millis(config.timeout_ms);

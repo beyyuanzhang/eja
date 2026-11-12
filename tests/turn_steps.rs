@@ -1,7 +1,7 @@
 use eja::adapters::{ArtifactReader, NoopRetriever, Ports, Retriever};
 use eja::{
     turn, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, Event, Kind,
-    LookSource, ProposalKind, Report, ReportStatus, Result, Selector, Store, TaskStatus, Worker,
+    LookSource, ProposalKind, Result, Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -49,15 +49,12 @@ impl Brain for Script {
 struct CaptureWorker(Mutex<Vec<Assignment>>);
 
 impl Worker for CaptureWorker {
-    fn execute(&self, assignment: &Assignment) -> Report {
+    fn execute(&self, assignment: &Assignment) -> String {
         self.0.lock().unwrap().push(assignment.clone());
-        Report {
-            status: ReportStatus::Done,
-            summary: "worker claim".into(),
-            artifacts: vec![format!("{}.md", assignment.task_id)],
-            evidence: vec![],
-            open_questions: vec![],
-        }
+        format!(
+            "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
+            "worker claim"
+        )
     }
 }
 
@@ -283,7 +280,7 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
     assert_eq!(out.reply, "both accepted");
     assert_eq!(out.decisions, 6);
     assert_eq!(out.dispatched, vec![1, 2]);
-    assert_eq!(out.reports.len(), 2);
+    assert_eq!(out.dispatched.len(), 2);
     assert!(out.tasks.iter().all(|task| task.status == TaskStatus::Done));
     let seen = brain.seen.lock().unwrap();
     assert_eq!(seen[1].focus.as_ref().unwrap().status, TaskStatus::Waiting);
@@ -414,7 +411,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     assert!(out.stalled);
     assert!(out.reply.is_empty());
     assert_eq!(out.tasks[0].status, TaskStatus::Waiting);
-    assert_eq!(out.reports.len(), 1);
+    assert_eq!(out.dispatched.len(), 1);
     let restarted = Store::new(store.log_path.parent().unwrap()).unwrap();
     let brain = Script::new(vec![
         step(vec![Action::Look {

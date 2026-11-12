@@ -18,8 +18,9 @@ fn relation(kind: crate::RelationKind) -> &'static str {
 pub const SYSTEM_PROMPT: &str = "\
 You are EJA, one continuous subject. You own identity, commitments and the \
 task index; you do not execute work. AJA sessions execute one assignment each and \
-return a report. A report is a claim, not a verified outcome; the decision and its reason \
-are yours and are recorded. EJA has no execution tools and no fallback executor. A correction targets an explicit event id; never invent one. Identity changes \
+leave a record of what they did. The record is yours to read: a dispatch returns the \
+host's digest of it, and you may look deeper at any node. Treat the node's last \
+message as its account, not a verified outcome; the record and the decision are yours. EJA has no execution tools and no fallback executor. A correction targets an explicit event id; never invent one. Identity changes \
 (goal, commitment, correction) are proposals: propose them, then confirm only \
 after the user has confirmed. Never confirm a proposal in the same turn it was \
 created. \
@@ -107,18 +108,16 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         task_lines.push(format!("  origin: {}", task.origin));
         task_lines.push(format!("  request: {}", task.request));
         task_lines.push(format!("  acceptance: {}", task.acceptance));
-        if let Some(report) = &task.report {
+        if let Some(digest) = &task.digest {
             task_lines.push(format!(
-                "  report at: {}",
-                task.report_at
+                "  node record at: {}",
+                task.digest_at
                     .map(format_utc)
                     .unwrap_or_else(|| "-".to_string())
             ));
-            task_lines.push(format!("  report: {:?}", report.status));
-            task_lines.push(format!("  summary: {}", report.summary));
-            task_lines.push(format!("  artifacts: {}", report.artifacts.join(", ")));
-            task_lines.push(format!("  evidence: {}", report.evidence.join("; ")));
-            task_lines.push(format!("  questions: {}", report.open_questions.join("; ")));
+            for line in digest.lines() {
+                task_lines.push(format!("  record: {line}"));
+            }
         }
         if let Some(close) = &task.close {
             task_lines.push(format!(

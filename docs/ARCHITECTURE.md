@@ -21,17 +21,19 @@ S' = commit(S, confirmed actions)
    replaces an active event of the same kind; no phrase matching.
 5. Focus is an explicit task id; a log look returns event ids from an adapter.
 6. Identity changes require a proposal and a later confirmation.
-7. A report is a claim. EJA decides; nothing else can accept on its behalf.
+7. A node record is evidence; the node's last message is its own account. EJA
+   decides; nothing else can accept on its behalf.
    Reading artifacts or the outside world is an option, never a required gate.
 8. A task closes only from `waiting` with `close_task`.
 9. AJA : task = 1:1. The native worker uses one temporary Rust process per
    assignment and one execution slot. Finishing a node freezes its complete
    context: the manifest, the assignment, the start messages, every assistant
-   turn, every tool call with arguments and result, and the report, all read-only.
+   turn, every tool call with arguments and result, and the finish entry, all
+   read-only.
    No session survives; retries/continuations are new linked nodes.
 10. Language, prompts, retrieval and artifact reading live in adapters.
 11. A crashed `running` task is reconciled to `waiting` with an interrupted
-    failed report; no automatic duplicate dispatch.
+    record; no automatic duplicate dispatch.
 12. The worker receives its node's `request`; the original input stays in EJA
     as `origin`. Acceptance remains EJA's responsibility.
 13. If exactly one active task is waiting, the turn starts with that task as
@@ -40,7 +42,7 @@ S' = commit(S, confirmed actions)
     ends at a fixpoint: a decision that observes nothing, or a projection that
     repeats. Recorded results are always retained and a stalled turn is reported
     explicitly; pure state-writing actions can finish.
-15. Prompts carry protocol only: actions, limits and what a report means. Task
+15. Prompts carry protocol only: actions, limits and what a node record means. Task
     strategy is not written in code or prompt text; it is what EJA records in its
     own identity events (goal, commitment, decision, correction).
 

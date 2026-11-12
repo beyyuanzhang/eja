@@ -1,7 +1,7 @@
 use eja::adapters::{ArtifactReader, NoopRetriever, Ports};
 use eja::{
-    turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, LookSource, Report,
-    ReportStatus, Selector, Store, TaskStatus, Worker,
+    turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, LookSource,
+    Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -32,11 +32,11 @@ impl Brain for QueueBrain {
 }
 
 struct QueueWorker {
-    queue: Mutex<VecDeque<Report>>,
+    queue: Mutex<VecDeque<String>>,
 }
 
 impl QueueWorker {
-    fn new(reports: Vec<Report>) -> Self {
+    fn new(reports: Vec<String>) -> Self {
         Self {
             queue: Mutex::new(reports.into()),
         }
@@ -44,12 +44,17 @@ impl QueueWorker {
 }
 
 impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment) -> Report {
+    fn execute(&self, _assignment: &Assignment) -> String {
         self.queue
             .lock()
             .expect("worker")
             .pop_front()
-            .unwrap_or_else(|| Report::failed("no report"))
+            .unwrap_or_else(|| {
+                format!(
+                    "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+                    "no record"
+                )
+            })
     }
 }
 
@@ -73,14 +78,11 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
     }
 }
 
-fn done_report() -> Report {
-    Report {
-        status: ReportStatus::Done,
-        summary: "checklist written".to_string(),
-        artifacts: vec!["out.md".to_string()],
-        evidence: vec!["out.md".to_string()],
-        open_questions: Vec::new(),
-    }
+fn record() -> String {
+    format!(
+        "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
+        "checklist written"
+    )
 }
 
 #[test]
@@ -120,7 +122,7 @@ fn eja_reads_artifact_content_then_decides() {
         &store,
         "do the task",
         &brain,
-        &QueueWorker::new(vec![done_report()]),
+        &QueueWorker::new(vec![record()]),
         &Ports {
             log: Some(&NoopRetriever),
             node: Some(&FakeReader),

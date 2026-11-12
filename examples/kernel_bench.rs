@@ -7,7 +7,7 @@ use eja::adapters::FileArtifactReader;
 use eja::adapters::{ArtifactReader, NoopRetriever, Ports};
 use eja::{
     project, recover, turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext,
-    EventMeta, Kind, Report, ReportStatus, Result, Store, Worker,
+    EventMeta, Kind, Result, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -55,14 +55,11 @@ impl Brain for QueueBrain {
 struct DoneWorker;
 
 impl Worker for DoneWorker {
-    fn execute(&self, _assignment: &Assignment) -> Report {
-        Report {
-            status: ReportStatus::Done,
-            summary: "done".to_string(),
-            artifacts: Vec::new(),
-            evidence: Vec::new(),
-            open_questions: Vec::new(),
-        }
+    fn execute(&self, _assignment: &Assignment) -> String {
+        format!(
+            "1 steps, 1 tool calls, 0 artifacts, ended: message\n{}",
+            "done"
+        )
     }
 }
 

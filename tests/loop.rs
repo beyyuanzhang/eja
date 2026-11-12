@@ -1,7 +1,7 @@
 use eja::adapters::Ports;
 use eja::{
     active_identity, open_commitments, tasks, turn_at, Action, Assignment, Brain, Decision,
-    EjaContext, Kind, ProposalKind, Report, ReportStatus, Store, TaskStatus, Worker,
+    EjaContext, Kind, ProposalKind, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,11 +35,11 @@ impl Brain for QueueBrain {
 }
 
 struct QueueWorker {
-    queue: Mutex<VecDeque<Report>>,
+    queue: Mutex<VecDeque<String>>,
 }
 
 impl QueueWorker {
-    fn new(reports: Vec<Report>) -> Self {
+    fn new(reports: Vec<String>) -> Self {
         Self {
             queue: Mutex::new(reports.into()),
         }
@@ -47,12 +47,17 @@ impl QueueWorker {
 }
 
 impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment) -> Report {
+    fn execute(&self, _assignment: &Assignment) -> String {
         self.queue
             .lock()
             .expect("worker")
             .pop_front()
-            .unwrap_or_else(|| Report::failed("no scripted report"))
+            .unwrap_or_else(|| {
+                format!(
+                    "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+                    "no scripted record"
+                )
+            })
     }
 }
 
@@ -63,14 +68,11 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
     }
 }
 
-fn done_report(summary: &str) -> Report {
-    Report {
-        status: ReportStatus::Done,
-        summary: summary.to_string(),
-        artifacts: vec!["artifact.md".to_string()],
-        evidence: vec!["checked".to_string()],
-        open_questions: Vec::new(),
-    }
+fn record(summary: &str) -> String {
+    format!(
+        "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
+        summary
+    )
 }
 
 fn temp_store() -> std::path::PathBuf {
@@ -157,7 +159,7 @@ fn closed_loop_dispatches_reports_and_accepts() {
             }],
         ),
     ]);
-    let worker = QueueWorker::new(vec![done_report("checklist written")]);
+    let worker = QueueWorker::new(vec![record("checklist written")]);
 
     let outcome = turn_at(
         &store,
@@ -174,7 +176,7 @@ fn closed_loop_dispatches_reports_and_accepts() {
     assert_eq!(outcome.tasks[0].status, TaskStatus::Done);
     assert_eq!(outcome.tasks[0].origin, "write a release checklist");
     assert_eq!(outcome.dispatched, vec![1]);
-    assert_eq!(outcome.reports.len(), 1);
+    assert_eq!(outcome.dispatched.len(), 1);
 
     let events = store.events().expect("events");
     let kinds: Vec<Kind> = events.iter().map(|event| event.kind).collect();
@@ -226,14 +228,16 @@ fn rejection_fails_the_task_and_keeps_the_report() {
             }],
         ),
     ]);
-    let mut report = done_report("only backup and dual-write");
-    report.status = ReportStatus::Blocked;
+    let digest = format!(
+        "0 steps, 0 tool calls, 0 artifacts, ended: budget\n{}",
+        "only backup and dual-write"
+    );
 
     let outcome = turn_at(
         &store,
         "do the migration",
         &brain,
-        &QueueWorker::new(vec![report]),
+        &QueueWorker::new(vec![digest]),
         &Ports::default(),
         now(),
     )
@@ -241,10 +245,11 @@ fn rejection_fails_the_task_and_keeps_the_report() {
 
     assert_eq!(outcome.tasks[0].status, TaskStatus::Failed);
     assert!(!outcome.tasks[0].close.as_ref().expect("close").accepted);
-    assert_eq!(
-        outcome.tasks[0].report.as_ref().expect("report").status,
-        ReportStatus::Blocked
-    );
+    assert!(outcome.tasks[0]
+        .digest
+        .as_deref()
+        .unwrap_or("")
+        .contains("ended: budget"));
 }
 
 #[test]
@@ -342,7 +347,7 @@ fn explicit_dispatch_runs_an_open_task() {
             }],
         ),
     ]);
-    let worker = QueueWorker::new(vec![done_report("organized")]);
+    let worker = QueueWorker::new(vec![record("organized")]);
     turn_at(
         &store,
         "open a task",
@@ -366,7 +371,7 @@ fn cannot_close_without_a_worker_report() {
         "close",
         vec![
             Action::OpenTask {
-                title: "no report".to_string(),
+                title: "no record".to_string(),
                 request: "do something".to_string(),
                 acceptance: "has a result".to_string(),
                 run: false,
@@ -412,22 +417,25 @@ fn worker_failure_stays_waiting_for_eja() {
         ),
         decision("worker failed", vec![]),
     ]);
-    let mut report = done_report("failed");
-    report.status = ReportStatus::Failed;
+    let digest = format!(
+        "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+        "failed"
+    );
     let outcome = turn_at(
         &store,
         "run",
         &brain,
-        &QueueWorker::new(vec![report]),
+        &QueueWorker::new(vec![digest]),
         &Ports::default(),
         now(),
     )
     .expect("turn");
     assert_eq!(outcome.tasks[0].status, TaskStatus::Waiting);
-    assert_eq!(
-        outcome.tasks[0].report.as_ref().expect("report").status,
-        ReportStatus::Failed
-    );
+    assert!(outcome.tasks[0]
+        .digest
+        .as_deref()
+        .unwrap_or("")
+        .contains("ended: error"));
 }
 
 #[test]

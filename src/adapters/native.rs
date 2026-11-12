@@ -2,7 +2,7 @@
 use super::{tools::relative_file, Control, Model, ToolContext, ToolGateway};
 use crate::{
     aja::{self, Limits, Request, Start},
-    Assignment, Report, Result, Worker,
+    Assignment, Result, Worker,
 };
 use serde_json::{json, Value};
 use std::{
@@ -26,6 +26,7 @@ use std::{
 struct ContextLog {
     file: fs::File,
     started: bool,
+    assistants: usize,
 }
 
 impl ContextLog {
@@ -37,10 +38,18 @@ impl ContextLog {
         Ok(Self {
             file,
             started: false,
+            assistants: 0,
         })
     }
 
+    fn assistants(&self) -> usize {
+        self.assistants
+    }
+
     fn record(&mut self, entry: Value) -> Result<()> {
+        if entry.get("kind").and_then(Value::as_str) == Some("assistant") {
+            self.assistants += 1;
+        }
         let mut line = serde_json::to_vec(&entry)?;
         line.push(b'\n');
         self.file.write_all(&line)?;
@@ -208,7 +217,8 @@ impl NativeWorker {
         control: &Control,
         artifacts: &mut HashSet<String>,
         log: &mut ContextLog,
-    ) -> Result<Report> {
+        counts: &mut std::collections::BTreeMap<String, usize>,
+    ) -> Result<(String, String)> {
         let definitions = self.tools.definitions(assignment);
         let allowed: HashSet<String> = definitions
             .iter()
@@ -241,7 +251,10 @@ impl NativeWorker {
                     if self.limits.steps.is_some_and(|limit| steps > limit)
                         || serde_json::to_vec(&messages)?.len() > self.limits.context_bytes
                     {
-                        return Err("AJA model budget exceeded".into());
+                        return Ok((
+                            "AJA context budget exhausted; continue in a new node".into(),
+                            "budget".into(),
+                        ));
                     }
                     let value =
                         self.model
@@ -260,6 +273,7 @@ impl NativeWorker {
                 }
                 Request::Tool { name, arguments } => {
                     control.check()?;
+                    *counts.entry(name.clone()).or_insert(0) += 1;
                     let value = if !allowed.contains(&name) {
                         json!({"error":"tool not allowed"})
                     } else {
@@ -281,9 +295,9 @@ impl NativeWorker {
                     }))?;
                     value
                 }
-                Request::Finish { report } => {
+                Request::Finish { text, reason } => {
                     control.check()?;
-                    return Ok(report);
+                    return Ok((text, reason));
                 }
             };
             control.check()?;
@@ -298,10 +312,13 @@ impl NativeWorker {
         &self,
         node: &Path,
         assignment: &Assignment,
-        mut report: Report,
+        outcome: (&str, &str),
+        steps: usize,
+        counts: &std::collections::BTreeMap<String, usize>,
         paths: HashSet<String>,
-    ) -> Result<Report> {
+    ) -> Result<String> {
         let mut sealed = Vec::new();
+        let mut failed = Vec::new();
         let output = node.join("artifacts");
         fs::create_dir(&output)?;
         let mut paths: Vec<_> = paths.into_iter().collect();
@@ -324,13 +341,9 @@ impl NativeWorker {
             })();
             match copied {
                 Ok(()) => sealed.push(format!("{}/artifacts/{name}", assignment.task_id)),
-                Err(error) => {
-                    report.status = crate::ReportStatus::Failed;
-                    report.summary = format!("artifact could not be sealed: {error}");
-                }
+                Err(error) => failed.push(format!("{name} could not be sealed: {error}")),
             }
         }
-        report.artifacts = sealed;
         fs::remove_dir_all(node.join("work"))?;
         let context = node.join("context.jsonl");
         if let Ok(file) = fs::OpenOptions::new().write(true).open(&context) {
@@ -340,9 +353,38 @@ impl NativeWorker {
             fs::set_permissions(&context, permissions)?;
         }
         let context_bytes = fs::metadata(&context).map(|m| m.len()).unwrap_or(0);
+        let calls: usize = counts.values().sum();
+        let histogram: Vec<String> = {
+            let mut pairs: Vec<_> = counts.iter().collect();
+            pairs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            pairs
+                .iter()
+                .map(|(name, count)| format!("{name}x{count}"))
+                .collect()
+        };
+        let (text, reason) = outcome;
+        let digest = format!(
+            "{steps} steps, {calls} tool calls{}, {} artifacts{}{}, ended: {reason}\n{text}",
+            if histogram.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", histogram.join(" "))
+            },
+            sealed.len(),
+            if sealed.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", sealed.join(", "))
+            },
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!("; seal failed: {}", failed.join("; "))
+            }
+        );
         let manifest = json!({
             "assignment": assignment,
-            "report": report,
+            "digest": digest,
             "context": "context.jsonl",
             "context_bytes": context_bytes,
             "frozen": true,
@@ -358,34 +400,31 @@ impl NativeWorker {
             permissions.set_readonly(true);
             fs::set_permissions(&manifest, permissions)?;
         }
-        Ok(report)
+        Ok(digest)
     }
 }
 
 impl Worker for NativeWorker {
-    fn execute(&self, assignment: &Assignment) -> Report {
+    fn execute(&self, assignment: &Assignment) -> String {
         let node = self.root.join(assignment.task_id.to_string());
         // Reserve once. Restart or replay cannot overwrite an existing node, even after failure.
         if assignment.task_id == 0 {
-            return Report::failed("invalid node id");
+            return "0 steps, 0 tool calls, 0 artifacts, ended: error\ninvalid node id".into();
         }
         if INTERRUPTED.load(Ordering::SeqCst) {
-            return Report::failed("interrupted before the node started");
+            return "0 steps, 0 tool calls, 0 artifacts, ended: budget\ninterrupted before the node started".into();
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
             if !active.is_empty() {
-                return Report {
-                    status: crate::ReportStatus::Blocked,
-                    summary: "execution slot is busy".into(),
-                    artifacts: vec![],
-                    evidence: vec![],
-                    open_questions: vec![],
-                };
+                return "0 steps, 0 tool calls, 0 artifacts, ended: budget\nexecution slot is busy"
+                    .into();
             }
             if let Err(e) = fs::create_dir(&node) {
-                return Report::failed(format!("node already reserved or unavailable: {e}"));
+                return format!(
+                    "0 steps, 0 tool calls, 0 artifacts, ended: error\nnode already reserved or unavailable: {e}"
+                );
             }
             active.insert(assignment.task_id, cancelled.clone());
         }
@@ -399,19 +438,41 @@ impl Worker for NativeWorker {
             cancelled.clone(),
         );
         let mut paths = HashSet::new();
+        let mut counts = std::collections::BTreeMap::new();
         let mut log = match ContextLog::create(&node) {
             Ok(log) => log,
-            Err(error) => return Report::failed(format!("node context is unavailable: {error}")),
+            Err(error) => {
+                return format!(
+                    "0 steps, 0 tool calls, 0 artifacts, ended: error\nnode context is unavailable: {error}"
+                )
+            }
         };
-        let result = fs::create_dir(node.join("work"))
+        let result: Result<(String, String)> = fs::create_dir(node.join("work"))
             .map_err(Into::into)
-            .and_then(|_| self.run(assignment, &node, &control, &mut paths, &mut log));
+            .and_then(|_| {
+                let outcome = self.run(
+                    assignment,
+                    &node,
+                    &control,
+                    &mut paths,
+                    &mut log,
+                    &mut counts,
+                )?;
+                Ok(outcome)
+            });
+        let steps = log.assistants();
         cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything
-        let report = result.unwrap_or_else(|e| Report::failed(e.to_string()));
-        let _ = log.record(json!({"kind": "report", "report": &report}));
+        let (text, reason) = match result {
+            Ok(outcome) => outcome,
+            Err(error) => (error.to_string(), "error".to_string()),
+        };
+        let _ = log.record(json!({"kind": "finish", "text": &text, "reason": &reason}));
         drop(log);
-        paths.extend(report.artifacts.iter().cloned());
-        let result = self.seal(&node, assignment, report, paths);
-        result.unwrap_or_else(|e| Report::failed(format!("node could not be frozen: {e}")))
+        self.seal(&node, assignment, (&text, &reason), steps, &counts, paths)
+            .unwrap_or_else(|e| {
+                format!(
+                    "{steps} steps, 0 tool calls, 0 artifacts, ended: error\nnode could not be frozen: {e}"
+                )
+            })
     }
 }

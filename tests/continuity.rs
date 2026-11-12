@@ -2,7 +2,7 @@ use chrono::{TimeZone, Utc};
 use eja::adapters::Ports;
 use eja::{
     current_goal, open_commitments, project, turn_at, Action, Assignment, Brain, Decision,
-    EjaContext, Kind, ProposalKind, Report, ReportStatus, Store, TaskStatus, Worker,
+    EjaContext, Kind, ProposalKind, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,11 +36,11 @@ impl Brain for QueueBrain {
 }
 
 struct QueueWorker {
-    queue: Mutex<VecDeque<Report>>,
+    queue: Mutex<VecDeque<String>>,
 }
 
 impl QueueWorker {
-    fn new(reports: Vec<Report>) -> Self {
+    fn new(reports: Vec<String>) -> Self {
         Self {
             queue: Mutex::new(reports.into()),
         }
@@ -48,12 +48,17 @@ impl QueueWorker {
 }
 
 impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment) -> Report {
+    fn execute(&self, _assignment: &Assignment) -> String {
         self.queue
             .lock()
             .expect("worker")
             .pop_front()
-            .unwrap_or_else(|| Report::failed("no scripted report"))
+            .unwrap_or_else(|| {
+                format!(
+                    "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+                    "no scripted record"
+                )
+            })
     }
 }
 
@@ -64,14 +69,11 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
     }
 }
 
-fn done_report() -> Report {
-    Report {
-        status: ReportStatus::Done,
-        summary: "done".to_string(),
-        artifacts: vec!["artifact.md".to_string()],
-        evidence: vec!["checked".to_string()],
-        open_questions: Vec::new(),
-    }
+fn record() -> String {
+    format!(
+        "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
+        "done"
+    )
 }
 
 fn temp_store() -> std::path::PathBuf {
@@ -345,7 +347,7 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
         &store,
         "make a checklist",
         &brain,
-        &QueueWorker::new(vec![done_report()]),
+        &QueueWorker::new(vec![record()]),
         &Ports::default(),
         at,
     )
@@ -355,7 +357,7 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
     let task = &outcome.tasks[0];
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.created_at, at.timestamp());
-    assert_eq!(task.report_at, Some(at.timestamp()));
+    assert_eq!(task.digest_at, Some(at.timestamp()));
     assert_eq!(task.closed_at, Some(at.timestamp()));
 
     let events = store.events().expect("events");

@@ -3,7 +3,7 @@ use eja::{
         Control, FileTools, Model, NativeWorker, OpenAiModel, ToolContext, ToolGateway, ToolOutput,
     },
     aja::Limits,
-    Assignment, ReportStatus, Result, Worker,
+    Assignment, Result, Worker,
 };
 use serde_json::{json, Value};
 use std::{
@@ -154,9 +154,9 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
         final_message(&["out.txt"]),
     ]));
     let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
-    let report = w.execute(&assignment(1));
-    assert_eq!(report.status, ReportStatus::Done, "{}", report.summary);
-    assert_eq!(report.artifacts, vec!["1/artifacts/out.txt"]);
+    let digest = w.execute(&assignment(1));
+    assert!(digest.contains("ended: message"), "{digest}");
+    assert!(digest.contains("1/artifacts/out.txt"), "{digest}");
     assert_eq!(
         std::fs::read_to_string(f.0.join(".eja/nodes/1/artifacts/out.txt")).unwrap(),
         "node result"
@@ -172,7 +172,7 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
         "the frozen manifest is read-only"
     );
     let context = std::fs::read_to_string(f.0.join(".eja/nodes/1/context.jsonl")).unwrap();
-    for kind in ["start", "assistant", "tool", "report"] {
+    for kind in ["start", "assistant", "tool", "finish"] {
         assert!(
             context.contains(&format!("\"kind\":\"{kind}\"")),
             "context is missing {kind}: {context}"
@@ -201,7 +201,7 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     assert!(!model.pids.lock().unwrap().is_empty());
     assert_reaped(&model.pids.lock().unwrap());
     let before = f.manifest(1);
-    assert_eq!(w.execute(&assignment(1)).status, ReportStatus::Failed);
+    assert!(w.execute(&assignment(1)).contains("ended: error"));
     assert_eq!(f.manifest(1), before);
 }
 
@@ -236,8 +236,8 @@ fn node_workspaces_and_tool_grants_are_independent() {
         final_message(&[]),
     ]));
     let w = f.worker(model.clone(), Arc::new(Policy), Limits::default());
-    assert_eq!(w.execute(&assignment(1)).status, ReportStatus::Done);
-    assert_eq!(w.execute(&assignment(2)).status, ReportStatus::Done);
+    assert!(w.execute(&assignment(1)).contains("ended: message"));
+    assert!(w.execute(&assignment(2)).contains("ended: message"));
     let seen = model.seen.lock().unwrap();
     let results = seen[3]
         .iter()
@@ -250,10 +250,10 @@ fn node_workspaces_and_tool_grants_are_independent() {
         std::fs::read_to_string(f.0.join(".eja/nodes/1/artifacts/same.txt")).unwrap(),
         "one"
     );
-    assert!(f.manifest(2)["report"]["artifacts"]
-        .as_array()
+    assert!(f.manifest(2)["digest"]
+        .as_str()
         .unwrap()
-        .is_empty());
+        .contains("0 artifacts"));
     assert_reaped(&model.pids.lock().unwrap());
 }
 
@@ -277,9 +277,9 @@ fn traversal_private_state_and_symlinks_are_not_file_capabilities() {
         final_message(&["../escape.txt"]),
     ]));
     let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
-    let report = w.execute(&assignment(1));
-    assert_eq!(report.status, ReportStatus::Failed);
-    assert!(report.artifacts.is_empty());
+    let digest = w.execute(&assignment(1));
+    // The claim mentions an escaping path; the host seals nothing.
+    assert!(digest.contains("0 artifacts"), "{digest}");
     assert!(!f.0.join(".eja/nodes/1/escape.txt").exists());
     assert!(!f.0.join(".eja/nodes/1/work").exists());
     assert_eq!(f.manifest(1)["frozen"], true);
@@ -310,10 +310,13 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
     );
     let r = w.execute(&assignment(1));
     // A spent budget stops the node without calling its work a failure.
-    assert_eq!(r.status, ReportStatus::Blocked, "{}", r.summary);
-    assert!(r.summary.contains("budget"));
-    assert_eq!(r.artifacts, vec!["1/artifacts/partial.txt"]);
-    assert_eq!(f.manifest(1)["report"]["status"], "blocked");
+    assert!(r.contains("ended: budget"), "{r}");
+    assert!(r.contains("budget"), "{r}");
+    assert!(r.contains("1/artifacts/partial.txt"), "{r}");
+    assert!(f.manifest(1)["digest"]
+        .as_str()
+        .unwrap()
+        .contains("ended: budget"));
     let context_limits = Limits {
         context_bytes: 16,
         ..Limits::default()
@@ -321,37 +324,37 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
     let context_model = Arc::new(Script::new(vec![]));
     let w = f.worker(context_model, Arc::new(FileTools), context_limits);
     let r = w.execute(&assignment(2));
-    assert_eq!(r.status, ReportStatus::Blocked, "{}", r.summary);
-    assert!(r.summary.contains("context budget"), "{}", r.summary);
+    assert!(r.contains("ended: budget"), "{r}");
+    assert!(r.contains("context budget"), "{r}");
     assert_eq!(w.active_count(), 0);
     assert_eq!(f.manifest(2)["frozen"], true);
-    // Protocol breaches stay failures: they are not a budget the node spent.
-    for (id, limits, replies, expected) in [
-        (
-            3,
-            Limits {
-                response_bytes: 128,
-                ..Limits::default()
-            },
-            vec![json!({"role":"assistant","content":"x".repeat(129)})],
-            "output limit",
-        ),
-        (
-            4,
-            Limits::default(),
-            vec![json!({"role":"assistant","content":"not a report"})],
-            "expected",
-        ),
-    ] {
-        let model = Arc::new(Script::new(replies));
-        let w = f.worker(model, Arc::new(FileTools), limits);
-        let r = w.execute(&assignment(id));
-        assert_eq!(r.status, ReportStatus::Failed, "{id}");
-        assert!(r.summary.contains(expected), "{}", r.summary);
-        assert_eq!(w.active_count(), 0);
-        assert_eq!(f.manifest(id)["frozen"], true);
-    }
-    assert_reaped(&model.pids.lock().unwrap());
+    // A protocol breach is an error, not a budget the node spent.
+    let oversized = Arc::new(Script::new(vec![json!({
+        "role": "assistant",
+        "content": "x".repeat(129),
+    })]));
+    let w = f.worker(
+        oversized,
+        Arc::new(FileTools),
+        Limits {
+            response_bytes: 128,
+            ..Limits::default()
+        },
+    );
+    let r = w.execute(&assignment(3));
+    assert!(r.contains("ended: error"), "{r}");
+    assert!(r.contains("output limit"), "{r}");
+    assert_eq!(w.active_count(), 0);
+    assert_eq!(f.manifest(3)["frozen"], true);
+    // A plain-text final message is a claim, not a schema breach.
+    let plain = Arc::new(Script::new(vec![
+        json!({"role":"assistant","content":"not a digest"}),
+    ]));
+    let w = f.worker(plain.clone(), Arc::new(FileTools), Limits::default());
+    let r = w.execute(&assignment(5));
+    assert!(r.contains("ended: message"), "{r}");
+    assert!(r.contains("not a digest"), "{r}");
+    assert_reaped(&plain.pids.lock().unwrap());
 }
 
 struct Blocking(Arc<AtomicBool>);
@@ -388,18 +391,16 @@ fn timeout_cancellation_and_busy_slot_release_all_node_resources() {
         }
         let pids = worker_pids();
         assert!(!pids.is_empty());
-        assert_eq!(w.execute(&assignment(2)).status, ReportStatus::Blocked);
+        assert!(w.execute(&assignment(2)).contains("ended: budget"));
         assert!(!f.0.join(".eja/nodes/2").exists());
         if cancel {
             assert!(w.cancel(1));
         }
         let r = join.join().unwrap();
-        assert_eq!(r.status, ReportStatus::Failed);
+        assert!(r.contains("ended: error"), "{r}");
         assert!(
-            r.summary
-                .contains(if cancel { "cancelled" } else { "timed out" }),
-            "{}",
-            r.summary
+            r.contains(if cancel { "cancelled" } else { "timed out" }),
+            "{r}"
         );
         assert_eq!(w.active_count(), 0);
         assert_eq!(f.manifest(1)["frozen"], true);
@@ -420,7 +421,7 @@ fn many_frozen_nodes_have_no_live_workers_or_growing_pipe_handles() {
     };
     let before = std::fs::read_dir(fd_path).unwrap().count();
     for id in 1..=25 {
-        assert_eq!(w.execute(&assignment(id)).status, ReportStatus::Done);
+        assert!(w.execute(&assignment(id)).contains("ended: message"));
         assert_eq!(w.active_count(), 0);
     }
     assert!(std::fs::read_dir(fd_path).unwrap().count() <= before + 1);
@@ -521,8 +522,8 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
         Arc::new(FileTools),
         Limits::default(),
     );
-    let report = w.execute(&assignment(1));
-    assert_eq!(report.status, ReportStatus::Done, "{}", report.summary);
+    let digest = w.execute(&assignment(1));
+    assert!(digest.contains("ended: message"), "{digest}");
     let seen = server.join().unwrap();
     assert_eq!(seen[0]["messages"][1]["content"], "node 1 work");
     assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 2);
@@ -531,7 +532,7 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
         .unwrap()
         .iter()
         .any(|m| m["role"] == "tool"));
-    assert_eq!(report.artifacts, vec!["1/artifacts/http.txt"]);
+    assert!(digest.contains("1/artifacts/http.txt"), "{digest}");
 }
 
 #[test]
@@ -608,9 +609,9 @@ fn oversized_start_is_rejected_without_leaving_a_process() {
     let worker = f.worker(model, Arc::new(FileTools), Limits::default());
     let mut input = assignment(1);
     input.objective = "x".repeat(eja::aja::FRAME_LIMIT);
-    let report = worker.execute(&input);
-    assert_eq!(report.status, ReportStatus::Failed);
-    assert!(report.summary.contains("frame exceeds limit"));
+    let digest = worker.execute(&input);
+    assert!(digest.contains("ended: error"), "{digest}");
+    assert!(digest.contains("frame exceeds limit"), "{digest}");
     assert_eq!(worker.active_count(), 0);
     assert!(worker_pids().is_empty());
     assert_eq!(f.manifest(1)["frozen"], true);

@@ -28,15 +28,19 @@ The node sends one request and waits for the host response:
 - `model {messages}` — host calls its configured model with the run's tool definitions.
 - `tool {name, arguments}` — host checks the snapshotted grant and binds the real
   node id, paths and control; unknown tools return an error to the model.
-- `finish {report}` — final `done|blocked|failed` claim with summary, relative
-  work artifacts, evidence and open questions.
+- `finish {text, reason}` — the node's last message and why it stopped
+  (`message|budget|error`). There is no report schema: the host folds the record
+  into a digest; the last message is the node's own account.
 
-The response is the model message or tool-result JSON. Fatal host errors close
-the run and produce a failed report; tool errors are returned as JSON to the
+The response is the model message or tool-result JSON. Fatal host errors end the
+run with `reason: error` in the record; tool errors are returned as JSON to the
 model. Every JSON payload is at most 256 KiB, followed by one newline delimiter.
 The loop serializes tool calls in model order and appends their results before
-requesting another response. Malformed reports, incomplete provider responses,
-invalid/duplicate tool calls fail the node. A spent budget is not a failure: when the step or context budget is exhausted the node returns a `blocked` report and EJA continues with a new node. The system prompt states the node's turn and time budget so it can plan the last turn for the report.
+requesting another response. Incomplete provider responses and invalid/duplicate
+tool calls fail the node. A spent budget is not a failure: when the step or
+context budget is exhausted the node stops with `reason: budget` and EJA
+continues with a new node. The system prompt states the node's turn and time
+budget.
 
 ## Ownership and termination
 
@@ -54,13 +58,14 @@ terminates the native loop. No idle session or process is retained.
 
 The host then copies validated artifacts into the node's artifact directory,
 marks files read-only, removes work, and publishes `node.json` by atomic rename.
-The manifest includes the assignment, report, `context: "context.jsonl"`, the
-frozen context size and `frozen: true`. The report is the node's claim; the
-frozen context is the host's record of the same run. The context file is the complete node
-record as the host saw it: start messages, assistant turns, tool calls with
-arguments and results, and the final report. Invalid artifact
-claims produce a failed report; valid partial writes remain inspectable. EJA's
-acceptance is a later log event and never keeps the process alive.
+The manifest includes the assignment, the host's digest, `context:
+"context.jsonl"`, the frozen context size and `frozen: true`. The digest folds
+the record the host observed: steps, tool calls, sealed artifacts, how the run
+ended, and the node's last message. The context file is that record in full:
+start messages, assistant turns, tool calls with arguments and results, and the
+finish entry. A file the node names but never writes is not an artifact, and a
+partial write stays inspectable. EJA's acceptance is a later log event and never
+keeps the process alive.
 
 Node ids are reserved by creating their directory once. Replays/restarts cannot
 overwrite an existing node. An interrupted, unsealed directory stays reserved
