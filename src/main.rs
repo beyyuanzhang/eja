@@ -43,15 +43,12 @@ extern "C" fn on_sigint(_: libc::c_int) {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("usage: eja --dir DIR [--task ID] [--mcp-config FILE] MODE [text...]");
+        println!(
+            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn [text...] | show TARGET"
+        );
         println!();
         println!("  turn      one interaction: project, decide, act, record");
-        println!("  context   print the projection for the next decision");
-        println!("  tasks     list task nodes");
-        println!("  log       print the append-only event log as JSONL");
-        println!("  tools     print model-visible file and MCP tool schemas");
-        println!("  node ID   print one frozen node: manifest and context size");
-        println!("  audit ID  print the node chain of a task through continues edges");
+        println!("  show X    one view: context, log, tasks, tools, task:ID, node:ID, audit:ID");
         return ExitCode::SUCCESS;
     }
     unsafe {
@@ -103,8 +100,27 @@ fn main() -> ExitCode {
         }
     }
     let Some(mode) = mode else {
-        eprintln!("usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn|context|tasks|log|tools [text...]");
+        eprintln!(
+            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn [text...] | show TARGET"
+        );
         return ExitCode::FAILURE;
+    };
+    // One view verb: `eja show <target>`. The old names remain aliases.
+    let (mode, words) = if mode == "show" {
+        match words.first().cloned().unwrap_or_default().as_str() {
+            "" => {
+                eprintln!("show needs context, log, tasks, tools, task:ID, node:ID or audit:ID");
+                return ExitCode::FAILURE;
+            }
+            target => match target.split_once(':') {
+                Some((kind @ ("node" | "audit" | "task"), id)) => {
+                    (kind.to_string(), vec![id.to_string()])
+                }
+                _ => (target.to_string(), Vec::new()),
+            },
+        }
+    } else {
+        (mode, words)
     };
     let query = words.join(" ");
     let mcp_config = mcp_config.or_else(|| {
@@ -349,7 +365,11 @@ fn main() -> ExitCode {
             Ok(())
         })(),
         "tasks" => store.events().map(|events| {
+            let only: Option<u64> = query.trim().parse().ok();
             for task in tasks(&events) {
+                if only.is_some_and(|id| task.id != id) {
+                    continue;
+                }
                 println!(
                     "#{} [{}] {}",
                     task.id,

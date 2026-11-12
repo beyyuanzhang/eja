@@ -200,9 +200,12 @@ export LNA_MODEL=...
 # export LNA_RETRIEVER_MODEL=...
 
 cargo run -- --dir /tmp/eja turn "write a release checklist"
-cargo run -- --dir /tmp/eja tasks
-cargo run -- --dir /tmp/eja --task 1 context
-cargo run -- --dir /tmp/eja log
+cargo run -- --dir /tmp/eja show tasks
+cargo run -- --dir /tmp/eja show context
+cargo run -- --dir /tmp/eja show log
+cargo run -- --dir /tmp/eja show task:1
+cargo run -- --dir /tmp/eja show node:1
+cargo run -- --dir /tmp/eja show audit:1
 ```
 
 The current directory is the read-only project input. A node writes only its
@@ -212,8 +215,9 @@ are copied into `<dir>/nodes/<id>/artifacts`; returned references are relative t
 Interrupted directories remain reserved; continuation uses a new linked node.
 
 `NativeWorker` has one execution slot. Historical nodes are files, not sessions,
-processes or threads. `Limits` defaults to 300 seconds, 16 model steps, 256 KiB
-serialized context/frame, and 64 KiB model/tool output. A sealed artifact is at
+processes or threads. `Limits` defaults to 300 seconds, no model-step cap
+(`EJA_NODE_STEPS` sets one), 256 KiB serialized context/frame, and 64 KiB
+model/tool output. A sealed artifact is at
 most 256 KiB. `with_limits` and `cancel(node_id)` are host APIs; cancellation is
 also checked during HTTP requests. These are byte/step limits, not exact model
 token limits.
