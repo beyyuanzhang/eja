@@ -1,7 +1,7 @@
 use eja::{
     turn, Action, ArtifactContent, ArtifactReader, Assignment, Brain, Decision, EjaContext, Event,
-    Kind, NoopArtifactReader, NoopRetriever, ProposalKind, Report, ReportStatus, Result, Retriever,
-    Store, TaskStatus, Worker,
+    Kind, LookSource, NoopRetriever, Ports, ProposalKind, Report, ReportStatus, Result, Retriever,
+    Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -126,32 +126,46 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         "create task",
         &Script::new(vec![step(vec![open(false)])]),
         &worker,
-        &NoopRetriever,
-        &Reader,
+        &Ports {
+            log: Some(&NoopRetriever),
+            node: Some(&Reader),
+            ..Default::default()
+        },
     )
     .unwrap();
     let brain = Script::new(vec![
         step(vec![
-            Action::Recall {
-                query: "old fact".into(),
+            Action::Look {
+                source: LookSource::Log,
+                target: String::new(),
+                arguments: serde_json::Value::Null,
+                selector: Selector::Search {
+                    query: "old fact".into(),
+                },
             },
             Action::RecordDecision {
                 text: "written once".into(),
             },
         ]),
         step(vec![
-            Action::ReadTask { task_id: 1 },
+            Action::Focus { task_id: 1 },
             Action::Propose {
                 kind: ProposalKind::Commitment,
                 target_id: None,
                 text: "pending once".into(),
             },
         ]),
-        step(vec![Action::ReadArtifact {
-            path: "first.md".into(),
+        step(vec![Action::Look {
+            source: LookSource::Node,
+            target: "first.md".into(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
         }]),
-        step(vec![Action::ReadArtifact {
-            path: "second.md".into(),
+        step(vec![Action::Look {
+            source: LookSource::Node,
+            target: "second.md".into(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
         }]),
         done(),
     ]);
@@ -160,8 +174,11 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         "inspect",
         &brain,
         &worker,
-        &FixedRecall(fact.id),
-        &Reader,
+        &Ports {
+            log: Some(&FixedRecall(fact.id)),
+            node: Some(&Reader),
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(out.decisions, 5);
@@ -169,21 +186,37 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     assert!(!out.stalled);
     assert_eq!(out.reads, vec![1]);
     assert_eq!(out.context.focus.as_ref().unwrap().id, 1);
-    assert_eq!(out.recalled.len(), 1);
-    assert_eq!(out.recalled[0].id, fact.id);
-    assert_eq!(out.artifacts.len(), 2);
+    let log_look = out
+        .evidence
+        .iter()
+        .find(|look| look.source == LookSource::Log)
+        .expect("recall");
+    let events = log_look.result["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["id"], fact.id);
+    let node_looks = out
+        .evidence
+        .iter()
+        .filter(|look| look.source == LookSource::Node)
+        .count();
+    assert_eq!(node_looks, 2);
     let seen = brain.seen.lock().unwrap();
-    assert!(seen[1].recall.iter().any(|e| e.id == fact.id));
+    assert!(seen[1].evidence.iter().any(|look| look.result["events"]
+        .as_array()
+        .is_some_and(|events| events.iter().any(|event| event["id"] == fact.id))));
     assert_eq!(seen[2].proposals.len(), 1);
     for context in &seen[2..] {
         assert_eq!(context.focus.as_ref().unwrap().id, 1);
-        assert_eq!(context.recall.len(), 1);
+        assert!(context
+            .evidence
+            .iter()
+            .any(|look| look.source == LookSource::Log));
         assert!(eja::adapters::render_context(context).contains(&fact.text));
     }
     assert!(seen[4]
-        .artifacts
+        .evidence
         .iter()
-        .any(|a| a.text == "content of second.md"));
+        .any(|look| look.result["text"].as_str() == Some("content of second.md")));
     let events = store.events().unwrap();
     assert_eq!(
         events
@@ -210,15 +243,26 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
     let worker = CaptureWorker::default();
     let brain = Script::new(vec![
         step(vec![open(true)]),
-        step(vec![Action::Recall {
-            query: "old evidence".into(),
+        step(vec![Action::Look {
+            source: LookSource::Log,
+            target: String::new(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Search {
+                query: "old evidence".into(),
+            },
         }]),
-        step(vec![Action::ReadArtifact {
-            path: "1.md".into(),
+        step(vec![Action::Look {
+            source: LookSource::Node,
+            target: "1.md".into(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
         }]),
         step(vec![close(1), open(true)]),
-        step(vec![Action::ReadArtifact {
-            path: "2.md".into(),
+        step(vec![Action::Look {
+            source: LookSource::Node,
+            target: "2.md".into(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
         }]),
         Decision {
             reply: "both accepted".into(),
@@ -230,8 +274,11 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
         "work",
         &brain,
         &worker,
-        &FixedRecall(fact.id),
-        &Reader,
+        &Ports {
+            log: Some(&FixedRecall(fact.id)),
+            node: Some(&Reader),
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(out.reply, "both accepted");
@@ -242,8 +289,14 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
     let seen = brain.seen.lock().unwrap();
     assert_eq!(seen[1].focus.as_ref().unwrap().status, TaskStatus::Waiting);
     assert_eq!(seen[5].focus.as_ref().unwrap().id, 2);
-    assert_eq!(seen[5].recall[0].id, fact.id);
-    assert!(seen[5].artifacts.iter().any(|a| a.path == "2.md"));
+    assert!(seen[5]
+        .evidence
+        .iter()
+        .any(|look| look.source == LookSource::Log));
+    assert!(seen[5]
+        .evidence
+        .iter()
+        .any(|look| look.result["path"] == "2.md"));
     assert_eq!(worker.0.lock().unwrap().len(), 2);
 }
 
@@ -257,8 +310,11 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
                 target_id: None,
                 text: "not yet confirmed".into(),
             },
-            Action::ReadArtifact {
-                path: "background.md".into(),
+            Action::Look {
+                source: LookSource::Node,
+                target: "background.md".into(),
+                arguments: serde_json::Value::Null,
+                selector: Selector::Whole,
             },
         ]),
         step(vec![Action::Confirm { proposal_id: 2 }]),
@@ -268,8 +324,11 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
         "propose",
         &brain,
         &CaptureWorker::default(),
-        &NoopRetriever,
-        &Reader,
+        &Ports {
+            log: Some(&NoopRetriever),
+            node: Some(&Reader),
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(out.decisions, 2);
@@ -288,28 +347,23 @@ fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
     let brain = Script::new(
         (0..10)
             .map(|_| {
-                step(vec![Action::ReadArtifact {
-                    path: "missing.md".into(),
+                step(vec![Action::Look {
+                    source: LookSource::Node,
+                    target: "missing.md".into(),
+                    arguments: serde_json::Value::Null,
+                    selector: Selector::Whole,
                 }])
             })
             .collect(),
     );
     let worker = CaptureWorker::default();
-    let out = turn(
-        &store,
-        "inspect",
-        &brain,
-        &worker,
-        &NoopRetriever,
-        &NoopArtifactReader,
-    )
-    .unwrap();
+    let out = turn(&store, "inspect", &brain, &worker, &Ports::default()).unwrap();
     assert!(out.stalled);
     // The same read twice: the second look carries no new information.
     assert_eq!(out.decisions, 2);
     assert!(out.reply.is_empty());
-    assert_eq!(out.artifacts.len(), 2);
-    assert!(out.context.artifacts.iter().all(|a| a.error.is_some()));
+    assert_eq!(out.evidence.len(), 1);
+    assert!(out.context.evidence.iter().all(|look| look.error.is_some()));
     let events = store.events().unwrap();
     assert_eq!(
         events.last().unwrap().data.as_ref().unwrap()["stalled"],
@@ -322,18 +376,27 @@ fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
 fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     let store = store();
     let mut steps: Vec<Decision> = vec![
-        step(vec![Action::ReadArtifact {
-            path: "background.md".into(),
+        step(vec![Action::Look {
+            source: LookSource::Node,
+            target: "background.md".into(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
         }]),
-        step(vec![Action::ReadArtifact {
-            path: "second.md".into(),
+        step(vec![Action::Look {
+            source: LookSource::Node,
+            target: "second.md".into(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
         }]),
         step(vec![open(true)]),
     ];
     // Keep observing the same artifact until the view stops changing.
     steps.extend((0..8).map(|_| {
-        step(vec![Action::ReadArtifact {
-            path: "same.md".into(),
+        step(vec![Action::Look {
+            source: LookSource::Node,
+            target: "same.md".into(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
         }])
     }));
     let worker = CaptureWorker::default();
@@ -342,8 +405,11 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         "work",
         &Script::new(steps),
         &worker,
-        &NoopRetriever,
-        &Reader,
+        &Ports {
+            log: Some(&NoopRetriever),
+            node: Some(&Reader),
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(out.stalled);
@@ -352,8 +418,11 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     assert_eq!(out.reports.len(), 1);
     let restarted = Store::new(store.log_path.parent().unwrap()).unwrap();
     let brain = Script::new(vec![
-        step(vec![Action::ReadArtifact {
-            path: "1.md".into(),
+        step(vec![Action::Look {
+            source: LookSource::Node,
+            target: "1.md".into(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
         }]),
         Decision {
             reply: "accepted after restart".into(),
@@ -365,8 +434,11 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         "continue",
         &brain,
         &worker,
-        &NoopRetriever,
-        &Reader,
+        &Ports {
+            log: Some(&NoopRetriever),
+            node: Some(&Reader),
+            ..Default::default()
+        },
     )
     .unwrap();
     assert!(!resumed.stalled);

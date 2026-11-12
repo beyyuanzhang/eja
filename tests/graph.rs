@@ -1,6 +1,6 @@
 use eja::{
-    turn_at, Action, Assignment, Brain, Decision, Edge, EjaContext, NoopArtifactReader,
-    NoopRetriever, RelationKind, Report, ReportStatus, Store, Worker,
+    turn_at, Action, Assignment, Brain, Decision, Edge, EjaContext, Ports, RelationKind, Report,
+    ReportStatus, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -76,8 +76,7 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
         "build a long task",
         &brain,
         &DoneWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("turn");

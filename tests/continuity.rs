@@ -1,8 +1,7 @@
 use chrono::{TimeZone, Utc};
 use eja::{
     current_goal, open_commitments, project, turn_at, Action, Assignment, Brain, Decision,
-    EjaContext, Kind, NoopArtifactReader, NoopRetriever, ProposalKind, Report, ReportStatus, Store,
-    TaskStatus, Worker,
+    EjaContext, Kind, Ports, ProposalKind, Report, ReportStatus, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -110,8 +109,7 @@ fn propose_and_confirm(
         "propose",
         &propose,
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         at,
     )
     .expect("propose");
@@ -130,8 +128,7 @@ fn propose_and_confirm(
         "confirm",
         &confirm,
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         at,
     )
     .expect("confirm");
@@ -146,8 +143,7 @@ fn user_input_does_not_become_a_goal() {
         "what is the weather?",
         &QueueBrain::new(vec![decision("a reply", vec![])]),
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         day(2026, 11, 9, 9),
     )
     .expect("turn");
@@ -174,8 +170,7 @@ fn unrelated_input_preserves_a_confirmed_goal() {
         "what is the weather?",
         &QueueBrain::new(vec![decision("a reply", vec![])]),
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         day(2026, 11, 9, 10),
     )
     .expect("turn");
@@ -205,8 +200,7 @@ fn restart_and_model_switch_preserve_identity() {
         "what did I commit to?",
         &other_model,
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         day(2026, 11, 10, 9),
     )
     .expect("continue");
@@ -352,8 +346,7 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
         "make a checklist",
         &brain,
         &QueueWorker::new(vec![done_report()]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         at,
     )
     .expect("turn");

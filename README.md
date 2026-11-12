@@ -11,7 +11,7 @@ The core is a typed state machine over an append-only log. **It does not read la
 ```
 L' = L + e
 S  = fold(L)
-C  = project(S, input, focus, recall, artifacts)
+C  = project(S, input, focus, evidence)
 d  = Model(C)              // language: adapter
 p  = Propose(d)            // identity changes are proposals
 S' = commit(S, confirmed actions)
@@ -73,25 +73,28 @@ A proposal cannot be confirmed in the same turn it was created.
 Targets are checked at proposal and confirmation time. A stale or mismatched
 target cannot change state. Old events remain in the log for reconstruction.
 
-## Recall
+## Look
 
-`recall(query)` is an action:
+Every act of reading is one action:
 
 ```
-query → retriever adapter (semantic selection + graph/time expansion)
-      → [event ids]
-      → core logs a Read event
-      → project includes those events
+look { source: log|node|world, target, selector }
 ```
 
-No text matching in core.
+- `log` — EJA's own log. A `search` selector asks the retriever for event ids; a
+  `task:<id>` or `event:<id>` target reads one record by address.
+- `node` — a frozen node record. `whole` reads a bounded file view, `range`
+  reads lines, `match` finds a passage with surrounding lines.
+- `world` — a read-only connector tool or a project file.
 
-## Observation
+Selectors: `{"select":"whole"}`,
+`{"select":"range","from":0,"lines":40}`,
+`{"select":"match","text":"PO-1010","before":2,"after":4}`,
+`{"select":"search","query":"what did we decide?"}`.
 
-`observe(tool, arguments)` is an action. It reaches only connector tools the
-server itself declared read-only (`readOnlyHint`), and the result is appended as
-an `Observed` event and rendered as OBSERVATIONS in the next projection. EJA can
-check a claim against the world; it never gains an effect tool.
+A look creates one `Observed` event and one EVIDENCE entry. Evidence belongs to
+the turn that asked for it; the log keeps every look forever. `focus {task_id}`
+is navigation, not reading: it chooses the task the turn is about.
 
 ## Turn loop
 
@@ -101,8 +104,7 @@ Each decision's actions execute in order through one loop:
 project → decide → act → append results → project
 ```
 
-Reading tasks, recalling events, reading artifacts, observing read-only connector
-tools and receiving AJA reports all continue through that loop, in any order. A final reply with only state-writing
+Every look and every AJA report continue through that loop, in any order. A final reply with only state-writing
 actions (or no actions) ends the turn. Task focus and recalled evidence remain
 available across steps. A turn ends when a decision observes nothing, or when the
 projection stops changing: repeated observations that carry no new information are
@@ -118,13 +120,11 @@ EJA judges worker output itself:
 worker report (a claim) → EJA decides → close_task { accepted, note }
 ```
 
-`read_artifact` is an optional observation. When a node wrote files, EJA can read
-them; when the work lives in an external system (a connector or a service), the
-artifact list is legitimately empty and EJA decides from the report. Nothing is
-required before `close_task`, and there is no separate verifier. `observe` is the
-other optional look: a read-only connector tool or a project file, recorded as an
-OBSERVATIONS entry, so EJA can check a claim against the world when the host
-grants that view. EJA never gets an effect tool.
+A look is optional. When a node wrote files, EJA can read them; when the work
+lives in an external system, the artifact list is legitimately empty and EJA
+decides from the report. Nothing is required before `close_task`, and there is no
+separate verifier. A look at a read-only connector tool lets EJA check a claim
+against the world when the host grants that view; it never gets an effect tool.
 
 `node.json` keeps the host-observed tool log of the node in the sealed report
 (`report.tools`), and the current task renders it. It is a record, not a gate.
@@ -251,7 +251,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Covers the closed loop, artifact reading, proposals/confirmation, recall by
+Covers the closed loop, look sources and selectors, proposals/confirmation, recall by
 event id, recovery, UTC, projection bounds, worker timeout/cancellation/process cleanup,
 the per-node task contract, the native worker IPC and tool loop, bounded/cancelled
 HTTP, frozen artifacts, replay protection, resource cleanup, the waiting-task fast

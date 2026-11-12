@@ -1,6 +1,6 @@
 use eja::{
-    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind,
-    NoopArtifactReader, NoopRetriever, ProposalKind, Report, Store, Worker,
+    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, Ports,
+    ProposalKind, Report, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -70,8 +70,7 @@ fn proposal_does_not_change_identity_until_confirmed() {
         "propose",
         &propose,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("propose");
@@ -88,8 +87,7 @@ fn proposal_does_not_change_identity_until_confirmed() {
         "confirm",
         &confirm,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("confirm");
@@ -116,8 +114,7 @@ fn a_proposal_cannot_be_confirmed_in_the_same_turn() {
         "do both",
         &brain,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("turn");
@@ -140,8 +137,7 @@ fn rejection_leaves_identity_unchanged() {
         "propose",
         &propose,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("propose");
@@ -158,8 +154,7 @@ fn rejection_leaves_identity_unchanged() {
         "reject",
         &reject,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("reject");
@@ -193,8 +188,7 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
         "propose",
         &propose,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .unwrap();
@@ -214,8 +208,7 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
         "confirm",
         &confirm,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .unwrap();
@@ -265,8 +258,7 @@ fn invalid_revision_targets_do_not_create_proposals() {
         "propose",
         &brain,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .unwrap();

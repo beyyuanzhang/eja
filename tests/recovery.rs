@@ -1,6 +1,6 @@
 use eja::{
-    recover, turn_at, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, NoopArtifactReader,
-    NoopRetriever, ReportStatus, Store, TaskStatus, Worker,
+    recover, turn_at, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, Ports,
+    ReportStatus, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -111,8 +111,7 @@ fn interrupted_assignment_is_reconciled_without_duplicate_dispatch() {
         "continue",
         &brain,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         chrono::Utc::now(),
     )
     .expect("turn");

@@ -2,7 +2,7 @@ use eja::adapters::{
     self, FileArtifactReader, HostTools, ModelRetriever, NativeWorker, OpenAiBrain, OpenAiModel,
     ToolGateway,
 };
-use eja::{project, tasks, turn_observed, NoopRetriever, Retriever, Store, TaskStatus};
+use eja::{project, tasks, turn, NoopRetriever, Retriever, Store, TaskStatus};
 use std::process::ExitCode;
 
 fn status_label(status: TaskStatus) -> &'static str {
@@ -178,15 +178,12 @@ fn main() -> ExitCode {
                 None => Box::new(NoopRetriever),
             };
             let artifacts = FileArtifactReader::new(nodes);
-            let result = turn_observed(
-                &store,
-                &query,
-                &brain,
-                &worker,
-                &*retriever,
-                &artifacts,
-                &*tools,
-            );
+            let ports = eja::Ports {
+                log: Some(&*retriever),
+                node: Some(&artifacts),
+                world: Some(&*tools),
+            };
+            let result = turn(&store, &query, &brain, &worker, &ports);
             if eja::adapters::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
                 eprintln!("interrupted; the node was stopped and its run is recorded");
                 return ExitCode::FAILURE;
@@ -197,7 +194,7 @@ fn main() -> ExitCode {
                     println!("[turn stalled: the model repeated a state with no new observation]");
                 }
                 println!(
-                    "[{} | focus #{} | dispatched {} | reads {} | decisions {} | worker {}ms | log {}]",
+                    "[{} | focus #{} | dispatched {} | looks {} | decisions {} | worker {}ms | log {}]",
                     counts(&outcome.tasks),
                     outcome
                         .context
@@ -206,7 +203,7 @@ fn main() -> ExitCode {
                         .map(|task| task.id.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                     outcome.dispatched.len(),
-                    outcome.reads.len(),
+                    outcome.evidence.len(),
                     outcome.decisions,
                     outcome.worker_ms,
                     store.events().map(|events| events.len()).unwrap_or(0)

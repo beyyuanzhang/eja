@@ -1,6 +1,6 @@
 use eja::{
-    turn_observed, Action, Brain, Decision, EjaContext, Kind, NoopArtifactReader, NoopRetriever,
-    Observer, Report, Result, Store, Worker,
+    turn, Action, Brain, Decision, EjaContext, Kind, LookSource, Observer, Ports, Report, Result,
+    Selector, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -41,9 +41,11 @@ fn observing_a_read_only_tool_records_a_view() {
     let brain = Script(Mutex::new(VecDeque::from(vec![
         Decision {
             reply: String::new(),
-            actions: vec![Action::Observe {
-                tool: "mcp__weather__get".into(),
+            actions: vec![Action::Look {
+                source: LookSource::World,
+                target: "mcp__weather__get".to_string(),
                 arguments: serde_json::json!({"city": "berlin"}),
+                selector: Selector::Whole,
             }],
         },
         Decision {
@@ -51,31 +53,31 @@ fn observing_a_read_only_tool_records_a_view() {
             actions: vec![],
         },
     ])));
-    let out = turn_observed(
+    let out = turn(
         &store,
         "what is the sky?",
         &brain,
         &EmptyWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
-        &Weather,
+        &Ports {
+            world: Some(&Weather),
+            ..Default::default()
+        },
     )
     .expect("turn");
     assert_eq!(out.reply, "it is clear");
-    assert_eq!(out.context.observations.len(), 1);
-    assert_eq!(out.context.observations[0].tool, "mcp__weather__get");
-    assert_eq!(out.context.observations[0].result["sky"], "clear");
+    assert_eq!(out.context.evidence.len(), 1);
+    assert_eq!(out.context.evidence[0].source, LookSource::World);
+    assert_eq!(out.context.evidence[0].result["sky"], "clear");
     assert!(store
         .events()
         .expect("events")
         .iter()
         .any(|event| event.kind == Kind::Observed));
     let rendered = eja::adapters::render_context(&out.context);
-    let at = rendered.find("OBSERV").unwrap_or(0);
     assert!(
-        rendered.contains("OBSERVATIONS (1):"),
+        rendered.contains("EVIDENCE (1):"),
         "{}",
-        &rendered[at..(at + 200).min(rendered.len())]
+        &rendered[..200.min(rendered.len())]
     );
     assert!(rendered.contains("clear"));
 }

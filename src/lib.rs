@@ -276,6 +276,14 @@ impl ArtifactContent {
 
 pub trait ArtifactReader {
     fn read(&self, path: &str) -> ArtifactContent;
+
+    /// A selected view of a node file. Readers that cannot slice still serve whole reads.
+    fn slice(&self, path: &str, selector: &Selector) -> Result<Value> {
+        if !matches!(selector, Selector::Whole) {
+            return Err("this reader cannot select a range".into());
+        }
+        Ok(serde_json::to_value(self.read(path))?)
+    }
 }
 
 /// Read-only observation of an external system. EJA may look; it never acts.
@@ -289,14 +297,6 @@ impl Observer for NoopObserver {
     fn observe(&self, _: &str, _: &Value) -> Result<Value> {
         Err("no observer is configured".into())
     }
-}
-
-/// One read-only look at an external system, kept in the log.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Observation {
-    pub tool: String,
-    pub arguments: Value,
-    pub result: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,9 +637,7 @@ pub struct EjaContext {
     pub tasks: Vec<TaskSummary>,
     pub relations: Vec<Edge>,
     pub focus: Option<Task>,
-    pub recall: Vec<Event>,
-    pub observations: Vec<Observation>,
-    pub artifacts: Vec<ArtifactContent>,
+    pub evidence: Vec<Observation>,
     pub proposals: Vec<ProposalView>,
 }
 
@@ -649,15 +647,15 @@ pub fn project(
     focus_task: Option<TaskId>,
     now: DateTime<Utc>,
 ) -> Result<EjaContext> {
-    project_with_recall(store, input, focus_task, now, &[])
+    project_with_evidence(store, input, focus_task, now, &[])
 }
 
-pub fn project_with_recall(
+pub fn project_with_evidence(
     store: &Store,
     input: &str,
     focus_task: Option<TaskId>,
     now: DateTime<Utc>,
-    recall: &[Event],
+    evidence: &[Observation],
 ) -> Result<EjaContext> {
     let events = store.events()?;
     let all_tasks = tasks(&events);
@@ -686,57 +684,7 @@ pub fn project_with_recall(
         tasks: summaries,
         relations: relations_with_tasks(&events, &all_tasks),
         focus,
-        recall: recall.to_vec(),
-        // A view of the current world, not of every look: the newest look per
-        // (tool, arguments) is what matters, so repeating it changes nothing.
-        observations: {
-            let mut seen = HashSet::new();
-            let mut observations: Vec<Observation> = Vec::new();
-            for event in events
-                .iter()
-                .rev()
-                .filter(|event| event.kind == Kind::Observed)
-            {
-                let Some(data) = event.data.as_ref() else {
-                    continue;
-                };
-                let Some(tool) = data.get("tool").and_then(Value::as_str) else {
-                    continue;
-                };
-                let arguments = data.get("arguments").cloned().unwrap_or(Value::Null);
-                if !seen.insert((tool.to_string(), arguments.to_string())) {
-                    continue;
-                }
-                observations.push(Observation {
-                    tool: tool.to_string(),
-                    arguments,
-                    result: data.get("result").cloned().unwrap_or(Value::Null),
-                });
-            }
-            observations.reverse();
-            observations
-        },
-        artifacts: {
-            let mut seen = HashSet::new();
-            let mut artifacts: Vec<ArtifactContent> = Vec::new();
-            for event in events
-                .iter()
-                .rev()
-                .filter(|event| event.kind == Kind::ArtifactRead)
-            {
-                let Some(content) = event.data.as_ref().and_then(|value| {
-                    serde_json::from_value::<ArtifactContent>(value.clone()).ok()
-                }) else {
-                    continue;
-                };
-                if !seen.insert(content.path.clone()) {
-                    continue;
-                }
-                artifacts.push(content);
-            }
-            artifacts.reverse();
-            artifacts
-        },
+        evidence: evidence.to_vec(),
         proposals: pending_proposals(&events),
     })
 }
@@ -796,20 +744,153 @@ pub enum Action {
         #[serde(default)]
         note: String,
     },
-    ReadTask {
+    /// Navigation, not acquisition: what this turn is about.
+    #[serde(rename = "focus")]
+    Focus {
         task_id: TaskId,
     },
-    Recall {
-        query: String,
-    },
-    ReadArtifact {
-        path: String,
-    },
-    Observe {
-        tool: String,
+    #[serde(rename = "look")]
+    Look {
+        source: LookSource,
+        #[serde(default)]
+        target: String,
         #[serde(default)]
         arguments: Value,
+        #[serde(default)]
+        selector: Selector,
     },
+}
+
+/// Where a look reads from: EJA's own log, a frozen node record, or the world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookSource {
+    Log,
+    Node,
+    World,
+}
+
+/// How much of the target to read. One selector replaces offset/paging/query options.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "select", rename_all = "snake_case")]
+pub enum Selector {
+    #[default]
+    Whole,
+    Range {
+        from: usize,
+        lines: usize,
+    },
+    Match {
+        text: String,
+        before: usize,
+        after: usize,
+    },
+    Search {
+        query: String,
+    },
+}
+
+/// One look, recorded once. This is the only shape an EJA observation has.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Observation {
+    pub source: LookSource,
+    pub target: String,
+    #[serde(default)]
+    pub arguments: Value,
+    #[serde(default)]
+    pub selector: Selector,
+    #[serde(default)]
+    pub result: Value,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The only read primitive. A source, a target and a selector; nothing else.
+pub trait Lookup {
+    fn look(
+        &self,
+        source: LookSource,
+        target: &str,
+        arguments: &Value,
+        selector: &Selector,
+        log: &[Event],
+    ) -> Result<Value>;
+}
+
+pub struct NoopLookup;
+
+impl Lookup for NoopLookup {
+    fn look(
+        &self,
+        source: LookSource,
+        _: &str,
+        _: &Value,
+        _: &Selector,
+        _: &[Event],
+    ) -> Result<Value> {
+        Err(format!("no {source:?} reader is configured").into())
+    }
+}
+
+/// Host composition: one lookup over the three sources an EJA deployment has.
+#[derive(Default, Clone, Copy)]
+pub struct Ports<'a> {
+    pub log: Option<&'a dyn Retriever>,
+    pub node: Option<&'a dyn ArtifactReader>,
+    pub world: Option<&'a dyn Observer>,
+}
+
+impl Lookup for Ports<'_> {
+    fn look(
+        &self,
+        source: LookSource,
+        target: &str,
+        arguments: &Value,
+        selector: &Selector,
+        log: &[Event],
+    ) -> Result<Value> {
+        match source {
+            LookSource::Log => {
+                let retriever = self.log.ok_or("no log reader is configured")?;
+                match selector {
+                    Selector::Search { query } => {
+                        let ids = retriever.retrieve(query, log)?;
+                        let events: Vec<&Event> =
+                            log.iter().filter(|event| ids.contains(&event.id)).collect();
+                        Ok(serde_json::json!({"matches": events.len(), "events": events}))
+                    }
+                    Selector::Whole => {
+                        if let Some(raw) = target.strip_prefix("task:") {
+                            let id: u64 = raw.parse().map_err(|_| "task target needs an id")?;
+                            let task = tasks(log)
+                                .into_iter()
+                                .find(|task| task.id == id)
+                                .ok_or("no such task")?;
+                            return Ok(serde_json::to_value(task)?);
+                        }
+                        if let Some(raw) = target.strip_prefix("event:") {
+                            let id: u64 = raw.parse().map_err(|_| "event target needs an id")?;
+                            let event = log
+                                .iter()
+                                .find(|event| event.id == id)
+                                .ok_or("no such event")?;
+                            return Ok(serde_json::to_value(event)?);
+                        }
+                        Err("a log look targets task:<id>, event:<id>, or a search".into())
+                    }
+                    _ => Err("a log look uses whole or search".into()),
+                }
+            }
+            LookSource::Node => {
+                let node = self.node.ok_or("no node reader is configured")?;
+                node.slice(target, selector)
+            }
+            LookSource::World => {
+                let world = self.world.ok_or("no world reader is configured")?;
+                world.observe(target, arguments)
+            }
+        }
+    }
 }
 
 pub trait Brain {
@@ -848,8 +929,7 @@ pub struct TurnOutcome {
     pub dispatched: Vec<TaskId>,
     pub reports: Vec<(TaskId, Report)>,
     pub reads: Vec<TaskId>,
-    pub recalled: Vec<Event>,
-    pub artifacts: Vec<ArtifactContent>,
+    pub evidence: Vec<Observation>,
     pub decisions: usize,
     pub worker_ms: u128,
     pub stalled: bool,
@@ -1107,9 +1187,7 @@ struct ActionCtx<'a> {
     turn: u64,
     at: i64,
     worker: &'a dyn Worker,
-    retriever: &'a dyn Retriever,
-    artifacts: &'a dyn ArtifactReader,
-    observer: &'a dyn Observer,
+    lookup: &'a dyn Lookup,
 }
 
 fn apply_actions(
@@ -1182,7 +1260,7 @@ fn apply_actions(
                 accepted,
                 note,
             } => close_task(ctx.store, *task_id, *accepted, note, ctx.turn, ctx.at)?,
-            Action::ReadTask { task_id } => {
+            Action::Focus { task_id } => {
                 ctx.store.append(
                     Kind::Read,
                     "eja",
@@ -1194,56 +1272,43 @@ fn apply_actions(
                 *focus = Some(*task_id);
                 observed = true;
             }
-            Action::Recall { query } => {
+            Action::Look {
+                source,
+                target,
+                arguments,
+                selector,
+            } => {
                 let events = ctx.store.events()?;
-                let ids = ctx.retriever.retrieve(query, &events).unwrap_or_default();
-                let found: Vec<Event> =
-                    events.into_iter().filter(|e| ids.contains(&e.id)).collect();
-                let ids: Vec<u64> = found.iter().map(|e| e.id).collect();
-                ctx.store.append(
-                    Kind::Read,
-                    "eja",
-                    "",
-                    ctx.turn,
-                    EventMeta::data(ctx.at, serde_json::json!({"queries": [query], "ids": ids})),
-                )?;
-                out.recalled.extend(found);
-                out.recalled.sort_by_key(|e| e.id);
-                out.recalled.dedup_by_key(|e| e.id);
-                observed = true;
-            }
-            Action::ReadArtifact { path } => {
-                let content = ctx.artifacts.read(path);
-                ctx.store.append(
-                    Kind::ArtifactRead,
-                    "eja",
-                    "",
-                    ctx.turn,
-                    EventMeta::data(ctx.at, serde_json::to_value(&content)?),
-                )?;
-                out.artifacts.push(content);
-                observed = true;
-            }
-            Action::Observe { tool, arguments } => {
-                let (result, error) = match ctx.observer.observe(tool, arguments) {
+                let (result, error) = match ctx
+                    .lookup
+                    .look(*source, target, arguments, selector, &events)
+                {
                     Ok(value) => (value, None),
                     Err(error) => (Value::Null, Some(error.to_string())),
+                };
+                let observation = Observation {
+                    source: *source,
+                    target: target.clone(),
+                    arguments: arguments.clone(),
+                    selector: selector.clone(),
+                    result,
+                    error,
                 };
                 ctx.store.append(
                     Kind::Observed,
                     "eja",
                     "",
                     ctx.turn,
-                    EventMeta::data(
-                        ctx.at,
-                        serde_json::json!({
-                            "tool": tool,
-                            "arguments": arguments,
-                            "result": result,
-                            "error": error,
-                        }),
-                    ),
+                    EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
                 )?;
+                // The view holds one entry per distinct look, not every repeat.
+                out.evidence.retain(|other| {
+                    !(other.source == observation.source
+                        && other.target == observation.target
+                        && other.arguments == observation.arguments
+                        && other.selector == observation.selector)
+                });
+                out.evidence.push(observation);
                 observed = true;
             }
         }
@@ -1265,10 +1330,9 @@ pub fn turn(
     input: &str,
     brain: &dyn Brain,
     worker: &dyn Worker,
-    retriever: &dyn Retriever,
-    artifacts: &dyn ArtifactReader,
+    lookup: &dyn Lookup,
 ) -> Result<TurnOutcome> {
-    turn_at(store, input, brain, worker, retriever, artifacts, now_utc())
+    turn_at(store, input, brain, worker, lookup, now_utc())
 }
 
 pub fn turn_at(
@@ -1276,52 +1340,7 @@ pub fn turn_at(
     input: &str,
     brain: &dyn Brain,
     worker: &dyn Worker,
-    retriever: &dyn Retriever,
-    artifact_reader: &dyn ArtifactReader,
-    now: DateTime<Utc>,
-) -> Result<TurnOutcome> {
-    turn_observed_at(
-        store,
-        input,
-        brain,
-        worker,
-        retriever,
-        artifact_reader,
-        &NoopObserver,
-        now,
-    )
-}
-
-pub fn turn_observed(
-    store: &Store,
-    input: &str,
-    brain: &dyn Brain,
-    worker: &dyn Worker,
-    retriever: &dyn Retriever,
-    artifacts: &dyn ArtifactReader,
-    observer: &dyn Observer,
-) -> Result<TurnOutcome> {
-    turn_observed_at(
-        store,
-        input,
-        brain,
-        worker,
-        retriever,
-        artifacts,
-        observer,
-        now_utc(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn turn_observed_at(
-    store: &Store,
-    input: &str,
-    brain: &dyn Brain,
-    worker: &dyn Worker,
-    retriever: &dyn Retriever,
-    artifact_reader: &dyn ArtifactReader,
-    observer: &dyn Observer,
+    lookup: &dyn Lookup,
     now: DateTime<Utc>,
 ) -> Result<TurnOutcome> {
     let at = now.timestamp();
@@ -1345,8 +1364,7 @@ pub fn turn_observed_at(
         dispatched: Vec::new(),
         reports: Vec::new(),
         reads: Vec::new(),
-        recalled: Vec::new(),
-        artifacts: Vec::new(),
+        evidence: Vec::new(),
         decisions: 0,
         worker_ms: 0,
         stalled: false,
@@ -1357,9 +1375,7 @@ pub fn turn_observed_at(
         turn: turn_no,
         at,
         worker,
-        retriever,
-        artifacts: artifact_reader,
-        observer,
+        lookup,
     };
     let mut seen = HashSet::new();
     seen.insert(fingerprint(&out.context));
@@ -1367,14 +1383,14 @@ pub fn turn_observed_at(
         out.decisions += 1;
         let decision = brain.decide(&out.context);
         let observed = apply_actions(&decision.actions, &ctx, &mut out, &mut focus)?;
-        out.context = project_with_recall(store, input, focus, now, &out.recalled)?;
+        out.context = project_with_evidence(store, input, focus, now, &out.evidence)?;
         if !observed {
             out.reply = decision.reply.trim().to_string();
             break;
         }
-        // Every observation uses the same continuation path, including AJA reports.
-        // An observation that leaves the projection unchanged carries no new
-        // information: the turn is over, instead of stopping at an arbitrary count.
+        // Every look uses the same continuation path. A look that leaves the
+        // projection unchanged carries no new information: the turn is over,
+        // instead of stopping at an arbitrary count.
         if !seen.insert(fingerprint(&out.context)) {
             out.stalled = true;
             break;
@@ -1392,7 +1408,7 @@ pub fn turn_observed_at(
         meta.data = Some(serde_json::json!({"stalled": true}));
     }
     store.append(Kind::Eja, "eja", &out.reply, turn_no, meta)?;
-    out.context = project_with_recall(store, input, focus, now, &out.recalled)?;
+    out.context = project_with_evidence(store, input, focus, now, &out.evidence)?;
     out.tasks = tasks(&store.events()?);
     Ok(out)
 }

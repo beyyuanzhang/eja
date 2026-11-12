@@ -1,4 +1,4 @@
-use crate::{format_utc, Brain, Decision, EjaContext};
+use crate::{format_utc, Brain, Decision, EjaContext, LookSource, Selector};
 use serde_json::json;
 use std::time::Duration;
 
@@ -27,10 +27,10 @@ The current input is separate from the persistent goal. Use a goal/commitment \
 proposal without target_id to add one; with target_id to replace an active event \
 of the same kind. Use correction with target_id only to withdraw that event. \
 The proposal text is the replacement content, or the withdrawal reason. \
-Actions execute in their listed order. Reading a task, recalling history, reading \
-an artifact, observing a read-only connector tool or dispatching an AJA returns \
-observations for your next decision. A continuation is represented as a new \
-task related to the previous one with \
+Actions execute in their listed order. Every read is one action: a look names \
+a source (log, node or world), a target and a selector. Dispatching an AJA also \
+returns an observation. A continuation is represented as a new task related to \
+the previous one with \
 {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
 To finish, return your final reply with no observation-producing actions. \
 Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes: \
@@ -41,10 +41,13 @@ Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes:
 {\"op\":\"open_task\",\"title\":\"...\",\"request\":\"...\",\"acceptance\":\"...\",\"run\":true}; \
 {\"op\":\"dispatch\",\"task_id\":1}; \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
-{\"op\":\"read_task\",\"task_id\":1}; \
-{\"op\":\"recall\",\"query\":\"what did we decide about X?\"}; \
-{\"op\":\"read_artifact\",\"path\":\"out.md\"}; \
-{\"op\":\"observe\",\"tool\":\"mcp__server__tool\",\"arguments\":{}}.";
+{\"op\":\"focus\",\"task_id\":1}; \
+{\"op\":\"look\",\"source\":\"log\",\"selector\":{\"select\":\"search\",\"query\":\"what did we decide?\"}}; \
+{\"op\":\"look\",\"source\":\"log\",\"target\":\"task:1\"}; \
+{\"op\":\"look\",\"source\":\"node\",\"target\":\"1/artifacts/out.md\"}; \
+{\"op\":\"look\",\"source\":\"node\",\"target\":\"3/context.jsonl\",\"selector\":{\"select\":\"match\",\"text\":\"PO-1010\",\"before\":2,\"after\":4}}; \
+{\"op\":\"look\",\"source\":\"node\",\"target\":\"1/artifacts/out.md\",\"selector\":{\"select\":\"range\",\"from\":0,\"lines\":40}}; \
+{\"op\":\"look\",\"source\":\"world\",\"target\":\"mcp__server__tool\",\"arguments\":{}}.";
 
 struct Section {
     title: &'static str,
@@ -158,64 +161,57 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     }
     sections.push(section("CURRENT TASK", false, vec![task_lines]));
 
-    // Evidence sits before the index: when a budget forces a trim, the newest
-    // observations survive and old index entries are dropped first.
-    let mut observation_items = Vec::new();
-    for observation in &context.observations {
-        let mut text = format!("    {}", observation.result);
-        if text.len() > 2000 {
-            text.truncate(2000);
-            text.push('…');
-        }
-        observation_items.push(vec![
-            format!("  {} {}", observation.tool, observation.arguments),
-            text,
-        ]);
-    }
-    sections.push(section("OBSERVATIONS", true, observation_items));
-
-    let mut artifact_items = Vec::new();
-    for artifact in &context.artifacts {
+    // Evidence sits before the index: when a budget forces a trim, what EJA
+    // actually looked at survives and old index entries are dropped first.
+    let mut evidence_items = Vec::new();
+    for observation in &context.evidence {
+        let selector = match &observation.selector {
+            Selector::Whole => String::new(),
+            Selector::Range { from, lines } => format!(" range {from}+{lines}"),
+            Selector::Match { text, .. } => format!(" match \"{text}\""),
+            Selector::Search { query } => format!(" search \"{query}\""),
+        };
         let mut item = vec![format!(
-            "  {} ({} bytes{})",
-            artifact.path,
-            artifact.text.len(),
-            if artifact.truncated {
-                ", truncated"
-            } else {
-                ""
-            }
+            "  [{} {}]{}",
+            source_label(observation.source),
+            observation.target,
+            selector
         )];
-        if let Some(error) = &artifact.error {
+        if let Some(error) = &observation.error {
             item.push(format!("    error: {error}"));
-        } else {
-            for line in artifact.text.lines() {
-                item.push(format!("    {line}"));
+        } else if observation.source == LookSource::Log {
+            let events: Vec<crate::Event> = observation
+                .result
+                .get("events")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+            for event in events {
+                item.push(format!(
+                    "    #{} [{}] {} scope={}: {}",
+                    event.id,
+                    label(event.kind),
+                    format_utc(event.at),
+                    event.scope,
+                    event.text
+                ));
+                if let Some(target) = event.closes {
+                    item.push(format!("      closes: #{target}"));
+                }
+                if let Some(data) = &event.data {
+                    item.push(format!("      data: {data}"));
+                }
             }
+        } else {
+            let mut text = format!("    {}", observation.result);
+            if text.len() > 2000 {
+                text.truncate(2000);
+                text.push('…');
+            }
+            item.push(text);
         }
-        artifact_items.push(item);
+        evidence_items.push(item);
     }
-    sections.push(section("ARTIFACT READS", true, artifact_items));
-
-    let mut recall_items = Vec::new();
-    for event in &context.recall {
-        let mut item = vec![format!(
-            "  #{} [{}] {} scope={}: {}",
-            event.id,
-            label(event.kind),
-            format_utc(event.at),
-            event.scope,
-            event.text
-        )];
-        if let Some(target) = event.closes {
-            item.push(format!("    closes: #{target}"));
-        }
-        if let Some(data) = &event.data {
-            item.push(format!("    data: {data}"));
-        }
-        recall_items.push(item);
-    }
-    sections.push(section("RECALLED EVENTS", true, recall_items));
+    sections.push(section("EVIDENCE", true, evidence_items));
 
     sections.push(section(
         "ACTIVE IDENTITY",
@@ -447,5 +443,13 @@ impl Brain for OpenAiBrain {
                 actions: vec![],
             },
         }
+    }
+}
+
+fn source_label(source: LookSource) -> &'static str {
+    match source {
+        LookSource::Log => "log",
+        LookSource::Node => "node",
+        LookSource::World => "world",
     }
 }

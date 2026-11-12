@@ -639,7 +639,7 @@ fn cli_eja_dispatches_native_node_reads_frozen_output_and_accepts() {
             "stop",
             decision(
                 "reading",
-                json!([{"op":"read_artifact","path":"1/artifacts/checklist.txt"}]),
+                json!([{"op":"look","source":"node","target":"1/artifacts/checklist.txt"}]),
             ),
         ),
         response(

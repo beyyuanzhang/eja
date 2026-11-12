@@ -1,6 +1,6 @@
 use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, NoopArtifactReader, NoopRetriever,
-    Report, ReportStatus, Store, TaskStatus, Worker,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, Ports, Report, ReportStatus, Store,
+    TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -78,8 +78,7 @@ fn single_waiting_task_is_focused_without_the_extra_initial_call() {
         "open",
         &open,
         &DoneWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("open");
@@ -102,8 +101,7 @@ fn single_waiting_task_is_focused_without_the_extra_initial_call() {
         "continue",
         &close,
         &DoneWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("close");
@@ -140,8 +138,7 @@ fn multiple_active_tasks_do_not_use_the_fast_path() {
         "open two",
         &open,
         &DoneWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("open");
@@ -163,8 +160,7 @@ fn multiple_active_tasks_do_not_use_the_fast_path() {
         "close",
         &close,
         &DoneWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("close");

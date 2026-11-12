@@ -5,7 +5,7 @@
 ```
 L' = L + e
 S  = fold(L)
-C  = project(S, input, focus, recall, artifacts)
+C  = project(S, input, focus, evidence)
 d  = Model(C)
 p  = Propose(d)
 a  = ArtifactReader(path)   // EJA-initiated, read-only
@@ -19,7 +19,7 @@ S' = commit(S, confirmed actions)
 3. State transitions accept typed actions with ids/refs/timestamps.
 4. A correction withdraws an event by id. A goal/commitment with `closes`
    replaces an active event of the same kind; no phrase matching.
-5. Focus is an explicit task id; recall returns event ids from an adapter.
+5. Focus is an explicit task id; a log look returns event ids from an adapter.
 6. Identity changes require a proposal and a later confirmation.
 7. A report is a claim. EJA decides; nothing else can accept on its behalf.
    Reading artifacts or the outside world is an option, never a required gate.
@@ -49,7 +49,7 @@ S' = commit(S, confirmed actions)
 - `Store`: append/read events; flush + `sync_all`; tolerant torn tail.
 - `current_goal`, `open_commitments`, `active_identity`, `tasks`, `relations`.
 - `project`: structured context (goal, identity, commitments, task index,
-  focus, recall, artifact reads, pending proposals, now).
+  focus, evidence, pending proposals, now).
 - `turn_at`: one project/decide/act loop for typed actions and observations; it
   ends at a fixpoint and reports `decisions`, `worker_ms` and `stalled`.
 - `aja`: bounded disposable loop and framed IPC, no external effects.
@@ -73,10 +73,8 @@ S' = commit(S, confirmed actions)
 | `open_task {…, run}` | create a task; optionally dispatch |
 | `dispatch {task_id}` | run an open task |
 | `close_task {task_id, accepted, note}` | verdict on a waiting task |
-| `read_task {task_id}` | structured task focus |
-| `recall {query}` | retriever adapter → event ids |
-| `read_artifact {path}` | artifact adapter → bounded content in EJA context |
-| `observe {tool, arguments}` | read-only connector tool → `Observed` event and OBSERVATIONS view |
+| `focus {task_id}` | structured task focus (navigation, not reading) |
+| `look {source,target,selector}` | one read: log search or task/event by id, node file whole/range/match, read-only world tool |
 
 ## Modules
 

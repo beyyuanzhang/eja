@@ -1,5 +1,8 @@
 use eja::adapters::{render_context, OpenAiBrain};
-use eja::{project_with_recall, Action, Brain, EventMeta, Kind, ProposalKind, Store};
+use eja::{
+    project_with_evidence, Action, Brain, EventMeta, Kind, LookSource, Observation, ProposalKind,
+    Selector, Store,
+};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
@@ -23,8 +26,18 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
             ),
         )
         .unwrap();
+    let evidence = vec![Observation {
+        source: LookSource::Log,
+        target: String::new(),
+        arguments: serde_json::Value::Null,
+        selector: Selector::Search {
+            query: "old".to_string(),
+        },
+        result: serde_json::json!({"matches": 1, "events": [old]}),
+        error: None,
+    }];
     let context =
-        project_with_recall(&store, "revise the goal", None, eja::now_utc(), &[old]).unwrap();
+        project_with_evidence(&store, "revise the goal", None, eja::now_utc(), &evidence).unwrap();
     assert!(render_context(&context).contains("CURRENT INPUT"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let port = listener.local_addr().expect("addr").port();
@@ -59,7 +72,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
             .contains("You are EJA"));
         let input = request["messages"][1]["content"].as_str().unwrap();
         assert!(input.contains(&format!("#{} original goal", goal.id)));
-        assert!(input.contains("RECALLED EVENTS"));
+        assert!(input.contains("EVIDENCE"));
         assert!(input.contains("recalled report"));
         assert!(input.contains("recalled structured evidence"));
         let content = serde_json::json!({

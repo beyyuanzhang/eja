@@ -1,6 +1,6 @@
 use eja::{
     turn_at, Action, ArtifactContent, ArtifactReader, Assignment, Brain, Decision, EjaContext,
-    NoopRetriever, Report, ReportStatus, Store, TaskStatus, Worker,
+    LookSource, NoopRetriever, Ports, Report, ReportStatus, Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -100,8 +100,11 @@ fn eja_reads_artifact_content_then_decides() {
         ),
         decision(
             "read",
-            vec![Action::ReadArtifact {
-                path: "out.md".to_string(),
+            vec![Action::Look {
+                source: LookSource::Node,
+                target: "out.md".to_string(),
+                arguments: serde_json::Value::Null,
+                selector: Selector::Whole,
             }],
         ),
         decision(
@@ -118,15 +121,21 @@ fn eja_reads_artifact_content_then_decides() {
         "do the task",
         &brain,
         &QueueWorker::new(vec![done_report()]),
-        &NoopRetriever,
-        &FakeReader,
+        &Ports {
+            log: Some(&NoopRetriever),
+            node: Some(&FakeReader),
+            ..Default::default()
+        },
         eja::now_utc(),
     )
     .expect("turn");
 
-    assert_eq!(outcome.artifacts.len(), 1);
-    assert_eq!(outcome.artifacts[0].path, "out.md");
-    assert!(outcome.artifacts[0].text.contains("upload"));
+    assert_eq!(outcome.evidence.len(), 1);
+    assert_eq!(outcome.evidence[0].result["path"], "out.md");
+    assert!(outcome.evidence[0].result["text"]
+        .as_str()
+        .expect("text")
+        .contains("upload"));
     assert_eq!(outcome.tasks[0].status, TaskStatus::Done);
     assert!(outcome.tasks[0].close.as_ref().expect("close").accepted);
 }

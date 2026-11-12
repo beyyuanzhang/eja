@@ -6,8 +6,8 @@ use chrono::{TimeZone, Utc};
 use eja::adapters::FileArtifactReader;
 use eja::{
     project, recover, turn_at, Action, ArtifactContent, ArtifactReader, Assignment, Brain,
-    Decision, EjaContext, EventMeta, Kind, NoopRetriever, Report, ReportStatus, Result, Store,
-    Worker,
+    Decision, EjaContext, EventMeta, Kind, NoopRetriever, Ports, Report, ReportStatus, Result,
+    Store, Worker,
 };
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -160,8 +160,11 @@ fn bench_empty_turns(root: &Path, count: usize) -> (f64, f64) {
             "ping",
             &NoBrain,
             &DoneWorker,
-            &NoopRetriever,
-            &NoArtifacts,
+            &Ports {
+                log: Some(&NoopRetriever),
+                node: Some(&NoArtifacts),
+                ..Default::default()
+            },
             now() + chrono::Duration::seconds(index as i64),
         )
         .expect("turn");
@@ -200,8 +203,11 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
             "run",
             &brain,
             &DoneWorker,
-            &NoopRetriever,
-            &NoArtifacts,
+            &Ports {
+                log: Some(&NoopRetriever),
+                node: Some(&NoArtifacts),
+                ..Default::default()
+            },
             now() + chrono::Duration::seconds(index as i64 * 10),
         )
         .expect("turn");
@@ -233,8 +239,11 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
             "propose",
             &propose,
             &DoneWorker,
-            &NoopRetriever,
-            &NoArtifacts,
+            &Ports {
+                log: Some(&NoopRetriever),
+                node: Some(&NoArtifacts),
+                ..Default::default()
+            },
             now() + chrono::Duration::seconds(index as i64 * 2),
         )
         .expect("propose");
@@ -248,8 +257,11 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
             "confirm",
             &confirm,
             &DoneWorker,
-            &NoopRetriever,
-            &NoArtifacts,
+            &Ports {
+                log: Some(&NoopRetriever),
+                node: Some(&NoArtifacts),
+                ..Default::default()
+            },
             now() + chrono::Duration::seconds(index as i64 * 2 + 1),
         )
         .expect("confirm");

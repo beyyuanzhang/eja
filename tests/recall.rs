@@ -1,6 +1,7 @@
 use eja::{
     open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Event, Kind,
-    NoopArtifactReader, NoopRetriever, ProposalKind, Report, Result, Retriever, Store, Worker,
+    LookSource, NoopArtifactReader, Ports, ProposalKind, Report, Result, Retriever, Selector,
+    Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -79,8 +80,7 @@ fn recall_is_an_id_result_not_text_matching() {
         "commit",
         &propose,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("propose");
@@ -94,8 +94,7 @@ fn recall_is_an_id_result_not_text_matching() {
         "confirm",
         &confirm,
         &NoWorker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("confirm");
@@ -104,8 +103,13 @@ fn recall_is_an_id_result_not_text_matching() {
     let brain = QueueBrain::new(vec![
         decision(
             "searching",
-            vec![Action::Recall {
-                query: "what did we decide?".to_string(),
+            vec![Action::Look {
+                source: LookSource::Log,
+                target: String::new(),
+                arguments: serde_json::Value::Null,
+                selector: Selector::Search {
+                    query: "what did we decide?".to_string(),
+                },
             }],
         ),
         decision("found it", vec![]),
@@ -115,20 +119,27 @@ fn recall_is_an_id_result_not_text_matching() {
         "what did we decide?",
         &brain,
         &NoWorker,
-        &FakeRetriever {
-            ids: vec![commitment.id],
+        &Ports {
+            log: Some(&FakeRetriever {
+                ids: vec![commitment.id],
+            }),
+            node: Some(&NoopArtifactReader),
+            ..Default::default()
         },
-        &NoopArtifactReader,
         eja::now_utc(),
     )
     .expect("recall");
 
-    assert_eq!(outcome.recalled.len(), 1);
-    assert_eq!(outcome.recalled[0].id, commitment.id);
-    assert_eq!(outcome.context.recall.len(), 1);
+    assert_eq!(outcome.evidence.len(), 1);
+    let events = outcome.evidence[0].result["events"]
+        .as_array()
+        .expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["id"], commitment.id);
+    assert_eq!(outcome.context.evidence.len(), 1);
     assert!(store
         .events()
         .expect("events")
         .iter()
-        .any(|event| event.kind == Kind::Read));
+        .any(|event| event.kind == Kind::Observed));
 }

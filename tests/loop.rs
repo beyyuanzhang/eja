@@ -1,7 +1,6 @@
 use eja::{
     active_identity, open_commitments, tasks, turn_at, Action, Assignment, Brain, Decision,
-    EjaContext, Kind, NoopArtifactReader, NoopRetriever, ProposalKind, Report, ReportStatus, Store,
-    TaskStatus, Worker,
+    EjaContext, Kind, Ports, ProposalKind, Report, ReportStatus, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -110,8 +109,7 @@ fn propose_and_confirm(
         "propose",
         &propose,
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         at,
     )
     .expect("propose");
@@ -130,8 +128,7 @@ fn propose_and_confirm(
         "confirm",
         &confirm,
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         at,
     )
     .expect("confirm");
@@ -167,8 +164,7 @@ fn closed_loop_dispatches_reports_and_accepts() {
         "write a release checklist",
         &brain,
         &worker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         now(),
     )
     .expect("turn");
@@ -238,8 +234,7 @@ fn rejection_fails_the_task_and_keeps_the_report() {
         "do the migration",
         &brain,
         &QueueWorker::new(vec![report]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         now(),
     )
     .expect("turn");
@@ -296,29 +291,11 @@ fn task_index_and_read_task_are_structured() {
         ),
     ]);
     let worker = QueueWorker::new(vec![]);
-    turn_at(
-        &store,
-        "open A",
-        &open,
-        &worker,
-        &NoopRetriever,
-        &NoopArtifactReader,
-        now(),
-    )
-    .expect("A");
-    turn_at(
-        &store,
-        "open B",
-        &open,
-        &worker,
-        &NoopRetriever,
-        &NoopArtifactReader,
-        now(),
-    )
-    .expect("B");
+    turn_at(&store, "open A", &open, &worker, &Ports::default(), now()).expect("A");
+    turn_at(&store, "open B", &open, &worker, &Ports::default(), now()).expect("B");
 
     let read = QueueBrain::new(vec![
-        decision("reading", vec![Action::ReadTask { task_id: 1 }]),
+        decision("reading", vec![Action::Focus { task_id: 1 }]),
         decision("found", vec![]),
     ]);
     let outcome = turn_at(
@@ -326,8 +303,7 @@ fn task_index_and_read_task_are_structured() {
         "look at the first task",
         &read,
         &worker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         now(),
     )
     .expect("read");
@@ -372,21 +348,12 @@ fn explicit_dispatch_runs_an_open_task() {
         "open a task",
         &brain,
         &worker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         now(),
     )
     .expect("open");
-    let outcome = turn_at(
-        &store,
-        "run it",
-        &brain,
-        &worker,
-        &NoopRetriever,
-        &NoopArtifactReader,
-        now(),
-    )
-    .expect("dispatch");
+    let outcome =
+        turn_at(&store, "run it", &brain, &worker, &Ports::default(), now()).expect("dispatch");
     assert_eq!(outcome.dispatched, vec![1]);
     assert_eq!(outcome.tasks[0].status, TaskStatus::Done);
 }
@@ -416,8 +383,7 @@ fn cannot_close_without_a_worker_report() {
         "open and close",
         &brain,
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         now(),
     )
     .expect("turn");
@@ -453,8 +419,7 @@ fn worker_failure_stays_waiting_for_eja() {
         "run",
         &brain,
         &QueueWorker::new(vec![report]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         now(),
     )
     .expect("turn");
@@ -491,8 +456,7 @@ fn correction_targets_an_event_id_not_a_phrase() {
         "correct",
         &wrong,
         &QueueWorker::new(vec![]),
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         now(),
     )
     .expect("wrong");

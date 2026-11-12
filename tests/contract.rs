@@ -1,6 +1,6 @@
 use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, NoopArtifactReader, NoopRetriever,
-    Report, ReportStatus, Store, TaskStatus, Worker,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, Ports, Report, ReportStatus, Store,
+    TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -73,8 +73,7 @@ fn worker_receives_its_node_task_and_origin_remains_in_eja() {
         "raw user task",
         &brain,
         &worker,
-        &NoopRetriever,
-        &NoopArtifactReader,
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("turn");
