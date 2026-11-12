@@ -164,6 +164,13 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     assert!(!f.0.join(".eja/nodes/1/work").exists());
     assert_eq!(f.manifest(1)["frozen"], true);
     assert_eq!(f.manifest(1)["context"], "context.jsonl");
+    assert!(
+        std::fs::metadata(f.0.join(".eja/nodes/1/node.json"))
+            .unwrap()
+            .permissions()
+            .readonly(),
+        "the frozen manifest is read-only"
+    );
     let context = std::fs::read_to_string(f.0.join(".eja/nodes/1/context.jsonl")).unwrap();
     for kind in ["start", "assistant", "tool", "report"] {
         assert!(

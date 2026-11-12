@@ -351,6 +351,13 @@ impl NativeWorker {
         fs::write(&temp, serde_json::to_vec_pretty(&manifest)?)?;
         fs::File::open(&temp)?.sync_all()?;
         fs::rename(temp, node.join("node.json"))?;
+        // The manifest is part of the frozen record, like the context and artifacts.
+        let manifest = node.join("node.json");
+        if let Ok(file) = fs::OpenOptions::new().write(true).open(&manifest) {
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&manifest, permissions)?;
+        }
         Ok(report)
     }
 }
