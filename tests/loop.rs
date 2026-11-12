@@ -1,4 +1,4 @@
-use eja::adapters::Ports;
+use eja::adapters::{render_context, Ports};
 use eja::{
     active_identity, open_commitments, tasks, turn_at, Action, Assignment, Brain, Decision,
     EjaContext, Kind, ProposalKind, Store, TaskStatus, Worker,
@@ -30,6 +30,7 @@ impl Brain for QueueBrain {
             .unwrap_or_else(|| Decision {
                 reply: String::new(),
                 actions: Vec::new(),
+                refused: Vec::new(),
             })
     }
 }
@@ -65,6 +66,7 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
     Decision {
         reply: reply.to_string(),
         actions,
+        refused: Vec::new(),
     }
 }
 
@@ -326,6 +328,12 @@ fn impossible_actions_are_refused_visibly_and_change_nothing() {
         1
     );
     assert!(events.iter().all(|event| event.kind != Kind::TaskClosed));
+    // A refused action becomes a host note in the log and in the next projection:
+    // EJA can read its own dead ends instead of repeating them.
+    assert!(events.iter().any(|event| event.kind == Kind::Refused));
+    let rendered = render_context(&outcome.context);
+    assert!(rendered.contains("REFUSED"), "{rendered}");
+    assert!(rendered.contains("no task 9"), "{rendered}");
 }
 
 #[test]

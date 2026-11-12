@@ -27,6 +27,7 @@ impl Brain for QueueBrain {
             .unwrap_or_else(|| Decision {
                 reply: "continued".to_string(),
                 actions: Vec::new(),
+                refused: Vec::new(),
             })
     }
 }

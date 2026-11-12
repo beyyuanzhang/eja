@@ -16,6 +16,7 @@ impl Brain for QueueBrain {
             .unwrap_or_else(|| Decision {
                 reply: String::new(),
                 actions: Vec::new(),
+                refused: Vec::new(),
             })
     }
 }
@@ -51,6 +52,7 @@ fn worker_receives_its_node_task_and_origin_remains_in_eja() {
                     acceptance: "EJA acceptance only".to_string(),
                     run: true,
                 }],
+                refused: Vec::new(),
             },
             Decision {
                 reply: "done".to_string(),
@@ -59,6 +61,7 @@ fn worker_receives_its_node_task_and_origin_remains_in_eja() {
                     accepted: true,
                     note: "ok".to_string(),
                 }],
+                refused: Vec::new(),
             },
         ])),
     };

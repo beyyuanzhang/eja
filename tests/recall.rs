@@ -27,6 +27,7 @@ impl Brain for QueueBrain {
             .unwrap_or_else(|| Decision {
                 reply: String::new(),
                 actions: Vec::new(),
+                refused: Vec::new(),
             })
     }
 }
@@ -56,6 +57,7 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
     Decision {
         reply: reply.to_string(),
         actions,
+        refused: Vec::new(),
     }
 }
 

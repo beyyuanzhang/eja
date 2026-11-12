@@ -23,6 +23,7 @@ impl Brain for NoBrain {
         Decision {
             reply: "ok".to_string(),
             actions: Vec::new(),
+            refused: Vec::new(),
         }
     }
 }
@@ -48,6 +49,7 @@ impl Brain for QueueBrain {
             .unwrap_or_else(|| Decision {
                 reply: "ok".to_string(),
                 actions: Vec::new(),
+                refused: Vec::new(),
             })
     }
 }
@@ -183,6 +185,7 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
                     acceptance: "done".to_string(),
                     run: true,
                 }],
+                refused: Vec::new(),
             },
             Decision {
                 reply: "accept".to_string(),
@@ -191,6 +194,7 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
                     accepted: true,
                     note: "ok".to_string(),
                 }],
+                refused: Vec::new(),
             },
         ]);
         let start = Instant::now();
@@ -229,6 +233,7 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
                 target_id: None,
                 text: format!("commitment {index}"),
             }],
+            refused: Vec::new(),
         }]);
         let outcome = turn_at(
             &store,
@@ -247,6 +252,7 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
         let confirm = QueueBrain::new(vec![Decision {
             reply: "confirm".to_string(),
             actions: vec![Action::Confirm { proposal_id }],
+            refused: Vec::new(),
         }]);
         turn_at(
             &store,

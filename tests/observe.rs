@@ -50,10 +50,12 @@ fn observing_a_read_only_tool_records_a_view() {
                 arguments: serde_json::json!({"city": "berlin"}),
                 selector: Selector::Whole,
             }],
+            refused: Vec::new(),
         },
         Decision {
             reply: "it is clear".into(),
             actions: vec![],
+            refused: Vec::new(),
         },
     ])));
     let out = turn(

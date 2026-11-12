@@ -83,6 +83,7 @@ fn step(actions: Vec<Action>) -> Decision {
     Decision {
         reply: "intermediate reply".into(),
         actions,
+        refused: Vec::new(),
     }
 }
 
@@ -90,6 +91,7 @@ fn done() -> Decision {
     Decision {
         reply: "final answer".into(),
         actions: vec![],
+        refused: Vec::new(),
     }
 }
 
@@ -263,6 +265,7 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
         Decision {
             reply: "both accepted".into(),
             actions: vec![close(2)],
+            refused: Vec::new(),
         },
     ]);
     let out = turn(
@@ -423,6 +426,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         Decision {
             reply: "accepted after restart".into(),
             actions: vec![close(1)],
+            refused: Vec::new(),
         },
     ]);
     let resumed = turn(

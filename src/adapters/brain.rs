@@ -145,6 +145,21 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     }
     sections.push(section("CURRENT TASK", false, vec![task_lines]));
 
+    // What the host could not do, in EJA's own words from the last decision: the
+    // state refused it, or it could not be read as an action. EJA sees this before
+    // deciding again, so an impossible action is not a dead end.
+    if !context.refused.is_empty() {
+        sections.push(section(
+            "REFUSED",
+            false,
+            context
+                .refused
+                .iter()
+                .map(|note| vec![format!("  {note}")])
+                .collect(),
+        ));
+    }
+
     // Evidence sits before the index: when a budget forces a trim, what EJA
     // actually looked at survives and old index entries are dropped first.
     let mut evidence_items = Vec::new();
@@ -365,15 +380,17 @@ pub fn parse_decision(raw: &str) -> Decision {
         return Decision {
             reply: trimmed.to_string(),
             actions: Vec::new(),
+            refused: Vec::new(),
         };
     };
     if !value.is_object() {
         return Decision {
             reply: trimmed.to_string(),
             actions: Vec::new(),
+            refused: Vec::new(),
         };
     }
-    let mut reply = value
+    let reply = value
         .get("reply")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
@@ -394,14 +411,11 @@ pub fn parse_decision(raw: &str) -> Decision {
         Some(None) => notes.push("actions was not a list".to_string()),
         None => {}
     }
-    if !notes.is_empty() {
-        reply.push_str(&format!(
-            "\n[decision: {} action(s) not understood: {}]",
-            notes.len(),
-            notes.join("; ")
-        ));
+    Decision {
+        reply,
+        actions,
+        refused: notes,
     }
-    Decision { reply, actions }
 }
 
 /// Conservative adapter-level guard: large enough for normal sessions, small
@@ -458,6 +472,7 @@ impl Brain for OpenAiBrain {
             Err(error) => Decision {
                 reply: format!("[EJA model error] {error}"),
                 actions: vec![],
+                refused: Vec::new(),
             },
         }
     }

@@ -111,12 +111,13 @@ fn one_unreadable_action_does_not_discard_the_rest() {
     let raw = r#"{"reply":"go","actions":[{"op":"focus","task_id":1},{"op":"look","source":"node","target":"3","selector":{"select":"last"}}]}"#;
     let decision = eja::adapters::parse_decision(raw);
     assert_eq!(decision.actions.len(), 1, "{:?}", decision.actions);
+    assert_eq!(decision.refused.len(), 1, "{:?}", decision.refused);
     assert!(
-        decision.reply.contains("not understood"),
-        "{}",
-        decision.reply
+        decision.refused[0].contains("selector"),
+        "{:?}",
+        decision.refused
     );
-    assert!(decision.reply.starts_with("go"));
+    assert_eq!(decision.reply, "go");
 }
 
 #[test]

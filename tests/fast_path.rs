@@ -21,6 +21,7 @@ impl Brain for CountingBrain {
             .unwrap_or_else(|| Decision {
                 reply: String::new(),
                 actions: Vec::new(),
+                refused: Vec::new(),
             })
     }
 }
@@ -59,10 +60,12 @@ fn single_waiting_task_is_focused_without_the_extra_initial_call() {
             Decision {
                 reply: "open".to_string(),
                 actions: vec![open_task("one")],
+                refused: Vec::new(),
             },
             Decision {
                 reply: "waiting".to_string(),
                 actions: Vec::new(),
+                refused: Vec::new(),
             },
         ])),
         focus: Arc::new(Mutex::new(Vec::new())),
@@ -87,6 +90,7 @@ fn single_waiting_task_is_focused_without_the_extra_initial_call() {
                 accepted: true,
                 note: "ok".to_string(),
             }],
+            refused: Vec::new(),
         }])),
         focus: focus.clone(),
     };
@@ -124,6 +128,7 @@ fn multiple_active_tasks_do_not_use_the_fast_path() {
                     run: false,
                 },
             ],
+            refused: Vec::new(),
         }])),
         focus: Arc::new(Mutex::new(Vec::new())),
     };
@@ -146,6 +151,7 @@ fn multiple_active_tasks_do_not_use_the_fast_path() {
                 accepted: false,
                 note: "no".to_string(),
             }],
+            refused: Vec::new(),
         }])),
         focus: focus.clone(),
     };

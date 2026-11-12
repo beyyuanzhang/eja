@@ -54,6 +54,9 @@ pub enum Kind {
     TaskClosed,
     Read,
     Observed,
+    /// The host rejected an action: the state did not allow it, or it could not
+    /// be read as one of EJA's own actions. EJA reads these back in its projection.
+    Refused,
 }
 
 impl Kind {
@@ -556,6 +559,8 @@ pub struct EjaContext {
     pub focus: Option<Task>,
     pub evidence: Vec<Observation>,
     pub proposals: Vec<ProposalView>,
+    /// Actions this turn that the host could not carry out.
+    pub refused: Vec<String>,
 }
 
 pub fn project(
@@ -603,7 +608,19 @@ pub fn project_with_evidence(
         focus,
         evidence: evidence.to_vec(),
         proposals: pending_proposals(&events),
+        refused: turn_refusals(&events),
     })
+}
+
+fn turn_refusals(events: &[Event]) -> Vec<String> {
+    let Some(turn) = events.last().map(|event| event.turn) else {
+        return Vec::new();
+    };
+    events
+        .iter()
+        .filter(|event| event.kind == Kind::Refused && event.turn == turn)
+        .map(|event| event.text.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -612,6 +629,10 @@ pub struct Decision {
     pub reply: String,
     #[serde(default)]
     pub actions: Vec<Action>,
+    /// Actions the decision named that could not be read. The turn records them
+    /// as host notes; they are never dropped silently.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub refused: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1290,7 +1311,12 @@ pub fn turn_at(
     loop {
         out.decisions += 1;
         let decision = brain.decide(&out.context);
+        let notes = out.refused.len();
+        out.refused.extend(decision.refused.iter().cloned());
         let observed = apply_actions(&decision.actions, &ctx, &mut out, &mut focus)?;
+        for note in &out.refused[notes..] {
+            store.append(Kind::Refused, "eja", note, ctx.turn, EventMeta::new(at))?;
+        }
         out.context = project_with_evidence(store, input, focus, now, &out.evidence)?;
         if !observed {
             out.reply = decision.reply.trim().to_string();

@@ -18,6 +18,7 @@ impl Brain for QueueBrain {
             .unwrap_or_else(|| Decision {
                 reply: String::new(),
                 actions: Vec::new(),
+                refused: Vec::new(),
             })
     }
 }
@@ -65,6 +66,7 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
                     kind: RelationKind::DependsOn,
                 },
             ],
+            refused: Vec::new(),
         }])),
     };
     let outcome = turn_at(
