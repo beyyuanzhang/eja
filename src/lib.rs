@@ -765,6 +765,8 @@ pub struct TurnOutcome {
     pub context: EjaContext,
     pub tasks: Vec<Task>,
     pub dispatched: Vec<TaskId>,
+    /// Actions EJA asked for that the state did not allow; nothing was dropped silently.
+    pub refused: Vec<String>,
     pub reads: Vec<TaskId>,
     pub evidence: Vec<Observation>,
     pub decisions: usize,
@@ -836,10 +838,12 @@ fn propose(
     text: &str,
     turn: u64,
     at: i64,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let events = store.events()?;
     if !valid_proposal_target(&events, kind, target_id) {
-        return Ok(());
+        return Ok(Some(format!(
+            "proposal refused: no active {kind:?} target to replace"
+        )));
     }
     store.append(
         Kind::Proposal,
@@ -848,29 +852,39 @@ fn propose(
         turn,
         EventMeta::data(at, serde_json::to_value(ProposalData { kind, target_id })?),
     )?;
-    Ok(())
+    Ok(None)
 }
 
-fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Result<()> {
+fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Result<Option<String>> {
     let events = store.events()?;
     if !proposal_is_pending(&events, proposal_id) {
-        return Ok(());
+        return Ok(Some(format!(
+            "confirm refused: proposal {proposal_id} is not pending"
+        )));
     }
     let Some(event) = proposal_event(&events, proposal_id) else {
-        return Ok(());
+        return Ok(Some(format!(
+            "confirm refused: proposal {proposal_id} is not pending"
+        )));
     };
     if event.turn >= turn {
-        return Ok(());
+        return Ok(Some(format!(
+            "confirm refused: proposal {proposal_id} was created this turn; confirm it in a later turn"
+        )));
     }
     let Some(data) = event
         .data
         .as_ref()
         .and_then(|value| serde_json::from_value::<ProposalData>(value.clone()).ok())
     else {
-        return Ok(());
+        return Ok(Some(format!(
+            "confirm refused: proposal {proposal_id} has no readable target"
+        )));
     };
     if !valid_proposal_target(&events, data.kind, data.target_id) {
-        return Ok(());
+        return Ok(Some(format!(
+            "confirm refused: the target of proposal {proposal_id} is no longer active"
+        )));
     }
     // One event both establishes the replacement and closes its predecessor.
     // A Correction has no replacement: it only withdraws its target.
@@ -892,13 +906,21 @@ fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Resu
         turn,
         EventMeta::data(at, serde_json::json!({"proposal_id": proposal_id})),
     )?;
-    Ok(())
+    Ok(None)
 }
 
-fn reject_proposal(store: &Store, proposal_id: u64, note: &str, turn: u64, at: i64) -> Result<()> {
+fn reject_proposal(
+    store: &Store,
+    proposal_id: u64,
+    note: &str,
+    turn: u64,
+    at: i64,
+) -> Result<Option<String>> {
     let events = store.events()?;
     if !proposal_is_pending(&events, proposal_id) {
-        return Ok(());
+        return Ok(Some(format!(
+            "reject refused: proposal {proposal_id} is not pending"
+        )));
     }
     store.append(
         Kind::ProposalRejected,
@@ -910,7 +932,17 @@ fn reject_proposal(store: &Store, proposal_id: u64, note: &str, turn: u64, at: i
             serde_json::json!({"proposal_id": proposal_id, "note": note}),
         ),
     )?;
-    Ok(())
+    Ok(None)
+}
+
+fn task_status_name(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Open => "open",
+        TaskStatus::Running => "running",
+        TaskStatus::Waiting => "waiting",
+        TaskStatus::Done => "done",
+        TaskStatus::Failed => "failed",
+    }
 }
 
 fn append_identity(store: &Store, action: &Action, turn: u64, at: i64) -> Result<()> {
@@ -950,15 +982,22 @@ fn open_task(store: &Store, input: OpenTaskInput<'_>) -> Result<TaskId> {
     Ok(id)
 }
 
-fn dispatch_task(ctx: &ActionCtx<'_>, task_id: TaskId, out: &mut TurnOutcome) -> Result<bool> {
+fn dispatch_task(
+    ctx: &ActionCtx<'_>,
+    task_id: TaskId,
+    out: &mut TurnOutcome,
+) -> Result<Option<String>> {
     let Some(task) = tasks(&ctx.store.events()?)
         .into_iter()
         .find(|task| task.id == task_id)
     else {
-        return Ok(false);
+        return Ok(Some(format!("dispatch refused: no task {task_id}")));
     };
     if task.status != TaskStatus::Open {
-        return Ok(false);
+        return Ok(Some(format!(
+            "dispatch refused: task {task_id} is {}; only an Open task can be dispatched",
+            task_status_name(task.status)
+        )));
     }
     let assignment = Assignment {
         task_id: task.id,
@@ -983,7 +1022,7 @@ fn dispatch_task(ctx: &ActionCtx<'_>, task_id: TaskId, out: &mut TurnOutcome) ->
         EventMeta::new(ctx.at),
     )?;
     out.dispatched.push(task.id);
-    Ok(true)
+    Ok(None)
 }
 
 fn close_task(
@@ -993,15 +1032,18 @@ fn close_task(
     note: &str,
     turn: u64,
     at: i64,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let Some(task) = tasks(&store.events()?)
         .into_iter()
         .find(|task| task.id == task_id)
     else {
-        return Ok(());
+        return Ok(Some(format!("close refused: no task {task_id}")));
     };
     if task.status != TaskStatus::Waiting {
-        return Ok(());
+        return Ok(Some(format!(
+            "close refused: task {task_id} is {}; a node record is required first",
+            task_status_name(task.status)
+        )));
     }
     let data = serde_json::to_value(Close {
         accepted,
@@ -1014,7 +1056,7 @@ fn close_task(
         turn,
         EventMeta::data(at, data),
     )?;
-    Ok(())
+    Ok(None)
 }
 
 struct ActionCtx<'a> {
@@ -1042,12 +1084,22 @@ fn apply_actions(
                 kind,
                 target_id,
                 text,
-            } => propose(ctx.store, *kind, *target_id, text, ctx.turn, ctx.at)?,
+            } => {
+                if let Some(note) = propose(ctx.store, *kind, *target_id, text, ctx.turn, ctx.at)? {
+                    out.refused.push(note);
+                }
+            }
             Action::Confirm { proposal_id } => {
-                confirm_proposal(ctx.store, *proposal_id, ctx.turn, ctx.at)?
+                if let Some(note) = confirm_proposal(ctx.store, *proposal_id, ctx.turn, ctx.at)? {
+                    out.refused.push(note);
+                }
             }
             Action::Reject { proposal_id, note } => {
-                reject_proposal(ctx.store, *proposal_id, note, ctx.turn, ctx.at)?
+                if let Some(note) =
+                    reject_proposal(ctx.store, *proposal_id, note, ctx.turn, ctx.at)?
+                {
+                    out.refused.push(note);
+                }
             }
             Action::OpenTask {
                 title,
@@ -1066,17 +1118,23 @@ fn apply_actions(
                         at: ctx.at,
                     },
                 )?;
-                if *run && dispatch_task(ctx, id, out)? {
-                    *focus = Some(id);
-                    observed = true;
+                if *run {
+                    match dispatch_task(ctx, id, out)? {
+                        None => {
+                            *focus = Some(id);
+                            observed = true;
+                        }
+                        Some(note) => out.refused.push(note),
+                    }
                 }
             }
-            Action::Dispatch { task_id } => {
-                if dispatch_task(ctx, *task_id, out)? {
+            Action::Dispatch { task_id } => match dispatch_task(ctx, *task_id, out)? {
+                None => {
                     *focus = Some(*task_id);
                     observed = true;
                 }
-            }
+                Some(note) => out.refused.push(note),
+            },
             Action::LinkTasks { from, to, kind } => {
                 let data = serde_json::to_value(TaskRelationData {
                     from: *from,
@@ -1095,8 +1153,22 @@ fn apply_actions(
                 task_id,
                 accepted,
                 note,
-            } => close_task(ctx.store, *task_id, *accepted, note, ctx.turn, ctx.at)?,
+            } => {
+                if let Some(reason) =
+                    close_task(ctx.store, *task_id, *accepted, note, ctx.turn, ctx.at)?
+                {
+                    out.refused.push(reason);
+                }
+            }
             Action::Focus { task_id } => {
+                if !tasks(&ctx.store.events()?)
+                    .iter()
+                    .any(|task| task.id == *task_id)
+                {
+                    out.refused
+                        .push(format!("focus refused: no task {task_id}"));
+                    continue;
+                }
                 ctx.store.append(
                     Kind::Read,
                     "eja",
@@ -1198,6 +1270,7 @@ pub fn turn_at(
         context: project(store, input, focus, now)?,
         tasks: Vec::new(),
         dispatched: Vec::new(),
+        refused: Vec::new(),
         reads: Vec::new(),
         evidence: Vec::new(),
         decisions: 0,

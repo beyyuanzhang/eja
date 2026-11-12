@@ -212,6 +212,9 @@ fn main() -> ExitCode {
             }
             result.map(|outcome| {
                 println!("eja: {}", outcome.reply);
+                for note in &outcome.refused {
+                    println!("[refused: {note}]");
+                }
                 if outcome.stalled {
                     println!("[turn stalled: the model repeated a state with no new observation]");
                 }

@@ -253,6 +253,82 @@ fn rejection_fails_the_task_and_keeps_the_report() {
 }
 
 #[test]
+fn impossible_actions_are_refused_visibly_and_change_nothing() {
+    let dir = temp_store();
+    let store = Store::new(&dir).expect("store");
+    let first = QueueBrain::new(vec![
+        decision(
+            "start",
+            vec![Action::OpenTask {
+                title: "one run".to_string(),
+                request: "do the work".to_string(),
+                acceptance: "a record exists".to_string(),
+                run: true,
+            }],
+        ),
+        // The task now has a node record: dispatching it again is refused.
+        decision("again", vec![Action::Dispatch { task_id: 1 }]),
+    ]);
+    let worker = QueueWorker::new(vec![record("first run")]);
+    let outcome = turn_at(
+        &store,
+        "one task",
+        &first,
+        &worker,
+        &Ports::default(),
+        now(),
+    )
+    .expect("first turn");
+    assert_eq!(outcome.refused.len(), 1, "{:?}", outcome.refused);
+    assert!(
+        outcome.refused[0].contains("waiting"),
+        "{:?}",
+        outcome.refused
+    );
+    assert!(outcome.dispatched.len() == 1);
+
+    // Unknown ids are refused too, and nothing is appended for them.
+    let second = QueueBrain::new(vec![decision(
+        "close early",
+        vec![
+            Action::CloseTask {
+                task_id: 9,
+                accepted: true,
+                note: "nothing".to_string(),
+            },
+            Action::Dispatch { task_id: 9 },
+        ],
+    )]);
+    let outcome = turn_at(
+        &store,
+        "close early",
+        &second,
+        &worker,
+        &Ports::default(),
+        now(),
+    )
+    .expect("second turn");
+    assert_eq!(outcome.refused.len(), 2, "{:?}", outcome.refused);
+    assert!(outcome
+        .refused
+        .iter()
+        .any(|note| note.contains("close refused")));
+    assert!(outcome
+        .refused
+        .iter()
+        .any(|note| note.contains("no task 9")));
+    let events = store.events().expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == Kind::TaskAssigned)
+            .count(),
+        1
+    );
+    assert!(events.iter().all(|event| event.kind != Kind::TaskClosed));
+}
+
+#[test]
 fn identity_is_reconstructed_and_worker_reports_are_not_identity() {
     let dir = temp_store();
     let store = Store::new(&dir).expect("store");
