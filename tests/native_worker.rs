@@ -307,10 +307,6 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
     assert!(r.summary.contains("budget"));
     assert_eq!(r.artifacts, vec!["1/artifacts/partial.txt"]);
     assert_eq!(f.manifest(1)["report"]["status"], "blocked");
-    assert_eq!(
-        f.manifest(1)["report"]["tools"].as_array().unwrap().len(),
-        1
-    );
     let context_limits = Limits {
         context_bytes: 16,
         ..Limits::default()

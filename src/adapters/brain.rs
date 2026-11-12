@@ -119,25 +119,6 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             task_lines.push(format!("  artifacts: {}", report.artifacts.join(", ")));
             task_lines.push(format!("  evidence: {}", report.evidence.join("; ")));
             task_lines.push(format!("  questions: {}", report.open_questions.join("; ")));
-            if !report.tools.is_empty() {
-                let names: Vec<&str> = report
-                    .tools
-                    .iter()
-                    .take(8)
-                    .map(|call| call.tool.as_str())
-                    .collect();
-                let more = if report.tools.len() > names.len() {
-                    ", …"
-                } else {
-                    ""
-                };
-                task_lines.push(format!(
-                    "  host-observed tools: {} calls — {}{}",
-                    report.tools.len(),
-                    names.join(", "),
-                    more
-                ));
-            }
         }
         if let Some(close) = &task.close {
             task_lines.push(format!(

@@ -1,6 +1,7 @@
+use eja::adapters::{Observer, Ports};
 use eja::{
-    turn, Action, Brain, Decision, EjaContext, Kind, LookSource, Observer, Ports, Report, Result,
-    Selector, Store, Worker,
+    turn, Action, Brain, Decision, EjaContext, Kind, LookSource, Report, Result, Selector, Store,
+    Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;

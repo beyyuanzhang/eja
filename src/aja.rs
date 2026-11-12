@@ -86,7 +86,6 @@ fn budget_exhausted(reason: &str) -> Report {
         artifacts: Vec::new(),
         evidence: Vec::new(),
         open_questions: vec!["continue in a new node".to_string()],
-        tools: Vec::new(),
     }
 }
 

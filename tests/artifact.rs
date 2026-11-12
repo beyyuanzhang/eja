@@ -1,6 +1,7 @@
+use eja::adapters::{ArtifactReader, NoopRetriever, Ports};
 use eja::{
-    turn_at, Action, ArtifactContent, ArtifactReader, Assignment, Brain, Decision, EjaContext,
-    LookSource, NoopRetriever, Ports, Report, ReportStatus, Selector, Store, TaskStatus, Worker,
+    turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, LookSource, Report,
+    ReportStatus, Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -79,7 +80,6 @@ fn done_report() -> Report {
         artifacts: vec!["out.md".to_string()],
         evidence: vec!["out.md".to_string()],
         open_questions: Vec::new(),
-        tools: Vec::new(),
     }
 }
 
@@ -138,4 +138,45 @@ fn eja_reads_artifact_content_then_decides() {
         .contains("upload"));
     assert_eq!(outcome.tasks[0].status, TaskStatus::Done);
     assert!(outcome.tasks[0].close.as_ref().expect("close").accepted);
+}
+
+#[test]
+fn node_files_answer_a_range_and_a_match() {
+    use eja::adapters::FileArtifactReader;
+    let dir = std::env::temp_dir().join(format!("eja-slice-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let body: String = (0..20).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(dir.join("note.txt"), body).expect("write");
+    let reader = FileArtifactReader::new(&dir);
+    let range = reader
+        .slice("note.txt", &Selector::Range { from: 5, lines: 3 })
+        .expect("range");
+    assert_eq!(range["total_lines"], 20);
+    assert_eq!(range["lines"][0]["line"], 5);
+    assert_eq!(range["lines"][0]["text"], "line 5");
+    assert_eq!(range["lines"].as_array().unwrap().len(), 3);
+    let hit = reader
+        .slice(
+            "note.txt",
+            &Selector::Match {
+                text: "line 12".to_string(),
+                before: 1,
+                after: 1,
+            },
+        )
+        .expect("match");
+    assert_eq!(hit["matches"][0]["line"], 12);
+    assert_eq!(hit["matches"][0]["context"].as_array().unwrap().len(), 3);
+    let none = reader
+        .slice(
+            "note.txt",
+            &Selector::Match {
+                text: "absent".to_string(),
+                before: 0,
+                after: 0,
+            },
+        )
+        .expect("match");
+    assert!(none["matches"].as_array().unwrap().is_empty());
 }

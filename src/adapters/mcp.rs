@@ -1,6 +1,7 @@
 //! Shared, host-owned MCP clients. No connector state is passed to AJA.
+use super::Observer;
 use super::{Control, FileTools, ToolContext, ToolGateway, ToolOutput};
-use crate::{aja::FRAME_LIMIT, Assignment, Observer, Result};
+use crate::{aja::FRAME_LIMIT, Assignment, Result};
 use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, ClientCapabilities, ClientConfig, ClientRequest,

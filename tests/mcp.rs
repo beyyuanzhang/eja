@@ -487,7 +487,7 @@ fn cli_catalog_uses_owned_default_config_and_fails_explicit_missing_path() {
     let f = Fixture::new();
     let path = f.config(json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
-        .args(["--dir", f.0.to_str().unwrap(), "tools"])
+        .args(["--dir", f.0.to_str().unwrap(), "show", "tools"])
         .output()
         .unwrap();
     assert!(
@@ -524,8 +524,9 @@ fn host_declared_read_only_tools_are_observable() {
     config["read_only"] = json!(["echo"]);
     let path = f.config(json!({"mcpServers":{"fixture":config}}));
     let host = HostTools::new(Some(&path), &f.0, &f.0).unwrap();
-    let value = eja::Observer::observe(&host, "mcp__fixture__echo", &json!({"text":"probe"}))
-        .expect("declared read-only tool is observable");
+    let value =
+        eja::adapters::Observer::observe(&host, "mcp__fixture__echo", &json!({"text":"probe"}))
+            .expect("declared read-only tool is observable");
     assert!(value.to_string().contains("probe") || !value.is_null());
-    assert!(eja::Observer::observe(&host, "mcp__fixture__fail", &json!({})).is_err());
+    assert!(eja::adapters::Observer::observe(&host, "mcp__fixture__fail", &json!({})).is_err());
 }

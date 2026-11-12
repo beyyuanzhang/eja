@@ -1,6 +1,7 @@
+use eja::adapters::Ports;
 use eja::{
-    recover, turn_at, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, Ports,
-    ReportStatus, Store, TaskStatus, Worker,
+    recover, turn_at, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, ReportStatus,
+    Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;

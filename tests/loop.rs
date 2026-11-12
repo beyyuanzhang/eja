@@ -1,6 +1,7 @@
+use eja::adapters::Ports;
 use eja::{
     active_identity, open_commitments, tasks, turn_at, Action, Assignment, Brain, Decision,
-    EjaContext, Kind, Ports, ProposalKind, Report, ReportStatus, Store, TaskStatus, Worker,
+    EjaContext, Kind, ProposalKind, Report, ReportStatus, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,7 +70,6 @@ fn done_report(summary: &str) -> Report {
         artifacts: vec!["artifact.md".to_string()],
         evidence: vec!["checked".to_string()],
         open_questions: Vec::new(),
-        tools: Vec::new(),
     }
 }
 

@@ -4,10 +4,10 @@
 
 use chrono::{TimeZone, Utc};
 use eja::adapters::FileArtifactReader;
+use eja::adapters::{ArtifactReader, NoopRetriever, Ports};
 use eja::{
-    project, recover, turn_at, Action, ArtifactContent, ArtifactReader, Assignment, Brain,
-    Decision, EjaContext, EventMeta, Kind, NoopRetriever, Ports, Report, ReportStatus, Result,
-    Store, Worker,
+    project, recover, turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext,
+    EventMeta, Kind, Report, ReportStatus, Result, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -62,7 +62,6 @@ impl Worker for DoneWorker {
             artifacts: Vec::new(),
             evidence: Vec::new(),
             open_questions: Vec::new(),
-            tools: Vec::new(),
         }
     }
 }

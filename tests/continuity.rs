@@ -1,7 +1,8 @@
 use chrono::{TimeZone, Utc};
+use eja::adapters::Ports;
 use eja::{
     current_goal, open_commitments, project, turn_at, Action, Assignment, Brain, Decision,
-    EjaContext, Kind, Ports, ProposalKind, Report, ReportStatus, Store, TaskStatus, Worker,
+    EjaContext, Kind, ProposalKind, Report, ReportStatus, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,7 +71,6 @@ fn done_report() -> Report {
         artifacts: vec!["artifact.md".to_string()],
         evidence: vec!["checked".to_string()],
         open_questions: Vec::new(),
-        tools: Vec::new(),
     }
 }
 

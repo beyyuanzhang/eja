@@ -1,7 +1,7 @@
+use eja::adapters::{NoopArtifactReader, Ports, Retriever};
 use eja::{
     open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Event, Kind,
-    LookSource, NoopArtifactReader, Ports, ProposalKind, Report, Result, Retriever, Selector,
-    Store, Worker,
+    LookSource, ProposalKind, Report, Result, Selector, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;

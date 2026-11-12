@@ -1,5 +1,6 @@
+use eja::adapters::Ports;
 use eja::{
-    turn_at, Action, Assignment, Brain, Decision, Edge, EjaContext, Ports, RelationKind, Report,
+    turn_at, Action, Assignment, Brain, Decision, Edge, EjaContext, RelationKind, Report,
     ReportStatus, Store, Worker,
 };
 use std::collections::VecDeque;
@@ -32,7 +33,6 @@ impl Worker for DoneWorker {
             artifacts: Vec::new(),
             evidence: Vec::new(),
             open_questions: Vec::new(),
-            tools: Vec::new(),
         }
     }
 }

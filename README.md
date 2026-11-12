@@ -126,8 +126,10 @@ decides from the report. Nothing is required before `close_task`, and there is n
 separate verifier. A look at a read-only connector tool lets EJA check a claim
 against the world when the host grants that view; it never gets an effect tool.
 
-`node.json` keeps the host-observed tool log of the node in the sealed report
-(`report.tools`), and the current task renders it. It is a record, not a gate.
+`node.json` keeps the assignment and the report; the node's whole record — the
+start messages, every assistant turn, every tool call with arguments and result,
+and the report — is frozen next to it as `context.jsonl`. The report is the
+claim; the frozen context is what the host saw. Neither is a gate.
 
 ## Prompt and strategy
 

@@ -1,7 +1,7 @@
+use eja::adapters::{ArtifactReader, NoopRetriever, Ports, Retriever};
 use eja::{
-    turn, Action, ArtifactContent, ArtifactReader, Assignment, Brain, Decision, EjaContext, Event,
-    Kind, LookSource, NoopRetriever, Ports, ProposalKind, Report, ReportStatus, Result, Retriever,
-    Selector, Store, TaskStatus, Worker,
+    turn, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, Event, Kind,
+    LookSource, ProposalKind, Report, ReportStatus, Result, Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -57,7 +57,6 @@ impl Worker for CaptureWorker {
             artifacts: vec![format!("{}.md", assignment.task_id)],
             evidence: vec![],
             open_questions: vec![],
-            tools: Vec::new(),
         }
     }
 }

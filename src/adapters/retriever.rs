@@ -1,4 +1,5 @@
-use crate::{format_utc, Event, Result, Retriever};
+use super::Retriever;
+use crate::{format_utc, Event, Result};
 use serde_json::Value;
 use std::time::Duration;
 

@@ -1,6 +1,7 @@
+use eja::adapters::Ports;
 use eja::{
-    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, Ports,
-    ProposalKind, Report, Store, Worker,
+    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind,
+    Report, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;

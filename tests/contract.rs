@@ -1,5 +1,6 @@
+use eja::adapters::Ports;
 use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, Ports, Report, ReportStatus, Store,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, Report, ReportStatus, Store,
     TaskStatus, Worker,
 };
 use std::collections::VecDeque;
@@ -35,7 +36,6 @@ impl Worker for CaptureWorker {
             artifacts: Vec::new(),
             evidence: Vec::new(),
             open_questions: Vec::new(),
-            tools: Vec::new(),
         }
     }
 }

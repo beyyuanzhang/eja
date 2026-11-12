@@ -1,8 +1,8 @@
 use eja::adapters::{
-    self, FileArtifactReader, HostTools, ModelRetriever, NativeWorker, OpenAiBrain, OpenAiModel,
-    ToolGateway,
+    self, FileArtifactReader, HostTools, ModelRetriever, NativeWorker, NoopRetriever, OpenAiBrain,
+    OpenAiModel, Ports, Retriever, ToolGateway,
 };
-use eja::{project, tasks, turn, NoopRetriever, Retriever, Store, TaskStatus};
+use eja::{project, tasks, turn, Store, TaskStatus};
 use std::process::ExitCode;
 
 fn status_label(status: TaskStatus) -> &'static str {
@@ -105,7 +105,13 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    // One view verb: `eja show <target>`. The old names remain aliases.
+    // One view verb: `eja show <target>`. Old names are not accepted.
+    if mode != "show" && mode != "turn" {
+        eprintln!(
+            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn [text...] | show TARGET"
+        );
+        return ExitCode::FAILURE;
+    }
     let (mode, words) = if mode == "show" {
         match words.first().cloned().unwrap_or_default().as_str() {
             "" => {
@@ -194,7 +200,7 @@ fn main() -> ExitCode {
                 None => Box::new(NoopRetriever),
             };
             let artifacts = FileArtifactReader::new(nodes);
-            let ports = eja::Ports {
+            let ports = Ports {
                 log: Some(&*retriever),
                 node: Some(&artifacts),
                 world: Some(&*tools),

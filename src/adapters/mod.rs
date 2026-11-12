@@ -7,6 +7,7 @@ mod brain;
 mod mcp;
 mod model;
 mod native;
+mod ports;
 mod retriever;
 mod tools;
 
@@ -17,6 +18,9 @@ pub use brain::{
 pub use mcp::{HostTools, McpTools};
 pub use model::{Control, Model, OpenAiModel};
 pub use native::{NativeWorker, INTERRUPTED};
+pub use ports::{
+    ArtifactReader, NoopArtifactReader, NoopObserver, NoopRetriever, Observer, Ports, Retriever,
+};
 pub use retriever::ModelRetriever;
 pub use tools::{FileTools, ToolContext, ToolGateway, ToolOutput};
 
