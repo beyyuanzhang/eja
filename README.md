@@ -263,4 +263,8 @@ shared connections and process/session cleanup.
 - tokenizer/pattern matching in core.
 - separate verifier authority over EJA.
 - parallel workers, multi-writer locks, auth, multi-user.
+- MCP startup: servers initialize in order, and the tool catalog is a snapshot
+  taken at startup; restart to pick up a changed server.
+- typed errors: boundary failures are opaque strings (`Box<dyn Error>`); the CLI
+  prints them and adapters keep their context.
 - streaming progress/cancel to the user.
