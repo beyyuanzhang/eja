@@ -526,7 +526,7 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
     assert!(digest.contains("ended: message"), "{digest}");
     let seen = server.join().unwrap();
     assert_eq!(seen[0]["messages"][1]["content"], "node 1 work");
-    assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 3);
     assert!(seen[1]["messages"]
         .as_array()
         .unwrap()

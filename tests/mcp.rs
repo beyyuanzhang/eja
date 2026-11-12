@@ -125,6 +125,7 @@ fn stdio_discovery_grants_results_and_owned_process_group() {
         tool_names(&host),
         [
             "read_file",
+            "list_dir",
             "write_file",
             "mcp__fixture__a_b",
             "mcp__fixture__echo",
