@@ -3,10 +3,14 @@ use crate::{format_utc, Event, Result};
 use serde_json::Value;
 use std::time::Duration;
 
-use super::{label, llm_env, Control, OpenAiModel};
+/// A retriever call may not outlive this; it is a host resource, not a result cap.
+const RETRIEVE_TIMEOUT: Duration = Duration::from_secs(120);
+
+use super::{cut_chars, label, llm_env, Control, OpenAiModel};
 
 pub struct ModelRetriever {
     model: OpenAiModel,
+    budget: usize,
 }
 
 impl ModelRetriever {
@@ -21,23 +25,42 @@ impl ModelRetriever {
     pub fn new(base: impl Into<String>, key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             model: OpenAiModel::new(base, key, model),
+            budget: budget(),
         }
     }
 
-    fn index(events: &[Event]) -> String {
-        let mut lines = Vec::new();
-        for event in events.iter().rev().take(1000).rev() {
-            let text: String = event.text.chars().take(300).collect();
-            lines.push(format!(
+    pub fn with_budget(mut self, budget: usize) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Fill newest-first until the declared budget; the cut is stated in the prompt.
+    fn index(events: &[Event], budget: usize) -> String {
+        let mut newest_first = Vec::new();
+        let mut used = 0usize;
+        for event in events.iter().rev() {
+            let line = format!(
                 "#{} [{}] {} scope={} {}",
                 event.id,
                 label(event.kind),
                 format_utc(event.at),
                 event.scope,
-                text
-            ));
+                event.text
+            );
+            let need = line.len() + 1;
+            if used + need > budget {
+                let left = budget.saturating_sub(used);
+                if left > 8 {
+                    let cut = cut_chars(&line, left - 2);
+                    newest_first.push(format!("{cut}…"));
+                }
+                break;
+            }
+            used += need;
+            newest_first.push(line);
         }
-        lines.join("\n")
+        newest_first.reverse();
+        newest_first.join("\n")
     }
 
     fn expand(ids: &[u64], events: &[Event]) -> Vec<u64> {
@@ -62,7 +85,6 @@ impl ModelRetriever {
         }
         out.sort_unstable();
         out.dedup();
-        out.truncate(16);
         out
     }
 }
@@ -72,16 +94,25 @@ impl Retriever for ModelRetriever {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        let index = Self::index(events, self.budget);
+        let shown = index.lines().count();
+        let coverage = if shown < events.len() {
+            format!(
+                "SHOWING {shown} OF {} EVENTS (newest fit the budget; older events are not shown)",
+                events.len()
+            )
+        } else {
+            format!("SHOWING ALL {} EVENTS", events.len())
+        };
         let prompt = format!(
-            "Relevant event ids for the query. Return ONLY JSON {{\"ids\":[1,2]}}.\n\nQUERY:\n{query}\n\nEVENTS:\n{}",
-            Self::index(events)
+            "Relevant event ids for the query. Return ONLY JSON {{\"ids\":[1,2]}}.\n\n{coverage}\n\nQUERY:\n{query}\n\nEVENTS:\n{index}"
         );
         let messages = vec![
             serde_json::json!({"role":"system","content":"Select relevant event ids from the supplied events. Return ONLY JSON {\"ids\":[1,2]}. Never invent ids."}),
             serde_json::json!({"role":"user","content":prompt}),
         ];
         let control = Control::new(
-            Duration::from_secs(120),
+            RETRIEVE_TIMEOUT,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let response = self
@@ -117,4 +148,11 @@ fn parse_ids(raw: &str, events: &[Event]) -> Vec<u64> {
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+fn budget() -> usize {
+    std::env::var("EJA_RETRIEVER_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(crate::aja::FRAME_LIMIT)
 }

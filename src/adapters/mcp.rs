@@ -30,8 +30,6 @@ use tokio::{
     runtime::Runtime,
 };
 
-const TOOL_LIMIT: usize = 256;
-const OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -180,9 +178,6 @@ impl McpTools {
             return Err("MCP config exceeds limit".into());
         }
         let config: Config = serde_json::from_slice(&bytes)?;
-        if config.servers.len() > 32 {
-            return Err("too many MCP servers".into());
-        }
         let mut host = Self {
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -255,7 +250,7 @@ impl McpTools {
                         stopped: false,
                     });
                     let transport = AsyncRwTransport::new_client(output, input)
-                        .with_max_line_length(FRAME_LIMIT);
+                        .with_max_line_length(FRAME_LIMIT * 2);
                     host.runtime
                         .block_on(async {
                             tokio::time::timeout(timeout, client.serve(transport)).await
@@ -304,7 +299,7 @@ impl McpTools {
                                 http,
                                 StreamableHttpClientTransportConfig::with_uri(url.clone())
                                     .custom_headers(headers)
-                                    .max_sse_event_size(FRAME_LIMIT)
+                                    .max_sse_event_size(FRAME_LIMIT * 2)
                                     .max_concurrent_requests(1)
                                     .control_request_timeout(Duration::from_millis(500))
                                     .reinit_on_expired_session(true),
@@ -328,16 +323,13 @@ impl McpTools {
                     let mut seen = HashSet::new();
                     let mut bytes = 0;
                     loop {
-                        if seen.len() >= TOOL_LIMIT {
-                            return Err("MCP catalog has too many pages".into());
-                        }
                         let page = host.connections[index]
                             .service
                             .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
                             .await?;
                         bytes += serde_json::to_vec(&page.tools)?.len();
                         all.extend(page.tools);
-                        if all.len() > TOOL_LIMIT || bytes > FRAME_LIMIT {
+                        if bytes > FRAME_LIMIT {
                             return Err("MCP tool catalog exceeds limit".into());
                         }
                         cursor = page.next_cursor;
@@ -413,8 +405,7 @@ impl McpTools {
                     return Err("MCP tool names collide after normalization".into());
                 }
             }
-            if host.tools.len() > TOOL_LIMIT
-                || serde_json::to_vec(
+            if serde_json::to_vec(
                     &host
                         .tools
                         .values()
@@ -471,7 +462,7 @@ impl ToolGateway for McpTools {
             return Err("MCP tool requires an unsupported interactive or task continuation".into());
         };
         let value = serde_json::to_value(result)?;
-        if serde_json::to_vec(&value)?.len() > OUTPUT_LIMIT {
+        if serde_json::to_vec(&value)?.len() > crate::aja::FRAME_LIMIT {
             return Err("MCP tool output exceeds limit".into());
         }
         Ok(ToolOutput {

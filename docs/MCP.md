@@ -66,7 +66,8 @@ adapter exposes MCP tools; it does not add a second agent loop, plugin system,
 resource browser or prompt registry.
 
 - Maximum 32 configured servers, 256 tools/pages, 256 KiB config/catalog/stdio frame,
-  64 KiB returned tool result. SDK HTTP parsers also bound transport messages.
+  frame-sized (256 KiB) returned tool result; the transport allows one frame of
+  payload plus envelope headroom. A larger result is refused with a clear error.
 - Per-server timeout defaults to 30 seconds (maximum 300 seconds), including
   initialization and discovery. Calls use the smaller of that timeout and the
   node's remaining deadline. Cancellation is checked while waiting, and sends

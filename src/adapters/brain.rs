@@ -328,7 +328,7 @@ fn fit_sections(sections: &[Section], budget: usize) -> String {
                 }
                 let left = budget.saturating_sub(out.len());
                 if left > 8 {
-                    out.push_str(cut_at(&line.clone(), left - 4));
+                    out.push_str(super::cut_chars(line, left - 4));
                     out.push('…');
                     out.push('\n');
                 }
@@ -428,16 +428,4 @@ fn source_label(source: LookSource) -> &'static str {
         LookSource::Node => "node",
         LookSource::World => "world",
     }
-}
-
-/// Cut a line at a byte budget without splitting a character.
-fn cut_at(line: &str, limit: usize) -> &str {
-    let mut end = 0;
-    for (index, _) in line.char_indices() {
-        if index > limit {
-            break;
-        }
-        end = index;
-    }
-    &line[..end]
 }

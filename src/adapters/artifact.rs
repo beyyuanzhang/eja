@@ -12,16 +12,18 @@ impl FileArtifactReader {
     pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
         Self {
             root: root.into(),
-            max_bytes: 16 * 1024,
+            max_bytes: crate::aja::FRAME_LIMIT,
         }
     }
 
+    /// A smaller page than the frame, when the caller wants one.
     pub fn with_limit(root: impl Into<std::path::PathBuf>, max_bytes: usize) -> Self {
         Self {
             root: root.into(),
             max_bytes,
         }
     }
+
 }
 
 impl FileArtifactReader {

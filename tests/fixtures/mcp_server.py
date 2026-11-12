@@ -71,10 +71,13 @@ def dispatch(message):
             event.wait(10)
             pending.pop(ident, None)
         if name == "big":
-            text = "x" * 70000
+            text = "x" * 300000
+        structured = {"node": text, "marker": os.getenv("MCP_MARKER", "")}
+        if name == "big":
+            structured = {"marker": os.getenv("MCP_MARKER", "")}
         reply["result"] = {
             "content": [{"type": "text", "text": text}],
-            "structuredContent": {"node": text, "marker": os.getenv("MCP_MARKER", "")},
+            "structuredContent": structured,
             "isError": name == "fail",
         }
     elif method == "ping":

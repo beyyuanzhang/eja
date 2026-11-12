@@ -49,3 +49,15 @@ fn llm_env() -> Option<(String, String, String)> {
         .unwrap_or_else(|_| "gpt-4.1-mini".into());
     Some((base, key, model))
 }
+
+/// Cut a line at a byte budget without splitting a character.
+pub(crate) fn cut_chars(line: &str, limit: usize) -> &str {
+    let mut end = 0;
+    for (index, _) in line.char_indices() {
+        if index > limit {
+            break;
+        }
+        end = index;
+    }
+    &line[..end]
+}

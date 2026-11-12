@@ -472,10 +472,6 @@ fn next_task_id(events: &[Event]) -> TaskId {
         + 1
 }
 
-pub fn relations(events: &[Event]) -> Vec<Edge> {
-    relations_with_tasks(events, &tasks(events))
-}
-
 fn relations_with_tasks(events: &[Event], tasks: &[Task]) -> Vec<Edge> {
     let known: std::collections::HashSet<TaskId> = tasks.iter().map(|task| task.id).collect();
     let mut out = Vec::new();

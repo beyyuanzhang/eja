@@ -78,10 +78,9 @@ impl ToolGateway for FileTools {
                     return Err("not a regular file".into());
                 }
                 let mut bytes = Vec::new();
-                file.take(FRAME_LIMIT as u64 / 16 + 1)
-                    .read_to_end(&mut bytes)?;
-                let truncated = bytes.len() > FRAME_LIMIT / 16;
-                bytes.truncate(FRAME_LIMIT / 16);
+                file.take(FRAME_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
+                let truncated = bytes.len() > FRAME_LIMIT;
+                bytes.truncate(FRAME_LIMIT);
                 (
                     json!({"text":String::from_utf8_lossy(&bytes),"truncated":truncated}),
                     vec![],
@@ -89,9 +88,6 @@ impl ToolGateway for FileTools {
             }
             "write_file" => {
                 let text = args["text"].as_str().ok_or("missing text")?;
-                if text.len() > FRAME_LIMIT / 4 {
-                    return Err("file exceeds write limit".into());
-                }
                 let full = relative_file(ctx.work, path)?;
                 if let Some(parent) = full.parent() {
                     fs::create_dir_all(parent)?;
