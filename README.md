@@ -228,7 +228,7 @@ Interrupted directories remain reserved; continuation uses a new linked node.
 declares its capacity, and a decision that dispatches several tasks groups them
 by that capacity. Historical nodes are files, not sessions, processes or threads.
 `Limits` defaults to 300 seconds, no model-step cap (`EJA_NODE_STEPS` sets one),
-256 KiB serialized context/frame, and 64 KiB model/tool output. A sealed artifact is at
+256 KiB serialized context/frame, and a 64 KiB model reply. A sealed artifact is at
 most 256 KiB. `with_limits` and `cancel(node_id)` are host APIs; cancellation is
 also checked during HTTP requests. These are byte/step limits, not exact model
 token limits.
