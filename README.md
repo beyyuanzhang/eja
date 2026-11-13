@@ -243,15 +243,14 @@ are snapshotted for a run and checked again on invocation. The gateway receives
 the bound node id, work/project roots and cancellation/deadline control. A node
 cannot select another id or expand its own grants.
 
-The supplied `FileTools` implements `read_file`, `list_dir`, `write_file` and
-`edit_file` (one exact match, so an edit is never ambiguous). Project reads
-exclude the private state directory; absolute paths, parent traversal and
-symlinks are rejected. Writes land in the workspace and stay there, including partial work
-from failed/cancelled nodes. Sealed results cannot be written through this API.
-`FileArtifactReader` gives EJA bounded reads of the resulting files; EJA's
-observer may also `read_file` and `list_dir` the project, and nothing else.
+A node acts only through its host's declared connectors: there are no built-in
+file tools. The workspace is reached the way the host provides it, so writing a
+deliverable costs the same as working on it — one interface, no cheap path
+around the work. `FileTools` (read_file, list_dir, and one-exact-match edits)
+stays as EJA's bounded observation surface: EJA may read the project and nothing
+else.
 
-`HostTools` combines file tools with optional MCP tools. The host owns the MCP
+`HostTools` exposes the optional MCP tools to nodes. The host owns the MCP
 configuration, credentials, runtime and connections; all nodes reuse them through
 the same gateway. Both stdio and Streamable HTTP (JSON/SSE) are supported by the
 official Rust SDK. Put `mcp.json` in the chosen `--dir`, or pass

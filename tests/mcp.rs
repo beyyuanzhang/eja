@@ -125,10 +125,6 @@ fn stdio_discovery_grants_results_and_owned_process_group() {
     assert_eq!(
         tool_names(&host),
         [
-            "read_file",
-            "list_dir",
-            "edit_file",
-            "write_file",
             "mcp__fixture__a_b",
             "mcp__fixture__echo",
             "mcp__fixture__fail"

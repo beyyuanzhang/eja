@@ -500,22 +500,23 @@ impl HostTools {
     }
 }
 impl ToolGateway for HostTools {
+    /// A node acts only through the host's declared connectors. There are no
+    /// built-in file tools: the workspace is reached the way the host provides
+    /// it, so writing a deliverable costs the same as working on it.
     fn definitions(&self, assignment: &Assignment) -> Vec<Value> {
-        let mut tools = FileTools.definitions(assignment);
-        if let Some(mcp) = &self.mcp {
-            tools.extend(mcp.definitions(assignment));
+        match &self.mcp {
+            Some(mcp) => mcp.definitions(assignment),
+            None => Vec::new(),
         }
-        tools
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<ToolOutput> {
-        if name.starts_with("mcp__") {
-            self.mcp
-                .as_ref()
-                .ok_or("MCP is not configured")?
-                .call(ctx, name, args)
-        } else {
-            FileTools.call(ctx, name, args)
+        if !name.starts_with("mcp__") {
+            return Err(format!("{name} is not a declared connector tool").into());
         }
+        self.mcp
+            .as_ref()
+            .ok_or("MCP is not configured")?
+            .call(ctx, name, args)
     }
 }
 
