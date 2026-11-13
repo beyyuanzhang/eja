@@ -10,16 +10,15 @@ use std::{
 
 pub struct ToolContext<'a> {
     pub node_id: u64,
-    pub work: &'a Path,
+    /// The one workspace: the project. There is no second place to write.
     pub project: &'a Path,
+    /// The host's own state, which no node may read or write.
     pub private: &'a Path,
     pub control: &'a Control,
 }
 
 pub struct ToolOutput {
     pub value: Value,
-    /// Relative work files to seal, including partial work if the run later fails.
-    pub artifacts: Vec<String>,
 }
 
 pub trait ToolGateway: Send + Sync {
@@ -55,25 +54,20 @@ pub struct FileTools;
 impl ToolGateway for FileTools {
     fn definitions(&self, _: &crate::Assignment) -> Vec<Value> {
         vec![
-            json!({"type":"function","function":{"name":"read_file","description":"Read a UTF-8 file from work or the read-only project. Large files are truncated.","parameters":{"type":"object","properties":{"path":{"type":"string"},"area":{"type":"string","enum":["work","project"]}},"required":["path","area"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"list_dir","description":"List one directory level from work or the read-only project: names, kind and size. Bounded by the output frame, reporting how many entries were kept.","parameters":{"type":"object","properties":{"path":{"type":"string"},"area":{"type":"string","enum":["work","project"]}},"required":["path","area"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"edit_file","description":"Replace one exact occurrence in a work-area file. Fails unless the find text occurs exactly once, so an edit is always unambiguous.","parameters":{"type":"object","properties":{"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["path","find","replace"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"write_file","description":"Write UTF-8 content in this node's private work area. The file will be sealed as an artifact.","parameters":{"type":"object","properties":{"path":{"type":"string"},"text":{"type":"string"}},"required":["path","text"],"additionalProperties":false}}}),
+            json!({"type":"function","function":{"name":"read_file","description":"Read a UTF-8 file from the workspace. Large files are truncated.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}),
+            json!({"type":"function","function":{"name":"list_dir","description":"List one directory level of the workspace: names, kind and size. Bounded by the output frame, reporting how many entries were kept.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}),
+            json!({"type":"function","function":{"name":"edit_file","description":"Replace one exact occurrence in a workspace file. Fails unless the find text occurs exactly once, so an edit is always unambiguous.","parameters":{"type":"object","properties":{"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["path","find","replace"],"additionalProperties":false}}}),
+            json!({"type":"function","function":{"name":"write_file","description":"Write UTF-8 content into the workspace.","parameters":{"type":"object","properties":{"path":{"type":"string"},"text":{"type":"string"}},"required":["path","text"],"additionalProperties":false}}}),
         ]
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<ToolOutput> {
         ctx.control.check()?;
         let path = args["path"].as_str().ok_or("missing path")?;
-        let (value, artifacts) = match name {
+        let value = match name {
             "read_file" => {
-                let root = match args["area"].as_str() {
-                    Some("work") => ctx.work,
-                    Some("project") => ctx.project,
-                    _ => return Err("area must be work or project".into()),
-                };
-                let full = relative_file(root, path)?;
-                if full.starts_with(ctx.private) && root == ctx.project {
-                    return Err("EJA private state is not readable".into());
+                let full = relative_file(ctx.project, path)?;
+                if full.starts_with(ctx.private) {
+                    return Err("the host's private state is not readable".into());
                 }
                 let file = fs::File::open(full)?;
                 if !file.metadata()?.is_file() {
@@ -83,22 +77,17 @@ impl ToolGateway for FileTools {
                 file.take(FRAME_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
                 let truncated = bytes.len() > FRAME_LIMIT;
                 bytes.truncate(FRAME_LIMIT);
-                (
-                    json!({"text":String::from_utf8_lossy(&bytes),"truncated":truncated}),
-                    vec![],
-                )
+                json!({"text":String::from_utf8_lossy(&bytes),"truncated":truncated})
             }
             "list_dir" => {
-                let root = match args["area"].as_str() {
-                    Some("work") => ctx.work,
-                    Some("project") => ctx.project,
-                    _ => return Err("area must be work or project".into()),
-                };
                 let full = if path == "." {
-                    root.to_path_buf()
+                    ctx.project.to_path_buf()
                 } else {
-                    relative_file(root, path)?
+                    relative_file(ctx.project, path)?
                 };
+                if full.starts_with(ctx.private) {
+                    return Err("the host's private state is not readable".into());
+                }
                 let mut entries: Vec<String> = Vec::new();
                 let mut shown = 0usize;
                 let mut bytes = 0usize;
@@ -119,15 +108,15 @@ impl ToolGateway for FileTools {
                     entries.push(line);
                     shown += 1;
                 }
-                (
-                    json!({"path":path,"area":args["area"],"entries":entries,"showing":shown,"total":total,"truncated":shown < total}),
-                    vec![],
-                )
+                json!({"path":path,"entries":entries,"showing":shown,"total":total,"truncated":shown < total})
             }
             "edit_file" => {
                 let find = args["find"].as_str().ok_or("missing find")?;
                 let replace = args["replace"].as_str().ok_or("missing replace")?;
-                let full = relative_file(ctx.work, path)?;
+                let full = relative_file(ctx.project, path)?;
+                if full.starts_with(ctx.private) {
+                    return Err("the host's private state is not writable".into());
+                }
                 let mut text = fs::read_to_string(&full)?;
                 if text.len() > FRAME_LIMIT {
                     return Err("file is too large to edit".into());
@@ -138,19 +127,22 @@ impl ToolGateway for FileTools {
                 }
                 text = text.replacen(find, replace, 1);
                 fs::write(full, text)?;
-                (json!({"edited":path}), vec![path.to_string()])
+                json!({"edited":path})
             }
             "write_file" => {
                 let text = args["text"].as_str().ok_or("missing text")?;
-                let full = relative_file(ctx.work, path)?;
+                let full = relative_file(ctx.project, path)?;
+                if full.starts_with(ctx.private) {
+                    return Err("the host's private state is not writable".into());
+                }
                 if let Some(parent) = full.parent() {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(full, text)?;
-                (json!({"written":path}), vec![path.to_string()])
+                json!({"written":path})
             }
             _ => return Err("tool not allowed".into()),
         };
-        Ok(ToolOutput { value, artifacts })
+        Ok(ToolOutput { value })
     }
 }

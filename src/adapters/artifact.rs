@@ -5,6 +5,7 @@ use std::io::Read;
 
 pub struct FileArtifactReader {
     root: std::path::PathBuf,
+    checkpoints: Option<std::path::PathBuf>,
     max_bytes: usize,
 }
 
@@ -12,6 +13,20 @@ impl FileArtifactReader {
     pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
         Self {
             root: root.into(),
+            checkpoints: None,
+            max_bytes: crate::aja::FRAME_LIMIT,
+        }
+    }
+
+    /// Node looks also read the frozen world: `<id>/<path>` resolves against the
+    /// checkpoint that node committed, not the workspace as it is now.
+    pub fn with_checkpoints(
+        root: impl Into<std::path::PathBuf>,
+        checkpoints: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            checkpoints: Some(checkpoints.into()),
             max_bytes: crate::aja::FRAME_LIMIT,
         }
     }
@@ -20,8 +35,37 @@ impl FileArtifactReader {
     pub fn with_limit(root: impl Into<std::path::PathBuf>, max_bytes: usize) -> Self {
         Self {
             root: root.into(),
+            checkpoints: None,
             max_bytes,
         }
+    }
+
+    /// Read one path from the world a node left behind.
+    fn fossil(&self, id: &str, path: &str) -> crate::Result<String> {
+        let checkpoints = self
+            .checkpoints
+            .as_ref()
+            .ok_or("no checkpoint store is configured")?;
+        let manifest = std::fs::read_to_string(self.root.join(id).join("node.json"))?;
+        let manifest: serde_json::Value = serde_json::from_str(&manifest)?;
+        let commit = manifest
+            .get("checkpoint")
+            .and_then(|value| value.as_str())
+            .ok_or("this node left no checkpoint")?;
+        let output = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(checkpoints)
+            .arg("show")
+            .arg(format!("{commit}:{path}"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .to_string()
+                .into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }
 
@@ -39,6 +83,31 @@ impl FileArtifactReader {
 
 impl ArtifactReader for FileArtifactReader {
     fn read(&self, path: &str) -> ArtifactContent {
+        // `<id>/<file>` is the workspace that node left; the node's own record
+        // files (node.json, context.jsonl) are read directly.
+        if let Some((id, rest)) = path.split_once('/') {
+            if self.checkpoints.is_some()
+                && !rest.starts_with("context.jsonl")
+                && !rest.starts_with("node.json")
+            {
+                return match self.fossil(id, rest) {
+                    Ok(text) => {
+                        let truncated = text.len() > self.max_bytes;
+                        ArtifactContent {
+                            path: path.to_string(),
+                            text: if truncated {
+                                text[..self.max_bytes].to_string()
+                            } else {
+                                text
+                            },
+                            truncated,
+                            error: None,
+                        }
+                    }
+                    Err(error) => ArtifactContent::failed(path, error.to_string()),
+                };
+            }
+        }
         let bytes = match (|| -> crate::Result<Vec<u8>> {
             let full = super::tools::relative_file(&self.root, path)?;
             let file = std::fs::File::open(full)?;

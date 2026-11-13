@@ -464,10 +464,7 @@ impl ToolGateway for McpTools {
         if serde_json::to_vec(&value)?.len() > crate::aja::FRAME_LIMIT {
             return Err("MCP tool output exceeds limit".into());
         }
-        Ok(ToolOutput {
-            value,
-            artifacts: vec![],
-        })
+        Ok(ToolOutput { value })
     }
 }
 
@@ -529,15 +526,11 @@ impl Observer for HostTools {
         let control = Control::new(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));
         let context = ToolContext {
             node_id: 0,
-            work: &self.private,
             project: &self.project,
             private: &self.private,
             control: &control,
         };
         if tool == "read_file" || tool == "list_dir" {
-            if arguments.get("area").and_then(Value::as_str) != Some("project") {
-                return Err("EJA may only read the project area".into());
-            }
             return Ok(FileTools.call(&context, tool, arguments)?.value);
         }
         if tool == "write_file" || tool == "edit_file" {

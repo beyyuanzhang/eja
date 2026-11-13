@@ -24,14 +24,14 @@ S' = commit(S, confirmed actions)
 | core | log, fold, projection, typed actions, ids, UTC, recovery | tokenize, match phrases, render prompts |
 | brain adapter | language, prompt, proposal JSON | write state directly |
 | retriever adapter | semantic query + graph/time expansion → event ids | write state |
-| artifact adapter | bounded read of worker output | decide acceptance |
+| node reader | bounded read of a node's record and the world it left | decide acceptance |
 | worker adapter | assignment (objective + acceptance) → AJA run → its record | write identity |
 | AJA loop | local transcript, model/tool continuation, last message | access host state or configuration directly |
 
 ```
 core/       domain, fold, project, turn, ports
 aja/        disposable model/tool loop
-adapters/   brain, retriever, artifact, worker
+adapters/   brain, retriever, node reader, worker
 app/        CLI and wiring
 ```
 
@@ -126,9 +126,10 @@ node record (what the host saw it do) → EJA decides → close_task { accepted,
 ```
 
 A dispatch returns the host's digest of the node's record — steps, tool calls,
-what changed in the project (created, modified, deleted), sealed artifacts, how
-it ended, and the node's last message. A look is optional:
-EJA can read the node's whole record, the artifacts or the world, and decide for
+what changed in the project (created, modified, deleted), how it ended, and the
+node's last message; the node also records a checkpoint of the world it ended in. A look is optional:
+EJA can read the node's whole record, the world it left behind, or the world as
+it is now, and decide for
 itself. Nothing is required before `close_task`, and there is no separate
 verifier. A look at a read-only connector tool lets EJA check the work against
 the world when the host grants that view; it never gets an effect tool.
@@ -180,9 +181,9 @@ with `relate {kind: part_of}`; `part_of` is containment;
 - the node's `request` is its work instruction; `origin` stays in EJA as provenance;
 - model access and tools are injected through host IPC; the node has no credentials,
   plugin discovery, MCP client, shell executor, or state-log access;
-- node work areas are independent; project files are read-only through host tools;
+- one workspace: a node writes the project itself, and its writes are the work;
 - the runtime kills/reaps the process, joins its IPC reader and revokes the run
-  before sealing artifacts and atomically publishing `node.json`;
+  before committing a checkpoint and atomically publishing `node.json`;
 - waiting for EJA's acceptance consumes no AJA process; records remain evidence;
 - a node's live transcript compacts against its declared budget; the frozen record
   keeps every tool result;
@@ -220,8 +221,9 @@ cargo run -- --dir /tmp/eja show audit:1
 ```
 
 The current directory is the read-only project input. A node writes only its
-private `<dir>/nodes/<id>/work` area. On completion, work is removed and artifacts
-are copied into `<dir>/nodes/<id>/artifacts`; returned references are relative to
+project itself. On completion the host commits the workspace to a shadow
+repository at `<dir>/checkpoints` and records that commit in the node's manifest;
+`look node <id>/<path>` reads a file from that commit.
 `<dir>/nodes`. A node id is reserved once and cannot be rerun or overwritten.
 Interrupted directories remain reserved; continuation uses a new linked node.
 
@@ -229,7 +231,7 @@ Interrupted directories remain reserved; continuation uses a new linked node.
 declares its capacity, and a decision that dispatches several tasks groups them
 by that capacity. Historical nodes are files, not sessions, processes or threads.
 `Limits` defaults to 300 seconds, no model-step cap (`EJA_NODE_STEPS` sets one),
-256 KiB serialized context/frame, and a 64 KiB model reply. A sealed artifact is at
+256 KiB serialized context/frame, and a 64 KiB model reply. A checkpoint commit is at
 most 256 KiB. `with_limits` and `cancel(node_id)` are host APIs; cancellation is
 also checked during HTTP requests. These are byte/step limits, not exact model
 token limits.
@@ -244,7 +246,7 @@ cannot select another id or expand its own grants.
 The supplied `FileTools` implements `read_file`, `list_dir`, `write_file` and
 `edit_file` (one exact match, so an edit is never ambiguous). Project reads
 exclude the private state directory; absolute paths, parent traversal and
-symlinks are rejected. Writes are recorded as artifacts, including partial work
+symlinks are rejected. Writes land in the workspace and stay there, including partial work
 from failed/cancelled nodes. Sealed results cannot be written through this API.
 `FileArtifactReader` gives EJA bounded reads of the resulting files; EJA's
 observer may also `read_file` and `list_dir` the project, and nothing else.
@@ -272,7 +274,7 @@ cargo clippy --all-targets -- -D warnings
 Covers the closed loop, look sources and selectors, proposals/confirmation, recall by
 event id, recovery, UTC, projection bounds, worker timeout/cancellation/process cleanup,
 the per-node task contract, the native worker IPC and tool loop, bounded/cancelled
-HTTP, frozen artifacts, replay protection, resource cleanup, the waiting-task fast
+HTTP, frozen records, replay protection, resource cleanup, the waiting-task fast
 path, and the shared model adapter. MCP integration tests use a local Python 3
 fixture (no Python dependencies), covering stdio/HTTP, cancellation, grants,
 shared connections and process/session cleanup.

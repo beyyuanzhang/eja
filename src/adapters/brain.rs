@@ -29,7 +29,8 @@ proposal without target_id to add one; with target_id to replace an active event
 of the same kind. Use correction with target_id only to withdraw that event. \
 The proposal text is the replacement content, or the withdrawal reason. \
 Actions execute in their listed order. Every read is one action: a look names \
-a source (log, node or world), a target and a selector. Dispatching an AJA also \
+a source (log, node or world), a target and a selector. A node look reads that \
+node's own files or the workspace it left behind. Dispatching an AJA also \
 returns an observation, and several dispatches in one decision run together. A continuation is represented as a new task related to \
 the previous one with \
 {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
@@ -45,11 +46,11 @@ Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes:
 {\"op\":\"focus\",\"task_id\":1}; \
 {\"op\":\"look\",\"source\":\"log\",\"selector\":{\"select\":\"search\",\"query\":\"what did we decide?\"}}; \
 {\"op\":\"look\",\"source\":\"log\",\"target\":\"task:1\"}; \
-{\"op\":\"look\",\"source\":\"node\",\"target\":\"1/artifacts/out.md\"}; \
+{\"op\":\"look\",\"source\":\"node\",\"target\":\"1/report/out.md\"}; \
 {\"op\":\"look\",\"source\":\"node\",\"target\":\"3/context.jsonl\",\"selector\":{\"select\":\"match\",\"text\":\"PO-1010\",\"before\":2,\"after\":4}}; \
-{\"op\":\"look\",\"source\":\"node\",\"target\":\"1/artifacts/out.md\",\"selector\":{\"select\":\"range\",\"from\":0,\"lines\":40}}; \
-{\"op\":\"look\",\"source\":\"world\",\"target\":\"list_dir\",\"arguments\":{\"path\":\".\",\"area\":\"project\"}}; \
-{\"op\":\"look\",\"source\":\"world\",\"target\":\"read_file\",\"arguments\":{\"path\":\"README.md\",\"area\":\"project\"}}; \
+{\"op\":\"look\",\"source\":\"node\",\"target\":\"1/report/out.md\",\"selector\":{\"select\":\"range\",\"from\":0,\"lines\":40}}; \
+{\"op\":\"look\",\"source\":\"world\",\"target\":\"list_dir\",\"arguments\":{\"path\":\".\"}}; \
+{\"op\":\"look\",\"source\":\"world\",\"target\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}; \
 {\"op\":\"look\",\"source\":\"world\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
 Preconditions: dispatch runs only a task in open state; a task that has a node \
 record is waiting for your judgment, so close it or open a new task for more \

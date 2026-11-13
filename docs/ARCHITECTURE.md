@@ -23,7 +23,8 @@ S' = commit(S, confirmed actions)
 6. Identity changes require a proposal and a later confirmation.
 7. A node record is evidence; the node's last message is its own account. EJA
    decides; nothing else can accept on its behalf.
-   Reading artifacts or the outside world is an option, never a required gate.
+   Reading a node's record, the world it left, or the outside world is an option,
+   never a required gate.
 8. A task closes only from `waiting` with `close_task`.
 9. AJA : task = 1:1. The native worker uses one temporary Rust process per
    assignment; its concurrency is a declared capacity (`slots`), not a hidden
@@ -31,7 +32,7 @@ S' = commit(S, confirmed actions)
    assignment, the start messages, every assistant turn, every tool call with
    arguments and result, and the finish entry, all read-only.
    No session survives; retries/continuations are new linked nodes.
-10. Language, prompts, retrieval and artifact reading live in adapters.
+10. Language, prompts, retrieval and node reading live in adapters.
 11. A crashed `running` task is reconciled to `waiting` with an interrupted
     record; no automatic duplicate dispatch.
 12. The worker receives its node's contract: the request (objective) and the
@@ -64,7 +65,7 @@ S' = commit(S, confirmed actions)
   ends at a fixpoint and reports `decisions`, `worker_ms` and `stalled`.
 - `aja`: bounded disposable loop and framed IPC, no external effects.
 - `NativeWorker`: host model/tool gateway, node workspace, cancellation, process
-  cleanup, artifact sealing and frozen manifest. One run per node id.
+  cleanup, checkpointing and frozen manifest. One run per node id.
 - `ToolGateway`: per-node tool definitions and host execution, with scoped paths;
   file tools are `read_file`, `list_dir`, `write_file` and the single-match
   `edit_file`; EJA's observer may read the project (`read_file`, `list_dir`)
@@ -93,7 +94,7 @@ S' = commit(S, confirmed actions)
 ```
 core/       src/lib.rs
 aja/        src/aja.rs (temporary model/tool loop)
-adapters/   brain, retriever, model, artifact, tools, mcp, native
+adapters/   brain, retriever, model, node reader, tools, mcp, native
 app/        src/main.rs
 ```
 

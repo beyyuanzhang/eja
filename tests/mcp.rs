@@ -51,7 +51,6 @@ impl Fixture {
     ) -> Result<Value> {
         let ctx = ToolContext {
             node_id: 123,
-            work: &self.0,
             project: &self.0,
             private: &self.0,
             control,

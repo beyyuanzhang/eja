@@ -64,14 +64,14 @@ thread on every return path. Cancelling a node revokes its control; the HTTP
 adapter observes cancellation while waiting for the provider. Host pipe closure
 terminates the native loop. No idle session or process is retained.
 
-The host then copies validated artifacts into the node's artifact directory,
+The host then commits the workspace into a checkpoint and
 marks files read-only, removes work, and publishes `node.json` by atomic rename.
 The manifest includes the assignment, the host's digest, `context:
 "context.jsonl"`, the frozen context size and `frozen: true`. The digest folds
-the record the host observed: steps, tool calls, sealed artifacts, how the run
+the record the host observed: steps, tool calls, the project's change, how the run
 ended, and the node's last message. The context file is that record in full:
 start messages, assistant turns, tool calls with arguments and results, and the
-finish entry. A file the node names but never writes is not an artifact, and a
+finish entry. A file the node writes lands in the workspace, and a
 partial write stays inspectable. EJA's acceptance is a later log event and never
 keeps the process alive.
 

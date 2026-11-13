@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "3338d619-4636-4a3c-8ea6-ecf7d4de13cc",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/Volumes/Machina/tfoc-code/eja/.archify/architecture-eja-aja-logic-20261113-230500/candidate.json",
+  "output": "/Volumes/Machina/tfoc-code/eja/.archify/architecture-eja-aja-logic-20261113-230500/eja-aja-logic.html",
+  "specification": {
+    "sha256": "5df526ee69829ec77abc255cd9f2990c4ac3580799462094a215917e005cef88",
+    "bytes": 7695
+  },
+  "artifact": {
+    "sha256": "ca31621c96cde77f09f3aa726334944c7ff40fe1553d5f88e7e624916319c42a",
+    "bytes": 778758
+  }
+}

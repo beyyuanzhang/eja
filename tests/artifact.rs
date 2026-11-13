@@ -50,12 +50,7 @@ impl Worker for QueueWorker {
             .lock()
             .expect("worker")
             .pop_front()
-            .unwrap_or_else(|| {
-                format!(
-                    "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
-                    "no record"
-                )
-            })
+            .unwrap_or_else(|| format!("0 steps, 0 tool calls, ended: error\n{}", "no record"))
     }
 }
 
@@ -82,7 +77,7 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
 
 fn record() -> String {
     format!(
-        "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
+        "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
         "checklist written"
     )
 }
@@ -225,17 +220,12 @@ fn list_dir_reads_the_project_and_reports_what_it_hid() {
     );
     let ctx = ToolContext {
         node_id: 1,
-        work: &project,
         project: &project,
         private: &private,
         control: &control,
     };
     let listing = FileTools
-        .call(
-            &ctx,
-            "list_dir",
-            &serde_json::json!({"path": ".", "area": "project"}),
-        )
+        .call(&ctx, "list_dir", &serde_json::json!({"path": "."}))
         .unwrap()
         .value;
     let entries = listing["entries"].as_array().unwrap();
@@ -254,6 +244,7 @@ fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
     let _ = std::fs::remove_dir_all(&root);
     let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(root.join("state")).unwrap();
     std::fs::write(work.join("a.txt"), "alpha beta gamma").unwrap();
     let control = eja::adapters::Control::new(
         std::time::Duration::from_secs(5),
@@ -261,9 +252,8 @@ fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
     );
     let ctx = ToolContext {
         node_id: 1,
-        work: &work,
         project: &work,
-        private: &root,
+        private: &root.join("state"),
         control: &control,
     };
     let ok = FileTools

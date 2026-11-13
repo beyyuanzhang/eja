@@ -98,19 +98,11 @@ fn eja_can_observe_project_files_but_never_write() {
     std::fs::create_dir_all(&private).expect("private");
     std::fs::write(project.join("note.txt"), "hello from the project").expect("write");
     let host = HostTools::new(None, &project, &private).expect("tools");
-    let value = Observer::observe(
-        &host,
-        "read_file",
-        &serde_json::json!({"area":"project","path":"note.txt"}),
-    )
-    .expect("project file is observable");
+    let value = Observer::observe(&host, "read_file", &serde_json::json!({"path":"note.txt"}))
+        .expect("project file is observable");
     assert!(value.to_string().contains("hello"));
-    assert!(Observer::observe(
-        &host,
-        "read_file",
-        &serde_json::json!({"area":"work","path":"note.txt"})
-    )
-    .is_err());
+    // There is no second area to read from any more; the world is one place.
+    assert!(Observer::observe(&host, "list_dir", &serde_json::json!({"path": ".."})).is_err());
     assert!(Observer::observe(
         &host,
         "write_file",
@@ -120,7 +112,7 @@ fn eja_can_observe_project_files_but_never_write() {
     assert!(Observer::observe(
         &host,
         "read_file",
-        &serde_json::json!({"area":"project","path":"../state/secret"})
+        &serde_json::json!({"path":"../state/secret"})
     )
     .is_err());
     // An edit is an effect: the observer names the refusal instead of pretending

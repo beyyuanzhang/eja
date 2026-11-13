@@ -1,5 +1,5 @@
 //! Single native worker path: same binary, private AJA mode, host-owned effects.
-use super::{tools::relative_file, Control, Model, ToolContext, ToolGateway};
+use super::{Control, Model, ToolContext, ToolGateway};
 use crate::{
     aja::{self, Limits, Request, Start},
     Assignment, Result, Worker,
@@ -268,7 +268,6 @@ struct Outcome<'a> {
     reason: &'a str,
     steps: usize,
     counts: &'a std::collections::BTreeMap<String, usize>,
-    paths: HashSet<String>,
 }
 
 struct Lease<'a> {
@@ -309,6 +308,11 @@ pub struct NativeWorker {
     /// Declared concurrent node capacity. Nodes are independent processes, so the
     /// host decides how many run at once.
     slots: usize,
+    /// The shadow repository that keeps one commit per node: the fossils.
+    checkpoints: PathBuf,
+    /// The host's own state, never part of what a node did to the project.
+    state: PathBuf,
+    checkpoint_lock: std::sync::Mutex<()>,
     active: Mutex<HashMap<u64, Arc<AtomicBool>>>,
 }
 
@@ -330,6 +334,9 @@ impl NativeWorker {
             tools,
             limits: Limits::default(),
             slots: 1,
+            checkpoints: root.parent().unwrap_or(&root).join("checkpoints"),
+            state: root.parent().unwrap_or(&root).to_path_buf(),
+            checkpoint_lock: std::sync::Mutex::new(()),
             active: Mutex::new(HashMap::new()),
         })
     }
@@ -365,9 +372,7 @@ impl NativeWorker {
     fn run(
         &self,
         assignment: &Assignment,
-        node: &Path,
         control: &Control,
-        artifacts: &mut HashSet<String>,
         log: &mut ContextLog,
         counts: &mut std::collections::BTreeMap<String, usize>,
     ) -> Result<(String, String)> {
@@ -383,10 +388,9 @@ impl NativeWorker {
             assignment: assignment.clone(),
             limits: self.limits.clone(),
         };
-        let mut process = Process::start(&self.binary, &node.join("work"), start)?;
+        let mut process = Process::start(&self.binary, &self.project, start)?;
         let context = ToolContext {
             node_id: assignment.task_id,
-            work: &node.join("work"),
             project: &self.project,
             private: self.root.parent().ok_or("missing state root")?,
             control,
@@ -434,10 +438,7 @@ impl NativeWorker {
                         json!({"error":"tool not allowed"})
                     } else {
                         match self.tools.call(&context, &name, &arguments) {
-                            Ok(output) => {
-                                artifacts.extend(output.artifacts);
-                                output.value
-                            }
+                            Ok(output) => output.value,
                             Err(error) => {
                                 json!({"error":error.to_string()})
                             }
@@ -467,6 +468,52 @@ impl NativeWorker {
         }
     }
 
+    /// Freeze the world this node left: one commit in the state's shadow
+    /// repository. The commit is the fossil EJA reads a node's files from.
+    fn checkpoint(&self, assignment: &Assignment) -> Option<String> {
+        let _guard = self
+            .checkpoint_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let git = |args: &[&str]| -> Result<String> {
+            let output = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&self.checkpoints)
+                .arg("--work-tree")
+                .arg(&self.project)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "eja")
+                .env("GIT_AUTHOR_EMAIL", "eja@local")
+                .env("GIT_COMMITTER_NAME", "eja")
+                .env("GIT_COMMITTER_EMAIL", "eja@local")
+                .output()?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr)
+                    .trim()
+                    .to_string()
+                    .into());
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        };
+        if !self.checkpoints.join("HEAD").exists() {
+            fs::create_dir_all(&self.checkpoints).ok()?;
+            git(&["init", "--quiet"]).ok()?;
+        }
+        let mut spec = vec!["add", "-A", "--", ".", ":!.git"];
+        if let Ok(relative) = self.state.strip_prefix(&self.project) {
+            let relative = relative.to_string_lossy().to_string();
+            if !relative.is_empty() {
+                let exclude = format!(":!{relative}");
+                spec.push(Box::leak(exclude.into_boxed_str()));
+            }
+        }
+        git(&spec).ok()?;
+        let message = format!("node {} at {}", assignment.task_id, assignment.issued_at);
+        git(&["commit", "--quiet", "--allow-empty", "-m", &message]).ok()?;
+        git(&["rev-parse", "HEAD"]).ok()
+    }
+
     fn seal(
         &self,
         node: &Path,
@@ -474,48 +521,7 @@ impl NativeWorker {
         outcome: Outcome<'_>,
         delta: &ProjectDelta,
     ) -> Result<String> {
-        let mut sealed = Vec::new();
-        let mut vanished = Vec::new();
-        let mut failed = Vec::new();
-        let output = node.join("artifacts");
-        fs::create_dir(&output)?;
-        let mut paths: Vec<_> = outcome.paths.into_iter().collect();
-        paths.sort();
-        for name in paths {
-            let source = match relative_file(&node.join("work"), &name) {
-                Ok(path) => path,
-                Err(error) => {
-                    failed.push(format!("{name} could not be sealed: {error}"));
-                    continue;
-                }
-            };
-            if !source.exists() {
-                // The node recorded this path and later removed it itself; the
-                // record says so instead of calling the seal broken.
-                vanished.push(name);
-                continue;
-            }
-            let copied = (|| -> Result<()> {
-                let source = relative_file(&node.join("work"), &name)?;
-                let target = relative_file(&output, &name)?;
-                let metadata = source.metadata()?;
-                if !metadata.is_file() || metadata.len() > aja::FRAME_LIMIT as u64 {
-                    return Err("artifact must be a bounded regular file".into());
-                }
-                fs::create_dir_all(target.parent().ok_or("missing artifact parent")?)?;
-                fs::copy(&source, &target)?;
-                let mut permissions = target.metadata()?.permissions();
-                permissions.set_readonly(true);
-                fs::set_permissions(&target, permissions)?;
-                fs::File::open(&target)?.sync_all()?;
-                Ok(())
-            })();
-            match copied {
-                Ok(()) => sealed.push(format!("{}/artifacts/{name}", assignment.task_id)),
-                Err(error) => failed.push(format!("{name} could not be sealed: {error}")),
-            }
-        }
-        fs::remove_dir_all(node.join("work"))?;
+        let checkpoint = self.checkpoint(assignment);
         let context = node.join("context.jsonl");
         if let Ok(file) = fs::OpenOptions::new().write(true).open(&context) {
             file.sync_all()?;
@@ -535,35 +541,19 @@ impl NativeWorker {
         };
         let (text, reason) = (outcome.text, outcome.reason);
         let steps = outcome.steps;
-        let digest =
-            format!(
-            "{steps} steps, {calls} tool calls{}, {}, {} artifacts{}{}{}, ended: {reason}\n{text}",
+        let digest = format!(
+            "{steps} steps, {calls} tool calls{}, {}, ended: {reason}\n{text}",
             if histogram.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", histogram.join(" "))
             },
             delta.line(),
-            sealed.len(),
-            if sealed.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", sealed.join(", "))
-            },
-            if vanished.is_empty() {
-                String::new()
-            } else {
-                format!("; {} vanished before sealing ({})", vanished.len(), vanished.join(", "))
-            },
-            if failed.is_empty() {
-                String::new()
-            } else {
-                format!("; seal failed: {}", failed.join("; "))
-            }
         );
         let manifest = json!({
             "assignment": assignment,
             "digest": digest,
+            "checkpoint": checkpoint,
             "context": "context.jsonl",
             "context_bytes": context_bytes,
             "frozen": true,
@@ -592,21 +582,21 @@ impl Worker for NativeWorker {
         let node = self.root.join(assignment.task_id.to_string());
         // Reserve once. Restart or replay cannot overwrite an existing node, even after failure.
         if assignment.task_id == 0 {
-            return "0 steps, 0 tool calls, 0 artifacts, ended: error\ninvalid node id".into();
+            return "0 steps, 0 tool calls, ended: error\ninvalid node id".into();
         }
         if INTERRUPTED.load(Ordering::SeqCst) {
-            return "0 steps, 0 tool calls, 0 artifacts, ended: budget\ninterrupted before the node started".into();
+            return "0 steps, 0 tool calls, ended: budget\ninterrupted before the node started"
+                .into();
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
             if !active.is_empty() {
-                return "0 steps, 0 tool calls, 0 artifacts, ended: budget\nexecution slot is busy"
-                    .into();
+                return "0 steps, 0 tool calls, ended: budget\nexecution slot is busy".into();
             }
             if let Err(e) = fs::create_dir(&node) {
                 return format!(
-                    "0 steps, 0 tool calls, 0 artifacts, ended: error\nnode already reserved or unavailable: {e}"
+                    "0 steps, 0 tool calls, ended: error\nnode already reserved or unavailable: {e}"
                 );
             }
             active.insert(assignment.task_id, cancelled.clone());
@@ -620,32 +610,20 @@ impl Worker for NativeWorker {
             Duration::from_millis(self.limits.timeout_ms),
             cancelled.clone(),
         );
-        let mut paths = HashSet::new();
         let mut counts = std::collections::BTreeMap::new();
         let mut log = match ContextLog::create(&node) {
             Ok(log) => log,
             Err(error) => {
                 return format!(
-                    "0 steps, 0 tool calls, 0 artifacts, ended: error\nnode context is unavailable: {error}"
+                    "0 steps, 0 tool calls, ended: error\nnode context is unavailable: {error}"
                 )
             }
         };
-        let before = snapshot_project(&self.project, &self.root);
-        let result: Result<(String, String)> = fs::create_dir(node.join("work"))
-            .map_err(Into::into)
-            .and_then(|_| {
-                let outcome = self.run(
-                    assignment,
-                    &node,
-                    &control,
-                    &mut paths,
-                    &mut log,
-                    &mut counts,
-                )?;
-                Ok(outcome)
-            });
+        let before = snapshot_project(&self.project, &self.state);
+        let result: Result<(String, String)> =
+            self.run(assignment, &control, &mut log, &mut counts);
         let steps = log.assistants();
-        let (after, truncated) = snapshot_project(&self.project, &self.root);
+        let (after, truncated) = snapshot_project(&self.project, &self.state);
         let delta = ProjectDelta::between(&before.0, &after, truncated || before.1);
         cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything
         let (text, reason) = match result {
@@ -662,14 +640,11 @@ impl Worker for NativeWorker {
                 reason: &reason,
                 steps,
                 counts: &counts,
-                paths,
             },
             &delta,
         )
-            .unwrap_or_else(|e| {
-                format!(
-                    "{steps} steps, 0 tool calls, 0 artifacts, ended: error\nnode could not be frozen: {e}"
-                )
-            })
+        .unwrap_or_else(|e| {
+            format!("{steps} steps, 0 tool calls, ended: error\nnode could not be frozen: {e}")
+        })
     }
 }

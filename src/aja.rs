@@ -82,8 +82,6 @@ pub(crate) fn receive<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead)
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// How many recent tool results stay verbatim when the transcript compacts.
-
 fn transcript_bytes(messages: &[Value]) -> usize {
     serde_json::to_vec(messages)
         .map(|bytes| bytes.len())
@@ -164,7 +162,7 @@ fn run(
         None => format!("You have {} seconds.", start.limits.timeout_ms / 1000),
     };
     let system = format!(
-        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Your work area is scratch: what you write there is sealed as your artifacts, which are evidence for EJA, not the deliverable. The project is the shared result: when the work must land there, change it with a tool that reaches the project, at the exact paths the work requires. {budget} The Acceptance line is the contract: the work is done when it holds. Stop calling tools then; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
+        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Your workspace is the project itself: everything you write stays where you put it, and EJA reads the record of your calls and the world you leave behind. {budget} The Acceptance line is the contract: the work is done when it holds. Stop calling tools then; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
     );
     let mut brief = start.assignment.objective.clone();
     let given = start.assignment.input.trim();

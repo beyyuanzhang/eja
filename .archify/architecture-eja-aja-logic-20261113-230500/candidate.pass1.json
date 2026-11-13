@@ -1,0 +1,404 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "EJA–AJA 现有逻辑全景",
+    "subtitle": "一个回合里真实存在的概念；红色标出重复表示同一件事的地方",
+    "locale": "zh-CN",
+    "output": "eja-aja-logic.html",
+    "quality_profile": "showcase"
+  },
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "EJA 主体（持久）",
+      "wraps": [
+        "log",
+        "fold",
+        "state",
+        "projection",
+        "brain",
+        "decision"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "AJA 节点（一次性）",
+      "wraps": [
+        "worker",
+        "aja",
+        "tools",
+        "record"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "世界",
+      "wraps": [
+        "project"
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "节点产物现在有四种表示",
+      "items": [
+        "Record：node.json + context.jsonl（磁盘上的完整记录）",
+        "Digest：宿主的 fold（步骤、调用、diff、结尾）",
+        "Artifacts：从私有区拷出的文件副本",
+        "Project diff：世界真实发生的变化"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "fold 与 digest 是同一个操作",
+      "items": [
+        "log → fold → State（主体记忆）",
+        "context.jsonl → fold → Digest（节点记忆）",
+        "差别的只是输入不同，操作是同一种"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "冗余点",
+      "items": [
+        "Artifacts 复制了 Project 已有的文件",
+        "私有区让 write_file 与 shell 写入不同世界",
+        "一个节点的结果因此有两条入账路径"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "EJA 的读（look）",
+      "items": [
+        "look {log | node | world} 是唯一读原语",
+        "log：按 id / search 查事件",
+        "node：读节点记录与文件",
+        "world：只读地看项目"
+      ]
+    }
+  ],
+  "components": [
+    {
+      "id": "input",
+      "type": "external",
+      "label": "用户输入",
+      "sublabel": "一次交互",
+      "pos": [
+        40,
+        150
+      ],
+      "size": [
+        120,
+        56
+      ]
+    },
+    {
+      "id": "log",
+      "type": "database",
+      "label": "Store · log.jsonl",
+      "sublabel": "追加-only · fsync",
+      "pos": [
+        210,
+        150
+      ],
+      "size": [
+        170,
+        56
+      ]
+    },
+    {
+      "id": "fold",
+      "type": "backend",
+      "label": "fold",
+      "sublabel": "纯函数",
+      "pos": [
+        440,
+        150
+      ],
+      "size": [
+        110,
+        56
+      ]
+    },
+    {
+      "id": "state",
+      "type": "backend",
+      "label": "State",
+      "sublabel": "任务/目标/承诺/关系",
+      "pos": [
+        610,
+        150
+      ],
+      "size": [
+        160,
+        56
+      ]
+    },
+    {
+      "id": "projection",
+      "type": "frontend",
+      "label": "projection",
+      "sublabel": "本回合看到的视图",
+      "pos": [
+        890,
+        150
+      ],
+      "size": [
+        160,
+        56
+      ]
+    },
+    {
+      "id": "brain",
+      "type": "backend",
+      "label": "Brain · 模型",
+      "sublabel": "JSON 决策",
+      "pos": [
+        1110,
+        150
+      ],
+      "size": [
+        140,
+        56
+      ]
+    },
+    {
+      "id": "decision",
+      "type": "backend",
+      "label": "Decision · 动作",
+      "sublabel": "open/dispatch/look/close",
+      "pos": [
+        1310,
+        150
+      ],
+      "size": [
+        170,
+        56
+      ]
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "NativeWorker",
+      "sublabel": "槽位 · 子进程 · IPC",
+      "pos": [
+        1180,
+        330
+      ],
+      "size": [
+        170,
+        56
+      ]
+    },
+    {
+      "id": "aja",
+      "type": "backend",
+      "label": "AJA 节点进程",
+      "sublabel": "transcript · compact 视图",
+      "pos": [
+        900,
+        330
+      ],
+      "size": [
+        180,
+        56
+      ]
+    },
+    {
+      "id": "tools",
+      "type": "security",
+      "label": "工具",
+      "sublabel": "write_file/edit/read · MCP shell",
+      "pos": [
+        620,
+        330
+      ],
+      "size": [
+        170,
+        56
+      ]
+    },
+    {
+      "id": "record",
+      "type": "database",
+      "label": "Record",
+      "sublabel": "node.json + context.jsonl",
+      "pos": [
+        900,
+        500
+      ],
+      "size": [
+        180,
+        56
+      ]
+    },
+    {
+      "id": "digest",
+      "type": "database",
+      "label": "Digest",
+      "sublabel": "步骤/调用/diff/结尾",
+      "pos": [
+        330,
+        500
+      ],
+      "size": [
+        170,
+        56
+      ]
+    },
+    {
+      "id": "artifacts",
+      "type": "database",
+      "label": "Artifacts",
+      "sublabel": "私有区文件副本",
+      "pos": [
+        330,
+        660
+      ],
+      "size": [
+        170,
+        56
+      ],
+      "tag": "冗余"
+    },
+    {
+      "id": "project",
+      "type": "cloud",
+      "label": "Project · 工作区",
+      "sublabel": "被 shell 直接改写",
+      "pos": [
+        330,
+        330
+      ],
+      "size": [
+        170,
+        56
+      ]
+    },
+    {
+      "id": "workdir",
+      "type": "database",
+      "label": "Work 私有区",
+      "sublabel": "write_file 只写这里",
+      "pos": [
+        620,
+        500
+      ],
+      "size": [
+        170,
+        56
+      ],
+      "tag": "冗余"
+    }
+  ],
+  "connections": [
+    {
+      "id": "input-log",
+      "from": "input",
+      "to": "log",
+      "label": "追加事件"
+    },
+    {
+      "id": "log-fold",
+      "from": "log",
+      "to": "fold",
+      "label": "重放"
+    },
+    {
+      "id": "fold-state",
+      "from": "fold",
+      "to": "state",
+      "label": "S = fold(L)"
+    },
+    {
+      "id": "state-proj",
+      "from": "state",
+      "to": "projection",
+      "label": "C = project(S)"
+    },
+    {
+      "id": "proj-brain",
+      "from": "projection",
+      "to": "brain",
+      "label": "一次请求"
+    },
+    {
+      "id": "brain-decision",
+      "from": "brain",
+      "to": "decision",
+      "label": "d"
+    },
+    {
+      "id": "decision-worker",
+      "from": "decision",
+      "to": "worker",
+      "label": "dispatch",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "worker-aja",
+      "from": "worker",
+      "to": "aja",
+      "label": "运行一次"
+    },
+    {
+      "id": "aja-tools",
+      "from": "aja",
+      "to": "tools",
+      "label": "调用",
+      "variant": "emphasis"
+    },
+    {
+      "id": "tools-workdir",
+      "from": "tools",
+      "to": "workdir",
+      "label": "write_file",
+      "variant": "dashed"
+    },
+    {
+      "id": "tools-project",
+      "from": "tools",
+      "to": "project",
+      "label": "shell 写世界",
+      "variant": "emphasis"
+    },
+    {
+      "id": "aja-record",
+      "from": "aja",
+      "to": "record",
+      "label": "记录",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "record-digest",
+      "from": "record",
+      "to": "digest",
+      "label": "fold(记录)"
+    },
+    {
+      "id": "workdir-artifacts",
+      "from": "workdir",
+      "to": "artifacts",
+      "label": "seal 拷贝",
+      "variant": "dashed"
+    },
+    {
+      "id": "digest-aja",
+      "from": "digest",
+      "to": "aja",
+      "label": "",
+      "route": "auto"
+    },
+    {
+      "id": "digest-log",
+      "from": "digest",
+      "to": "log",
+      "label": "worker_report 事件回灌",
+      "variant": "emphasis"
+    }
+  ]
+}

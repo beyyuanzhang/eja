@@ -206,7 +206,10 @@ fn main() -> ExitCode {
                 Some(retriever) => Box::new(retriever),
                 None => Box::new(NoopRetriever),
             };
-            let artifacts = FileArtifactReader::new(nodes);
+            let artifacts = FileArtifactReader::with_checkpoints(
+                nodes,
+                std::path::Path::new(&dir).join("checkpoints"),
+            );
             let ports = Ports {
                 log: Some(&*retriever),
                 node: Some(&artifacts),

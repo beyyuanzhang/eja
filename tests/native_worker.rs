@@ -152,19 +152,20 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     let model = Arc::new(Script::new(vec![
         calls(vec![
             call("write_file", json!({"path":"out.txt","text":"node result"})),
-            call("read_file", json!({"area":"work","path":"out.txt"})),
+            call("read_file", json!({"path":"out.txt"})),
         ]),
         final_message(&["out.txt"]),
     ]));
     let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
     let digest = w.execute(&assignment(1));
     assert!(digest.contains("ended: message"), "{digest}");
-    assert!(digest.contains("1/artifacts/out.txt"), "{digest}");
+    assert!(digest.contains("project: +1 created (out.txt)"), "{digest}");
     assert_eq!(
-        std::fs::read_to_string(f.0.join(".eja/nodes/1/artifacts/out.txt")).unwrap(),
-        "node result"
+        std::fs::read_to_string(f.0.join("out.txt")).unwrap(),
+        "node result",
+        "the node writes the workspace itself"
     );
-    assert!(!f.0.join(".eja/nodes/1/work").exists());
+    assert!(f.manifest(1)["checkpoint"].as_str().is_some());
     assert_eq!(f.manifest(1)["frozen"], true);
     assert_eq!(f.manifest(1)["context"], "context.jsonl");
     assert!(
@@ -228,21 +229,12 @@ impl ToolGateway for Effects {
                 std::fs::write(target, "delivered")?;
                 Ok(ToolOutput {
                     value: json!({"ok": true}),
-                    artifacts: Vec::new(),
-                })
-            }
-            "work" => {
-                std::fs::write(c.work.join(path), "draft")?;
-                Ok(ToolOutput {
-                    value: json!({"ok": true}),
-                    artifacts: vec![path.to_string()],
                 })
             }
             "drop" => {
-                std::fs::remove_file(c.work.join(path))?;
+                std::fs::remove_file(c.project.join(path))?;
                 Ok(ToolOutput {
                     value: json!({"ok": true}),
-                    artifacts: Vec::new(),
                 })
             }
             other => Err(format!("unknown effect {other}").into()),
@@ -270,23 +262,32 @@ fn the_digest_reports_what_the_project_gained() {
 }
 
 #[test]
-fn a_file_the_node_removed_is_reported_not_called_a_seal_failure() {
+fn the_node_leaves_a_fossil_of_the_world_it_ended_in() {
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new();
     let model = Arc::new(Script::new(vec![
-        calls(vec![
-            call("effect", json!({"kind":"work","path":"draft.txt"})),
-            call("effect", json!({"kind":"drop","path":"draft.txt"})),
-        ]),
+        calls(vec![call(
+            "effect",
+            json!({"kind":"project","path":"report.md"}),
+        )]),
         final_message(&[]),
     ]));
     let w = f.worker(model, Arc::new(Effects), Limits::default());
     let digest = w.execute(&assignment(1));
-    assert!(
-        digest.contains("1 vanished before sealing (draft.txt)"),
-        "{digest}"
-    );
-    assert!(!digest.contains("seal failed"), "{digest}");
+    assert!(digest.contains("+1 created"), "{digest}");
+    let manifest = f.manifest(1);
+    let commit = manifest["checkpoint"]
+        .as_str()
+        .expect("a node records its checkpoint");
+    assert_eq!(commit.len(), 40, "{commit}");
+    let read = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(f.0.join(".eja/checkpoints"))
+        .arg("show")
+        .arg(format!("{commit}:report.md"))
+        .output()
+        .expect("git");
+    assert_eq!(String::from_utf8_lossy(&read.stdout), "delivered");
 }
 
 struct Policy;
@@ -304,7 +305,7 @@ impl ToolGateway for Policy {
 }
 
 #[test]
-fn node_workspaces_and_tool_grants_are_independent() {
+fn nodes_share_the_workspace_and_grants_still_differ() {
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new();
     let model = Arc::new(Script::new(vec![
@@ -312,9 +313,9 @@ fn node_workspaces_and_tool_grants_are_independent() {
             "write_file",
             json!({"path":"same.txt","text":"one"}),
         )]),
-        final_message(&["same.txt"]),
+        final_message(&[]),
         calls(vec![
-            call("read_file", json!({"area":"work","path":"same.txt"})),
+            call("read_file", json!({"path":"same.txt"})),
             call("write_file", json!({"path":"same.txt","text":"two"})),
         ]),
         final_message(&[]),
@@ -328,17 +329,14 @@ fn node_workspaces_and_tool_grants_are_independent() {
         .filter(|m| m["role"] == "tool")
         .map(|m| m["content"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert!(results[0].contains("error"));
-    assert!(results[1].contains("not allowed"));
+    // There is one workspace: the second node reads what the first wrote.
+    assert!(results[0].contains("one"), "{}", results[0]);
+    // The grant, not the filesystem, is what a node may not cross.
+    assert!(results[1].contains("not allowed"), "{}", results[1]);
     assert_eq!(
-        std::fs::read_to_string(f.0.join(".eja/nodes/1/artifacts/same.txt")).unwrap(),
+        std::fs::read_to_string(f.0.join("same.txt")).unwrap(),
         "one"
     );
-    assert!(f.manifest(2)["digest"]
-        .as_str()
-        .unwrap()
-        .contains("0 artifacts"));
-    assert_reaped(&model.pids.lock().unwrap());
 }
 
 #[test]
@@ -352,20 +350,16 @@ fn traversal_private_state_and_symlinks_are_not_file_capabilities() {
     let model = Arc::new(Script::new(vec![
         calls(vec![
             call("write_file", json!({"path":"../escape.txt","text":"bad"})),
-            call(
-                "read_file",
-                json!({"area":"project","path":".eja/secret.txt"}),
-            ),
-            call("read_file", json!({"area":"project","path":"alias.txt"})),
+            call("read_file", json!({"path":".eja/secret.txt"})),
+            call("read_file", json!({"path":"alias.txt"})),
         ]),
         final_message(&["../escape.txt"]),
     ]));
     let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
     let digest = w.execute(&assignment(1));
-    // The claim mentions an escaping path; the host seals nothing.
-    assert!(digest.contains("0 artifacts"), "{digest}");
-    assert!(!f.0.join(".eja/nodes/1/escape.txt").exists());
-    assert!(!f.0.join(".eja/nodes/1/work").exists());
+    // The claim mentions an escaping path; the world did not move.
+    assert!(digest.contains("project: unchanged"), "{digest}");
+    assert!(!f.0.join("escape.txt").exists());
     assert_eq!(f.manifest(1)["frozen"], true);
     assert_eq!(
         model.seen.lock().unwrap()[1]
@@ -396,7 +390,7 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
     // A spent budget stops the node without calling its work a failure.
     assert!(r.contains("ended: budget"), "{r}");
     assert!(r.contains("budget"), "{r}");
-    assert!(r.contains("1/artifacts/partial.txt"), "{r}");
+    assert!(r.contains("project: +1 created (partial.txt)"), "{r}");
     assert!(f.manifest(1)["digest"]
         .as_str()
         .unwrap()
@@ -623,7 +617,10 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
         .unwrap()
         .iter()
         .any(|m| m["role"] == "tool"));
-    assert!(digest.contains("1/artifacts/http.txt"), "{digest}");
+    assert!(
+        digest.contains("project: +1 created (http.txt)"),
+        "{digest}"
+    );
 }
 
 #[test]
