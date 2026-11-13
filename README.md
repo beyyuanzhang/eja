@@ -126,7 +126,8 @@ node record (what the host saw it do) → EJA decides → close_task { accepted,
 ```
 
 A dispatch returns the host's digest of the node's record — steps, tool calls,
-sealed artifacts, how it ended, and the node's last message. A look is optional:
+what changed in the project (created, modified, deleted), sealed artifacts, how
+it ended, and the node's last message. A look is optional:
 EJA can read the node's whole record, the artifacts or the world, and decide for
 itself. Nothing is required before `close_task`, and there is no separate
 verifier. A look at a read-only connector tool lets EJA check the work against

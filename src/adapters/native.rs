@@ -130,6 +130,147 @@ impl Process {
     }
 }
 
+/// A project larger than this is reported as truncated instead of scanned.
+const PROJECT_ENTRIES: usize = 20_000;
+/// Names shown per change class before the rest are counted.
+const PROJECT_NAMES: usize = 6;
+
+type ProjectState = std::collections::BTreeMap<String, (u64, i64)>;
+
+/// Every regular file in the project, with its size and modification time. The
+/// worker's own state (`skip`) is not part of what the node did to the project.
+fn snapshot_project(root: &Path, skip: &Path) -> (ProjectState, bool) {
+    let mut state = ProjectState::new();
+    let mut truncated = false;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if state.len() >= PROJECT_ENTRIES {
+                truncated = true;
+                break;
+            }
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if path != skip {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let stamp = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|time| time.as_nanos() as i64)
+                .unwrap_or(0);
+            state.insert(
+                relative.to_string_lossy().replace('\\', "/"),
+                (metadata.len(), stamp),
+            );
+        }
+        if truncated {
+            break;
+        }
+    }
+    (state, truncated)
+}
+
+/// What the node did to the project: the world's answer, not the node's claim.
+#[derive(Default)]
+struct ProjectDelta {
+    created: Vec<String>,
+    modified: Vec<String>,
+    deleted: Vec<String>,
+    truncated: bool,
+}
+
+impl ProjectDelta {
+    fn between(before: &ProjectState, after: &ProjectState, truncated: bool) -> Self {
+        let mut delta = Self {
+            truncated,
+            ..Self::default()
+        };
+        for (name, stamp) in after {
+            match before.get(name) {
+                None => delta.created.push(name.clone()),
+                Some(was) if was != stamp => delta.modified.push(name.clone()),
+                Some(_) => {}
+            }
+        }
+        for name in before.keys() {
+            if !after.contains_key(name) {
+                delta.deleted.push(name.clone());
+            }
+        }
+        delta
+    }
+    fn line(&self) -> String {
+        if self.created.is_empty() && self.modified.is_empty() && self.deleted.is_empty() {
+            return "project: unchanged".into();
+        }
+        let names = |list: &[String]| {
+            let shown: Vec<&str> = list
+                .iter()
+                .take(PROJECT_NAMES)
+                .map(String::as_str)
+                .collect();
+            let rest = list.len().saturating_sub(shown.len());
+            let more = if rest == 0 {
+                String::new()
+            } else {
+                format!(", …{rest} more")
+            };
+            format!(" ({}{more})", shown.join(", "))
+        };
+        let mut parts = Vec::new();
+        if !self.created.is_empty() {
+            parts.push(format!(
+                "+{} created{}",
+                self.created.len(),
+                names(&self.created)
+            ));
+        }
+        if !self.modified.is_empty() {
+            parts.push(format!(
+                "~{} modified{}",
+                self.modified.len(),
+                names(&self.modified)
+            ));
+        }
+        if !self.deleted.is_empty() {
+            parts.push(format!(
+                "-{} deleted{}",
+                self.deleted.len(),
+                names(&self.deleted)
+            ));
+        }
+        if self.truncated {
+            parts.push("(truncated)".into());
+        }
+        format!("project: {}", parts.join(", "))
+    }
+}
+
+/// What one run of a node produced: the transcript's account of it.
+struct Outcome<'a> {
+    text: &'a str,
+    reason: &'a str,
+    steps: usize,
+    counts: &'a std::collections::BTreeMap<String, usize>,
+    paths: HashSet<String>,
+}
+
 struct Lease<'a> {
     active: &'a Mutex<HashMap<u64, Arc<AtomicBool>>>,
     id: u64,
@@ -330,18 +471,30 @@ impl NativeWorker {
         &self,
         node: &Path,
         assignment: &Assignment,
-        outcome: (&str, &str),
-        steps: usize,
-        counts: &std::collections::BTreeMap<String, usize>,
-        paths: HashSet<String>,
+        outcome: Outcome<'_>,
+        delta: &ProjectDelta,
     ) -> Result<String> {
         let mut sealed = Vec::new();
+        let mut vanished = Vec::new();
         let mut failed = Vec::new();
         let output = node.join("artifacts");
         fs::create_dir(&output)?;
-        let mut paths: Vec<_> = paths.into_iter().collect();
+        let mut paths: Vec<_> = outcome.paths.into_iter().collect();
         paths.sort();
         for name in paths {
+            let source = match relative_file(&node.join("work"), &name) {
+                Ok(path) => path,
+                Err(error) => {
+                    failed.push(format!("{name} could not be sealed: {error}"));
+                    continue;
+                }
+            };
+            if !source.exists() {
+                // The node recorded this path and later removed it itself; the
+                // record says so instead of calling the seal broken.
+                vanished.push(name);
+                continue;
+            }
             let copied = (|| -> Result<()> {
                 let source = relative_file(&node.join("work"), &name)?;
                 let target = relative_file(&output, &name)?;
@@ -371,28 +524,36 @@ impl NativeWorker {
             fs::set_permissions(&context, permissions)?;
         }
         let context_bytes = fs::metadata(&context).map(|m| m.len()).unwrap_or(0);
-        let calls: usize = counts.values().sum();
+        let calls: usize = outcome.counts.values().sum();
         let histogram: Vec<String> = {
-            let mut pairs: Vec<_> = counts.iter().collect();
+            let mut pairs: Vec<_> = outcome.counts.iter().collect();
             pairs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
             pairs
                 .iter()
                 .map(|(name, count)| format!("{name}x{count}"))
                 .collect()
         };
-        let (text, reason) = outcome;
-        let digest = format!(
-            "{steps} steps, {calls} tool calls{}, {} artifacts{}{}, ended: {reason}\n{text}",
+        let (text, reason) = (outcome.text, outcome.reason);
+        let steps = outcome.steps;
+        let digest =
+            format!(
+            "{steps} steps, {calls} tool calls{}, {}, {} artifacts{}{}{}, ended: {reason}\n{text}",
             if histogram.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", histogram.join(" "))
             },
+            delta.line(),
             sealed.len(),
             if sealed.is_empty() {
                 String::new()
             } else {
                 format!(" [{}]", sealed.join(", "))
+            },
+            if vanished.is_empty() {
+                String::new()
+            } else {
+                format!("; {} vanished before sealing ({})", vanished.len(), vanished.join(", "))
             },
             if failed.is_empty() {
                 String::new()
@@ -469,6 +630,7 @@ impl Worker for NativeWorker {
                 )
             }
         };
+        let before = snapshot_project(&self.project, &self.root);
         let result: Result<(String, String)> = fs::create_dir(node.join("work"))
             .map_err(Into::into)
             .and_then(|_| {
@@ -483,6 +645,8 @@ impl Worker for NativeWorker {
                 Ok(outcome)
             });
         let steps = log.assistants();
+        let (after, truncated) = snapshot_project(&self.project, &self.root);
+        let delta = ProjectDelta::between(&before.0, &after, truncated || before.1);
         cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything
         let (text, reason) = match result {
             Ok(outcome) => outcome,
@@ -490,7 +654,18 @@ impl Worker for NativeWorker {
         };
         let _ = log.record(json!({"kind": "finish", "text": &text, "reason": &reason}));
         drop(log);
-        self.seal(&node, assignment, (&text, &reason), steps, &counts, paths)
+        self.seal(
+            &node,
+            assignment,
+            Outcome {
+                text: &text,
+                reason: &reason,
+                steps,
+                counts: &counts,
+                paths,
+            },
+            &delta,
+        )
             .unwrap_or_else(|e| {
                 format!(
                     "{steps} steps, 0 tool calls, 0 artifacts, ended: error\nnode could not be frozen: {e}"

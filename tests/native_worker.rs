@@ -250,6 +250,45 @@ impl ToolGateway for Effects {
     }
 }
 
+#[test]
+fn the_digest_reports_what_the_project_gained() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let model = Arc::new(Script::new(vec![
+        calls(vec![
+            call("effect", json!({"kind":"project","path":"delivered.txt"})),
+            call("effect", json!({"kind":"project","path":"nested/also.txt"})),
+        ]),
+        final_message(&[]),
+    ]));
+    let w = f.worker(model, Arc::new(Effects), Limits::default());
+    let digest = w.execute(&assignment(1));
+    assert!(
+        digest.contains("project: +2 created (delivered.txt, nested/also.txt)"),
+        "{digest}"
+    );
+}
+
+#[test]
+fn a_file_the_node_removed_is_reported_not_called_a_seal_failure() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let model = Arc::new(Script::new(vec![
+        calls(vec![
+            call("effect", json!({"kind":"work","path":"draft.txt"})),
+            call("effect", json!({"kind":"drop","path":"draft.txt"})),
+        ]),
+        final_message(&[]),
+    ]));
+    let w = f.worker(model, Arc::new(Effects), Limits::default());
+    let digest = w.execute(&assignment(1));
+    assert!(
+        digest.contains("1 vanished before sealing (draft.txt)"),
+        "{digest}"
+    );
+    assert!(!digest.contains("seal failed"), "{digest}");
+}
+
 struct Policy;
 impl ToolGateway for Policy {
     fn definitions(&self, a: &Assignment) -> Vec<Value> {
