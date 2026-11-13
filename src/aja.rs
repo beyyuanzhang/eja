@@ -160,7 +160,7 @@ fn run(
         None => format!("You have {} seconds.", start.limits.timeout_ms / 1000),
     };
     let system = format!(
-        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. {budget} The Acceptance line is the contract: the work is done when it holds. Stop calling tools then; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
+        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Your work area is scratch: what you write there is sealed as your artifacts, which are evidence for EJA, not the deliverable. The project is the shared result: when the work must land there, change it with a tool that reaches the project, at the exact paths the work requires. {budget} The Acceptance line is the contract: the work is done when it holds. Stop calling tools then; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
     );
     let mut brief = start.assignment.objective.clone();
     if !start.assignment.acceptance.trim().is_empty() {
