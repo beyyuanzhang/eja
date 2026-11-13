@@ -83,7 +83,6 @@ pub(crate) fn receive<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead)
 }
 
 /// How many recent tool results stay verbatim when the transcript compacts.
-const KEEP_RECENT_TOOL_RESULTS: usize = 8;
 
 fn transcript_bytes(messages: &[Value]) -> usize {
     serde_json::to_vec(messages)
@@ -119,8 +118,9 @@ fn compact(messages: &mut [Value], budget: usize) {
         .filter(|(_, message)| message.get("role").and_then(Value::as_str) == Some("tool"))
         .map(|(index, _)| index)
         .collect();
-    let elidable = tools.len().saturating_sub(KEEP_RECENT_TOOL_RESULTS);
-    for &index in tools.iter().take(elidable) {
+    // Keep the newest result that still fits: a fixed number of recent results
+    // can itself exceed the budget and stop the node for no reason.
+    for &index in tools.iter().rev().skip(1).rev() {
         let id = messages[index]
             .get("tool_call_id")
             .and_then(Value::as_str)
