@@ -86,6 +86,7 @@ fn assignment(id: u64) -> Assignment {
         objective: "use the granted connector".into(),
         issued_at: 123,
         acceptance: String::new(),
+        input: String::new(),
     }
 }
 fn control(ms: u64) -> Control {

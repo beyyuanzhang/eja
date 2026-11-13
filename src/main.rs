@@ -263,6 +263,7 @@ fn main() -> ExitCode {
                     task_id: focus.unwrap_or(0),
                     objective: query,
                     acceptance: String::new(),
+                    input: String::new(),
                     issued_at: eja::now_utc().timestamp(),
                 };
                 println!(

@@ -6,6 +6,10 @@ use std::io::{BufRead, Write};
 
 pub const FRAME_LIMIT: usize = 256 * 1024;
 
+/// A model request travels wrapped in its JSON envelope, so the transcript budget
+/// leaves that much room inside the frame the transport accepts.
+pub const FRAME_ENVELOPE: usize = 4 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limits {
     pub timeout_ms: u64,
@@ -19,7 +23,7 @@ impl Default for Limits {
         Self {
             timeout_ms: 300_000,
             steps: None,
-            context_bytes: FRAME_LIMIT,
+            context_bytes: FRAME_LIMIT - FRAME_ENVELOPE,
             response_bytes: 64 * 1024,
         }
     }
@@ -30,7 +34,7 @@ impl Limits {
         if self.timeout_ms == 0
             || self.steps == Some(0)
             || self.context_bytes == 0
-            || self.context_bytes > FRAME_LIMIT
+            || self.context_bytes > FRAME_LIMIT - FRAME_ENVELOPE
             || self.response_bytes == 0
             || self.response_bytes > FRAME_LIMIT / 2
         {
@@ -163,6 +167,11 @@ fn run(
         "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Your work area is scratch: what you write there is sealed as your artifacts, which are evidence for EJA, not the deliverable. The project is the shared result: when the work must land there, change it with a tool that reaches the project, at the exact paths the work requires. {budget} The Acceptance line is the contract: the work is done when it holds. Stop calling tools then; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
     );
     let mut brief = start.assignment.objective.clone();
+    let given = start.assignment.input.trim();
+    if !given.is_empty() && given != brief.trim() {
+        brief.push_str("\n\nTask as given:\n");
+        brief.push_str(given);
+    }
     if !start.assignment.acceptance.trim().is_empty() {
         brief.push_str("\n\nAcceptance: ");
         brief.push_str(start.assignment.acceptance.trim());
@@ -184,8 +193,9 @@ fn run(
         // The transcript is a working view, not the record: the host keeps every
         // tool result in context.jsonl, so the oldest results can be elided in
         // place once the view outgrows its declared budget.
-        compact(&mut messages, start.limits.context_bytes);
-        if serde_json::to_vec(&messages)?.len() > start.limits.context_bytes {
+        let budget = start.limits.context_bytes.min(FRAME_LIMIT - FRAME_ENVELOPE);
+        compact(&mut messages, budget);
+        if serde_json::to_vec(&messages)?.len() > budget {
             return Ok(stopped("AJA context budget exhausted"));
         }
         let message = request(

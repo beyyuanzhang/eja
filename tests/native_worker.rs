@@ -71,6 +71,7 @@ fn assignment(id: u64) -> Assignment {
         objective: format!("node {id} work"),
         issued_at: 123,
         acceptance: String::new(),
+        input: String::new(),
     }
 }
 fn final_message(artifacts: &[&str]) -> Value {
@@ -205,6 +206,48 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     let before = f.manifest(1);
     assert!(w.execute(&assignment(1)).contains("ended: error"));
     assert_eq!(f.manifest(1), before);
+}
+
+/// Effects that reach past the work area, so the digest can be checked against
+/// the world rather than the node's own account.
+struct Effects;
+impl ToolGateway for Effects {
+    fn definitions(&self, _: &Assignment) -> Vec<Value> {
+        vec![
+            json!({"type":"function","function":{"name":"effect","description":"apply one effect","parameters":{"type":"object","properties":{"kind":{"type":"string"},"path":{"type":"string"}},"required":["kind","path"]}}}),
+        ]
+    }
+    fn call(&self, c: &ToolContext<'_>, _: &str, args: &Value) -> Result<ToolOutput> {
+        let path = args["path"].as_str().unwrap_or_default();
+        match args["kind"].as_str().unwrap_or_default() {
+            "project" => {
+                let target = c.project.join(path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target, "delivered")?;
+                Ok(ToolOutput {
+                    value: json!({"ok": true}),
+                    artifacts: Vec::new(),
+                })
+            }
+            "work" => {
+                std::fs::write(c.work.join(path), "draft")?;
+                Ok(ToolOutput {
+                    value: json!({"ok": true}),
+                    artifacts: vec![path.to_string()],
+                })
+            }
+            "drop" => {
+                std::fs::remove_file(c.work.join(path))?;
+                Ok(ToolOutput {
+                    value: json!({"ok": true}),
+                    artifacts: Vec::new(),
+                })
+            }
+            other => Err(format!("unknown effect {other}").into()),
+        }
+    }
 }
 
 struct Policy;
@@ -683,7 +726,7 @@ fn cli_eja_dispatches_native_node_reads_frozen_output_and_accepts() {
     assert_eq!(requests.len(), 5);
     assert_eq!(
         requests[1]["messages"][1]["content"],
-        "write only the release checklist\n\nAcceptance: build and test"
+        "write only the release checklist\n\nTask as given:\nbroad original user request\n\nAcceptance: build and test"
     );
     assert!(requests[4]["messages"][1]["content"]
         .as_str()

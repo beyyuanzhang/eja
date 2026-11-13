@@ -188,6 +188,10 @@ pub struct Assignment {
     /// What the task must satisfy; the node's exit criterion.
     #[serde(default)]
     pub acceptance: String,
+    /// The task exactly as it arrived, so the node works from the source and not
+    /// only from EJA's reading of it.
+    #[serde(default)]
+    pub input: String,
     pub issued_at: i64,
 }
 
@@ -1027,6 +1031,7 @@ fn reserve_dispatch(
     let assignment = Assignment {
         task_id: task.id,
         objective: task.request.clone(),
+        input: task.origin.clone(),
         acceptance: task.acceptance.clone(),
         issued_at: ctx.at,
     };

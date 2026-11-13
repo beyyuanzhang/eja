@@ -15,6 +15,7 @@ The initial frame contains:
 {
   "assignment": {"task_id": 1, "objective": "write the checklist",
                  "acceptance": "contains build, smoke test and upload",
+                 "input": "the request exactly as it arrived",
                  "issued_at": 1762699200},
   "limits": {"timeout_ms": 300000, "steps": 16, "context_bytes": 262144, "response_bytes": 65536}
 }
@@ -33,7 +34,9 @@ The node sends one request and waits for the host response:
   node id, paths and control; unknown tools return an error to the model.
 - `finish {text, reason}` — the node's last message and why it stopped
   (`message|budget|error`). There is no report schema: the host folds the record
-  into a digest; the last message is the node's own account.
+  and what it observed of the project into a digest; the last message is the
+  node's own account, and the assignment carries the request as it arrived so
+  the node works from the source, not only from EJA's reading of it.
 
 The response is the model message or tool-result JSON. Fatal host errors end the
 run with `reason: error` in the record; tool errors are returned as JSON to the
