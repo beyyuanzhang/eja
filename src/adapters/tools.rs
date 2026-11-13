@@ -57,6 +57,7 @@ impl ToolGateway for FileTools {
         vec![
             json!({"type":"function","function":{"name":"read_file","description":"Read a UTF-8 file from work or the read-only project. Large files are truncated.","parameters":{"type":"object","properties":{"path":{"type":"string"},"area":{"type":"string","enum":["work","project"]}},"required":["path","area"],"additionalProperties":false}}}),
             json!({"type":"function","function":{"name":"list_dir","description":"List one directory level from work or the read-only project: names, kind and size. Bounded by the output frame, reporting how many entries were kept.","parameters":{"type":"object","properties":{"path":{"type":"string"},"area":{"type":"string","enum":["work","project"]}},"required":["path","area"],"additionalProperties":false}}}),
+            json!({"type":"function","function":{"name":"edit_file","description":"Replace one exact occurrence in a work-area file. Fails unless the find text occurs exactly once, so an edit is always unambiguous.","parameters":{"type":"object","properties":{"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["path","find","replace"],"additionalProperties":false}}}),
             json!({"type":"function","function":{"name":"write_file","description":"Write UTF-8 content in this node's private work area. The file will be sealed as an artifact.","parameters":{"type":"object","properties":{"path":{"type":"string"},"text":{"type":"string"}},"required":["path","text"],"additionalProperties":false}}}),
         ]
     }
@@ -122,6 +123,22 @@ impl ToolGateway for FileTools {
                     json!({"path":path,"area":args["area"],"entries":entries,"showing":shown,"total":total,"truncated":shown < total}),
                     vec![],
                 )
+            }
+            "edit_file" => {
+                let find = args["find"].as_str().ok_or("missing find")?;
+                let replace = args["replace"].as_str().ok_or("missing replace")?;
+                let full = relative_file(ctx.work, path)?;
+                let mut text = fs::read_to_string(&full)?;
+                if text.len() > FRAME_LIMIT {
+                    return Err("file is too large to edit".into());
+                }
+                let matches = text.matches(find).count();
+                if matches != 1 {
+                    return Err(format!("find must occur exactly once (found {matches})").into());
+                }
+                text = text.replacen(find, replace, 1);
+                fs::write(full, text)?;
+                (json!({"edited":path}), vec![path.to_string()])
             }
             "write_file" => {
                 let text = args["text"].as_str().ok_or("missing text")?;

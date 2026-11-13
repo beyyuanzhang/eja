@@ -187,6 +187,9 @@ struct TaskRelationData {
 pub struct Assignment {
     pub task_id: TaskId,
     pub objective: String,
+    /// What the task must satisfy; the node's exit criterion.
+    #[serde(default)]
+    pub acceptance: String,
     pub issued_at: i64,
 }
 
@@ -774,10 +777,15 @@ pub trait Brain {
     fn decide(&self, context: &EjaContext) -> Decision;
 }
 
-pub trait Worker {
+pub trait Worker: Send + Sync {
     /// Run one node and return the host's fold of its record: what it did, how
     /// it ended and what it said last. EJA reads this and may look deeper.
     fn execute(&self, assignment: &Assignment) -> String;
+    /// How many nodes this worker runs at once. A decision's dispatches are
+    /// grouped by that capacity, so nothing is refused for being second.
+    fn capacity(&self) -> usize {
+        1
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1003,19 +1011,18 @@ fn open_task(store: &Store, input: OpenTaskInput<'_>) -> Result<TaskId> {
     Ok(id)
 }
 
-fn dispatch_task(
+fn reserve_dispatch(
     ctx: &ActionCtx<'_>,
     task_id: TaskId,
-    out: &mut TurnOutcome,
-) -> Result<Option<String>> {
+) -> Result<std::result::Result<Assignment, String>> {
     let Some(task) = tasks(&ctx.store.events()?)
         .into_iter()
         .find(|task| task.id == task_id)
     else {
-        return Ok(Some(format!("dispatch refused: no task {task_id}")));
+        return Ok(Err(format!("dispatch refused: no task {task_id}")));
     };
     if task.status != TaskStatus::Open {
-        return Ok(Some(format!(
+        return Ok(Err(format!(
             "dispatch refused: task {task_id} is {}; only an Open task can be dispatched",
             task_status_name(task.status)
         )));
@@ -1023,6 +1030,7 @@ fn dispatch_task(
     let assignment = Assignment {
         task_id: task.id,
         objective: task.request.clone(),
+        acceptance: task.acceptance.clone(),
         issued_at: ctx.at,
     };
     ctx.store.append(
@@ -1032,18 +1040,67 @@ fn dispatch_task(
         ctx.turn,
         EventMeta::data(ctx.at, serde_json::to_value(&assignment)?),
     )?;
-    let started = Instant::now();
-    let digest = ctx.worker.execute(&assignment);
-    out.worker_ms += started.elapsed().as_millis();
+    Ok(Ok(assignment))
+}
+
+fn record_dispatch(
+    ctx: &ActionCtx<'_>,
+    out: &mut TurnOutcome,
+    assignment: Assignment,
+    digest: String,
+) -> Result<()> {
     ctx.store.append(
         Kind::WorkerReport,
-        &task_scope(task.id),
+        &task_scope(assignment.task_id),
         &digest,
         ctx.turn,
         EventMeta::new(ctx.at),
     )?;
-    out.dispatched.push(task.id);
-    Ok(None)
+    out.dispatched.push(assignment.task_id);
+    Ok(())
+}
+
+/// Run the reserved dispatches. One node runs inline; several run together, up
+/// to the worker's declared capacity, and their reports are recorded in order.
+fn run_dispatches(
+    ctx: &ActionCtx<'_>,
+    out: &mut TurnOutcome,
+    pending: Vec<Assignment>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut results: Vec<(Assignment, String)> = Vec::with_capacity(pending.len());
+    let capacity = ctx.worker.capacity().max(1);
+    for group in pending.chunks(capacity) {
+        let started = Instant::now();
+        if group.len() == 1 {
+            let digest = ctx.worker.execute(&group[0]);
+            results.push((group[0].clone(), digest));
+        } else {
+            let mut digests = Vec::with_capacity(group.len());
+            let worker = ctx.worker;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = group
+                    .iter()
+                    .map(|assignment| scope.spawn(move || worker.execute(assignment)))
+                    .collect();
+                for handle in handles {
+                    digests.push(
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| "node panicked".to_string()),
+                    );
+                }
+            });
+            results.extend(group.iter().cloned().zip(digests));
+        }
+        out.worker_ms += started.elapsed().as_millis();
+    }
+    for (assignment, digest) in results {
+        record_dispatch(ctx, out, assignment, digest)?;
+    }
+    Ok(())
 }
 
 fn close_task(
@@ -1096,6 +1153,7 @@ fn apply_actions(
     focus: &mut Option<TaskId>,
 ) -> Result<bool> {
     let mut observed = false;
+    let mut pending: Vec<Assignment> = Vec::new();
     for action in actions {
         match action {
             Action::RecordDecision { .. } | Action::RecordRelationship { .. } => {
@@ -1140,21 +1198,23 @@ fn apply_actions(
                     },
                 )?;
                 if *run {
-                    match dispatch_task(ctx, id, out)? {
-                        None => {
+                    match reserve_dispatch(ctx, id)? {
+                        Ok(assignment) => {
                             *focus = Some(id);
+                            pending.push(assignment);
                             observed = true;
                         }
-                        Some(note) => out.refused.push(note),
+                        Err(note) => out.refused.push(note),
                     }
                 }
             }
-            Action::Dispatch { task_id } => match dispatch_task(ctx, *task_id, out)? {
-                None => {
+            Action::Dispatch { task_id } => match reserve_dispatch(ctx, *task_id)? {
+                Ok(assignment) => {
                     *focus = Some(*task_id);
+                    pending.push(assignment);
                     observed = true;
                 }
-                Some(note) => out.refused.push(note),
+                Err(note) => out.refused.push(note),
             },
             Action::LinkTasks { from, to, kind } => {
                 let data = serde_json::to_value(TaskRelationData {
@@ -1242,6 +1302,7 @@ fn apply_actions(
             }
         }
     }
+    run_dispatches(ctx, out, pending)?;
     Ok(observed)
 }
 

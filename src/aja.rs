@@ -78,6 +78,64 @@ pub(crate) fn receive<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead)
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// How many recent tool results stay verbatim when the transcript compacts.
+const KEEP_RECENT_TOOL_RESULTS: usize = 8;
+
+fn transcript_bytes(messages: &[Value]) -> usize {
+    serde_json::to_vec(messages)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
+/// Elide the oldest tool results until the transcript fits its budget. The tool
+/// call and its result message stay in place, so the provider's turn structure
+/// is untouched; only the payload is replaced by an accounted-for marker.
+fn compact(messages: &mut [Value], budget: usize) {
+    if transcript_bytes(messages) <= budget {
+        return;
+    }
+    let mut names = std::collections::HashMap::new();
+    for message in messages.iter() {
+        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                if let (Some(id), Some(name)) = (
+                    call.get("id").and_then(Value::as_str),
+                    call.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str),
+                ) {
+                    names.insert(id.to_string(), name.to_string());
+                }
+            }
+        }
+    }
+    let tools: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .map(|(index, _)| index)
+        .collect();
+    let elidable = tools.len().saturating_sub(KEEP_RECENT_TOOL_RESULTS);
+    for &index in tools.iter().take(elidable) {
+        let id = messages[index]
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = names.get(id).map(String::as_str).unwrap_or("tool");
+        let bytes = messages[index]
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or(0);
+        messages[index]["content"] = json!(format!(
+            "<elided {bytes} bytes from {name}; the full result stays in the record>"
+        ));
+        if transcript_bytes(messages) <= budget {
+            return;
+        }
+    }
+}
+
 /// A spent budget is a stopping point, not a failed piece of work.
 fn stopped(reason: &str) -> (String, String) {
     (format!("{reason}; continue in a new node"), "budget".into())
@@ -102,11 +160,16 @@ fn run(
         None => format!("You have {} seconds.", start.limits.timeout_ms / 1000),
     };
     let system = format!(
-        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. {budget} When the work is done, stop calling tools; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
+        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Paths are relative to your work area unless a tool explicitly reads the project. {budget} The Acceptance line is the contract: the work is done when it holds. Stop calling tools then; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
     );
+    let mut brief = start.assignment.objective.clone();
+    if !start.assignment.acceptance.trim().is_empty() {
+        brief.push_str("\n\nAcceptance: ");
+        brief.push_str(start.assignment.acceptance.trim());
+    }
     let mut messages = vec![
         json!({"role":"system","content":system}),
-        json!({"role":"user","content":start.assignment.objective}),
+        json!({"role":"user","content":brief}),
     ];
     let mut turns = 0usize;
     loop {
@@ -118,6 +181,10 @@ fn run(
             }
         }
         turns += 1;
+        // The transcript is a working view, not the record: the host keeps every
+        // tool result in context.jsonl, so the oldest results can be elided in
+        // place once the view outgrows its declared budget.
+        compact(&mut messages, start.limits.context_bytes);
         if serde_json::to_vec(&messages)?.len() > start.limits.context_bytes {
             return Ok(stopped("AJA context budget exhausted"));
         }
@@ -193,5 +260,57 @@ mod tests {
         let mut oversized = vec![b' '; FRAME_LIMIT + 1];
         oversized.push(b'\n');
         assert!(receive::<Value>(&mut oversized.as_slice()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    fn tool_message(id: &str, payload: &str) -> Value {
+        json!({"role": "tool", "tool_call_id": id, "content": payload})
+    }
+
+    fn assistant_call(id: &str, name: &str) -> Value {
+        json!({"role": "assistant", "content": null,
+               "tool_calls": [{"id": id, "type": "function",
+                               "function": {"name": name, "arguments": "{}"}}]})
+    }
+
+    #[test]
+    fn a_transcript_over_budget_elides_the_oldest_results_and_keeps_the_recent_ones() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "u"}),
+        ];
+        for round in 0..12 {
+            let id = format!("call_{round}");
+            messages.push(assistant_call(&id, "read_file"));
+            messages.push(tool_message(&id, &"x".repeat(2000)));
+        }
+        let before = transcript_bytes(&messages);
+        // Eight recent results stay verbatim, so the budget must be able to hold them.
+        compact(&mut messages, 20_000);
+        let after = transcript_bytes(&messages);
+        assert!(after < before, "{after} !< {before}");
+        let tool_contents: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .collect();
+        assert_eq!(tool_contents.len(), 12, "no message is removed");
+        assert!(tool_contents[0].starts_with("<elided 2000 bytes from read_file"));
+        assert!(tool_contents.iter().any(|c| c.len() == 2000));
+        assert!(after <= 20_000, "{after}");
+    }
+
+    #[test]
+    fn a_transcript_inside_budget_is_left_alone() {
+        let mut messages = vec![json!({"role": "system", "content": "s"})];
+        messages.push(assistant_call("call_1", "read_file"));
+        messages.push(tool_message("call_1", &"x".repeat(100)));
+        let before = messages.clone();
+        compact(&mut messages, 10_000);
+        assert_eq!(messages, before);
     }
 }

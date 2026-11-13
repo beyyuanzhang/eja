@@ -61,6 +61,7 @@ fn interrupted_assignment_is_reconciled_without_duplicate_dispatch() {
         task_id: 1,
         objective: "do it".to_string(),
         issued_at: 100,
+        acceptance: String::new(),
     };
     store
         .append(Kind::User, "eja", "run", 1, EventMeta::new(100))

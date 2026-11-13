@@ -186,6 +186,13 @@ fn main() -> ExitCode {
                             std::sync::Arc::new(model),
                             tools.clone() as std::sync::Arc<dyn ToolGateway>,
                         )
+                        .and_then(|worker| {
+                            let slots = std::env::var("EJA_NODE_SLOTS")
+                                .ok()
+                                .and_then(|raw| raw.parse::<usize>().ok())
+                                .unwrap_or(1);
+                            worker.with_slots(slots)
+                        })
                         .and_then(|worker| worker.with_limits(limits))
                         .map_err(|e| e.to_string())
                     }) {
@@ -255,6 +262,7 @@ fn main() -> ExitCode {
                 let assignment = eja::Assignment {
                     task_id: focus.unwrap_or(0),
                     objective: query,
+                    acceptance: String::new(),
                     issued_at: eja::now_utc().timestamp(),
                 };
                 println!(

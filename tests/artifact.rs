@@ -246,3 +246,56 @@ fn list_dir_reads_the_project_and_reports_what_it_hid() {
     assert_eq!(listing["truncated"], false);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
+    use eja::adapters::{FileTools, ToolContext, ToolGateway};
+    let root = std::env::temp_dir().join(format!("eja-edit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("a.txt"), "alpha beta gamma").unwrap();
+    let control = eja::adapters::Control::new(
+        std::time::Duration::from_secs(5),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let ctx = ToolContext {
+        node_id: 1,
+        work: &work,
+        project: &work,
+        private: &root,
+        control: &control,
+    };
+    let ok = FileTools
+        .call(
+            &ctx,
+            "edit_file",
+            &serde_json::json!({"path": "a.txt", "find": "beta", "replace": "B"}),
+        )
+        .unwrap();
+    assert_eq!(ok.value["edited"], "a.txt");
+    assert_eq!(
+        std::fs::read_to_string(work.join("a.txt")).unwrap(),
+        "alpha B gamma"
+    );
+    let missing = match FileTools.call(
+        &ctx,
+        "edit_file",
+        &serde_json::json!({"path": "a.txt", "find": "zzz", "replace": "x"}),
+    ) {
+        Ok(_) => panic!("a missing match must not edit"),
+        Err(error) => error.to_string(),
+    };
+    assert!(missing.contains("exactly once"), "{missing}");
+    std::fs::write(work.join("b.txt"), "same same").unwrap();
+    let ambiguous = match FileTools.call(
+        &ctx,
+        "edit_file",
+        &serde_json::json!({"path": "b.txt", "find": "same", "replace": "x"}),
+    ) {
+        Ok(_) => panic!("an ambiguous match must not edit"),
+        Err(error) => error.to_string(),
+    };
+    assert!(ambiguous.contains("found 2"), "{ambiguous}");
+    let _ = std::fs::remove_dir_all(&root);
+}

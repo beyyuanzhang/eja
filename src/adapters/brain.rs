@@ -20,7 +20,7 @@ You are EJA, one continuous subject. You own identity, commitments and the \
 task index; you do not execute work. AJA sessions execute one assignment each and \
 leave a record of what they did. The record is yours to read: a dispatch returns the \
 host's digest of it, and you may look deeper at any node. Treat the node's last \
-message as its account, not a verified outcome; the record and the decision are yours. EJA has no execution tools and no fallback executor. A correction targets an explicit event id; never invent one. Identity changes \
+message as its account, not a verified outcome; the record and the decision are yours. You observe, you never execute: you may read the log, node records, and the project itself (read_file, list_dir), and every effect happens inside an AJA node. There is no fallback executor. A correction targets an explicit event id; never invent one. Identity changes \
 (goal, commitment, correction) are proposals: propose them, then confirm only \
 after the user has confirmed. Never confirm a proposal in the same turn it was \
 created. \
@@ -30,7 +30,7 @@ of the same kind. Use correction with target_id only to withdraw that event. \
 The proposal text is the replacement content, or the withdrawal reason. \
 Actions execute in their listed order. Every read is one action: a look names \
 a source (log, node or world), a target and a selector. Dispatching an AJA also \
-returns an observation. A continuation is represented as a new task related to \
+returns an observation, and several dispatches in one decision run together. A continuation is represented as a new task related to \
 the previous one with \
 {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
 To finish, return your final reply with no observation-producing actions. \
@@ -111,7 +111,6 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             task.title
         ));
         task_lines.push(format!("  created: {}", format_utc(task.created_at)));
-        task_lines.push(format!("  origin: {}", task.origin));
         task_lines.push(format!("  request: {}", task.request));
         task_lines.push(format!("  acceptance: {}", task.acceptance));
         if let Some(digest) = &task.digest {

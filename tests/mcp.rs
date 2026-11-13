@@ -85,6 +85,7 @@ fn assignment(id: u64) -> Assignment {
         task_id: id,
         objective: "use the granted connector".into(),
         issued_at: 123,
+        acceptance: String::new(),
     }
 }
 fn control(ms: u64) -> Control {
@@ -126,6 +127,7 @@ fn stdio_discovery_grants_results_and_owned_process_group() {
         [
             "read_file",
             "list_dir",
+            "edit_file",
             "write_file",
             "mcp__fixture__a_b",
             "mcp__fixture__echo",

@@ -567,3 +567,89 @@ fn correction_targets_an_event_id_not_a_phrase() {
         .iter()
         .any(|task| task.status == TaskStatus::Running));
 }
+
+#[test]
+fn a_decision_that_dispatches_two_tasks_runs_them_together() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct OverlapWorker {
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+    impl Worker for OverlapWorker {
+        fn capacity(&self) -> usize {
+            2
+        }
+        fn execute(&self, assignment: &Assignment) -> String {
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            format!(
+                "1 steps, 1 tool calls, 0 artifacts, ended: message\nnode {} done",
+                assignment.task_id
+            )
+        }
+    }
+
+    let dir = temp_store();
+    let store = Store::new(&dir).expect("store");
+    let opener = QueueBrain::new(vec![decision(
+        "two tasks",
+        vec![
+            Action::OpenTask {
+                title: "a".to_string(),
+                request: "do a".to_string(),
+                acceptance: "a holds".to_string(),
+                run: false,
+            },
+            Action::OpenTask {
+                title: "b".to_string(),
+                request: "do b".to_string(),
+                acceptance: "b holds".to_string(),
+                run: false,
+            },
+        ],
+    )]);
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let worker = OverlapWorker {
+        running: running.clone(),
+        peak: peak.clone(),
+    };
+    turn_at(
+        &store,
+        "two tasks",
+        &opener,
+        &worker,
+        &Ports::default(),
+        now(),
+    )
+    .expect("open");
+    let brain = QueueBrain::new(vec![
+        decision(
+            "dispatch both",
+            vec![
+                Action::Dispatch { task_id: 1 },
+                Action::Dispatch { task_id: 2 },
+            ],
+        ),
+        decision("done", vec![]),
+    ]);
+    let outcome = turn_at(
+        &store,
+        "dispatch",
+        &brain,
+        &worker,
+        &Ports::default(),
+        now(),
+    )
+    .expect("turn");
+    assert_eq!(outcome.dispatched, vec![1, 2]);
+    assert_eq!(peak.load(Ordering::SeqCst), 2, "both nodes ran at once");
+    assert_eq!(
+        outcome.tasks.iter().filter(|t| t.digest.is_some()).count(),
+        2
+    );
+}

@@ -70,6 +70,7 @@ fn assignment(id: u64) -> Assignment {
         task_id: id,
         objective: format!("node {id} work"),
         issued_at: 123,
+        acceptance: String::new(),
     }
 }
 fn final_message(artifacts: &[&str]) -> Value {
@@ -534,7 +535,7 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
     assert!(digest.contains("ended: message"), "{digest}");
     let seen = server.join().unwrap();
     assert_eq!(seen[0]["messages"][1]["content"], "node 1 work");
-    assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 4);
     assert!(seen[1]["messages"]
         .as_array()
         .unwrap()
@@ -682,7 +683,7 @@ fn cli_eja_dispatches_native_node_reads_frozen_output_and_accepts() {
     assert_eq!(requests.len(), 5);
     assert_eq!(
         requests[1]["messages"][1]["content"],
-        "write only the release checklist"
+        "write only the release checklist\n\nAcceptance: build and test"
     );
     assert!(requests[4]["messages"][1]["content"]
         .as_str()

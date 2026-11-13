@@ -13,13 +13,16 @@ The initial frame contains:
 
 ```json
 {
-  "assignment": {"task_id": 1, "objective": "write the checklist", "issued_at": 1762699200},
+  "assignment": {"task_id": 1, "objective": "write the checklist",
+                 "acceptance": "contains build, smoke test and upload",
+                 "issued_at": 1762699200},
   "limits": {"timeout_ms": 300000, "steps": 16, "context_bytes": 262144, "response_bytes": 65536}
 }
 ```
 
-`objective` is the specific node request. The EJA log, original user history,
-acceptance text, credentials and connector configuration are not sent.
+`objective` is the specific node request and `acceptance` is its contract: the
+work is done when it holds. The EJA log, the original user history, credentials
+and connector configuration are not sent.
 
 ## Requests
 
@@ -34,7 +37,9 @@ The node sends one request and waits for the host response:
 
 The response is the model message or tool-result JSON. Fatal host errors end the
 run with `reason: error` in the record; tool errors are returned as JSON to the
-model. Every JSON payload is at most 256 KiB, followed by one newline delimiter.
+model. When the live transcript outgrows its declared budget, the oldest tool
+payloads are elided in place — the call and its result stay, the payload becomes
+an accounted-for marker — while the host's record keeps every full result. Every JSON payload is at most 256 KiB, followed by one newline delimiter.
 The loop serializes tool calls in model order and appends their results before
 requesting another response. Incomplete provider responses and invalid/duplicate
 tool calls fail the node. A spent budget is not a failure: when the step or

@@ -280,6 +280,7 @@ fn seed_interrupted(root: &Path, count: usize) -> Store {
             task_id,
             objective: "do it".to_string(),
             issued_at: 100,
+            acceptance: String::new(),
         };
         store
             .append(

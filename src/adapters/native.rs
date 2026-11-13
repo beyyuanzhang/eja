@@ -165,6 +165,9 @@ pub struct NativeWorker {
     model: Arc<dyn Model>,
     tools: Arc<dyn ToolGateway>,
     limits: Limits,
+    /// Declared concurrent node capacity. Nodes are independent processes, so the
+    /// host decides how many run at once.
+    slots: usize,
     active: Mutex<HashMap<u64, Arc<AtomicBool>>>,
 }
 
@@ -185,8 +188,16 @@ impl NativeWorker {
             model,
             tools,
             limits: Limits::default(),
+            slots: 1,
             active: Mutex::new(HashMap::new()),
         })
+    }
+    pub fn with_slots(mut self, slots: usize) -> Result<Self> {
+        if slots == 0 {
+            return Err("the node capacity must be at least one".into());
+        }
+        self.slots = slots;
+        Ok(self)
     }
     pub fn with_limits(mut self, limits: Limits) -> Result<Self> {
         limits.validate()?;
@@ -409,6 +420,10 @@ impl NativeWorker {
 }
 
 impl Worker for NativeWorker {
+    fn capacity(&self) -> usize {
+        self.slots
+    }
+
     fn execute(&self, assignment: &Assignment) -> String {
         let node = self.root.join(assignment.task_id.to_string());
         // Reserve once. Restart or replay cannot overwrite an existing node, even after failure.

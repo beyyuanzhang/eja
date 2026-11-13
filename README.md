@@ -25,7 +25,7 @@ S' = commit(S, confirmed actions)
 | brain adapter | language, prompt, proposal JSON | write state directly |
 | retriever adapter | semantic query + graph/time expansion → event ids | write state |
 | artifact adapter | bounded read of worker output | decide acceptance |
-| worker adapter | assignment → AJA session → its record | write identity |
+| worker adapter | assignment (objective + acceptance) → AJA run → its record | write identity |
 | AJA loop | local transcript, model/tool continuation, last message | access host state or configuration directly |
 
 ```
@@ -182,6 +182,8 @@ with `relate {kind: part_of}`; `part_of` is containment;
 - the runtime kills/reaps the process, joins its IPC reader and revokes the run
   before sealing artifacts and atomically publishing `node.json`;
 - waiting for EJA's acceptance consumes no AJA process; records remain evidence;
+- a node's live transcript compacts against its declared budget; the frozen record
+  keeps every tool result;
 - the prompt states the node's turn/time budget, and a spent budget ends the
   record with `ended: budget` for a new node instead of a false failure;
 - `node.json` also freezes the node's complete context (`context.jsonl`: the start
@@ -221,10 +223,11 @@ are copied into `<dir>/nodes/<id>/artifacts`; returned references are relative t
 `<dir>/nodes`. A node id is reserved once and cannot be rerun or overwritten.
 Interrupted directories remain reserved; continuation uses a new linked node.
 
-`NativeWorker` has one execution slot. Historical nodes are files, not sessions,
-processes or threads. `Limits` defaults to 300 seconds, no model-step cap
-(`EJA_NODE_STEPS` sets one), 256 KiB serialized context/frame, and 64 KiB
-model/tool output. A sealed artifact is at
+`NativeWorker` runs one node at a time by default; `with_slots`/`EJA_NODE_SLOTS`
+declares its capacity, and a decision that dispatches several tasks groups them
+by that capacity. Historical nodes are files, not sessions, processes or threads.
+`Limits` defaults to 300 seconds, no model-step cap (`EJA_NODE_STEPS` sets one),
+256 KiB serialized context/frame, and 64 KiB model/tool output. A sealed artifact is at
 most 256 KiB. `with_limits` and `cancel(node_id)` are host APIs; cancellation is
 also checked during HTTP requests. These are byte/step limits, not exact model
 token limits.
@@ -236,11 +239,13 @@ are snapshotted for a run and checked again on invocation. The gateway receives
 the bound node id, work/project roots and cancellation/deadline control. A node
 cannot select another id or expand its own grants.
 
-The supplied `FileTools` implements `read_file` and `write_file`. Project reads
+The supplied `FileTools` implements `read_file`, `list_dir`, `write_file` and
+`edit_file` (one exact match, so an edit is never ambiguous). Project reads
 exclude the private state directory; absolute paths, parent traversal and
 symlinks are rejected. Writes are recorded as artifacts, including partial work
 from failed/cancelled nodes. Sealed results cannot be written through this API.
-`FileArtifactReader` gives EJA bounded reads of the resulting files.
+`FileArtifactReader` gives EJA bounded reads of the resulting files; EJA's
+observer may also `read_file` and `list_dir` the project, and nothing else.
 
 `HostTools` combines file tools with optional MCP tools. The host owns the MCP
 configuration, credentials, runtime and connections; all nodes reuse them through

@@ -91,5 +91,6 @@ fn worker_receives_its_node_task_and_origin_remains_in_eja() {
         .find(|event| event.kind == eja::Kind::TaskAssigned)
         .and_then(|event| event.data)
         .expect("assigned data");
-    assert!(assigned.get("acceptance").is_none());
+    // The node gets the task's contract, not just its prose objective.
+    assert_eq!(assigned["acceptance"], "EJA acceptance only");
 }

@@ -26,16 +26,17 @@ S' = commit(S, confirmed actions)
    Reading artifacts or the outside world is an option, never a required gate.
 8. A task closes only from `waiting` with `close_task`.
 9. AJA : task = 1:1. The native worker uses one temporary Rust process per
-   assignment and one execution slot. Finishing a node freezes its complete
-   context: the manifest, the assignment, the start messages, every assistant
-   turn, every tool call with arguments and result, and the finish entry, all
-   read-only.
+   assignment; its concurrency is a declared capacity (`slots`), not a hidden
+   one. Finishing a node freezes its complete context: the manifest, the
+   assignment, the start messages, every assistant turn, every tool call with
+   arguments and result, and the finish entry, all read-only.
    No session survives; retries/continuations are new linked nodes.
 10. Language, prompts, retrieval and artifact reading live in adapters.
 11. A crashed `running` task is reconciled to `waiting` with an interrupted
     record; no automatic duplicate dispatch.
-12. The worker receives its node's `request`; the original input stays in EJA
-    as `origin`. Acceptance remains EJA's responsibility.
+12. The worker receives its node's contract: the request (objective) and the
+    acceptance. The original input stays in EJA as `origin`. Accepting the result
+    remains EJA's responsibility.
 13. If exactly one active task is waiting, the turn starts with that task as
     focus, avoiding one redundant initial model call.
 14. All actions execute in list order. Observations continue through one loop that
@@ -45,6 +46,13 @@ S' = commit(S, confirmed actions)
 15. Prompts carry protocol only: actions, limits and what a node record means. Task
     strategy is not written in code or prompt text; it is what EJA records in its
     own identity events (goal, commitment, decision, correction).
+16. A dispatch is reserved in list order and runs after the decision's actions;
+    its record then arrives as evidence. Several dispatches in one decision run
+    together, bounded by the worker's declared capacity, and their records are
+    recorded in dispatch order.
+17. A node's live transcript is a view with a declared budget; the frozen record
+    is complete. Compaction elides old tool payloads in the view only, never in
+    the record.
 
 ## Core API
 
@@ -57,7 +65,9 @@ S' = commit(S, confirmed actions)
 - `aja`: bounded disposable loop and framed IPC, no external effects.
 - `NativeWorker`: host model/tool gateway, node workspace, cancellation, process
   cleanup, artifact sealing and frozen manifest. One run per node id.
-- `ToolGateway`: per-node tool definitions and host execution, with scoped paths
+- `ToolGateway`: per-node tool definitions and host execution, with scoped paths;
+  file tools are `read_file`, `list_dir`, `write_file` and the single-match
+  `edit_file`; EJA's observer may read the project (`read_file`, `list_dir`)
   and deadline/cancellation control. `HostTools` combines file tools and host-owned
   `McpTools` (stdio / Streamable HTTP). Nodes share connections, not configuration.
 - `recover`: reconcile interrupted assignments.
