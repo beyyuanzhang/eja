@@ -49,6 +49,23 @@ pub(crate) fn relative_file(root: &Path, name: &str) -> Result<PathBuf> {
     Ok(full)
 }
 
+/// Resolve a workspace path: relative to the project, or absolute inside it.
+/// Anything else is refused, so the canonical path forms a caller sees in a task
+/// still address the workspace.
+pub(crate) fn workspace_path(root: &Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name == "." {
+        return Ok(root.to_path_buf());
+    }
+    let path = Path::new(name);
+    if path.is_absolute() {
+        let inside = path
+            .strip_prefix(root)
+            .map_err(|_| "absolute paths must stay inside the workspace")?;
+        return relative_file(root, &inside.to_string_lossy());
+    }
+    relative_file(root, name)
+}
+
 pub struct FileTools;
 
 impl ToolGateway for FileTools {
@@ -65,7 +82,7 @@ impl ToolGateway for FileTools {
         let path = args["path"].as_str().ok_or("missing path")?;
         let value = match name {
             "read_file" => {
-                let full = relative_file(ctx.project, path)?;
+                let full = workspace_path(ctx.project, path)?;
                 if full.starts_with(ctx.private) {
                     return Err("the host's private state is not readable".into());
                 }
@@ -80,11 +97,7 @@ impl ToolGateway for FileTools {
                 json!({"text":String::from_utf8_lossy(&bytes),"truncated":truncated})
             }
             "list_dir" => {
-                let full = if path == "." {
-                    ctx.project.to_path_buf()
-                } else {
-                    relative_file(ctx.project, path)?
-                };
+                let full = workspace_path(ctx.project, path)?;
                 if full.starts_with(ctx.private) {
                     return Err("the host's private state is not readable".into());
                 }
@@ -113,7 +126,7 @@ impl ToolGateway for FileTools {
             "edit_file" => {
                 let find = args["find"].as_str().ok_or("missing find")?;
                 let replace = args["replace"].as_str().ok_or("missing replace")?;
-                let full = relative_file(ctx.project, path)?;
+                let full = workspace_path(ctx.project, path)?;
                 if full.starts_with(ctx.private) {
                     return Err("the host's private state is not writable".into());
                 }
@@ -131,7 +144,7 @@ impl ToolGateway for FileTools {
             }
             "write_file" => {
                 let text = args["text"].as_str().ok_or("missing text")?;
-                let full = relative_file(ctx.project, path)?;
+                let full = workspace_path(ctx.project, path)?;
                 if full.starts_with(ctx.private) {
                     return Err("the host's private state is not writable".into());
                 }
