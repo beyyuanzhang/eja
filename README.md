@@ -39,7 +39,8 @@ app/        CLI and wiring
 
 - `Event`: `id, at (UTC seconds), turn, scope, kind, text, closes, data`
 - `Kind`: user, eja, goal, commitment, correction, proposal,
-  proposal_confirmed, proposal_rejected, artifact_read, read, task events
+  proposal_confirmed, proposal_rejected, decision, relationship, task events
+  (opened, relation, assigned, worker_report, closed), observed, refused
 - `ArtifactContent`: path, text, truncated, error
 - `Proposal`: typed goal/commitment/correction, pending until confirmed
 

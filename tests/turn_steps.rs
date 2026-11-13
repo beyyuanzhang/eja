@@ -182,7 +182,6 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     assert_eq!(out.decisions, 5);
     assert_eq!(out.reply, "final answer");
     assert!(!out.stalled);
-    assert_eq!(out.reads, vec![1]);
     assert_eq!(out.context.focus.as_ref().unwrap().id, 1);
     let log_look = out
         .evidence

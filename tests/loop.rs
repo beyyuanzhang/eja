@@ -397,14 +397,8 @@ fn task_index_and_read_task_are_structured() {
     )
     .expect("read");
 
-    assert_eq!(outcome.reads, vec![1]);
     assert_eq!(outcome.context.focus.as_ref().expect("focus").id, 1);
     assert_eq!(outcome.context.tasks.len(), 2);
-    assert!(store
-        .events()
-        .expect("events")
-        .iter()
-        .any(|event| event.kind == Kind::Read));
 }
 
 #[test]

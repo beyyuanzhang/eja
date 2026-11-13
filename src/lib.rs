@@ -43,7 +43,6 @@ pub enum Kind {
     Proposal,
     ProposalConfirmed,
     ProposalRejected,
-    ArtifactRead,
     #[serde(rename = "decision")]
     RecordDecision,
     Relationship,
@@ -52,7 +51,6 @@ pub enum Kind {
     TaskAssigned,
     WorkerReport,
     TaskClosed,
-    Read,
     Observed,
     /// The host rejected an action: the state did not allow it, or it could not
     /// be read as one of EJA's own actions. EJA reads these back in its projection.
@@ -796,7 +794,6 @@ pub struct TurnOutcome {
     pub dispatched: Vec<TaskId>,
     /// Actions EJA asked for that the state did not allow; nothing was dropped silently.
     pub refused: Vec<String>,
-    pub reads: Vec<TaskId>,
     pub evidence: Vec<Observation>,
     pub decisions: usize,
     pub worker_ms: u128,
@@ -1250,14 +1247,6 @@ fn apply_actions(
                         .push(format!("focus refused: no task {task_id}"));
                     continue;
                 }
-                ctx.store.append(
-                    Kind::Read,
-                    "eja",
-                    "",
-                    ctx.turn,
-                    EventMeta::data(ctx.at, serde_json::json!({"task_id": task_id})),
-                )?;
-                out.reads.push(*task_id);
                 *focus = Some(*task_id);
                 observed = true;
             }
@@ -1353,7 +1342,6 @@ pub fn turn_at(
         tasks: Vec::new(),
         dispatched: Vec::new(),
         refused: Vec::new(),
-        reads: Vec::new(),
         evidence: Vec::new(),
         decisions: 0,
         worker_ms: 0,
