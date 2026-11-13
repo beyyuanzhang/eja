@@ -104,6 +104,7 @@ impl Model for Script {
         _: &[Value],
         _: &Limits,
         control: &Control,
+        _json_mode: bool,
     ) -> Result<Value> {
         control.check()?;
         self.seen.lock().unwrap().push(messages.to_vec());
@@ -359,7 +360,14 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
 
 struct Blocking(Arc<AtomicBool>);
 impl Model for Blocking {
-    fn complete(&self, _: &[Value], _: &[Value], _: &Limits, c: &Control) -> Result<Value> {
+    fn complete(
+        &self,
+        _: &[Value],
+        _: &[Value],
+        _: &Limits,
+        c: &Control,
+        _: bool,
+    ) -> Result<Value> {
         self.0.store(true, Ordering::SeqCst);
         loop {
             c.check()?;
@@ -555,7 +563,8 @@ fn transport_rejects_truncation_duplicate_calls_and_oversized_responses() {
                     response_bytes: 1024,
                     ..Limits::default()
                 },
-                &control
+                &control,
+                false
             )
             .is_err());
         server.join().unwrap();
@@ -588,6 +597,7 @@ fn cancellation_interrupts_a_stalled_real_http_request() {
                 &[],
                 &Limits::default(),
                 &control,
+                false,
             )
             .map_err(|e| e.to_string())
     });

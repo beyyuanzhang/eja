@@ -412,6 +412,7 @@ impl Model for ConnectorModel {
         tools: &[Value],
         _: &Limits,
         _: &Control,
+        _json_mode: bool,
     ) -> Result<Value> {
         assert!(tools
             .iter()

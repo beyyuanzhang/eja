@@ -63,12 +63,16 @@ fn retry_delay(attempt: usize) -> Duration {
 
 pub trait Model: Send + Sync {
     /// Implementations must respect the host's cancellation/deadline and response cap.
+    /// `json_mode` asks the provider for a JSON object. A caller that acts
+    /// through tool calls does not need it, and a provider may reject it when
+    /// the prompt never mentions JSON.
     fn complete(
         &self,
         messages: &[Value],
         tools: &[Value],
         limits: &Limits,
         control: &Control,
+        json_mode: bool,
     ) -> Result<Value>;
 }
 
@@ -100,9 +104,13 @@ impl OpenAiModel {
         tools: &[Value],
         cap: usize,
         control: &Control,
+        json_mode: bool,
     ) -> Result<Value> {
         let timeout = control.remaining()?;
-        let mut body = json!({"model":self.model,"messages":messages,"temperature":0.2,"response_format":{"type":"json_object"}});
+        let mut body = json!({"model":self.model,"messages":messages,"temperature":0.2});
+        if json_mode {
+            body["response_format"] = json!({"type": "json_object"});
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
@@ -161,8 +169,9 @@ impl Model for OpenAiModel {
         tools: &[Value],
         limits: &Limits,
         control: &Control,
+        json_mode: bool,
     ) -> Result<Value> {
-        let value = self.request(messages, tools, limits.response_bytes, control)?;
+        let value = self.request(messages, tools, limits.response_bytes, control, json_mode)?;
         let reason = value
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)

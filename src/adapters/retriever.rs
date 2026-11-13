@@ -115,9 +115,9 @@ impl Retriever for ModelRetriever {
             RETRIEVE_TIMEOUT,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        let response = self
-            .model
-            .request(&messages, &[], crate::aja::FRAME_LIMIT, &control)?;
+        let response =
+            self.model
+                .request(&messages, &[], crate::aja::FRAME_LIMIT, &control, true)?;
         let raw = response
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)

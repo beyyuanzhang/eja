@@ -256,9 +256,13 @@ impl NativeWorker {
                             "budget".into(),
                         ));
                     }
-                    let value =
-                        self.model
-                            .complete(&messages, &definitions, &self.limits, control)?;
+                    let value = self.model.complete(
+                        &messages,
+                        &definitions,
+                        &self.limits,
+                        control,
+                        false,
+                    )?;
                     if serde_json::to_vec(&value)?.len() > self.limits.response_bytes {
                         return Err("AJA model output limit reached".into());
                     }

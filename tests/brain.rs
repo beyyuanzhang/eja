@@ -126,3 +126,81 @@ fn a_plain_reply_is_still_a_finished_decision() {
     assert!(decision.actions.is_empty());
     assert_eq!(decision.reply, "nothing left to do");
 }
+
+fn capture_request(response: &'static str) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut length = None;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+        }
+        let mut body = vec![0; length.expect("content length")];
+        reader.read_exact(&mut body).unwrap();
+        let response_body = response;
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(reply.as_bytes()).expect("write");
+        serde_json::from_slice(&body).unwrap()
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+#[test]
+fn json_mode_is_requested_only_where_a_json_object_is_expected() {
+    use eja::adapters::{Control, Model, OpenAiModel};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let answered = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+    let (url, server) = capture_request(answered);
+    let control = Control::new(Duration::from_secs(5), Arc::new(AtomicBool::new(false)));
+    let model = OpenAiModel::new(url, "k", "m");
+    model
+        .complete(
+            &[serde_json::json!({"role":"user","content":"choose"})],
+            &[],
+            &eja::aja::Limits::default(),
+            &control,
+            true,
+        )
+        .expect("decision call");
+    let decision = server.join().expect("server");
+    assert_eq!(decision["response_format"]["type"], "json_object");
+
+    // The node's turn acts through tool calls and ends in plain text; asking the
+    // provider for a JSON object there is wrong and a provider may reject it.
+    let (url, server) = capture_request(answered);
+    let model = OpenAiModel::new(url, "k", "m");
+    model
+        .complete(
+            &[serde_json::json!({"role":"user","content":"work"})],
+            &[],
+            &eja::aja::Limits::default(),
+            &control,
+            false,
+        )
+        .expect("node call");
+    let node = server.join().expect("server");
+    assert!(node.get("response_format").is_none(), "{node}");
+}

@@ -463,7 +463,7 @@ impl Brain for OpenAiBrain {
         );
         match self
             .model
-            .request(&messages, &[], crate::aja::FRAME_LIMIT, &control)
+            .request(&messages, &[], crate::aja::FRAME_LIMIT, &control, true)
         {
             Ok(value) => parse_decision(
                 value
