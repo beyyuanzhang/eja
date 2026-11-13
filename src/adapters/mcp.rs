@@ -540,6 +540,9 @@ impl Observer for HostTools {
             }
             return Ok(FileTools.call(&context, tool, arguments)?.value);
         }
+        if tool == "write_file" || tool == "edit_file" {
+            return Err("EJA only observes; edits belong to nodes".into());
+        }
         let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
         if !mcp.is_read_only(tool) {
             return Err("EJA may only observe read-only connector tools".into());

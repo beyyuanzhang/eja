@@ -123,4 +123,15 @@ fn eja_can_observe_project_files_but_never_write() {
         &serde_json::json!({"area":"project","path":"../state/secret"})
     )
     .is_err());
+    // An edit is an effect: the observer names the refusal instead of pretending
+    // the tool is a connector.
+    let edited = Observer::observe(
+        &host,
+        "edit_file",
+        &serde_json::json!({"path":"note.txt","find":"hello","replace":"bye"}),
+    );
+    assert!(edited
+        .unwrap_err()
+        .to_string()
+        .contains("edits belong to nodes"));
 }
