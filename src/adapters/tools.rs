@@ -17,14 +17,10 @@ pub struct ToolContext<'a> {
     pub control: &'a Control,
 }
 
-pub struct ToolOutput {
-    pub value: Value,
-}
-
 pub trait ToolGateway: Send + Sync {
     fn definitions(&self, assignment: &crate::Assignment) -> Vec<Value>;
     /// Trusted host implementations must honor control and bound their output/resources.
-    fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<ToolOutput>;
+    fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value>;
 }
 
 /// No absolute paths, parent traversal, or symlinks in a node's file capabilities.
@@ -81,7 +77,7 @@ impl ToolGateway for FileTools {
             json!({"type":"function","function":{"name":"write_file","description":"Write UTF-8 content into the workspace.","parameters":{"type":"object","properties":{"path":{"type":"string"},"text":{"type":"string"}},"required":["path","text"],"additionalProperties":false}}}),
         ]
     }
-    fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<ToolOutput> {
+    fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         ctx.control.check()?;
         let path = args["path"].as_str().ok_or("missing path")?;
         let value = match name {
@@ -94,20 +90,7 @@ impl ToolGateway for FileTools {
                 if !file.metadata()?.is_file() {
                     return Err("not a regular file".into());
                 }
-                let mut bytes = Vec::new();
-                file.take(FRAME_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
-                let truncated = bytes.len() > FRAME_LIMIT;
-                bytes.truncate(FRAME_LIMIT);
-                let mut text = String::from_utf8_lossy(&bytes).to_string();
-                let mut truncated = truncated;
-                loop {
-                    let value = json!({"text":text,"truncated":truncated});
-                    if serde_json::to_vec(&value)?.len() <= FRAME_LIMIT {
-                        break value;
-                    }
-                    text = super::cut_chars(&text, text.len() / 2).to_string();
-                    truncated = true;
-                }
+                super::text_view(file, FRAME_LIMIT, json!({}), ctx.control)?
             }
             "list_dir" => {
                 let full = workspace_path(ctx.project, path)?;
@@ -177,6 +160,6 @@ impl ToolGateway for FileTools {
             }
             _ => return Err("tool not allowed".into()),
         };
-        Ok(ToolOutput { value })
+        Ok(value)
     }
 }

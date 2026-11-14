@@ -19,8 +19,8 @@ pub use brain::{
 pub use mcp::{HostTools, McpTools};
 pub use model::{Control, Model, OpenAiModel};
 pub use native::{NativeWorker, INTERRUPTED};
-pub use ports::{ArtifactReader, NoopArtifactReader, NoopObserver, Observer, Ports};
-pub use tools::{FileTools, ToolContext, ToolGateway, ToolOutput};
+pub use ports::{ArtifactReader, Observer, Ports};
+pub use tools::{FileTools, ToolContext, ToolGateway};
 
 use crate::Kind;
 
@@ -55,6 +55,36 @@ pub(crate) fn cut_chars(line: &str, limit: usize) -> &str {
         end -= 1;
     }
     &line[..end]
+}
+
+/// Files and frozen artifacts share one text/output budget and one error path.
+fn text_view(
+    reader: impl std::io::Read,
+    limit: usize,
+    mut view: serde_json::Value,
+    control: &crate::Control,
+) -> crate::Result<serde_json::Value> {
+    use std::io::Read;
+    control.check()?;
+    let limit = limit.min(crate::aja::FRAME_LIMIT);
+    let mut bytes = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    let mut truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    loop {
+        control.check()?;
+        view["text"] = serde_json::json!(text);
+        view["truncated"] = serde_json::json!(truncated);
+        if serde_json::to_vec(&view)?.len() <= crate::aja::FRAME_LIMIT {
+            return Ok(view);
+        }
+        if text.is_empty() {
+            return Err("text metadata exceeds the view budget".into());
+        }
+        text = cut_chars(&text, text.len() / 2).into();
+        truncated = true;
+    }
 }
 
 /// Advance through a UTF-8 record even when the requested window is smaller

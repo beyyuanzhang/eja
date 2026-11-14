@@ -1,7 +1,7 @@
 use eja::adapters::{ArtifactReader, Ports};
 use eja::{
-    turn, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, Kind, LookSource,
-    ProposalKind, Selector, Store, TaskStatus, Worker,
+    turn, Action, Assignment, Brain, Decision, EjaContext, Kind, LookSource, ProposalKind,
+    Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -35,7 +35,7 @@ impl Script {
 }
 
 impl Brain for Script {
-    fn decide(&self, context: &EjaContext) -> Decision {
+    fn decide(&self, context: &EjaContext, _: &eja::Control) -> Decision {
         self.seen.lock().unwrap().push(context.clone());
         self.decisions
             .lock()
@@ -49,7 +49,7 @@ impl Brain for Script {
 struct CaptureWorker(Mutex<Vec<Assignment>>);
 
 impl Worker for CaptureWorker {
-    fn execute(&self, assignment: &Assignment) -> String {
+    fn execute(&self, assignment: &Assignment, _: &eja::Control) -> String {
         self.0.lock().unwrap().push(assignment.clone());
         format!(
             "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
@@ -61,13 +61,8 @@ impl Worker for CaptureWorker {
 struct Reader;
 
 impl ArtifactReader for Reader {
-    fn read(&self, path: &str) -> ArtifactContent {
-        ArtifactContent {
-            path: path.into(),
-            text: format!("content of {path}"),
-            truncated: false,
-            error: None,
-        }
+    fn slice(&self, path: &str, _: &Selector, _: &eja::Control) -> eja::Result<serde_json::Value> {
+        Ok(serde_json::json!({"path":path,"text":format!("content of {path}"),"truncated":false}))
     }
 }
 

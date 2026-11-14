@@ -23,7 +23,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext) -> Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -49,7 +49,7 @@ impl QueueWorker {
 }
 
 impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment) -> String {
+    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
         self.queue
             .lock()
             .expect("worker")

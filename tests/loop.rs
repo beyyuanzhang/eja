@@ -22,7 +22,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext) -> Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -48,7 +48,7 @@ impl QueueWorker {
 }
 
 impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment) -> String {
+    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
         self.queue
             .lock()
             .expect("worker")
@@ -578,7 +578,7 @@ fn correction_targets_an_event_id_not_a_phrase() {
 }
 
 #[test]
-fn a_decision_that_dispatches_two_tasks_runs_them_together() {
+fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -587,10 +587,7 @@ fn a_decision_that_dispatches_two_tasks_runs_them_together() {
         peak: Arc<AtomicUsize>,
     }
     impl Worker for OverlapWorker {
-        fn capacity(&self) -> usize {
-            2
-        }
-        fn execute(&self, assignment: &Assignment) -> String {
+        fn execute(&self, assignment: &Assignment, _: &eja::Control) -> String {
             let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(150));
@@ -656,7 +653,7 @@ fn a_decision_that_dispatches_two_tasks_runs_them_together() {
     )
     .expect("turn");
     assert_eq!(outcome.dispatched, vec![1, 2]);
-    assert_eq!(peak.load(Ordering::SeqCst), 2, "both nodes ran at once");
+    assert_eq!(peak.load(Ordering::SeqCst), 1, "one execution owner");
     assert_eq!(
         outcome.tasks.iter().filter(|t| t.digest.is_some()).count(),
         2

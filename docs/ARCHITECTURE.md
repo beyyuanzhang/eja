@@ -110,18 +110,22 @@ transcript or manufacture an acceptance.
 
 ## Port contracts
 
-- `Brain::decide_controlled`: return a decision under the supplied Control.
-- `Worker::execute_controlled`: own and settle the run; return its observed
-  digest. Capacity is an actual host capability, not a scheduling wish.
-- `Lookup::look_controlled`: read only, bound output, respect Control.
+- `Brain::decide`: return a decision under the supplied Control.
+- `Worker::execute`: own and settle one run; return its observed digest. Runs
+  execute in action order; each completed report is recorded before the next.
+- `Lookup::look`: read only, bound output, respect Control.
 - `Model` and `ToolGateway`: host effects under inherited grants/control.
 - `ArtifactReader` / `Observer`: capabilities composed by Ports, without another
   state store or task authority.
 
-Default controlled methods are convenience implementations for immediate,
-in-memory adapters; any blocking adapter must override them and honor Control.
-Native/model/MCP/project readers do so. External adapters are trusted code, not
-sandboxed extensions. Their own cancellation contracts govern remote effects.
+Every operation requires an explicit Control, including artifact selection,
+world observation and connector startup. There is no uncontrolled entry point or
+fallback implementation. Native/model/MCP/project readers honor this contract.
+External adapters are trusted code; their cancellation contracts govern remote effects.
+
+Shared text views bound both bytes read and encoded output. A failed artifact
+read uses the same Result/Observation error path as every other lookup. Match
+windows are derived from ordered hit positions, not a second pending-hit state.
 
 ## Composition laws and tests
 
@@ -138,7 +142,7 @@ sandboxed extensions. Their own cancellation contracts govern remote effects.
 | Model confirmation without host approval cannot alter identity | convergence + proposals |
 | Confirmation has one atomic resolving event | convergence |
 | Recovering a torn tail allows later appends; committed corruption errors | convergence + recovery |
-| Independent Store instances cannot recover each other’s live turn | convergence |
+| Cloned/independent Store instances cannot recover each other’s live turn | convergence |
 | New states cannot bypass a finite turn budget | convergence |
 | Rendered contexts respect exact UTF-8 byte bounds | convergence + projection |
 
@@ -150,8 +154,9 @@ remains model-dependent.
 
 Core modules are `domain`, `store`, `state`, `turn`, and shared `control`.
 Adapters never obtain a mutable identity handle. Store's low-level append API is
-for trusted host/admin code, including fixture construction. Per-Store append locks, a journal-wide Unix turn lease, file locking, and
-stale-cursor checks prevent accidental conflicting turns/appends; they do not implement a distributed scheduler.
+for trusted host/admin code, including fixture construction. The journal-wide
+Unix turn lease is the sole turn exclusion guard. Append locking and stale-cursor
+checks protect the rebuildable cursor; they do not implement a distributed scheduler.
 
 Existing serialized nodes default to kind `node`; grouping is never guessed
 from text or old containment usage. Legacy confirmation events still resolve

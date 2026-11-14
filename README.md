@@ -107,9 +107,10 @@ Default host budgets:
 
 One `Control` hierarchy propagates the turn deadline/cancellation to the brain,
 nodes, observations and model/tool calls. A child may shorten the deadline, never
-extend it. Native execution is serial: one mutable workspace has one execution
-owner. Generic worker ports may declare a capacity when their host can actually
-own independent executions; NativeWorker has no parallel-slots API.
+extend it. Every port requires this control explicitly; there is one entry point
+per operation. Dispatches run in action order under one execution owner, and each
+completed report is recorded before the next node starts. The host owns node step
+and time limits; the disposable loop only manages its bounded message view.
 
 ## Recovery
 

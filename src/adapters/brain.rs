@@ -31,7 +31,7 @@ The proposal text is the replacement content, or the withdrawal reason. \
 Actions execute in their listed order. Creating a node, group or proposal returns its allocated id in the next projection and continues this turn; use that id rather than guessing it. Every read is one action: a look names \
 a source (log, node or world), a target and a selector. A node look reads that \
 node's own files or the workspace it left behind. Dispatching an AJA also \
-returns an observation, and several dispatches in one decision run together. A continuation is represented as a new task related to \
+returns an observation, and dispatches in one decision run in action order. A continuation is represented as a new task related to \
 the previous one with \
 {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
 Tasks are execution nodes; open_group creates a non-executable container. part_of targets a group. A group can be closed after its children settle; judge its own acceptance contract. Execution edges are fixed before dispatch; continues has exactly one finished predecessor, and depends_on requires an accepted predecessor before dispatch. Open a continuation with run:false, relate it, then dispatch it. World reads are governed only by host capabilities. Read older conversation with look log history or all, using range to page event indices. To finish, return your final reply with no observation-producing actions. \
@@ -468,22 +468,12 @@ impl OpenAiBrain {
 }
 
 impl Brain for OpenAiBrain {
-    fn decide(&self, context: &EjaContext) -> Decision {
-        let control = Control::new(
-            DECIDE_TIMEOUT,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        );
-        self.decide_controlled(context, &control)
-    }
-    fn decide_controlled(&self, context: &EjaContext, parent: &Control) -> Decision {
+    fn decide(&self, context: &EjaContext, parent: &Control) -> Decision {
         let messages = vec![
             json!({"role":"system","content":SYSTEM_PROMPT}),
             json!({"role":"user","content":render_context_within(context, self.context_budget)}),
         ];
-        let control = parent.child(
-            DECIDE_TIMEOUT,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        );
+        let control = parent.child(DECIDE_TIMEOUT);
         match self.model.complete(
             &messages,
             &[],

@@ -42,10 +42,6 @@ impl ContextLog {
         })
     }
 
-    fn assistants(&self) -> usize {
-        self.assistants
-    }
-
     fn record(&mut self, entry: Value) -> Result<()> {
         if entry.get("kind").and_then(Value::as_str) == Some("assistant") {
             self.assistants += 1;
@@ -281,13 +277,13 @@ struct Outcome<'a> {
 
 struct Lease<'a> {
     active: &'a Mutex<Option<ActiveRun>>,
-    flag: Arc<AtomicBool>,
 }
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        self.flag.store(true, Ordering::SeqCst);
-        self.active.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(run) = self.active.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            run.cancelled.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -406,7 +402,7 @@ impl NativeWorker {
             super::record::replay(&self.root, &ancestors, self.limits.context_bytes, control)?;
         let messages = aja::prepare_messages(assignment, &self.limits, inherited)?;
         let start = Start {
-            limits: self.limits.clone(),
+            context_bytes: self.limits.context_bytes,
             messages,
         };
         let mut process = Process::start(&self.binary, &self.project, start)?;
@@ -421,9 +417,10 @@ impl NativeWorker {
             let response = match process.next(control)? {
                 Request::Model { messages } => {
                     steps += 1;
-                    if self.limits.steps.is_some_and(|limit| steps > limit)
-                        || serde_json::to_vec(&messages)?.len() > self.limits.context_bytes
-                    {
+                    if let Some(limit) = self.limits.steps.filter(|limit| steps > *limit) {
+                        return Ok((format!("AJA step budget of {limit} turns exhausted; continue in a new node"), "budget".into()));
+                    }
+                    if serde_json::to_vec(&messages)?.len() > self.limits.context_bytes {
                         return Ok((
                             "AJA context budget exhausted; continue in a new node".into(),
                             "budget".into(),
@@ -471,7 +468,7 @@ impl NativeWorker {
                         .unwrap_or_else(|error| json!({"error":error.to_string()}))
                     } else {
                         match self.tools.call(&context, &name, &arguments) {
-                            Ok(output) => output.value,
+                            Ok(output) => output,
                             Err(error) => {
                                 json!({"error":error.to_string()})
                             }
@@ -627,15 +624,7 @@ impl NativeWorker {
 }
 
 impl Worker for NativeWorker {
-    fn execute(&self, assignment: &Assignment) -> String {
-        let control = Control::new(
-            Duration::from_millis(self.limits.timeout_ms),
-            Arc::new(AtomicBool::new(false)),
-        );
-        self.execute_controlled(assignment, &control)
-    }
-
-    fn execute_controlled(&self, assignment: &Assignment, parent: &Control) -> String {
+    fn execute(&self, assignment: &Assignment, parent: &Control) -> String {
         if let Err(error) = parent.check() {
             return format!("0 steps, 0 tool calls, ended: budget\n{error}");
         }
@@ -662,12 +651,10 @@ impl Worker for NativeWorker {
         }
         let _lease = Lease {
             active: &self.active,
-            flag: cancelled.clone(),
         };
-        let control = parent.child(
-            Duration::from_millis(self.limits.timeout_ms),
-            cancelled.clone(),
-        );
+        let control = parent
+            .child(Duration::from_millis(self.limits.timeout_ms))
+            .cancelled_by(cancelled.clone());
         let mut counts = std::collections::BTreeMap::new();
         let mut log = match ContextLog::create(&node) {
             Ok(log) => log,
@@ -680,7 +667,7 @@ impl Worker for NativeWorker {
         let before = snapshot_project(&self.project, &self.state, &control);
         let result: Result<(String, String)> =
             self.run(assignment, &control, &mut log, &mut counts);
-        let steps = log.assistants();
+        let steps = log.assistants;
         let (after, truncated) = snapshot_project(&self.project, &self.state, &control);
         let delta = ProjectDelta::between(&before.0, &after, truncated || before.1);
         cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything

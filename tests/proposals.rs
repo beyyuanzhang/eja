@@ -19,7 +19,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext) -> Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -35,7 +35,7 @@ impl Brain for QueueBrain {
 struct NoWorker;
 
 impl Worker for NoWorker {
-    fn execute(&self, _assignment: &Assignment) -> String {
+    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
         format!(
             "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
             "no worker"

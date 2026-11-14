@@ -1,4 +1,5 @@
 //! Composition laws: these cross the boundaries that isolated feature tests miss.
+mod support;
 use eja::{
     adapters::{render_context_within, Observer, Ports},
     *,
@@ -12,6 +13,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use support::control;
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 struct Fixture(std::path::PathBuf);
 impl Fixture {
@@ -33,7 +35,7 @@ impl Drop for Fixture {
 }
 struct Script(Mutex<VecDeque<Decision>>);
 impl Brain for Script {
-    fn decide(&self, _: &EjaContext) -> Decision {
+    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
         self.0.lock().unwrap().pop_front().unwrap_or_default()
     }
 }
@@ -50,7 +52,7 @@ fn script(actions: Vec<Action>) -> Script {
 #[derive(Default)]
 struct WorkerLog(Mutex<Vec<Assignment>>);
 impl Worker for WorkerLog {
-    fn execute(&self, a: &Assignment) -> String {
+    fn execute(&self, a: &Assignment, _: &eja::Control) -> String {
         self.0.lock().unwrap().push(a.clone());
         "ended: message\nwork recorded".into()
     }
@@ -299,7 +301,7 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
 
 struct World;
 impl Observer for World {
-    fn observe(&self, _: &str, _: &Value) -> Result<Value> {
+    fn observe(&self, _: &str, _: &Value, _: &eja::Control) -> Result<Value> {
         Ok(json!({"fact":7}))
     }
 }
@@ -329,7 +331,7 @@ fn unrelated_tasks_do_not_change_world_capabilities() {
 
 struct Growing;
 impl Brain for Growing {
-    fn decide(&self, _: &EjaContext) -> Decision {
+    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
         Decision {
             actions: vec![node("another", true)],
             ..Decision::default()
@@ -369,10 +371,7 @@ fn endlessly_novel_states_stop_at_the_turn_budget_with_all_records_retained() {
 }
 struct Wait;
 impl Brain for Wait {
-    fn decide(&self, _: &EjaContext) -> Decision {
-        panic!("controlled entrypoint required")
-    }
-    fn decide_controlled(&self, _: &EjaContext, control: &Control) -> Decision {
+    fn decide(&self, _: &EjaContext, control: &Control) -> Decision {
         while control.check().is_ok() {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -381,6 +380,18 @@ impl Brain for Wait {
 }
 #[test]
 fn turn_deadline_and_cancellation_cross_the_brain_boundary() {
+    let parent = Control::new(Duration::from_secs(5), Default::default());
+    let local = Arc::new(AtomicBool::new(false));
+    let child = parent
+        .child(Duration::from_secs(50))
+        .cancelled_by(local.clone());
+    assert!(child.remaining().unwrap() <= Duration::from_secs(5));
+    local.store(true, Ordering::SeqCst);
+    assert_eq!(child.check(), Err(ControlError::Cancelled));
+    assert!(
+        parent.check().is_ok(),
+        "child revocation does not revoke its parent"
+    );
     let f = Fixture::new();
     let store = f.store();
     let worker = WorkerLog::default();
@@ -448,6 +459,7 @@ fn history_is_discoverable_and_all_rendered_views_obey_utf8_byte_budgets() {
             &Value::Null,
             &Selector::Range { from: 0, lines: 2 },
             &store.events().unwrap(),
+            &control(),
         )
         .unwrap();
     assert_eq!(history["events"].as_array().unwrap().len(), 2);
@@ -533,7 +545,7 @@ struct HeldBrain {
     release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 impl Brain for HeldBrain {
-    fn decide(&self, _: &EjaContext) -> Decision {
+    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
         self.entered.send(()).unwrap();
         self.release
             .lock()
@@ -544,41 +556,43 @@ impl Brain for HeldBrain {
     }
 }
 #[test]
-fn independent_store_instances_cannot_recover_each_others_live_turn() {
-    let f = Fixture::new();
-    let first = f.store();
-    let second = f.store();
-    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let running = std::thread::spawn(move || {
-        turn(
-            &first,
-            "first",
-            &HeldBrain {
-                entered: entered_tx,
-                release: Mutex::new(release_rx),
-            },
+fn the_journal_lease_excludes_both_cloned_and_independent_stores() {
+    for cloned in [false, true] {
+        let f = Fixture::new();
+        let first = f.store();
+        let second = if cloned { first.clone() } else { f.store() };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let running = std::thread::spawn(move || {
+            turn(
+                &first,
+                "first",
+                &HeldBrain {
+                    entered: entered_tx,
+                    release: Mutex::new(release_rx),
+                },
+                &WorkerLog::default(),
+                &Ports::default(),
+            )
+            .unwrap()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let blocked = turn(
+            &second,
+            "second",
+            &script(vec![]),
             &WorkerLog::default(),
             &Ports::default(),
-        )
-        .unwrap()
-    });
-    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    let blocked = turn(
-        &second,
-        "second",
-        &script(vec![]),
-        &WorkerLog::default(),
-        &Ports::default(),
-    );
-    assert!(blocked.unwrap_err().to_string().contains("another turn"));
-    release_tx.send(()).unwrap();
-    assert_eq!(running.join().unwrap().end, TurnEnd::Complete);
+        );
+        assert!(blocked.unwrap_err().to_string().contains("another turn"));
+        release_tx.send(()).unwrap();
+        assert_eq!(running.join().unwrap().end, TurnEnd::Complete);
+    }
 }
 
 struct ReceiptBrain(Mutex<usize>);
 impl Brain for ReceiptBrain {
-    fn decide(&self, context: &EjaContext) -> Decision {
+    fn decide(&self, context: &EjaContext, _: &eja::Control) -> Decision {
         let mut step = self.0.lock().unwrap();
         let actions = match *step {
             0 => vec![node("allocated", false)],
@@ -630,6 +644,7 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
             &Value::Null,
             &Selector::Range { from: 0, lines: 2 },
             &events,
+            &control(),
         )
         .unwrap();
     assert_eq!(page["next"], 2);
@@ -646,6 +661,7 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
             &Value::Null,
             &Selector::Bytes { from: at, bytes: 1 },
             &events,
+            &control(),
         )
         .unwrap();
     assert_eq!(chunk["text"], "前");
@@ -670,7 +686,15 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
 
 struct CancelLookup(Arc<AtomicBool>);
 impl Lookup for CancelLookup {
-    fn look(&self, _: LookSource, _: &str, _: &Value, _: &Selector, _: &[Event]) -> Result<Value> {
+    fn look(
+        &self,
+        _: LookSource,
+        _: &str,
+        _: &Value,
+        _: &Selector,
+        _: &[Event],
+        _: &Control,
+    ) -> Result<Value> {
         self.0.store(true, Ordering::SeqCst);
         Err(ControlError::Cancelled.into())
     }
@@ -705,4 +729,55 @@ fn cancellation_keeps_prior_refusals_and_reconciles_reserved_dispatches() {
         .any(|e| e.kind == Kind::Refused && e.text.contains("999")));
     assert_eq!(out.tasks[0].status, TaskStatus::Waiting);
     assert!(out.dispatched.is_empty());
+}
+
+#[test]
+fn cancellation_between_queued_nodes_preserves_completed_evidence_and_skips_the_next_run() {
+    struct CancelAfterFirst {
+        cancelled: Arc<AtomicBool>,
+        seen: Mutex<Vec<u64>>,
+    }
+    impl Worker for CancelAfterFirst {
+        fn execute(&self, assignment: &Assignment, _: &Control) -> String {
+            self.seen.lock().unwrap().push(assignment.task_id);
+            self.cancelled.store(true, Ordering::SeqCst);
+            "first execution completed".into()
+        }
+    }
+    let f = Fixture::new();
+    let store = f.store();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker = CancelAfterFirst {
+        cancelled: cancelled.clone(),
+        seen: Mutex::new(Vec::new()),
+    };
+    let out = turn_at_with_options(
+        &store,
+        "two nodes",
+        &script(vec![node("first", true), node("second", true)]),
+        &worker,
+        &Ports::default(),
+        now_utc(),
+        &TurnOptions {
+            cancelled,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(out.end, TurnEnd::Cancelled);
+    assert_eq!(*worker.seen.lock().unwrap(), vec![1]);
+    assert_eq!(out.dispatched, vec![1]);
+    assert_eq!(
+        out.tasks[0].digest.as_deref(),
+        Some("first execution completed")
+    );
+    assert!(out.tasks[1]
+        .digest
+        .as_deref()
+        .unwrap()
+        .contains("interrupted"));
+    assert!(out
+        .tasks
+        .iter()
+        .all(|task| task.status == TaskStatus::Waiting));
 }

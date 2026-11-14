@@ -1,4 +1,4 @@
-use eja::adapters::{NoopArtifactReader, Ports};
+use eja::adapters::Ports;
 use eja::{
     open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, LookSource,
     ProposalKind, Selector, Store, Worker,
@@ -19,7 +19,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext) -> Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -35,7 +35,7 @@ impl Brain for QueueBrain {
 struct NoWorker;
 
 impl Worker for NoWorker {
-    fn execute(&self, _assignment: &Assignment) -> String {
+    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
         format!(
             "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
             "no worker"
@@ -116,10 +116,7 @@ fn recall_is_an_id_result_not_text_matching() {
         "what did we decide?",
         &brain,
         &NoWorker,
-        &Ports {
-            node: Some(&NoopArtifactReader),
-            ..Default::default()
-        },
+        &Ports::default(),
         eja::now_utc(),
     )
     .expect("recall");

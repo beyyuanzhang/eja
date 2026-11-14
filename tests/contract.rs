@@ -8,7 +8,7 @@ struct QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext) -> Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -26,7 +26,7 @@ struct CaptureWorker {
 }
 
 impl Worker for CaptureWorker {
-    fn execute(&self, assignment: &Assignment) -> String {
+    fn execute(&self, assignment: &Assignment, _: &eja::Control) -> String {
         self.seen.lock().expect("seen").push(assignment.clone());
         format!(
             "1 steps, 1 tool calls, 0 artifacts, ended: message\n{}",

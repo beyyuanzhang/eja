@@ -200,27 +200,6 @@ pub struct CloseOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactContent {
-    pub path: String,
-    pub text: String,
-    #[serde(default)]
-    pub truncated: bool,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-impl ArtifactContent {
-    pub fn failed(path: &str, error: impl Into<String>) -> Self {
-        Self {
-            path: path.to_string(),
-            text: String::new(),
-            truncated: false,
-            error: Some(error.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub kind: TaskKind,
     pub id: TaskId,
@@ -388,7 +367,7 @@ pub struct Observation {
     pub error: Option<String>,
 }
 
-/// The only read primitive. A source, a target and a selector; nothing else.
+/// The only read primitive; every invocation inherits host control.
 pub trait Lookup {
     fn look(
         &self,
@@ -397,64 +376,17 @@ pub trait Lookup {
         arguments: &Value,
         selector: &Selector,
         log: &[Event],
-    ) -> Result<Value>;
-    fn look_controlled(
-        &self,
-        source: LookSource,
-        target: &str,
-        arguments: &Value,
-        selector: &Selector,
-        log: &[Event],
         control: &Control,
-    ) -> Result<Value> {
-        control.check()?;
-        self.look(source, target, arguments, selector, log)
-    }
-}
-
-pub struct NoopLookup;
-
-impl Lookup for NoopLookup {
-    fn look(
-        &self,
-        source: LookSource,
-        _: &str,
-        _: &Value,
-        _: &Selector,
-        _: &[Event],
-    ) -> Result<Value> {
-        Err(format!("no {source:?} reader is configured").into())
-    }
+    ) -> Result<Value>;
 }
 
 pub trait Brain {
-    fn decide(&self, context: &EjaContext) -> Decision;
-    fn decide_controlled(&self, context: &EjaContext, control: &Control) -> Decision {
-        if let Err(error) = control.check() {
-            return Decision {
-                reply: error.to_string(),
-                ..Decision::default()
-            };
-        }
-        self.decide(context)
-    }
+    fn decide(&self, context: &EjaContext, control: &Control) -> Decision;
 }
 
 pub trait Worker: Send + Sync {
-    /// Run one node and return the host's fold of its record: what it did, how
-    /// it ended and what it said last. EJA reads this and may look deeper.
-    fn execute(&self, assignment: &Assignment) -> String;
-    fn execute_controlled(&self, assignment: &Assignment, control: &Control) -> String {
-        if let Err(error) = control.check() {
-            return format!("ended: budget\n{error}");
-        }
-        self.execute(assignment)
-    }
-    /// How many nodes this worker runs at once. A decision's dispatches are
-    /// grouped by that capacity, so nothing is refused for being second.
-    fn capacity(&self) -> usize {
-        1
-    }
+    /// Settle one execution and return the host's account, never an acceptance.
+    fn execute(&self, assignment: &Assignment, control: &Control) -> String;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

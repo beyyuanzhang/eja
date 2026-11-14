@@ -97,11 +97,11 @@ pub(crate) fn relations_with_tasks(events: &[Event], tasks: &[Task]) -> Vec<Edge
 pub fn tasks(events: &[Event]) -> Vec<Task> {
     let mut out: Vec<Task> = Vec::new();
     for event in events {
+        let Some(task_id) = task_id_in_scope(&event.scope) else {
+            continue;
+        };
         match event.kind {
             Kind::TaskOpened => {
-                let Some(task_id) = task_id_in_scope(&event.scope) else {
-                    continue;
-                };
                 let Some(open) = event
                     .data
                     .as_ref()
@@ -125,9 +125,6 @@ pub fn tasks(events: &[Event]) -> Vec<Task> {
                 });
             }
             Kind::TaskAssigned => {
-                let Some(task_id) = task_id_in_scope(&event.scope) else {
-                    continue;
-                };
                 if event.data.is_some() {
                     if let Some(task) = out.iter_mut().find(|task| task.id == task_id) {
                         task.status = TaskStatus::Running;
@@ -135,9 +132,6 @@ pub fn tasks(events: &[Event]) -> Vec<Task> {
                 }
             }
             Kind::WorkerReport => {
-                let Some(task_id) = task_id_in_scope(&event.scope) else {
-                    continue;
-                };
                 if let Some(task) = out.iter_mut().find(|task| task.id == task_id) {
                     task.digest = Some(event.text.clone());
                     task.digest_at = Some(event.at);
@@ -145,9 +139,6 @@ pub fn tasks(events: &[Event]) -> Vec<Task> {
                 }
             }
             Kind::TaskClosed => {
-                let Some(task_id) = task_id_in_scope(&event.scope) else {
-                    continue;
-                };
                 let Some(close) = event
                     .data
                     .as_ref()
@@ -207,6 +198,9 @@ pub fn project_with_evidence(
             .cmp(&a.status.is_active())
             .then_with(|| b.id.cmp(&a.id))
     });
+    let history_before = events.last().map_or(0, |last| {
+        last.turn.saturating_add(u64::from(last.kind == Kind::Eja))
+    });
     Ok(EjaContext {
         now: now.timestamp(),
         input: input.to_string(),
@@ -221,12 +215,7 @@ pub fn project_with_evidence(
         history: events
             .iter()
             .filter(|event| matches!(event.kind, Kind::User | Kind::Eja))
-            .filter(|event| {
-                event.turn
-                    < events
-                        .last()
-                        .map_or(0, |last| last.turn + u64::from(last.kind == Kind::Eja))
-            })
+            .filter(|event| event.turn < history_before)
             .rev()
             .cloned()
             .collect(),
@@ -292,19 +281,6 @@ pub(crate) fn pending_proposals(events: &[Event]) -> Vec<ProposalView> {
             })
         })
         .collect()
-}
-
-pub(crate) fn proposal_event(events: &[Event], proposal_id: u64) -> Option<Event> {
-    events
-        .iter()
-        .find(|event| event.id == proposal_id && event.kind == Kind::Proposal)
-        .cloned()
-}
-
-pub(crate) fn proposal_is_pending(events: &[Event], proposal_id: u64) -> bool {
-    pending_proposals(events)
-        .iter()
-        .any(|proposal| proposal.id == proposal_id)
 }
 
 pub(crate) fn valid_proposal_target(

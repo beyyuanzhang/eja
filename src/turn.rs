@@ -1,15 +1,13 @@
 //! The single transition path: validate, record, execute, observe, project.
 use crate::domain::{ProposalData, TaskOpen};
 use crate::state::{
-    next_task_id, proposal_event, proposal_is_pending, relations_with_tasks, task_scope,
-    valid_proposal_target,
+    next_task_id, pending_proposals, relations_with_tasks, task_scope, valid_proposal_target,
 };
 use crate::*;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::{
     collections::HashSet,
-    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -57,31 +55,20 @@ fn propose(
 
 fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Result<Option<String>> {
     let events = store.events()?;
-    if !proposal_is_pending(&events, proposal_id) {
-        return Ok(Some(format!(
-            "confirm refused: proposal {proposal_id} is not pending"
-        )));
-    }
-    let Some(event) = proposal_event(&events, proposal_id) else {
+    let Some(proposal) = pending_proposals(&events)
+        .into_iter()
+        .find(|proposal| proposal.id == proposal_id)
+    else {
         return Ok(Some(format!(
             "confirm refused: proposal {proposal_id} is not pending"
         )));
     };
-    if event.turn >= turn {
+    if proposal.turn >= turn {
         return Ok(Some(format!(
             "confirm refused: proposal {proposal_id} was created this turn; confirm it in a later turn"
         )));
     }
-    let Some(data) = event
-        .data
-        .as_ref()
-        .and_then(|value| serde_json::from_value::<ProposalData>(value.clone()).ok())
-    else {
-        return Ok(Some(format!(
-            "confirm refused: proposal {proposal_id} has no readable target"
-        )));
-    };
-    if !valid_proposal_target(&events, data.kind, data.target_id) {
+    if !valid_proposal_target(&events, proposal.kind, proposal.target_id) {
         return Ok(Some(format!(
             "confirm refused: the target of proposal {proposal_id} is no longer active"
         )));
@@ -89,13 +76,13 @@ fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Resu
     // One event both establishes the replacement and closes its predecessor.
     // A Correction has no replacement: it only withdraws its target.
     store.append(
-        data.kind.event_kind(),
+        proposal.kind.event_kind(),
         "eja",
-        &event.text,
+        &proposal.text,
         turn,
         EventMeta {
             at,
-            closes: data.target_id,
+            closes: proposal.target_id,
             data: Some(serde_json::json!({"proposal_id": proposal_id})),
         },
     )?;
@@ -110,7 +97,10 @@ fn reject_proposal(
     at: i64,
 ) -> Result<Option<String>> {
     let events = store.events()?;
-    if !proposal_is_pending(&events, proposal_id) {
+    if !pending_proposals(&events)
+        .iter()
+        .any(|proposal| proposal.id == proposal_id)
+    {
         return Ok(Some(format!(
             "reject refused: proposal {proposal_id} is not pending"
         )));
@@ -138,31 +128,14 @@ fn append_identity(store: &Store, action: &Action, turn: u64, at: i64) -> Result
     Ok(())
 }
 
-struct OpenTaskInput<'a> {
-    kind: TaskKind,
-    title: &'a str,
-    request: &'a str,
-    origin: &'a str,
-    acceptance: &'a str,
-    turn: u64,
-    at: i64,
-}
-
-fn open_task(store: &Store, input: OpenTaskInput<'_>) -> Result<TaskId> {
-    let id = next_task_id(&store.events()?)?;
-    let data = serde_json::to_value(TaskOpen {
-        kind: input.kind,
-        title: input.title.to_string(),
-        request: input.request.to_string(),
-        origin: input.origin.to_string(),
-        acceptance: input.acceptance.to_string(),
-    })?;
-    store.append(
+fn open_task(ctx: &ActionCtx<'_>, input: TaskOpen) -> Result<TaskId> {
+    let id = next_task_id(&ctx.store.events()?)?;
+    ctx.store.append(
         Kind::TaskOpened,
         &task_scope(id),
-        input.title,
-        input.turn,
-        EventMeta::data(input.at, data),
+        &input.title,
+        ctx.turn,
+        EventMeta::data(ctx.at, serde_json::to_value(&input)?),
     )?;
     Ok(id)
 }
@@ -367,51 +340,21 @@ fn record_dispatch(
     Ok(())
 }
 
-/// Run the reserved dispatches. One node runs inline; several run together, up
-/// to the worker's declared capacity, and their reports are recorded in order.
+/// One execution owner; completed runs are recorded before the next starts.
 fn run_dispatches(
     ctx: &ActionCtx<'_>,
     out: &mut TurnOutcome,
     pending: Vec<Assignment>,
 ) -> Result<()> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let capacity = ctx.worker.capacity().max(1);
-    for group in pending.chunks(capacity) {
+    for assignment in pending {
         ctx.control.check()?;
         let started = Instant::now();
-        let digests = if group.len() == 1 {
-            vec![std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ctx.worker.execute_controlled(&group[0], ctx.control)
-            }))
-            .unwrap_or_else(|_| "node panicked".to_string())]
-        } else {
-            let mut digests = Vec::with_capacity(group.len());
-            let worker = ctx.worker;
-            let control = ctx.control;
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = group
-                    .iter()
-                    .map(|assignment| {
-                        scope.spawn(move || worker.execute_controlled(assignment, control))
-                    })
-                    .collect();
-                for handle in handles {
-                    digests.push(
-                        handle
-                            .join()
-                            .unwrap_or_else(|_| "node panicked".to_string()),
-                    );
-                }
-            });
-            digests
-        };
+        let digest = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.worker.execute(&assignment, ctx.control)
+        }))
+        .unwrap_or_else(|_| "node panicked".to_string());
         out.worker_ms += started.elapsed().as_millis();
-        // Publish completed runs before checking the next chunk's authority.
-        for (assignment, digest) in group.iter().cloned().zip(digests) {
-            record_dispatch(ctx, out, assignment, digest)?;
-        }
+        record_dispatch(ctx, out, assignment, digest)?;
     }
     Ok(())
 }
@@ -424,18 +367,15 @@ fn close_task(
     turn: u64,
     at: i64,
 ) -> Result<Option<String>> {
-    let Some(task) = tasks(&store.events()?)
-        .into_iter()
-        .find(|task| task.id == task_id)
-    else {
+    let events = store.events()?;
+    let all = tasks(&events);
+    let Some(task) = all.iter().find(|task| task.id == task_id) else {
         return Ok(Some(format!("close refused: no task {task_id}")));
     };
     if task.kind == TaskKind::Group {
         if task.status != TaskStatus::Open {
             return Ok(Some("close refused: group is already closed".into()));
         }
-        let events = store.events()?;
-        let all = tasks(&events);
         let edges = relations_with_tasks(&events, &all);
         let children: Vec<_> = edges
             .iter()
@@ -522,15 +462,13 @@ fn apply_actions(
             }
             Action::OpenGroup { title, acceptance } => {
                 let id = open_task(
-                    ctx.store,
-                    OpenTaskInput {
+                    ctx,
+                    TaskOpen {
                         kind: TaskKind::Group,
-                        title,
-                        request: "",
-                        origin: ctx.input,
-                        acceptance,
-                        turn: ctx.turn,
-                        at: ctx.at,
+                        title: title.clone(),
+                        request: String::new(),
+                        origin: ctx.input.into(),
+                        acceptance: acceptance.clone(),
                     },
                 )?;
                 *focus = Some(id);
@@ -543,15 +481,13 @@ fn apply_actions(
                 run,
             } => {
                 let id = open_task(
-                    ctx.store,
-                    OpenTaskInput {
+                    ctx,
+                    TaskOpen {
                         kind: TaskKind::Node,
-                        title,
-                        request,
-                        origin: ctx.input,
-                        acceptance,
-                        turn: ctx.turn,
-                        at: ctx.at,
+                        title: title.clone(),
+                        request: request.clone(),
+                        origin: ctx.input.into(),
+                        acceptance: acceptance.clone(),
                     },
                 )?;
                 *focus = Some(id);
@@ -608,7 +544,7 @@ fn apply_actions(
                 selector,
             } => {
                 let events = ctx.store.events()?;
-                let (result, error) = match ctx.lookup.look_controlled(
+                let (result, error) = match ctx.lookup.look(
                     *source,
                     target,
                     arguments,
@@ -696,6 +632,14 @@ pub fn turn_at(
     )
 }
 
+fn stop(out: &mut TurnOutcome, error: ControlError) {
+    out.end = match error {
+        ControlError::Cancelled => TurnEnd::Cancelled,
+        ControlError::Deadline => TurnEnd::Budget,
+    };
+    out.reason = Some(error.to_string());
+}
+
 pub fn turn_at_with_options(
     store: &Store,
     input: &str,
@@ -705,10 +649,6 @@ pub fn turn_at_with_options(
     now: DateTime<Utc>,
     options: &TurnOptions,
 ) -> Result<TurnOutcome> {
-    let _turn_guard = store
-        .active_turn
-        .try_lock()
-        .map_err(|_| "another turn is already active for this Store")?;
     let _journal_lease = store.lock_turn()?;
     options.limits.validate()?;
     let control = Control::new(
@@ -736,7 +676,7 @@ pub fn turn_at_with_options(
         ),
     )?;
 
-    let active: Vec<Task> = tasks(&store.events()?)
+    let active: Vec<Task> = existing_tasks
         .into_iter()
         .filter(|task| task.status.is_active())
         .collect();
@@ -771,17 +711,10 @@ pub fn turn_at_with_options(
     };
     let mut seen = HashSet::new();
     seen.insert(fingerprint(&out.context));
-    let mut refused_this_turn: Vec<String> = Vec::new();
     let mut actions_used = 0usize;
     loop {
         if let Err(error) = control.check() {
-            out.end =
-                if options.cancelled.load(Ordering::SeqCst) || INTERRUPTED.load(Ordering::SeqCst) {
-                    TurnEnd::Cancelled
-                } else {
-                    TurnEnd::Budget
-                };
-            out.reason = Some(error.to_string());
+            stop(&mut out, error);
             break;
         }
         if out.decisions >= options.limits.decisions {
@@ -790,15 +723,9 @@ pub fn turn_at_with_options(
             break;
         }
         out.decisions += 1;
-        let decision = brain.decide_controlled(&out.context, &control);
+        let decision = brain.decide(&out.context, &control);
         if let Err(error) = control.check() {
-            out.end =
-                if options.cancelled.load(Ordering::SeqCst) || INTERRUPTED.load(Ordering::SeqCst) {
-                    TurnEnd::Cancelled
-                } else {
-                    TurnEnd::Budget
-                };
-            out.reason = Some(error.to_string());
+            stop(&mut out, error);
             break;
         }
         if decision.actions.len() > options.limits.actions.saturating_sub(actions_used) {
@@ -834,28 +761,23 @@ pub fn turn_at_with_options(
         // not allow. A new note re-opens the projection so EJA can decide again;
         // a repeated note changes nothing and the fixpoint ends the turn.
         let mut told = false;
-        for note in &out.refused[notes..] {
-            if refused_this_turn.contains(note) {
+        for index in notes..out.refused.len() {
+            let note = &out.refused[index];
+            if out.refused[..index].contains(note) {
                 continue;
             }
             store.append(Kind::Refused, "eja", note, ctx.turn, EventMeta::new(at))?;
-            refused_this_turn.push(note.clone());
             told = true;
         }
         let acted = match actions_result {
             Ok(acted) => acted,
-            Err(error) if control.check().is_err() => {
-                out.end = if options.cancelled.load(Ordering::SeqCst)
-                    || INTERRUPTED.load(Ordering::SeqCst)
-                {
-                    TurnEnd::Cancelled
-                } else {
-                    TurnEnd::Budget
-                };
-                out.reason = Some(error.to_string());
-                break;
+            Err(error) => {
+                if let Err(stopped) = control.check() {
+                    stop(&mut out, stopped);
+                    break;
+                }
+                return Err(error);
             }
-            Err(error) => return Err(error),
         };
         let observed = acted || told;
         out.context = project_with_evidence(store, input, focus, now, &out.evidence)?;

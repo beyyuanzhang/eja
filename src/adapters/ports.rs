@@ -1,57 +1,14 @@
 //! Capabilities behind the single core port. The core only knows `Lookup`.
-use crate::{tasks, ArtifactContent, Event, LookSource, Lookup, Result, Selector};
+use crate::{tasks, Event, LookSource, Lookup, Result, Selector};
 use serde_json::Value;
 
 pub trait ArtifactReader {
-    fn read(&self, path: &str) -> ArtifactContent;
-
-    fn slice_controlled(
-        &self,
-        path: &str,
-        selector: &Selector,
-        control: &crate::Control,
-    ) -> Result<Value> {
-        control.check()?;
-        self.slice(path, selector)
-    }
-
-    /// A selected view of a node file. Readers that cannot slice still serve whole reads.
-    fn slice(&self, path: &str, selector: &Selector) -> Result<Value> {
-        if !matches!(selector, Selector::Whole) {
-            return Err("this reader cannot select a range".into());
-        }
-        Ok(serde_json::to_value(self.read(path))?)
-    }
+    fn slice(&self, path: &str, selector: &Selector, control: &crate::Control) -> Result<Value>;
 }
 
-pub struct NoopArtifactReader;
-
-impl ArtifactReader for NoopArtifactReader {
-    fn read(&self, path: &str) -> ArtifactContent {
-        ArtifactContent::failed(path, "no artifact reader configured")
-    }
-}
-
-/// Read-only observation of an external system. EJA may look; it never acts.
+/// Host-declared read-only capabilities, under the caller's control.
 pub trait Observer: Send + Sync {
-    fn observe(&self, tool: &str, arguments: &Value) -> Result<Value>;
-    fn observe_controlled(
-        &self,
-        tool: &str,
-        arguments: &Value,
-        control: &crate::Control,
-    ) -> Result<Value> {
-        control.check()?;
-        self.observe(tool, arguments)
-    }
-}
-
-pub struct NoopObserver;
-
-impl Observer for NoopObserver {
-    fn observe(&self, _: &str, _: &Value) -> Result<Value> {
-        Err("no observer is configured".into())
-    }
+    fn observe(&self, tool: &str, arguments: &Value, control: &crate::Control) -> Result<Value>;
 }
 
 /// Host composition: one lookup over the three sources an EJA deployment has.
@@ -69,7 +26,9 @@ impl Lookup for Ports<'_> {
         arguments: &Value,
         selector: &Selector,
         log: &[Event],
+        control: &crate::Control,
     ) -> Result<Value> {
+        control.check()?;
         match source {
             LookSource::Log => {
                 let events: Vec<&Event> = match target {
@@ -149,40 +108,15 @@ impl Lookup for Ports<'_> {
             }
             LookSource::Node => {
                 let node = self.node.ok_or("no node reader is configured")?;
-                node.slice(target, selector)
+                node.slice(target, selector, control)
             }
             LookSource::World => {
                 let world = self.world.ok_or("no world reader is configured")?;
                 if !matches!(selector, Selector::Whole) {
                     return Err("world tools select their result through arguments".into());
                 }
-                world.observe(target, arguments)
+                world.observe(target, arguments, control)
             }
-        }
-    }
-    fn look_controlled(
-        &self,
-        source: LookSource,
-        target: &str,
-        arguments: &Value,
-        selector: &Selector,
-        log: &[Event],
-        control: &crate::Control,
-    ) -> Result<Value> {
-        control.check()?;
-        if source == LookSource::World {
-            if !matches!(selector, Selector::Whole) {
-                return Err("world tools select through arguments".into());
-            }
-            self.world
-                .ok_or("no world reader is configured")?
-                .observe_controlled(target, arguments, control)
-        } else if source == LookSource::Node {
-            self.node
-                .ok_or("no node reader is configured")?
-                .slice_controlled(target, selector, control)
-        } else {
-            self.look(source, target, arguments, selector, log)
         }
     }
 }

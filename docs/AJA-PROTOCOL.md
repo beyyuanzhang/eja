@@ -7,8 +7,7 @@ connections, tool grants and all external effects. The node only runs framed IPC
 ## Startup
 
 ```
-Start { limits, messages }
-Limits { timeout_ms, steps, context_bytes, response_bytes }
+Start { context_bytes, messages }
 ```
 
 The host resolves the explicit predecessor's frozen record ancestry, reconstructs
@@ -17,7 +16,9 @@ and fits the resulting messages before sending Start. The serialized JSON frame
 is at most 256 KiB, followed by a newline. A fresh node has system + assignment
 messages; continuation adds historical observations, not restored world state.
 The assignment is frozen once in the host manifest; its prepared messages cross
-IPC without a second copy of the same brief.
+IPC without a second copy of the same brief. Step/time/response limits belong to
+the host, not a mirrored execution counter in the child. The child receives only
+the context bound needed to fit its working messages before transport.
 
 ## Requests
 

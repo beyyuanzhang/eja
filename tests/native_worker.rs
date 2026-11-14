@@ -1,7 +1,6 @@
+mod support;
 use eja::{
-    adapters::{
-        Control, FileTools, Model, NativeWorker, OpenAiModel, ToolContext, ToolGateway, ToolOutput,
-    },
+    adapters::{Control, FileTools, Model, NativeWorker, OpenAiModel, ToolContext, ToolGateway},
     aja::Limits,
     Assignment, Result, Worker,
 };
@@ -18,6 +17,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use support::control;
 
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 static LOCK: Mutex<()> = Mutex::new(());
@@ -165,7 +165,7 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
         final_message(&["out.txt"]),
     ]));
     let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
-    let digest = w.execute(&assignment(1));
+    let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("ended: message"), "{digest}");
     assert!(digest.contains("project: +1 created (out.txt)"), "{digest}");
     assert_eq!(
@@ -213,7 +213,9 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     assert!(!model.pids.lock().unwrap().is_empty());
     assert_reaped(&model.pids.lock().unwrap());
     let before = f.manifest(1);
-    assert!(w.execute(&assignment(1)).contains("ended: error"));
+    assert!(w
+        .execute(&assignment(1), &control())
+        .contains("ended: error"));
     assert_eq!(f.manifest(1), before);
 }
 
@@ -226,7 +228,7 @@ impl ToolGateway for Effects {
             json!({"type":"function","function":{"name":"effect","description":"apply one effect","parameters":{"type":"object","properties":{"kind":{"type":"string"},"path":{"type":"string"}},"required":["kind","path"]}}}),
         ]
     }
-    fn call(&self, c: &ToolContext<'_>, _: &str, args: &Value) -> Result<ToolOutput> {
+    fn call(&self, c: &ToolContext<'_>, _: &str, args: &Value) -> Result<Value> {
         let path = args["path"].as_str().unwrap_or_default();
         match args["kind"].as_str().unwrap_or_default() {
             "project" => {
@@ -235,15 +237,11 @@ impl ToolGateway for Effects {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(target, "delivered")?;
-                Ok(ToolOutput {
-                    value: json!({"ok": true}),
-                })
+                Ok(json!({"ok": true}))
             }
             "drop" => {
                 std::fs::remove_file(c.project.join(path))?;
-                Ok(ToolOutput {
-                    value: json!({"ok": true}),
-                })
+                Ok(json!({"ok": true}))
             }
             other => Err(format!("unknown effect {other}").into()),
         }
@@ -262,7 +260,7 @@ fn the_digest_reports_what_the_project_gained() {
         final_message(&[]),
     ]));
     let w = f.worker(model, Arc::new(Effects), Limits::default());
-    let digest = w.execute(&assignment(1));
+    let digest = w.execute(&assignment(1), &control());
     assert!(
         digest.contains("project: +2 created (delivered.txt, nested/also.txt)"),
         "{digest}"
@@ -281,7 +279,7 @@ fn the_node_leaves_a_fossil_of_the_world_it_ended_in() {
         final_message(&[]),
     ]));
     let w = f.worker(model, Arc::new(Effects), Limits::default());
-    let digest = w.execute(&assignment(1));
+    let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("+1 created"), "{digest}");
     let manifest = f.manifest(1);
     let commit = manifest["checkpoint"]
@@ -306,10 +304,8 @@ impl ToolGateway for Big {
             json!({"type":"function","function":{"name":"big","description":"a big result","parameters":{"type":"object","properties":{}}}}),
         ]
     }
-    fn call(&self, _: &ToolContext<'_>, _: &str, _: &Value) -> Result<ToolOutput> {
-        Ok(ToolOutput {
-            value: json!({"text": "x".repeat(64 * 1024)}),
-        })
+    fn call(&self, _: &ToolContext<'_>, _: &str, _: &Value) -> Result<Value> {
+        Ok(json!({"text": "x".repeat(64 * 1024)}))
     }
 }
 
@@ -322,7 +318,7 @@ fn a_large_tool_result_is_a_view_in_the_transcript_and_whole_in_the_record() {
         final_message(&[]),
     ]));
     let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
-    w.execute(&assignment(1));
+    w.execute(&assignment(1), &control());
     let record = std::fs::read_to_string(f.0.join(".eja/nodes/1/context.jsonl")).unwrap();
     assert!(
         record.contains(&"x".repeat(60 * 1024)),
@@ -360,10 +356,10 @@ fn a_continuation_starts_from_the_predecessor_record() {
         final_message(&[]),
     ]));
     let w = f.worker(model.clone(), Arc::new(Effects), Limits::default());
-    w.execute(&assignment(1));
+    w.execute(&assignment(1), &control());
     let mut second = assignment(2);
     second.resume = Some(1);
-    w.execute(&second);
+    w.execute(&second, &control());
     let seen = model.seen.lock().unwrap();
     let first_call_of_second_node = &seen[2];
     assert!(
@@ -396,7 +392,7 @@ impl ToolGateway for Policy {
             .filter(|d| a.task_id != 2 || d["function"]["name"] == "read_file")
             .collect()
     }
-    fn call(&self, c: &ToolContext<'_>, name: &str, args: &Value) -> Result<ToolOutput> {
+    fn call(&self, c: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         FileTools.call(c, name, args)
     }
 }
@@ -418,8 +414,12 @@ fn nodes_share_the_workspace_and_grants_still_differ() {
         final_message(&[]),
     ]));
     let w = f.worker(model.clone(), Arc::new(Policy), Limits::default());
-    assert!(w.execute(&assignment(1)).contains("ended: message"));
-    assert!(w.execute(&assignment(2)).contains("ended: message"));
+    assert!(w
+        .execute(&assignment(1), &control())
+        .contains("ended: message"));
+    assert!(w
+        .execute(&assignment(2), &control())
+        .contains("ended: message"));
     let seen = model.seen.lock().unwrap();
     let results = seen[3]
         .iter()
@@ -453,7 +453,7 @@ fn traversal_private_state_and_symlinks_are_not_file_capabilities() {
         final_message(&["../escape.txt"]),
     ]));
     let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
-    let digest = w.execute(&assignment(1));
+    let digest = w.execute(&assignment(1), &control());
     // The claim mentions an escaping path; the world did not move.
     assert!(digest.contains("project: unchanged"), "{digest}");
     assert!(!f.0.join("escape.txt").exists());
@@ -483,7 +483,7 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
             ..Limits::default()
         },
     );
-    let r = w.execute(&assignment(1));
+    let r = w.execute(&assignment(1), &control());
     // A spent budget stops the node without calling its work a failure.
     assert!(r.contains("ended: budget"), "{r}");
     assert!(r.contains("budget"), "{r}");
@@ -498,7 +498,7 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
     };
     let context_model = Arc::new(Script::new(vec![]));
     let w = f.worker(context_model, Arc::new(FileTools), context_limits);
-    let r = w.execute(&assignment(2));
+    let r = w.execute(&assignment(2), &control());
     assert!(r.contains("ended: budget"), "{r}");
     assert!(r.contains("context budget"), "{r}");
     assert_eq!(w.active_count(), 0);
@@ -516,7 +516,7 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
             ..Limits::default()
         },
     );
-    let r = w.execute(&assignment(3));
+    let r = w.execute(&assignment(3), &control());
     assert!(r.contains("ended: error"), "{r}");
     assert!(r.contains("output limit"), "{r}");
     assert_eq!(w.active_count(), 0);
@@ -526,7 +526,7 @@ fn step_context_and_output_limits_stop_the_node_and_preserve_partial_work() {
         json!({"role":"assistant","content":"not a digest"}),
     ]));
     let w = f.worker(plain.clone(), Arc::new(FileTools), Limits::default());
-    let r = w.execute(&assignment(5));
+    let r = w.execute(&assignment(5), &control());
     assert!(r.contains("ended: message"), "{r}");
     assert!(r.contains("not a digest"), "{r}");
     assert_reaped(&plain.pids.lock().unwrap());
@@ -565,7 +565,7 @@ fn timeout_cancellation_and_busy_slot_release_all_node_resources() {
             },
         );
         let running = w.clone();
-        let join = std::thread::spawn(move || running.execute(&assignment(1)));
+        let join = std::thread::spawn(move || running.execute(&assignment(1), &control()));
         let deadline = Instant::now() + Duration::from_secs(2);
         while !started.load(Ordering::SeqCst) {
             assert!(Instant::now() < deadline);
@@ -573,7 +573,9 @@ fn timeout_cancellation_and_busy_slot_release_all_node_resources() {
         }
         let pids = worker_pids();
         assert!(!pids.is_empty());
-        assert!(w.execute(&assignment(2)).contains("ended: budget"));
+        assert!(w
+            .execute(&assignment(2), &control())
+            .contains("ended: budget"));
         assert!(!f.0.join(".eja/nodes/2").exists());
         if cancel {
             assert!(w.cancel(1));
@@ -603,7 +605,9 @@ fn many_frozen_nodes_have_no_live_workers_or_growing_pipe_handles() {
     };
     let before = std::fs::read_dir(fd_path).unwrap().count();
     for id in 1..=25 {
-        assert!(w.execute(&assignment(id)).contains("ended: message"));
+        assert!(w
+            .execute(&assignment(id), &control())
+            .contains("ended: message"));
         assert_eq!(w.active_count(), 0);
     }
     assert!(std::fs::read_dir(fd_path).unwrap().count() <= before + 1);
@@ -629,7 +633,7 @@ fn native_worker_exits_when_its_host_pipe_disappears() {
     writeln!(
         input,
         "{}",
-        json!({"limits":Limits::default(),"messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":"work"}]})
+        json!({"context_bytes":Limits::default().context_bytes,"messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":"work"}]})
     )
     .unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
@@ -704,7 +708,7 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
         Arc::new(FileTools),
         Limits::default(),
     );
-    let digest = w.execute(&assignment(1));
+    let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("ended: message"), "{digest}");
     let seen = server.join().unwrap();
     assert_eq!(seen[0]["messages"][1]["content"], "node 1 work");
@@ -796,7 +800,7 @@ fn oversized_start_is_rejected_without_leaving_a_process() {
     let worker = f.worker(model, Arc::new(FileTools), Limits::default());
     let mut input = assignment(1);
     input.objective = "x".repeat(eja::aja::FRAME_LIMIT);
-    let digest = worker.execute(&input);
+    let digest = worker.execute(&input, &control());
     assert!(digest.contains("ended: budget"), "{digest}");
     assert!(digest.contains("context budget"), "{digest}");
     assert_eq!(worker.active_count(), 0);
@@ -904,11 +908,11 @@ fn live_and_replayed_results_share_one_view_and_large_records_still_resume() {
         final_message(&[]),
     ]));
     let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
-    let first = w.execute(&assignment(1));
+    let first = w.execute(&assignment(1), &control());
     assert!(first.contains("ended: message"), "{first}");
     let mut next = assignment(2);
     next.resume = Some(1);
-    let second = w.execute(&next);
+    let second = w.execute(&next, &control());
     assert!(second.contains("ended: message"), "{second}");
     let seen = model.seen.lock().unwrap();
     let live: Vec<_> = seen[1]
@@ -937,10 +941,8 @@ impl ToolGateway for Passage {
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         Big.definitions(&assignment(1))
     }
-    fn call(&self, _: &ToolContext<'_>, _: &str, _: &Value) -> Result<ToolOutput> {
-        Ok(ToolOutput {
-            value: json!({"text":format!("{}MIDDLE-SECRET-77{}","前".repeat(12000),"后".repeat(12000))}),
-        })
+    fn call(&self, _: &ToolContext<'_>, _: &str, _: &Value) -> Result<Value> {
+        Ok(json!({"text":format!("{}MIDDLE-SECRET-77{}","前".repeat(12000),"后".repeat(12000))}))
     }
 }
 struct ReadPassage(Mutex<usize>);
@@ -993,7 +995,7 @@ fn omitted_tool_passages_remain_addressable_without_expanding_grants() {
         Arc::new(Passage),
         Limits::default(),
     );
-    let digest = w.execute(&assignment(1));
+    let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("ended: message"), "{digest}");
     assert!(digest.contains("eja_read_recordx1"));
 }
@@ -1014,12 +1016,23 @@ fn checkpoint_whole_range_and_match_resolve_the_same_utf8_file() {
         final_message(&[]),
     ]));
     let w = f.worker(model, Arc::new(FileTools), Limits::default());
-    assert!(w.execute(&assignment(1)).contains("ended: message"));
+    assert!(w
+        .execute(&assignment(1), &control())
+        .contains("ended: message"));
     let reader =
         FileArtifactReader::with_checkpoints(f.0.join(".eja/nodes"), f.0.join(".eja/checkpoints"));
-    assert!(reader.read("1/out.txt").text.contains("第二行"));
+    assert!(reader
+        .slice("1/out.txt", &eja::Selector::Whole, &control())
+        .unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .contains("第二行"));
     let range = reader
-        .slice("1/out.txt", &Selector::Range { from: 1, lines: 1 })
+        .slice(
+            "1/out.txt",
+            &Selector::Range { from: 1, lines: 1 },
+            &control(),
+        )
         .unwrap();
     assert_eq!(range["lines"][0]["text"], "第二行");
     let found = reader
@@ -1030,6 +1043,7 @@ fn checkpoint_whole_range_and_match_resolve_the_same_utf8_file() {
                 before: 1,
                 after: 1,
             },
+            &control(),
         )
         .unwrap();
     assert_eq!(found["matches"][0]["context"].as_array().unwrap().len(), 3);
@@ -1061,7 +1075,7 @@ fn a_continuation_keeps_the_complete_prefix_of_an_interrupted_call_group() {
     let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
     let mut next = assignment(2);
     next.resume = Some(1);
-    assert!(w.execute(&next).contains("ended: message"));
+    assert!(w.execute(&next, &control()).contains("ended: message"));
     let seen = model.seen.lock().unwrap();
     assert!(seen[0]
         .iter()
@@ -1086,7 +1100,7 @@ fn a_turn_deadline_cannot_be_extended_by_a_nodes_own_timeout() {
     );
     let parent = Control::new(Duration::from_millis(100), Arc::new(AtomicBool::new(false)));
     let began = Instant::now();
-    let digest = w.execute_controlled(&assignment(1), &parent);
+    let digest = w.execute(&assignment(1), &parent);
     assert!(began.elapsed() < Duration::from_secs(2));
     assert!(digest.contains("ended: budget"), "{digest}");
     assert!(digest.contains("timed out"));
@@ -1107,7 +1121,7 @@ fn record_addresses_cannot_expand_a_nodes_ancestry_grant() {
         final_message(&[]),
     ]));
     let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
-    let digest = w.execute(&assignment(1));
+    let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("ended: message"));
     let seen = model.seen.lock().unwrap();
     assert!(seen[1].iter().any(|message| message["role"] == "tool"
@@ -1141,7 +1155,7 @@ fn relative_private_root_is_canonical_and_excluded_from_project_evidence() {
         Arc::new(FileTools),
     )
     .unwrap();
-    let digest = worker.execute(&assignment(1));
+    let digest = worker.execute(&assignment(1), &control());
     assert!(digest.contains("project: unchanged"), "{digest}");
     let manifest = f.manifest(1);
     let commit = manifest["checkpoint"].as_str().unwrap();
@@ -1163,7 +1177,7 @@ fn a_valid_long_assignment_crosses_start_ipc_once() {
     let worker = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
     let mut input = assignment(1);
     input.objective = "x".repeat(200 * 1024);
-    let digest = worker.execute(&input);
+    let digest = worker.execute(&input, &control());
     assert!(digest.contains("ended: message"), "{digest}");
     assert_eq!(model.seen.lock().unwrap()[0][1]["content"], input.objective);
 }
@@ -1177,13 +1191,13 @@ fn malformed_custom_model_messages_are_recorded_as_errors_and_not_replayed() {
         final_message(&[]),
     ]));
     let worker = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
-    let first = worker.execute(&assignment(1));
+    let first = worker.execute(&assignment(1), &control());
     assert!(first.contains("ended: error"), "{first}");
     let record = std::fs::read_to_string(f.0.join(".eja/nodes/1/context.jsonl")).unwrap();
     assert!(record.contains("model_error"));
     let mut next = assignment(2);
     next.resume = Some(1);
-    let digest = worker.execute(&next);
+    let digest = worker.execute(&next, &control());
     assert!(digest.contains("ended: message"), "{digest}");
     assert!(model.seen.lock().unwrap()[1]
         .iter()
@@ -1227,10 +1241,12 @@ fn empty_tool_lists_are_final_messages_and_a_missing_record_start_is_an_error() 
         final_message(&[]),
     ]));
     let worker = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
-    assert!(worker.execute(&assignment(1)).contains("ended: message"));
+    assert!(worker
+        .execute(&assignment(1), &control())
+        .contains("ended: message"));
     let mut next = assignment(2);
     next.resume = Some(1);
-    assert!(worker.execute(&next).contains("ended: message"));
+    assert!(worker.execute(&next, &control()).contains("ended: message"));
     assert!(model.seen.lock().unwrap()[1]
         .iter()
         .any(|m| m["content"] == "completed prefix"));
@@ -1244,7 +1260,7 @@ fn empty_tool_lists_are_final_messages_and_a_missing_record_start_is_an_error() 
     std::fs::write(damaged.join("context.jsonl"), "").unwrap();
     let mut next = assignment(4);
     next.resume = Some(3);
-    let digest = worker.execute(&next);
+    let digest = worker.execute(&next, &control());
     assert!(
         digest.contains("ended: error") && digest.contains("no start entry"),
         "{digest}"

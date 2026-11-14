@@ -1,10 +1,12 @@
+mod support;
 use eja::adapters::{ArtifactReader, Ports};
 use eja::{
-    turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, LookSource,
-    Selector, Store, TaskStatus, Worker,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, LookSource, Selector, Store,
+    TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use support::control;
 
 struct QueueBrain {
     queue: Mutex<VecDeque<Decision>>,
@@ -19,7 +21,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext) -> Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -45,7 +47,7 @@ impl QueueWorker {
 }
 
 impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment) -> String {
+    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
         self.queue
             .lock()
             .expect("worker")
@@ -57,13 +59,8 @@ impl Worker for QueueWorker {
 struct FakeReader;
 
 impl ArtifactReader for FakeReader {
-    fn read(&self, path: &str) -> ArtifactContent {
-        ArtifactContent {
-            path: path.to_string(),
-            text: "build\nsmoke test\nupload\n".to_string(),
-            truncated: false,
-            error: None,
-        }
+    fn slice(&self, path: &str, _: &Selector, _: &eja::Control) -> eja::Result<serde_json::Value> {
+        Ok(serde_json::json!({"path":path,"text":"build\nsmoke test\nupload\n","truncated":false}))
     }
 }
 
@@ -148,7 +145,11 @@ fn node_files_answer_a_range_and_a_match() {
     std::fs::write(dir.join("note.txt"), body).expect("write");
     let reader = FileArtifactReader::new(&dir);
     let range = reader
-        .slice("note.txt", &Selector::Range { from: 5, lines: 3 })
+        .slice(
+            "note.txt",
+            &Selector::Range { from: 5, lines: 3 },
+            &control(),
+        )
         .expect("range");
     assert_eq!(range["total_lines"], 20);
     assert_eq!(range["lines"][0]["line"], 5);
@@ -162,6 +163,7 @@ fn node_files_answer_a_range_and_a_match() {
                 before: 1,
                 after: 1,
             },
+            &control(),
         )
         .expect("match");
     assert_eq!(hit["matches"][0]["line"], 12);
@@ -174,6 +176,7 @@ fn node_files_answer_a_range_and_a_match() {
                 before: 0,
                 after: 0,
             },
+            &control(),
         )
         .expect("match");
     assert!(none["matches"].as_array().unwrap().is_empty());
@@ -196,6 +199,7 @@ fn a_match_returns_every_hit_and_the_view_budget_is_the_only_limit() {
                 before: 0,
                 after: 0,
             },
+            &control(),
         )
         .expect("match");
     assert_eq!(hit["matches"].as_array().unwrap().len(), 30);
@@ -225,8 +229,7 @@ fn list_dir_reads_the_project_and_reports_what_it_hid() {
     };
     let listing = FileTools
         .call(&ctx, "list_dir", &serde_json::json!({"path": "."}))
-        .unwrap()
-        .value;
+        .unwrap();
     let entries = listing["entries"].as_array().unwrap();
     assert!(entries
         .iter()
@@ -262,7 +265,7 @@ fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
             &serde_json::json!({"path": "a.txt", "find": "beta", "replace": "B"}),
         )
         .unwrap();
-    assert_eq!(ok.value["edited"], "a.txt");
+    assert_eq!(ok["edited"], "a.txt");
     assert_eq!(
         std::fs::read_to_string(work.join("a.txt")).unwrap(),
         "alpha B gamma"
@@ -294,7 +297,106 @@ fn oversized_artifact_target_fails_before_content_trimming() {
     let reader = eja::adapters::FileArtifactReader::new(std::env::temp_dir());
     let started = std::time::Instant::now();
     assert!(reader
-        .slice(&"x".repeat(eja::aja::FRAME_LIMIT + 1), &Selector::Whole)
+        .slice(
+            &"x".repeat(eja::aja::FRAME_LIMIT + 1),
+            &Selector::Whole,
+            &control()
+        )
         .is_err());
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn overlapping_match_windows_follow_hit_positions_including_the_file_end() {
+    use eja::adapters::FileArtifactReader;
+    let root = std::env::temp_dir().join(format!("eja-overlap-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("hits.txt"), "hit 0\nhit 1\nhit 2\nhit 3\nhit 4\n").unwrap();
+    let reader = FileArtifactReader::new(&root);
+    let value = reader
+        .slice(
+            "hits.txt",
+            &Selector::Match {
+                text: "hit".into(),
+                before: 1,
+                after: 2,
+            },
+            &control(),
+        )
+        .unwrap();
+    let contexts: Vec<Vec<u64>> = value["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| {
+            hit["context"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line["line"].as_u64().unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        contexts,
+        vec![
+            vec![0, 1, 2],
+            vec![0, 1, 2, 3],
+            vec![1, 2, 3, 4],
+            vec![2, 3, 4],
+            vec![3, 4]
+        ]
+    );
+    assert_eq!(value["truncated"], false);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn world_and_frozen_text_reads_share_encoding_bounds_and_cancellation() {
+    use eja::adapters::{FileArtifactReader, FileTools, ToolContext, ToolGateway};
+    let root = std::env::temp_dir().join(format!("eja-text-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("escaped.txt"),
+        [b'"', b'\\', 0, 0xff, b'\n'].repeat(60_000),
+    )
+    .unwrap();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control = eja::Control::new(std::time::Duration::from_secs(5), cancelled.clone());
+    let private = root.join(".eja");
+    let context = ToolContext {
+        node_id: 1,
+        project: &root,
+        private: &private,
+        control: &control,
+    };
+    let reader = FileArtifactReader::new(&root);
+    let node = reader
+        .slice("escaped.txt", &Selector::Whole, &control)
+        .unwrap();
+    let world = FileTools
+        .call(
+            &context,
+            "read_file",
+            &serde_json::json!({"path":"escaped.txt"}),
+        )
+        .unwrap();
+    assert_eq!(node["text"], world["text"]);
+    for value in [node, world] {
+        assert_eq!(value["truncated"], true);
+        assert!(value.to_string().len() <= eja::aja::FRAME_LIMIT);
+        assert!(value["text"].as_str().unwrap().contains('\u{fffd}'));
+    }
+    cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(reader
+        .slice("escaped.txt", &Selector::Whole, &control)
+        .is_err());
+    assert!(FileTools
+        .call(
+            &context,
+            "read_file",
+            &serde_json::json!({"path":"escaped.txt"})
+        )
+        .is_err());
+    let _ = std::fs::remove_dir_all(root);
 }

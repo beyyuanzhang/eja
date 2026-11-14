@@ -9,7 +9,7 @@ struct CountingBrain {
 }
 
 impl Brain for CountingBrain {
-    fn decide(&self, context: &EjaContext) -> Decision {
+    fn decide(&self, context: &EjaContext, _: &eja::Control) -> Decision {
         self.focus
             .lock()
             .expect("focus")
@@ -29,7 +29,7 @@ impl Brain for CountingBrain {
 struct DoneWorker;
 
 impl Worker for DoneWorker {
-    fn execute(&self, _assignment: &Assignment) -> String {
+    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
         format!(
             "1 steps, 1 tool calls, 0 artifacts, ended: message\n{}",
             "done"

@@ -1,18 +1,9 @@
 //! Host-owned model transport shared by EJA and its AJA nodes.
 use crate::{aja::Limits, Result};
 use serde_json::{json, Value};
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
 pub use crate::Control;
-
-impl Control {
-    fn wait<F: Future<Output = Result<Value>>>(&self, future: F) -> Result<Value> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(super::controlled(self, future))
-    }
-}
 
 /// Attempts per model call, including the first one.
 const MODEL_ATTEMPTS: usize = 4;
@@ -77,7 +68,10 @@ impl OpenAiModel {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
         }
-        control.wait(async {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(super::controlled(control, async {
             let client = reqwest::Client::builder().timeout(timeout).build()?;
             let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
             // A provider hiccup (429, 5xx, a dropped connection) is not EJA's
@@ -120,7 +114,7 @@ impl OpenAiModel {
                 }
                 return Ok(serde_json::from_slice(&bytes)?);
             }
-        })
+        }))
     }
 }
 

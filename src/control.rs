@@ -39,29 +39,31 @@ impl Control {
             cancellations: vec![cancelled],
         }
     }
-    pub fn child(&self, timeout: Duration, cancelled: Arc<AtomicBool>) -> Self {
-        let mut cancellations = self.cancellations.clone();
-        cancellations.push(cancelled);
+    pub fn child(&self, timeout: Duration) -> Self {
         Self {
             deadline: self.deadline.min(
                 Instant::now()
                     .checked_add(timeout)
                     .unwrap_or_else(Instant::now),
             ),
-            cancellations,
+            cancellations: self.cancellations.clone(),
         }
     }
-    pub fn check(&self) -> Result<()> {
+    pub fn cancelled_by(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancellations.push(flag);
+        self
+    }
+    pub fn check(&self) -> std::result::Result<(), ControlError> {
         if INTERRUPTED.load(Ordering::SeqCst)
             || self
                 .cancellations
                 .iter()
                 .any(|flag| flag.load(Ordering::SeqCst))
         {
-            return Err(ControlError::Cancelled.into());
+            return Err(ControlError::Cancelled);
         }
         if Instant::now() >= self.deadline {
-            return Err(ControlError::Deadline.into());
+            return Err(ControlError::Deadline);
         }
         Ok(())
     }

@@ -47,7 +47,7 @@ impl Limits {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Start {
-    pub limits: Limits,
+    pub context_bytes: usize,
     /// The final bounded starting view, prepared by the host before transport.
     pub messages: Vec<Value>,
 }
@@ -209,23 +209,15 @@ fn run(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
 ) -> Result<(String, String)> {
-    start.limits.validate()?;
+    if start.context_bytes == 0 || start.context_bytes > FRAME_LIMIT - FRAME_ENVELOPE {
+        return Err("invalid AJA context limit".into());
+    }
     let mut messages = start.messages;
-    let mut turns = 0usize;
     loop {
-        if let Some(limit) = start.limits.steps {
-            if turns >= limit {
-                return Ok(stopped(&format!(
-                    "AJA step budget of {limit} turns exhausted"
-                )));
-            }
-        }
-        turns += 1;
         // The transcript is a working view, not the record: the host keeps every
         // tool result in context.jsonl, so the oldest results can be elided in
         // place once the view outgrows its declared budget.
-        let budget = start.limits.context_bytes.min(FRAME_LIMIT - FRAME_ENVELOPE);
-        if !view::fit(&mut messages, budget) {
+        if !view::fit(&mut messages, start.context_bytes) {
             return Ok(stopped("AJA context budget exhausted"));
         }
         let message = request(

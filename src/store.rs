@@ -12,7 +12,6 @@ use std::{
 pub struct Store {
     pub log_path: PathBuf,
     writer: Arc<Mutex<Cursor>>,
-    pub(crate) active_turn: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -84,10 +83,9 @@ impl Store {
             .open(&log_path)?;
         lock_log(&locked)?;
         let (existing, committed) = scan_events(&log_path)?;
-        if log_path.exists() && fs::metadata(&log_path)?.len() != committed {
-            let file = OpenOptions::new().write(true).open(&log_path)?;
-            file.set_len(committed)?;
-            file.sync_all()?;
+        if locked.metadata()?.len() != committed {
+            locked.set_len(committed)?;
+            locked.sync_all()?;
         }
         let next_id = existing
             .iter()
@@ -110,7 +108,6 @@ impl Store {
                 next_turn,
                 bytes: committed,
             })),
-            active_turn: Arc::new(Mutex::new(())),
         })
     }
 

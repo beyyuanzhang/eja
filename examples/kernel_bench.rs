@@ -6,8 +6,8 @@ use chrono::{TimeZone, Utc};
 use eja::adapters::FileArtifactReader;
 use eja::adapters::{ArtifactReader, Ports};
 use eja::{
-    project, recover, turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext,
-    EventMeta, Kind, Result, Store, Worker,
+    project, recover, turn_at, Action, Assignment, Brain, Decision, EjaContext, EventMeta, Kind,
+    Result, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 struct NoBrain;
 
 impl Brain for NoBrain {
-    fn decide(&self, _context: &EjaContext) -> Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         Decision {
             reply: "ok".to_string(),
             actions: Vec::new(),
@@ -41,7 +41,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext) -> Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -57,19 +57,11 @@ impl Brain for QueueBrain {
 struct DoneWorker;
 
 impl Worker for DoneWorker {
-    fn execute(&self, _assignment: &Assignment) -> String {
+    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
         format!(
             "1 steps, 1 tool calls, 0 artifacts, ended: message\n{}",
             "done"
         )
-    }
-}
-
-struct NoArtifacts;
-
-impl ArtifactReader for NoArtifacts {
-    fn read(&self, path: &str) -> ArtifactContent {
-        ArtifactContent::failed(path, "benchmark")
     }
 }
 
@@ -158,10 +150,7 @@ fn bench_empty_turns(root: &Path, count: usize) -> (f64, f64) {
             "ping",
             &NoBrain,
             &DoneWorker,
-            &Ports {
-                node: Some(&NoArtifacts),
-                ..Default::default()
-            },
+            &Ports::default(),
             now() + chrono::Duration::seconds(index as i64),
         )
         .expect("turn");
@@ -202,10 +191,7 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
             "run",
             &brain,
             &DoneWorker,
-            &Ports {
-                node: Some(&NoArtifacts),
-                ..Default::default()
-            },
+            &Ports::default(),
             now() + chrono::Duration::seconds(index as i64 * 10),
         )
         .expect("turn");
@@ -238,10 +224,7 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
             "propose",
             &propose,
             &DoneWorker,
-            &Ports {
-                node: Some(&NoArtifacts),
-                ..Default::default()
-            },
+            &Ports::default(),
             now() + chrono::Duration::seconds(index as i64 * 2),
         )
         .expect("propose");
@@ -256,10 +239,7 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
             "confirm",
             &confirm,
             &DoneWorker,
-            &Ports {
-                node: Some(&NoArtifacts),
-                ..Default::default()
-            },
+            &Ports::default(),
             now() + chrono::Duration::seconds(index as i64 * 2 + 1),
             &eja::TurnOptions {
                 approvals: vec![proposal_id],
@@ -331,10 +311,16 @@ fn bench_artifact(root: &Path, count: usize) -> (f64, f64) {
     let mut samples = Vec::new();
     for _ in 0..count {
         let start = Instant::now();
-        let artifact = reader.read("artifact.txt");
+        let artifact = reader
+            .slice(
+                "artifact.txt",
+                &eja::Selector::Whole,
+                &eja::Control::new(Duration::from_secs(5), Default::default()),
+            )
+            .unwrap();
         samples.push(start.elapsed());
-        assert!(!artifact.truncated);
-        assert_eq!(artifact.text.len(), 16 * 1024);
+        assert_eq!(artifact["truncated"], false);
+        assert_eq!(artifact["text"].as_str().unwrap().len(), 16 * 1024);
     }
     (pct(&samples, 0.5), pct(&samples, 0.95))
 }

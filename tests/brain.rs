@@ -1,3 +1,4 @@
+mod support;
 use eja::adapters::{render_context, OpenAiBrain};
 use eja::{
     project_with_evidence, Action, Brain, EventMeta, Kind, LookSource, Observation, ProposalKind,
@@ -5,6 +6,7 @@ use eja::{
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use support::control;
 
 #[test]
 fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
@@ -91,7 +93,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
     });
 
     let brain = OpenAiBrain::new(format!("http://127.0.0.1:{port}"), "test-key", "test-model");
-    let decision = brain.decide(&context);
+    let decision = brain.decide(&context, &control());
     assert_eq!(decision.reply, "recorded");
     assert_eq!(
         decision.actions,

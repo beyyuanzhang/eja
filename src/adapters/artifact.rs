@@ -1,6 +1,6 @@
 //! A single reader/selector path for frozen records and checkpointed files.
 use super::ArtifactReader;
-use crate::{ArtifactContent, Control, Result, Selector};
+use crate::{Control, Result, Selector};
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
@@ -74,20 +74,6 @@ impl FileArtifactReader {
         }
         Ok(Source::File(file))
     }
-    fn whole(&self, path: &str) -> Result<ArtifactContent> {
-        let mut bytes = Vec::new();
-        self.source(path)?
-            .take(self.max_bytes.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)?;
-        let truncated = bytes.len() > self.max_bytes;
-        bytes.truncate(self.max_bytes);
-        Ok(ArtifactContent {
-            path: path.into(),
-            text: String::from_utf8_lossy(&bytes).into_owned(),
-            truncated,
-            error: None,
-        })
-    }
 }
 
 enum Source {
@@ -118,44 +104,24 @@ impl Drop for Source {
 }
 
 impl ArtifactReader for FileArtifactReader {
-    fn read(&self, path: &str) -> ArtifactContent {
-        self.whole(path)
-            .unwrap_or_else(|error| ArtifactContent::failed(path, error.to_string()))
-    }
-    fn slice(&self, path: &str, selector: &Selector) -> Result<Value> {
-        let control = Control::new(
-            std::time::Duration::from_secs(60),
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        );
-        self.slice_controlled(path, selector, &control)
-    }
-    fn slice_controlled(
-        &self,
-        path: &str,
-        selector: &Selector,
-        control: &Control,
-    ) -> Result<Value> {
+    fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value> {
         control.check()?;
         super::tools::relative_file(&self.root, path)?;
         if matches!(selector, Selector::Bytes { .. }) {
             return Err("node files use whole, range or match".into());
         }
         if matches!(selector, Selector::Whole) {
-            let mut content = self.read(path);
-            while serde_json::to_vec(&content)?.len() > crate::aja::FRAME_LIMIT {
-                control.check()?;
-                if content.text.is_empty() {
-                    return Err("artifact metadata exceeds the view budget".into());
-                }
-                content.text = super::cut_chars(&content.text, content.text.len() / 2).to_string();
-                content.truncated = true;
-            }
-            return Ok(serde_json::to_value(content)?);
+            return super::text_view(
+                self.source(path)?,
+                self.max_bytes,
+                json!({"path":path}),
+                control,
+            );
         }
         let mut reader = BufReader::new(self.source(path)?);
         let mut all = VecDeque::new();
         let mut selected = Vec::new();
-        let mut hits: Vec<Value> = Vec::new();
+        let mut hits: Vec<(usize, Vec<Value>)> = Vec::new();
         let mut total = 0usize;
         let mut bytes = 256usize;
         let mut truncated = false;
@@ -171,7 +137,6 @@ impl ArtifactReader for FileArtifactReader {
             } => (text.as_str(), *before, *after),
             _ => ("", 0, 0),
         };
-        let mut pending: Vec<(usize, usize, Vec<Value>)> = Vec::new();
         loop {
             control.check()?;
             let mut raw = Vec::new();
@@ -219,25 +184,17 @@ impl ArtifactReader for FileArtifactReader {
                 }
             }
             if matches!(selector, Selector::Match { .. }) {
-                for (_, remaining, context) in &mut pending {
-                    if *remaining > 0 {
-                        let size = line.to_string().len() + 1;
-                        if bytes.saturating_add(size) < crate::aja::FRAME_LIMIT {
-                            context.push(line.clone());
-                            bytes += size;
-                        } else {
-                            truncated = true;
-                        }
-                        *remaining -= 1;
-                    }
-                }
-                let mut i = 0;
-                while i < pending.len() {
-                    if pending[i].1 == 0 {
-                        let (at, _, context) = pending.remove(i);
-                        hits.push(json!({"line":at,"context":context}));
+                for (_, context) in hits
+                    .iter_mut()
+                    .rev()
+                    .take_while(|(at, _)| total <= at.saturating_add(after))
+                {
+                    let size = line.to_string().len() + 1;
+                    if bytes.saturating_add(size) < crate::aja::FRAME_LIMIT {
+                        context.push(line.clone());
+                        bytes += size;
                     } else {
-                        i += 1;
+                        truncated = true;
                     }
                 }
                 if text.contains(needle) {
@@ -246,11 +203,7 @@ impl ArtifactReader for FileArtifactReader {
                     let size = serde_json::to_vec(&context)?.len() + 64;
                     if bytes.saturating_add(size) < crate::aja::FRAME_LIMIT {
                         bytes += size;
-                        if after == 0 {
-                            hits.push(json!({"line":total,"context":context}));
-                        } else {
-                            pending.push((total, after, context));
-                        }
+                        hits.push((total, context));
                     } else {
                         truncated = true;
                     }
@@ -266,15 +219,13 @@ impl ArtifactReader for FileArtifactReader {
             }
             total += 1;
         }
-        hits.extend(
-            pending
-                .into_iter()
-                .map(|(at, _, context)| json!({"line":at,"context":context})),
-        );
-        hits.sort_by_key(|hit| hit["line"].as_u64());
         let value = if matches!(selector, Selector::Range { .. }) {
             json!({"path":path,"total_lines":total,"from":from.min(total),"lines":selected,"truncated":truncated})
         } else {
+            let hits: Vec<_> = hits
+                .into_iter()
+                .map(|(line, context)| json!({"line":line,"context":context}))
+                .collect();
             json!({"path":path,"total_lines":total,"matches":hits,"truncated":truncated})
         };
         if value.to_string().len() > crate::aja::FRAME_LIMIT {

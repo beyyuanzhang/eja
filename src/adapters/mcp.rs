@@ -1,6 +1,6 @@
 //! Shared, host-owned MCP clients. No connector state is passed to AJA.
 use super::Observer;
-use super::{Control, FileTools, ToolContext, ToolGateway, ToolOutput};
+use super::{Control, FileTools, ToolContext, ToolGateway};
 use crate::{aja::FRAME_LIMIT, Assignment, Result};
 use rmcp::{
     model::{
@@ -22,7 +22,6 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 use tokio::{
@@ -167,11 +166,7 @@ impl McpTools {
     }
 
     /// Explicit host config only; no home/project auto-discovery or shell expansion.
-    pub fn load(path: &Path, project: &Path) -> Result<Self> {
-        let control = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
-        Self::load_controlled(path, project, &control)
-    }
-    pub fn load_controlled(path: &Path, project: &Path, parent: &Control) -> Result<Self> {
+    pub fn load(path: &Path, project: &Path, parent: &Control) -> Result<Self> {
         parent.check()?;
         let mut bytes = Vec::new();
         fs::File::open(path)?
@@ -193,7 +188,7 @@ impl McpTools {
             children: vec![],
             tools: BTreeMap::new(),
         };
-        let startup = parent.child(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
+        let startup = parent.child(Duration::from_secs(300));
         for (name, config) in config.servers {
             startup.check()?;
             if !config.enabled {
@@ -213,10 +208,7 @@ impl McpTools {
             if config.timeout_ms == 0 || config.timeout_ms > 300_000 {
                 return Err(format!("invalid MCP timeout for {name}").into());
             }
-            let control = startup.child(
-                Duration::from_millis(config.timeout_ms),
-                Arc::new(AtomicBool::new(false)),
-            );
+            let control = startup.child(Duration::from_millis(config.timeout_ms));
             let timeout = Duration::from_millis(config.timeout_ms);
             let client = ClientConfig::new(
                 ClientCapabilities::default(),
@@ -451,7 +443,7 @@ impl ToolGateway for McpTools {
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         self.tools.values().map(|t| t.definition.clone()).collect()
     }
-    fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<ToolOutput> {
+    fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         ctx.control.check()?;
         let tool = self.tools.get(name).ok_or("MCP tool not granted")?;
         let connection = &self.connections[tool.server];
@@ -465,7 +457,7 @@ impl ToolGateway for McpTools {
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(
                 CallToolRequestParams::new(tool.name.clone()).with_arguments(args),
             ));
-            let call_control=ctx.control.child(remaining,Arc::new(AtomicBool::new(false)));
+            let call_control=ctx.control.child(remaining);
             let mut handle=super::controlled(&call_control,async {Ok(peer.send_cancellable_request(request,PeerRequestOptions::with_timeout(remaining)).await?) }).await?;
             loop {
                 tokio::select! {
@@ -488,7 +480,7 @@ impl ToolGateway for McpTools {
         if serde_json::to_vec(&value)?.len() > crate::aja::FRAME_LIMIT {
             return Err("MCP tool output exceeds limit".into());
         }
-        Ok(ToolOutput { value })
+        Ok(value)
     }
 }
 
@@ -515,9 +507,16 @@ pub struct HostTools {
     private: PathBuf,
 }
 impl HostTools {
-    pub fn new(config: Option<&Path>, project: &Path, private: &Path) -> Result<Self> {
+    pub fn new(
+        config: Option<&Path>,
+        project: &Path,
+        private: &Path,
+        control: &Control,
+    ) -> Result<Self> {
         Ok(Self {
-            mcp: config.map(|p| McpTools::load(p, project)).transpose()?,
+            mcp: config
+                .map(|p| McpTools::load(p, project, control))
+                .transpose()?,
             project: project.canonicalize()?,
             private: private.canonicalize()?,
         })
@@ -533,7 +532,7 @@ impl ToolGateway for HostTools {
             None => Vec::new(),
         }
     }
-    fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<ToolOutput> {
+    fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         if !name.starts_with("mcp__") {
             return Err(format!("{name} is not a declared connector tool").into());
         }
@@ -547,12 +546,8 @@ impl ToolGateway for HostTools {
 impl Observer for HostTools {
     /// EJA may look at the world; it may never act. Files are readable only from
     /// the project, connector tools only when declared read-only.
-    fn observe(&self, tool: &str, arguments: &Value) -> Result<Value> {
-        let control = Control::new(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));
-        self.observe_controlled(tool, arguments, &control)
-    }
-    fn observe_controlled(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
-        let control = parent.child(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));
+    fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
+        let control = parent.child(Duration::from_secs(60));
         let context = ToolContext {
             node_id: 0,
             project: &self.project,
@@ -560,7 +555,7 @@ impl Observer for HostTools {
             control: &control,
         };
         if tool == "read_file" || tool == "list_dir" {
-            return Ok(FileTools.call(&context, tool, arguments)?.value);
+            return FileTools.call(&context, tool, arguments);
         }
         if tool == "write_file" || tool == "edit_file" {
             return Err("EJA only observes; edits belong to nodes".into());
@@ -569,6 +564,6 @@ impl Observer for HostTools {
         if !mcp.is_read_only(tool) {
             return Err("EJA may only observe read-only connector tools".into());
         }
-        Ok(mcp.call(&context, tool, arguments)?.value)
+        mcp.call(&context, tool, arguments)
     }
 }
