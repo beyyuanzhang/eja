@@ -171,6 +171,7 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
                     title: format!("task {index}"),
                     request: "do it".to_string(),
                     acceptance: "done".to_string(),
+                    evidence: None,
                     run: true,
                 }],
                 refused: Vec::new(),

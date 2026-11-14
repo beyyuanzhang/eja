@@ -1,8 +1,6 @@
 mod support;
 use eja::adapters::{Observer, Ports};
-use eja::{
-    turn, Action, Brain, Decision, EjaContext, Kind, LookSource, Result, Selector, Store, Worker,
-};
+use eja::{turn, Action, Brain, Decision, EjaContext, Kind, Result, Selector, Store, Worker};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use support::control;
@@ -52,7 +50,6 @@ fn a_world_look_does_not_depend_on_waiting_tasks() {
         Decision {
             reply: String::new(),
             actions: vec![Action::Look {
-                source: LookSource::World,
                 target: "mcp__weather__get".to_string(),
                 arguments: serde_json::json!({"city": "berlin"}),
                 selector: Selector::Whole,
@@ -98,6 +95,7 @@ fn observing_a_read_only_tool_records_a_view() {
                 title: "sky".into(),
                 request: "check the sky".into(),
                 acceptance: String::new(),
+                evidence: None,
                 run: true,
             }],
             refused: Vec::new(),
@@ -105,7 +103,6 @@ fn observing_a_read_only_tool_records_a_view() {
         Decision {
             reply: String::new(),
             actions: vec![Action::Look {
-                source: LookSource::World,
                 target: "mcp__weather__get".to_string(),
                 arguments: serde_json::json!({"city": "berlin"}),
                 selector: Selector::Whole,
@@ -131,7 +128,7 @@ fn observing_a_read_only_tool_records_a_view() {
     .expect("turn");
     assert_eq!(out.reply, "it is clear");
     assert_eq!(out.context.evidence.len(), 1);
-    assert_eq!(out.context.evidence[0].source, LookSource::World);
+    assert_eq!(out.context.evidence[0].target, "mcp__weather__get");
     assert_eq!(out.context.evidence[0].result["sky"], "clear");
     assert!(store
         .events()

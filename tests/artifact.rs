@@ -1,8 +1,7 @@
 mod support;
 use eja::adapters::{Ports, RecordReader};
 use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, LookSource, Selector, Store,
-    TaskStatus, Worker,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -91,14 +90,14 @@ fn eja_reads_artifact_content_then_decides() {
                 title: "release checklist".to_string(),
                 request: "write a checklist".to_string(),
                 acceptance: "contains build, smoke test, upload".to_string(),
+                evidence: None,
                 run: true,
             }],
         ),
         decision(
             "read",
             vec![Action::Look {
-                source: LookSource::Aja,
-                target: "out.md".to_string(),
+                target: "record:1/out.md".to_string(),
                 arguments: serde_json::Value::Null,
                 selector: Selector::Whole,
             }],
@@ -126,7 +125,7 @@ fn eja_reads_artifact_content_then_decides() {
     .expect("turn");
 
     assert_eq!(outcome.evidence.len(), 1);
-    assert_eq!(outcome.evidence[0].result["path"], "out.md");
+    assert_eq!(outcome.evidence[0].result["path"], "1/out.md");
     assert!(outcome.evidence[0].result["text"]
         .as_str()
         .expect("text")

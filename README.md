@@ -33,6 +33,14 @@ record reading.
 - A checkpoint captures Git-visible workspace files. It is evidence about the
   world at that time; a continuation inherits observations, not a restored world.
   Missing checkpoints are reported in both manifest and digest.
+- An approval is its own event, recorded by the host for one turn. Confirmation
+  reads that event, so a caller's flag never becomes a second authority.
+- A task may declare **evidence** at open: what the host must observe before the
+  task can be judged. The host's observation is recorded as one `Observed` event
+  scoped to the task; without it the judgment is undecidable, not failed.
+- One address space covers every fact a view can read: `log:<target>`,
+  `record:<aja>/<entry or path>`, `world:<path>`. Any other target is a host read
+  tool. A folded region and a live one are read the same way.
 
 ## Tasks and authority
 
@@ -55,10 +63,12 @@ validated before entering the log. `relates_to`, `supersedes` and `contradicts`
 are descriptive edges; they do not silently change task state.
 
 Goals, commitments and corrections start as proposals. Confirmation requires an
-explicit approval id supplied by the host in `TurnOptions.approvals`, recorded
-with that turn's user event, and a proposal from an earlier turn. Model output
-alone cannot authorize confirmation. One identity event applies the change and
-resolves the proposal atomically. Existing confirmation events remain readable.
+approval the host recorded **for this turn** — `TurnOptions.approvals` is written
+as Approval events before the first decision — and a proposal from an earlier
+turn. Model output alone cannot authorize confirmation. One identity event
+applies the change and resolves the proposal atomically. An approval authorizes
+one turn, so a proposal that needs one ends the turn and the next turn carries
+it: the turn is the unit of waiting, not a mid-turn park.
 
 EJA may observe any host-granted read-only capability. Its ability to observe
 never depends on unrelated tasks. Effects occur through an AJA's host gateway.
@@ -78,6 +88,9 @@ look {source: log | aja | world, target, selector}
   Whole, range and match use the same source resolver, including checkpoints.
 - World targets: `read_file`, `list_dir`, or a granted read-only connector.
   World tools select content through their own arguments.
+- A target may instead be an address: `log:event:12`, `log:task:1`,
+  `record:3/4` (one tool result), `record:3/report.md` (one frozen file),
+  `world:src/out.txt`. Addresses use the same selector semantics as any look.
 
 Selectors are `{"select":"whole"}`, `{"select":"range","from":0,"lines":40}`,
 `{"select":"match","text":"passage","before":2,"after":4}`, and
@@ -118,7 +131,7 @@ Default host budgets:
 
 | Resource | Default |
 |---|---:|
-| Turn decisions / actions / dispatches | 128 / 4096 / 128 |
+| Turn decisions / actions / dispatches / slots | 128 / 4096 / 128 / 1 |
 | Turn elapsed time | 30 minutes |
 | Aja model steps / elapsed time | 256 / 300 seconds |
 | Aja context / model response | 252 KiB / 64 KiB |
@@ -130,9 +143,11 @@ Default host budgets:
 One `Control` hierarchy propagates the turn deadline/cancellation to the brain,
 ajas, observations and model/tool calls. A child may shorten the deadline, never
 extend it. Every port requires this control explicitly; there is one entry point
-per operation. Dispatches run in action order under one execution owner, and each
-completed report is recorded before the next aja starts. The host owns aja step
-and time limits; the disposable loop only manages its bounded message view.
+per operation. Dispatches run in action order. With one slot they also run one at
+a time in one shared world; with more slots the host must reserve an isolated
+world per run, and the journal still records reports in dispatch order. The host
+owns aja step and time limits; the disposable loop only manages its bounded
+message view.
 
 ## Recovery
 
@@ -149,9 +164,15 @@ missing predecessor records are explicit errors, never a silent fresh start.
 
 ## Compatibility
 
+0.12 turns approvals into events, moves acceptance evidence into the task's own
+contract, adds a slot budget with isolated worlds and world reconciliation, and
+replaces the look source taxonomy with one address space. Older logs stay
+readable: new fields default to absent, and a proposal without an Approval event
+simply stays pending. A state directory written by 0.11 or earlier is still
+refused; there is no migration.
+
 0.11 renames the execution record from `nodes/` to `ajas/` and the environment
-verbs `EJA_NODE_*` to `EJA_AJA_*`. A state directory written by an older version
-is not read by this one; there is no migration.
+verbs `EJA_NODE_*` to `EJA_AJA_*`.
 
 ## Run
 
@@ -177,10 +198,13 @@ has no filesystem-write or external-effect capability. See [MCP setup](docs/MCP.
 and the [native protocol](docs/AJA-PROTOCOL.md).
 
 Host resource configuration: `EJA_TURN_DECISIONS`, `EJA_TURN_ACTIONS`,
-`EJA_TURN_DISPATCHES`, `EJA_TURN_TIMEOUT_MS`, `EJA_AJA_STEPS`,
+`EJA_TURN_DISPATCHES`, `EJA_AJA_SLOTS`, `EJA_TURN_TIMEOUT_MS`, `EJA_AJA_STEPS`,
 `EJA_AJA_TIMEOUT_MS`, `EJA_CONTEXT_BYTES`. Limits must be positive.
-`EJA_AJA_SLOTS` must be absent or `1`: one mutable workspace has one execution
-owner, so any other value is refused instead of starting a second runner.
+`EJA_AJA_SLOTS` is the number of runs that may share a turn. With one slot the
+host runs one shared world. Above one it needs a git project with at least one
+commit, because each run gets its own worktree and branch (`<dir>/worlds/<id>`)
+and is reconciled only when asked. A worktree world starts at `HEAD`: uncommitted
+project changes stay in the project and are reported by the run's own account.
 `--task ID` selects initial focus. `show audit:ID` follows explicit containment
 and continuation edges; matching input text never invents a job relationship.
 
@@ -195,7 +219,11 @@ cargo test
 Composition regressions cover unrelated-task invariance, large-result replay,
 record addressability, aggregate completion, relation uniqueness and cross-kind
 cycles, host authorization, atomic confirmation, torn-tail recovery, UTF-8 byte
-budgets, deadlines and always-changing model states. Native/MCP tests also cover
+budgets, deadlines and always-changing model states. Identity regressions add the
+protocol-only contract, self-before-index rendering and addressable folding.
+Acceptance regressions add one-turn approvals and witness-or-undecidable
+judgments; world regressions add parallel slots with ordered reports, explicit
+reconciliation and conflict reporting. Native/MCP tests also cover
 real local HTTP, cancellation, process cleanup and frozen checkpoints.
 
 Trusted adapters must honor Control, own their resources and bound their output.

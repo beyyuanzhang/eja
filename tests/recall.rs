@@ -1,7 +1,7 @@
 use eja::adapters::Ports;
 use eja::{
-    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, LookSource,
-    ProposalKind, Selector, Store, Worker,
+    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind,
+    Selector, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -103,8 +103,7 @@ fn recall_is_an_id_result_not_text_matching() {
         decision(
             "searching",
             vec![Action::Look {
-                source: LookSource::Log,
-                target: format!("event:{}", commitment.id),
+                target: format!("log:event:{}", commitment.id),
                 arguments: serde_json::Value::Null,
                 selector: Selector::Whole,
             }],

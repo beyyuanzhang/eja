@@ -27,6 +27,9 @@ pub enum Kind {
     WorkerReport,
     TaskClosed,
     Observed,
+    /// A host-recorded approval of one pending proposal, for this turn. Approval
+    /// is a fact like any other, never a caller's flag.
+    Approval,
     /// The host rejected an action: the state did not allow it, or it could not
     /// be read as one of EJA's own actions. EJA reads these back in its projection.
     Refused,
@@ -64,6 +67,9 @@ pub struct ProposalView {
     pub text: String,
     pub created_at: i64,
     pub turn: u64,
+    /// True when the host recorded an approval for this turn.
+    #[serde(default)]
+    pub approved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +197,10 @@ pub(crate) struct TaskOpen {
     pub(crate) request: String,
     pub(crate) origin: String,
     pub(crate) acceptance: String,
+    /// A host-interpreted request for acceptance evidence. A judgment counts only
+    /// when the host observed that evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +223,14 @@ pub struct Task {
     pub closed_at: Option<i64>,
     pub digest: Option<String>,
     pub close: Option<CloseOutcome>,
+    /// The acceptance evidence this task asked the host for, fixed at open.
+    #[serde(default)]
+    pub witness: Option<Value>,
+    /// The observation that answered it, when the host produced one.
+    #[serde(default)]
+    pub witness_id: Option<u64>,
+    #[serde(default)]
+    pub witness_result: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,7 +247,6 @@ pub struct EjaContext {
     pub now: i64,
     pub input: String,
     pub history: Vec<Event>,
-    pub approved_proposals: Vec<u64>,
     pub goal: Option<Event>,
     pub identity: Vec<Event>,
     pub commitments: Vec<Event>,
@@ -287,6 +304,9 @@ pub enum Action {
         title: String,
         request: String,
         acceptance: String,
+        /// What the host must observe before the task can be judged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<Value>,
         #[serde(default)]
         run: bool,
     },
@@ -305,6 +325,11 @@ pub enum Action {
         #[serde(default)]
         note: String,
     },
+    /// Ask the host to bring one run's world back. The outcome, conflicts
+    /// included, is recorded evidence; nothing merges silently.
+    Reconcile {
+        task_id: TaskId,
+    },
     /// Navigation, not acquisition: what this turn is about.
     #[serde(rename = "focus")]
     Focus {
@@ -312,7 +337,7 @@ pub enum Action {
     },
     #[serde(rename = "look")]
     Look {
-        source: LookSource,
+        /// An address (`log:`, `record:`, `world:`) or a host read tool.
         #[serde(default)]
         target: String,
         #[serde(default)]
@@ -320,15 +345,6 @@ pub enum Action {
         #[serde(default)]
         selector: Selector,
     },
-}
-
-/// Where a look reads from: EJA's own log, a frozen aja record, or the world.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LookSource {
-    Log,
-    Aja,
-    World,
 }
 
 /// How much of the target to read. One selector replaces offset/paging/query options.
@@ -355,7 +371,6 @@ pub enum Selector {
 /// One look, recorded once. This is the only shape an EJA observation has.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Observation {
-    pub source: LookSource,
     pub target: String,
     #[serde(default)]
     pub arguments: Value,
@@ -367,17 +382,37 @@ pub struct Observation {
     pub error: Option<String>,
 }
 
-/// The only read primitive; every invocation inherits host control.
-pub trait Lookup {
+/// The host: one read primitive, and the two host acts a turn may request.
+///
+/// Every method inherits host control. A host that declares no worlds and no
+/// acceptance evidence is still a complete host; the defaults say so.
+pub trait Host {
+    /// One read. A target that parses as an address resolves through that
+    /// authority; any other target is a host read tool name.
     fn look(
         &self,
-        source: LookSource,
         target: &str,
         arguments: &Value,
         selector: &Selector,
         log: &[Event],
         control: &Control,
     ) -> Result<Value>;
+
+    /// Observe the acceptance evidence one task asked for, at the host's discretion.
+    fn witness(&self, _request: &Value, _control: &Control) -> Result<Value> {
+        Err("this host observes no acceptance evidence".into())
+    }
+
+    /// Bring one run's world back into the shared world. The account, conflicts
+    /// included, is evidence; the host never merges silently.
+    fn reconcile(&self, _task: TaskId, _control: &Control) -> Result<Value> {
+        Err("this host isolates no worlds".into())
+    }
+}
+
+/// One host capability that may answer an acceptance witness.
+pub trait Witness: Send + Sync {
+    fn observe(&self, request: &Value, control: &Control) -> Result<Value>;
 }
 
 pub trait Brain {
@@ -403,6 +438,9 @@ pub struct TurnLimits {
     pub decisions: usize,
     pub actions: usize,
     pub dispatches: usize,
+    /// How many worlds one decision may run at once. Each slot needs its own
+    /// world, so this is also the isolation budget.
+    pub slots: usize,
     pub timeout_ms: u64,
 }
 impl Default for TurnLimits {
@@ -411,13 +449,18 @@ impl Default for TurnLimits {
             decisions: 128,
             actions: 4096,
             dispatches: 128,
+            slots: 1,
             timeout_ms: 1_800_000,
         }
     }
 }
 impl TurnLimits {
     pub fn validate(&self) -> Result<()> {
-        if self.decisions == 0 || self.actions == 0 || self.dispatches == 0 || self.timeout_ms == 0
+        if self.decisions == 0
+            || self.actions == 0
+            || self.dispatches == 0
+            || self.slots == 0
+            || self.timeout_ms == 0
         {
             return Err("turn budgets must be positive".into());
         }
@@ -446,4 +489,54 @@ pub struct TurnOutcome {
     pub worker_ms: u128,
     pub end: TurnEnd,
     pub reason: Option<String>,
+}
+/// Where a payload lives. One address space over every authority a view can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Authority {
+    /// A committed fact in the journal.
+    Log,
+    /// One entry or file of a frozen execution record.
+    Record,
+    /// A path in the world the host grants.
+    World,
+}
+
+/// An address names one region of one authority, so a folded region and a live
+/// one are read the same way: `log:event:12`, `record:3/4`, `record:3/report.md`,
+/// `world:src/out.txt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Address {
+    pub authority: Authority,
+    pub id: String,
+}
+
+impl Address {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (scheme, id) = raw.split_once(':')?;
+        if id.is_empty() {
+            return None;
+        }
+        let authority = match scheme {
+            "log" => Authority::Log,
+            "record" => Authority::Record,
+            "world" => Authority::World,
+            _ => return None,
+        };
+        Some(Self {
+            authority,
+            id: id.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scheme = match self.authority {
+            Authority::Log => "log",
+            Authority::Record => "record",
+            Authority::World => "world",
+        };
+        write!(formatter, "{scheme}:{}", self.id)
+    }
 }

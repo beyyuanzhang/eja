@@ -1,8 +1,8 @@
 mod support;
 use eja::adapters::{render_context, OpenAiBrain};
 use eja::{
-    project_with_evidence, Action, Brain, EventMeta, Kind, LookSource, Observation, ProposalKind,
-    Selector, Store,
+    project_with_evidence, Action, Brain, EventMeta, Kind, Observation, ProposalKind, Selector,
+    Store,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -29,8 +29,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         )
         .unwrap();
     let evidence = vec![Observation {
-        source: LookSource::Log,
-        target: format!("event:{}", old.id),
+        target: format!("log:event:{}", old.id),
         arguments: serde_json::Value::Null,
         selector: Selector::Whole,
         result: serde_json::json!({"matches": 1, "events": [old]}),
@@ -66,10 +65,12 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         let mut body = vec![0; length.expect("content length")];
         reader.read_exact(&mut body).unwrap();
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(request["messages"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("You are EJA"));
+        // The contract describes the protocol, never the subject: identity comes
+        // from the record, not from a prompt that says who the model is.
+        let system = request["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("Return ONE JSON object"), "{system}");
+        assert!(system.contains("\"op\":\"dispatch\""), "{system}");
+        assert!(!system.contains("You are"), "{system}");
         let input = request["messages"][1]["content"].as_str().unwrap();
         assert!(input.contains(&format!("#{} original goal", goal.id)));
         assert!(input.contains("EVIDENCE"));

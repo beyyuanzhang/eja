@@ -62,6 +62,7 @@ fn aja(title: &str, run: bool) -> Action {
         title: title.into(),
         request: title.into(),
         acceptance: "done".into(),
+        evidence: None,
         run,
     }
 }
@@ -163,11 +164,15 @@ fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal()
     assert!(!events
         .iter()
         .any(|event| event.kind == Kind::ProposalConfirmed));
-    assert!(events.iter().any(|event| event.kind == Kind::User
+    // An approval is its own fact, not a field the caller re-declares each turn.
+    assert!(events.iter().any(|event| event.kind == Kind::Approval
         && event
             .data
             .as_ref()
-            .is_some_and(|data| data["approved_proposals"] == json!([id]))));
+            .is_some_and(|data| data["proposal_id"] == json!(id))));
+    assert!(!events
+        .iter()
+        .any(|event| event.kind == Kind::User && event.data.is_some()));
     assert!(project(&f.store(), "", None, now_utc())
         .unwrap()
         .proposals
@@ -175,14 +180,12 @@ fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal()
 }
 
 #[test]
-fn prospective_host_approval_cannot_confirm_a_proposal_in_its_creation_turn() {
+fn an_approval_cannot_confirm_a_proposal_in_its_creation_turn() {
     let f = Fixture::new();
     let store = f.store();
     let worker = WorkerLog::default();
-    let options = TurnOptions {
-        approvals: vec![2],
-        ..Default::default()
-    };
+    // Event 1 is the user event, so the proposal a scripted decision creates is
+    // event 2: the decision may name it, and the same turn may not confirm it.
     let out = turn_at_with_options(
         &store,
         "request",
@@ -197,7 +200,7 @@ fn prospective_host_approval_cannot_confirm_a_proposal_in_its_creation_turn() {
         &worker,
         &Ports::default(),
         now_utc(),
-        &options,
+        &TurnOptions::default(),
     )
     .unwrap();
     assert!(out.context.commitments.is_empty());
@@ -307,7 +310,6 @@ impl Observer for World {
 }
 fn look() -> Action {
     Action::Look {
-        source: LookSource::World,
         target: "fact".into(),
         arguments: Value::Null,
         selector: Selector::Whole,
@@ -454,8 +456,7 @@ fn history_is_discoverable_and_all_rendered_views_obey_utf8_byte_budgets() {
     assert!(context.history.iter().any(|event| event.text == "finished"));
     let history = Ports::default()
         .look(
-            LookSource::Log,
-            "history",
+            "log:history",
             &Value::Null,
             &Selector::Range { from: 0, lines: 2 },
             &store.events().unwrap(),
@@ -639,8 +640,7 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
     let ports = Ports::default();
     let page = ports
         .look(
-            LookSource::Log,
-            "all",
+            "log:all",
             &Value::Null,
             &Selector::Range { from: 0, lines: 2 },
             &events,
@@ -651,12 +651,11 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
     assert_eq!(page["partial_events"][0]["id"], first.id);
     assert_eq!(page["events"][0]["text"], "later fact");
     assert!(page.to_string().len() <= aja::FRAME_LIMIT);
-    let target = format!("event:{}", first.id);
+    let target = format!("log:event:{}", first.id);
     let text = serde_json::to_string(&first).unwrap();
     let at = text.find('前').unwrap();
     let chunk = ports
         .look(
-            LookSource::Log,
             &target,
             &Value::Null,
             &Selector::Bytes { from: at, bytes: 1 },
@@ -670,8 +669,7 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
         &store,
         "read",
         &script(vec![Action::Look {
-            source: LookSource::Log,
-            target: "all".into(),
+            target: "log:all".into(),
             arguments: Value::Null,
             selector: Selector::Range { from: 0, lines: 2 },
         }]),
@@ -685,16 +683,8 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
 }
 
 struct CancelLookup(Arc<AtomicBool>);
-impl Lookup for CancelLookup {
-    fn look(
-        &self,
-        _: LookSource,
-        _: &str,
-        _: &Value,
-        _: &Selector,
-        _: &[Event],
-        _: &Control,
-    ) -> Result<Value> {
+impl eja::Host for CancelLookup {
+    fn look(&self, _: &str, _: &Value, _: &Selector, _: &[Event], _: &Control) -> Result<Value> {
         self.0.store(true, Ordering::SeqCst);
         Err(ControlError::Cancelled.into())
     }

@@ -1,6 +1,7 @@
 //! Shared, host-owned MCP clients. No connector state is passed to AJA.
 use super::Observer;
 use super::{Control, FileTools, ToolContext, ToolGateway};
+use crate::Witness;
 use crate::{aja::FRAME_LIMIT, Assignment, Result};
 use rmcp::{
     model::{
@@ -52,6 +53,10 @@ struct ServerConfig {
     /// Server tool names the host declares read-only for EJA's observation.
     #[serde(default)]
     read_only: Vec<String>,
+    /// Server tool names that may answer an acceptance witness. A witness is an
+    /// effect-capable host act, so it is declared here and nowhere else.
+    #[serde(default)]
+    witness: Vec<String>,
     #[serde(default = "enabled")]
     enabled: bool,
     #[serde(default = "timeout")]
@@ -142,6 +147,8 @@ struct RemoteTool {
     name: String,
     definition: Value,
     read_only: bool,
+    /// The host declared this tool may answer an acceptance witness.
+    witness: bool,
 }
 struct Connection {
     name: String,
@@ -163,6 +170,11 @@ impl McpTools {
         self.tools
             .get(public)
             .is_some_and(|remote| remote.read_only)
+    }
+
+    /// A tool may answer a witness only when the host declared it.
+    pub fn is_witness(&self, public: &str) -> bool {
+        self.tools.get(public).is_some_and(|remote| remote.witness)
     }
 
     /// Explicit host config only; no home/project auto-discovery or shell expansion.
@@ -382,6 +394,15 @@ impl McpTools {
                 )
                 .into());
             }
+            if config
+                .witness
+                .iter()
+                .any(|declared| !available.contains(declared))
+            {
+                return Err(
+                    format!("MCP {name}: witness tool is absent from the server catalog").into(),
+                );
+            }
             for tool in listed {
                 if requested
                     .as_ref()
@@ -406,6 +427,10 @@ impl McpTools {
                             server: index,
                             name: tool.name.to_string(),
                             definition,
+                            witness: config
+                                .witness
+                                .iter()
+                                .any(|witness| witness == tool.name.as_ref()),
                             read_only: config
                                 .read_only
                                 .iter()
@@ -540,6 +565,38 @@ impl ToolGateway for HostTools {
             .as_ref()
             .ok_or("MCP is not configured")?
             .call(ctx, name, args)
+    }
+}
+
+impl Witness for HostTools {
+    /// A witness is one declared host capability. The request names the tool; the
+    /// host decides whether that name may answer it, and reading a file can have
+    /// no effect, so the host's own read tools are always allowed.
+    fn observe(&self, request: &Value, control: &Control) -> Result<Value> {
+        let tool = request["tool"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or("a witness names one host tool")?;
+        let arguments = request
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let control = control.child(Duration::from_secs(120));
+        control.check()?;
+        let context = ToolContext {
+            aja_id: 0,
+            project: &self.project,
+            private: &self.private,
+            control: &control,
+        };
+        if tool == "read_file" || tool == "list_dir" {
+            return FileTools.call(&context, tool, &arguments);
+        }
+        let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
+        if !mcp.is_witness(tool) {
+            return Err(format!("{tool} is not a declared witness").into());
+        }
+        mcp.call(&context, tool, &arguments)
     }
 }
 

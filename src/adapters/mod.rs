@@ -11,6 +11,7 @@ mod process;
 mod record;
 mod records;
 mod tools;
+mod worlds;
 
 pub use brain::{
     parse_decision, render_context, render_context_within, OpenAiBrain, SYSTEM_PROMPT,
@@ -21,6 +22,7 @@ pub use native::{NativeWorker, INTERRUPTED};
 pub use ports::{Observer, Ports, RecordReader};
 pub use records::RecordFiles;
 pub use tools::{FileTools, ToolContext, ToolGateway};
+pub use worlds::{ProjectDelta, Shared, Worktrees, World, Worlds};
 
 use crate::Kind;
 

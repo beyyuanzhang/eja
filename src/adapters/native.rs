@@ -1,5 +1,5 @@
 //! Single native worker path: same binary, private AJA mode, host-owned effects.
-use super::{Control, Model, ToolContext, ToolGateway};
+use super::{Control, Model, ProjectDelta, Shared, ToolContext, ToolGateway, World, Worlds};
 use crate::fold;
 use crate::{
     aja::{self, Limits, Request, Start},
@@ -125,161 +125,6 @@ impl Process {
     }
 }
 
-/// A project larger than this is reported as truncated instead of scanned.
-const PROJECT_ENTRIES: usize = 20_000;
-/// Names shown per change class before the rest are counted.
-const PROJECT_NAMES: usize = 6;
-
-type ProjectState = std::collections::BTreeMap<String, (u64, i64)>;
-
-/// Every regular file in the project, with its size and modification time. The
-/// worker's own state (`skip`) is not part of what the aja did to the project.
-fn snapshot_project(root: &Path, skip: &Path, control: &Control) -> (ProjectState, bool) {
-    let mut state = ProjectState::new();
-    let mut truncated = false;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        if control.check().is_err() {
-            truncated = true;
-            break;
-        }
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if control.check().is_err() || state.len() >= PROJECT_ENTRIES {
-                truncated = true;
-                break;
-            }
-            let path = entry.path();
-            let Ok(metadata) = entry.path().symlink_metadata() else {
-                continue;
-            };
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            if metadata.is_dir() {
-                if path != skip && entry.file_name() != ".git" {
-                    pending.push(path);
-                }
-                continue;
-            }
-            if !metadata.is_file() {
-                continue;
-            }
-            let Ok(relative) = path.strip_prefix(root) else {
-                continue;
-            };
-            let stamp = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|time| time.as_nanos() as i64)
-                .unwrap_or(0);
-            state.insert(
-                relative.to_string_lossy().replace('\\', "/"),
-                (metadata.len(), stamp),
-            );
-        }
-        if truncated {
-            break;
-        }
-    }
-    (state, truncated)
-}
-
-/// What the aja did to the project: the world's answer, not the aja's claim.
-#[derive(Debug, Default)]
-struct ProjectDelta {
-    created: Vec<String>,
-    modified: Vec<String>,
-    deleted: Vec<String>,
-    truncated: bool,
-}
-
-impl ProjectDelta {
-    /// A change is claimed only when the inventory that could observe it is
-    /// complete: an inventory that was cut short (budget, cancellation, entry
-    /// cap) is expressible as "unobserved", never as a created/deleted file.
-    fn between(
-        before: &ProjectState,
-        after: &ProjectState,
-        before_complete: bool,
-        after_complete: bool,
-    ) -> Self {
-        let mut delta = Self {
-            truncated: !(before_complete && after_complete),
-            ..Self::default()
-        };
-        for (name, stamp) in after {
-            match before.get(name) {
-                None if before_complete => delta.created.push(name.clone()),
-                Some(was) if was != stamp => delta.modified.push(name.clone()),
-                _ => {}
-            }
-        }
-        if after_complete {
-            for name in before.keys() {
-                if !after.contains_key(name) {
-                    delta.deleted.push(name.clone());
-                }
-            }
-        }
-        delta
-    }
-    fn line(&self) -> String {
-        if self.created.is_empty() && self.modified.is_empty() && self.deleted.is_empty() {
-            return if self.truncated {
-                "project: no change observed (inventory truncated)".into()
-            } else {
-                "project: unchanged".into()
-            };
-        }
-        let names = |list: &[String]| {
-            let shown: Vec<&str> = list
-                .iter()
-                .take(PROJECT_NAMES)
-                .map(String::as_str)
-                .collect();
-            let rest = list.len().saturating_sub(shown.len());
-            let more = if rest == 0 {
-                String::new()
-            } else {
-                format!(", …{rest} more")
-            };
-            format!(" ({}{more})", shown.join(", "))
-        };
-        let mut parts = Vec::new();
-        if !self.created.is_empty() {
-            parts.push(format!(
-                "+{} created{}",
-                self.created.len(),
-                names(&self.created)
-            ));
-        }
-        if !self.modified.is_empty() {
-            parts.push(format!(
-                "~{} modified{}",
-                self.modified.len(),
-                names(&self.modified)
-            ));
-        }
-        if !self.deleted.is_empty() {
-            parts.push(format!(
-                "-{} deleted{}",
-                self.deleted.len(),
-                names(&self.deleted)
-            ));
-        }
-        let tail = if self.truncated {
-            " (inventory truncated)"
-        } else {
-            ""
-        };
-        format!("project: {}{tail}", parts.join(", "))
-    }
-}
-
 /// What one run of a aja produced: the transcript's account of it.
 struct Outcome<'a> {
     text: &'a str,
@@ -289,14 +134,28 @@ struct Outcome<'a> {
 }
 
 struct Lease<'a> {
-    active: &'a Mutex<Option<ActiveRun>>,
+    active: &'a Mutex<Vec<ActiveRun>>,
+    id: u64,
 }
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        if let Some(run) = self.active.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            run.cancelled.store(true, Ordering::SeqCst);
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = active.iter().position(|run| run.id == self.id) {
+            active.remove(index).cancelled.store(true, Ordering::SeqCst);
         }
+    }
+}
+
+/// A reserved world released on every exit path, panic included.
+struct Held<'a> {
+    worlds: &'a dyn Worlds,
+    world: World,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.worlds.release(&self.world);
     }
 }
 
@@ -320,7 +179,6 @@ struct ActiveRun {
 pub struct NativeWorker {
     binary: PathBuf,
     root: PathBuf,
-    project: PathBuf,
     model: Arc<dyn Model>,
     tools: Arc<dyn ToolGateway>,
     limits: Limits,
@@ -328,7 +186,11 @@ pub struct NativeWorker {
     checkpoints: PathBuf,
     /// The host's own state, never part of what a aja did to the project.
     state: PathBuf,
-    active: Mutex<Option<ActiveRun>>,
+    /// Where each run may change things. Isolation is the host's decision.
+    worlds: Arc<dyn Worlds>,
+    /// How many worlds may run at once.
+    slots: usize,
+    active: Mutex<Vec<ActiveRun>>,
 }
 
 impl NativeWorker {
@@ -356,14 +218,27 @@ impl NativeWorker {
         Ok(Self {
             binary: binary.into().canonicalize()?,
             root,
-            project,
             model,
             tools,
             limits: Limits::default(),
             checkpoints,
+            worlds: Arc::new(Shared {
+                project: project.clone(),
+                private: state.clone(),
+            }),
+            slots: 1,
             state,
-            active: Mutex::new(None),
+            active: Mutex::new(Vec::new()),
         })
+    }
+    /// The worlds this host provides. Without one, every run shares the project.
+    pub fn with_worlds(mut self, worlds: Arc<dyn Worlds>) -> Self {
+        self.worlds = worlds;
+        self
+    }
+    pub fn with_slots(mut self, slots: usize) -> Self {
+        self.slots = slots.max(1);
+        self
     }
     pub fn with_limits(mut self, limits: Limits) -> Result<Self> {
         limits.validate()?;
@@ -371,26 +246,17 @@ impl NativeWorker {
         Ok(self)
     }
     pub fn cancel(&self, aja_id: u64) -> bool {
-        if let Some(flag) = self
-            .active
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .filter(|run| run.id == aja_id)
-        {
-            flag.cancelled.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        match active.iter().find(|run| run.id == aja_id) {
+            Some(run) => {
+                run.cancelled.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
         }
     }
     pub fn active_count(&self) -> usize {
-        usize::from(
-            self.active
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some(),
-        )
+        self.active.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     fn run(
@@ -399,6 +265,7 @@ impl NativeWorker {
         control: &Control,
         log: &mut ContextLog,
         counts: &mut std::collections::BTreeMap<String, usize>,
+        world: &World,
     ) -> Result<(String, String)> {
         let mut definitions = self.tools.definitions(assignment);
         definitions.push(super::record::definition());
@@ -418,10 +285,10 @@ impl NativeWorker {
             context_bytes: self.limits.context_bytes,
             messages,
         };
-        let mut process = Process::start(&self.binary, &self.project, start)?;
+        let mut process = Process::start(&self.binary, &world.root, start)?;
         let context = ToolContext {
             aja_id: assignment.task_id,
-            project: &self.project,
+            project: &world.root,
             private: self.root.parent().ok_or("missing state root")?,
             control,
         };
@@ -526,14 +393,19 @@ impl NativeWorker {
 
     /// Freeze the world this aja left: one commit in the state's shadow
     /// repository. The commit is the fossil EJA reads a aja's files from.
-    fn checkpoint(&self, assignment: &Assignment, control: &Control) -> Result<String> {
+    fn checkpoint(
+        &self,
+        assignment: &Assignment,
+        root: &Path,
+        control: &Control,
+    ) -> Result<String> {
         let git = |args: &[&str]| -> Result<String> {
             let mut command = std::process::Command::new("git");
             command
                 .arg("--git-dir")
                 .arg(&self.checkpoints)
                 .arg("--work-tree")
-                .arg(&self.project)
+                .arg(root)
                 .args([
                     "-c",
                     "core.hooksPath=/dev/null",
@@ -561,7 +433,7 @@ impl NativeWorker {
             ".".into(),
             ":!.git".into(),
         ];
-        if let Ok(relative) = self.state.strip_prefix(&self.project) {
+        if let Ok(relative) = self.state.strip_prefix(root) {
             let relative = relative.to_string_lossy().to_string();
             if !relative.is_empty() {
                 let exclude = format!(":!{relative}");
@@ -574,15 +446,17 @@ impl NativeWorker {
         git(&["rev-parse", "HEAD"])
     }
 
-    fn seal(
-        &self,
-        aja: &Path,
-        assignment: &Assignment,
-        outcome: Outcome<'_>,
-        delta: &ProjectDelta,
-        control: &Control,
-    ) -> Result<String> {
-        let (checkpoint, checkpoint_error) = match self.checkpoint(assignment, control) {
+    fn seal(&self, run: Run<'_>, control: &Control) -> Result<String> {
+        let Run {
+            aja,
+            assignment,
+            outcome,
+            change,
+            world,
+            settled,
+        } = run;
+        let (checkpoint, checkpoint_error) = match self.checkpoint(assignment, &world.root, control)
+        {
             Ok(commit) => (Some(commit), None),
             Err(error) => (None, Some(error.to_string())),
         };
@@ -605,14 +479,21 @@ impl NativeWorker {
         };
         let (text, reason) = (outcome.text, outcome.reason);
         let steps = outcome.steps;
+        // One line says which world this run was given and what it did to it.
+        let mut world_line = format!("world: {}: {}", world.label, change.line());
+        if let Some(commit) = settled
+            .and_then(|value| value.get("commit"))
+            .and_then(Value::as_str)
+        {
+            world_line.push_str(&format!(" at {commit}"));
+        }
         let mut digest = format!(
-            "{steps} steps, {calls} tool calls{}, {}, ended: {reason}\n{text}",
+            "{steps} steps, {calls} tool calls{}, ended: {reason}\n{world_line}\n{text}",
             if histogram.is_empty() {
                 String::new()
             } else {
                 format!(" ({})", histogram.join(" "))
             },
-            delta.line(),
         );
         if let Some(error) = &checkpoint_error {
             digest.push_str(&format!("\ncheckpoint unavailable: {error}"));
@@ -620,6 +501,7 @@ impl NativeWorker {
         let manifest = json!({
             "assignment": assignment,
             "digest": digest,
+            "world": world.label,
             "checkpoint": checkpoint,
             "checkpoint_error": checkpoint_error,
             "context": "context.jsonl",
@@ -641,6 +523,16 @@ impl NativeWorker {
     }
 }
 
+/// Everything one run produced, in one place: the record is sealed from this.
+struct Run<'a> {
+    aja: &'a Path,
+    assignment: &'a Assignment,
+    outcome: Outcome<'a>,
+    change: &'a ProjectDelta,
+    world: &'a World,
+    settled: Option<&'a Value>,
+}
+
 impl Worker for NativeWorker {
     fn execute(&self, assignment: &Assignment, parent: &Control) -> String {
         if let Err(error) = parent.check() {
@@ -654,25 +546,34 @@ impl Worker for NativeWorker {
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            if active.is_some() {
-                return "0 steps, 0 tool calls, ended: budget\nexecution owner is busy".into();
+            if active.len() >= self.slots {
+                return "0 steps, 0 tool calls, ended: budget\nno free world".into();
             }
             if let Err(e) = fs::create_dir(&aja) {
                 return format!(
                     "0 steps, 0 tool calls, ended: error\nnode already reserved or unavailable: {e}"
                 );
             }
-            *active = Some(ActiveRun {
+            active.push(ActiveRun {
                 id: assignment.task_id,
                 cancelled: cancelled.clone(),
             });
         }
         let _lease = Lease {
             active: &self.active,
+            id: assignment.task_id,
         };
         let control = parent
             .child(Duration::from_millis(self.limits.timeout_ms))
             .cancelled_by(cancelled.clone());
+        let world = match self.worlds.reserve(assignment.task_id, &control) {
+            Ok(world) => Held {
+                worlds: &*self.worlds,
+                world,
+            },
+            Err(error) => return format!("0 steps, 0 tool calls, ended: error\nno world: {error}"),
+        };
+        let world = &world.world;
         let mut counts = std::collections::BTreeMap::new();
         let mut log = match ContextLog::create(&aja) {
             Ok(log) => log,
@@ -682,13 +583,13 @@ impl Worker for NativeWorker {
                 )
             }
         };
-        let before = snapshot_project(&self.project, &self.state, &control);
         let result: Result<(String, String)> =
-            self.run(assignment, &control, &mut log, &mut counts);
+            self.run(assignment, &control, &mut log, &mut counts, world);
         let steps = log.assistants;
-        let (after, truncated) = snapshot_project(&self.project, &self.state, &control);
-        let delta = ProjectDelta::between(&before.0, &after, !before.1, !truncated);
-        cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything
+        // The world's account is measured before the run is revoked: an expired
+        // deadline makes it honest ("unobserved"), not optimistic.
+        let change = world.change(&control);
+        cancelled.store(true, Ordering::SeqCst);
         let (text, reason) = match result {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -703,75 +604,28 @@ impl Worker for NativeWorker {
         };
         let _ = log.record(json!({"kind": "finish", "text": &text, "reason": &reason}));
         drop(log);
+        let settled = self
+            .worlds
+            .settle(world, &change, &parent.child(Duration::from_secs(60)))
+            .ok();
         self.seal(
-            &aja,
-            assignment,
-            Outcome {
-                text: &text,
-                reason: &reason,
-                steps,
-                counts: &counts,
+            Run {
+                aja: &aja,
+                assignment,
+                outcome: Outcome {
+                    text: &text,
+                    reason: &reason,
+                    steps,
+                    counts: &counts,
+                },
+                change: &change,
+                world,
+                settled: settled.as_ref(),
             },
-            &delta,
             parent,
         )
         .unwrap_or_else(|e| {
             format!("{steps} steps, 0 tool calls, ended: error\nnode could not be frozen: {e}")
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn inventory(entries: &[(&str, u64)]) -> ProjectState {
-        entries
-            .iter()
-            .map(|(name, size)| ((*name).to_string(), (*size, 0)))
-            .collect()
-    }
-
-    #[test]
-    fn a_partial_inventory_reports_only_what_it_observed() {
-        let before = inventory(&[("kept.txt", 1), ("other.txt", 1)]);
-        let empty = ProjectState::new();
-        // The second inventory never saw the project: it proves nothing.
-        let delta = ProjectDelta::between(&before, &empty, true, false);
-        assert!(delta.deleted.is_empty(), "{delta:?}");
-        assert!(delta.created.is_empty());
-        assert!(delta.truncated);
-        assert!(
-            delta.line().contains("inventory truncated"),
-            "{}",
-            delta.line()
-        );
-        // An unobserved earlier world cannot invent creations either.
-        let delta = ProjectDelta::between(&empty, &before, false, true);
-        assert!(delta.created.is_empty(), "{delta:?}");
-        assert!(delta.truncated);
-        // What was genuinely compared survives the truncation notice.
-        let after = inventory(&[("kept.txt", 2)]);
-        let delta = ProjectDelta::between(&before, &after, true, false);
-        assert_eq!(delta.modified, vec!["kept.txt".to_string()]);
-        assert!(delta.created.is_empty());
-        assert!(delta.deleted.is_empty());
-        assert!(
-            delta.line().starts_with("project: ~1 modified"),
-            "{}",
-            delta.line()
-        );
-    }
-
-    #[test]
-    fn two_complete_inventories_report_every_change() {
-        let before = inventory(&[("kept.txt", 1), ("gone.txt", 1)]);
-        let after = inventory(&[("kept.txt", 2), ("new.txt", 1)]);
-        let delta = ProjectDelta::between(&before, &after, true, true);
-        assert_eq!(delta.created, vec!["new.txt".to_string()]);
-        assert_eq!(delta.modified, vec!["kept.txt".to_string()]);
-        assert_eq!(delta.deleted, vec!["gone.txt".to_string()]);
-        assert!(!delta.truncated);
-        assert!(!delta.line().contains("truncated"), "{}", delta.line());
     }
 }

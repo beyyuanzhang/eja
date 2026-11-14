@@ -167,7 +167,10 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("ended: message"), "{digest}");
-    assert!(digest.contains("project: +1 created (out.txt)"), "{digest}");
+    assert!(
+        digest.contains("world: shared: +1 created (out.txt)"),
+        "{digest}"
+    );
     assert_eq!(
         std::fs::read_to_string(f.0.join("out.txt")).unwrap(),
         "aja result",
@@ -262,7 +265,7 @@ fn the_digest_reports_what_the_project_gained() {
     let w = f.worker(model, Arc::new(Effects), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     assert!(
-        digest.contains("project: +2 created (delivered.txt, nested/also.txt)"),
+        digest.contains("world: shared: +2 created (delivered.txt, nested/also.txt)"),
         "{digest}"
     );
 }
@@ -455,7 +458,7 @@ fn traversal_private_state_and_symlinks_are_not_file_capabilities() {
     let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     // The claim mentions an escaping path; the world did not move.
-    assert!(digest.contains("project: unchanged"), "{digest}");
+    assert!(digest.contains("world: shared: unchanged"), "{digest}");
     assert!(!f.0.join("escape.txt").exists());
     assert_eq!(f.manifest(1)["frozen"], true);
     assert_eq!(
@@ -487,7 +490,7 @@ fn step_context_and_output_limits_stop_the_aja_and_preserve_partial_work() {
     // A spent budget stops the aja without calling its work a failure.
     assert!(r.contains("ended: budget"), "{r}");
     assert!(r.contains("budget"), "{r}");
-    assert!(r.contains("project: +1 created (partial.txt)"), "{r}");
+    assert!(r.contains("world: shared: +1 created (partial.txt)"), "{r}");
     assert!(f.manifest(1)["digest"]
         .as_str()
         .unwrap()
@@ -760,7 +763,7 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
         .iter()
         .any(|m| m["role"] == "tool"));
     assert!(
-        digest.contains("project: +1 created (http.txt)"),
+        digest.contains("world: shared: +1 created (http.txt)"),
         "{digest}"
     );
 }
@@ -882,7 +885,7 @@ fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
             "stop",
             decision(
                 "reading",
-                json!([{"op":"look","source":"aja","target":"1/checklist.txt"}]),
+                json!([{"op":"look","target":"record:1/checklist.txt"}]),
             ),
         ),
         response(
@@ -1196,7 +1199,7 @@ fn relative_private_root_is_canonical_and_excluded_from_project_evidence() {
     )
     .unwrap();
     let digest = worker.execute(&assignment(1), &control());
-    assert!(digest.contains("project: unchanged"), "{digest}");
+    assert!(digest.contains("world: shared: unchanged"), "{digest}");
     let manifest = f.manifest(1);
     let commit = manifest["checkpoint"].as_str().unwrap();
     let tree = Command::new("git")

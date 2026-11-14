@@ -1,4 +1,4 @@
-use crate::{format_utc, Action, Brain, Decision, EjaContext, LookSource, Selector};
+use crate::{format_utc, Action, Brain, Decision, EjaContext, Selector};
 use serde_json::json;
 use std::time::Duration;
 
@@ -16,46 +16,62 @@ fn relation(kind: crate::RelationKind) -> &'static str {
 }
 
 pub const SYSTEM_PROMPT: &str = "\
-You are EJA, one continuous subject. You own identity, commitments and the \
-task index; you do not execute work. AJA sessions execute one assignment each and \
-leave a record of what they did. The record is yours to read: a dispatch returns the \
-host's digest of it, and you may look deeper at any aja. Treat the aja's last \
-message as its account, not a verified outcome; the record and the decision are yours. You observe, you never execute: you may read the log, aja records, and the project itself (read_file, list_dir), and every effect happens inside an AJA aja. There is no fallback executor. A correction targets an explicit event id; never invent one. Identity changes \
-(goal, commitment, correction) are proposals: propose them, then confirm \
-only when its id is in HOST APPROVED PROPOSALS. Never confirm a proposal in the same turn it was \
-created. \
+Return ONE JSON object: {\"reply\":\"...\",\"actions\":[...]}. \
+A decision cannot execute anything: the host validates every action, records it, and \
+runs the executions. Actions run in their listed order. Creating a aja, group or \
+proposal returns its allocated id in the next projection and continues this turn; \
+use that id instead of guessing it. \
+A dispatch returns the host's account of one run; the run's record is its evidence. \
+Treat a run's last message as its account, not as a verified outcome. \
+Every read is one action: a look names a target and a selector. A target is an \
+address -- log:event:12, log:task:1, log:history, record:3/4 (one tool result), \
+record:3/report.md (one frozen file), world:src/out.txt -- or a host read tool such \
+as read_file, list_dir or a granted connector, which selects through arguments. \
+Identity changes (goal, commitment, correction) are proposals: propose them, then \
+confirm only when the proposal is marked approved in PENDING PROPOSALS, and never \
+in the turn that created it. An approval is recorded by the host for one turn; \
+model text never is. An approval authorizes one turn, so a proposal that needs one \
+ends the turn and the next turn carries it. \
 The current input is separate from the persistent goal. Use a goal/commitment \
 proposal without target_id to add one; with target_id to replace an active event \
 of the same kind. Use correction with target_id only to withdraw that event. \
 The proposal text is the replacement content, or the withdrawal reason. \
-Actions execute in their listed order. Creating a aja, group or proposal returns its allocated id in the next projection and continues this turn; use that id rather than guessing it. Every read is one action: a look names \
-a source (log, aja or world), a target and a selector. A aja look reads that \
-aja's own files or the workspace it left behind. Dispatching an AJA also \
-returns an observation, and dispatches in one decision run in action order. A continuation is represented as a new task related to \
-the previous one with \
-{\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
-Tasks are execution ajas; open_group creates a non-executable container. part_of targets a group. A group can be closed after its children settle; judge its own acceptance contract. Execution edges are fixed before dispatch; continues has exactly one finished predecessor, and depends_on requires an accepted predecessor before dispatch. Open a continuation with run:false, relate it, then dispatch it. World reads are governed only by host capabilities. Read older conversation with look log history or all, using range to page event indices. To finish, return your final reply with no observation-producing actions. \
-Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes: \
+Execution edges are fixed before dispatch: dispatch runs only an open aja, \
+depends_on needs its target done, continues has exactly one predecessor with a \
+frozen record, and part_of targets an open group. A group can be closed after its \
+children settle; judge its own acceptance contract, not its children's verdicts. \
+An aja opened with evidence asks the host for acceptance evidence; without the \
+host's observation the judgment is undecidable, not failed. A run that left an \
+isolated world can be reconciled explicitly; the outcome, conflicts included, is \
+recorded evidence. \
+Tasks are execution ajas; open_group creates a non-executable container. \
+Dispatches in one decision run in action order; the host may run them at once when \
+it has isolated worlds. A continuation is a new task related to the previous one \
+with {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
+Action shapes: \
 {\"op\":\"propose\",\"kind\":\"goal|commitment|correction\",\"target_id\":1,\"text\":\"...\"}; \
 {\"op\":\"confirm\",\"proposal_id\":1}; \
 {\"op\":\"reject\",\"proposal_id\":1,\"note\":\"...\"}; \
 {\"op\":\"decision|relationship\",\"text\":\"...\"}; \
 {\"op\":\"open_group\",\"title\":\"...\",\"acceptance\":\"...\"}; \
-{\"op\":\"open_task\",\"title\":\"...\",\"request\":\"...\",\"acceptance\":\"...\",\"run\":true}; \
+{\"op\":\"open_task\",\"title\":\"...\",\"request\":\"...\",\"acceptance\":\"...\",\
+\"evidence\":{\"tool\":\"<host tool>\",\"arguments\":{}},\"run\":true}; \
+{\"op\":\"reconcile\",\"task_id\":1}; \
 {\"op\":\"dispatch\",\"task_id\":1}; \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
 {\"op\":\"focus\",\"task_id\":1}; \
-{\"op\":\"look\",\"source\":\"log\",\"target\":\"task:1\"}; \
-{\"op\":\"look\",\"source\":\"aja\",\"target\":\"1/report/out.md\"}; \
-{\"op\":\"look\",\"source\":\"aja\",\"target\":\"3/context.jsonl\",\"selector\":{\"select\":\"match\",\"text\":\"PO-1010\",\"before\":2,\"after\":4}}; \
-{\"op\":\"look\",\"source\":\"aja\",\"target\":\"1/report/out.md\",\"selector\":{\"select\":\"range\",\"from\":0,\"lines\":40}}; \
-{\"op\":\"look\",\"source\":\"world\",\"target\":\"list_dir\",\"arguments\":{\"path\":\".\"}}; \
-{\"op\":\"look\",\"source\":\"world\",\"target\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}; \
-{\"op\":\"look\",\"source\":\"world\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
+{\"op\":\"look\",\"target\":\"log:task:1\"}; \
+{\"op\":\"look\",\"target\":\"record:3/4\",\"selector\":{\"select\":\"bytes\",\"from\":0,\"bytes\":4096}}; \
+{\"op\":\"look\",\"target\":\"world:read_file\",\"arguments\":{\"path\":\"README.md\"}}; \
+{\"op\":\"look\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
 Preconditions: dispatch runs only a task in open state; a task that has a aja \
-record is waiting for your judgment, so close it or open a new task for more \
-work. close_task requires a waiting aja, an open aja being cancelled, or a group whose children are terminal. confirm needs a host-approved pending proposal from an \
-earlier turn. Log pages expose from/next/total; continue at next. Oversized events are listed in partial_events: read event:<id> with selector {\"select\":\"bytes\",\"from\":0,\"bytes\":4096}, then continue at next_offset. Byte views contain serialized event text.";
+record is waiting for judgment, so close it or open a new task for more work. \
+close_task requires a waiting aja, an open aja being cancelled, a group whose \
+children are terminal, and the witness evidence a task asked for. confirm needs a \
+proposal from an earlier turn that the host approved for this turn. Log pages \
+expose from/next/total; continue at next. Oversized events are listed in \
+partial_events: read event:<id> with selector {\"select\":\"bytes\",\"from\":0,\
+\"bytes\":4096}, then continue at next_offset. Byte views contain serialized event text.";
 
 struct Section {
     title: &'static str,
@@ -118,13 +134,6 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         false,
         one_line(format!("  {}", context.input)),
     ));
-    if !context.approved_proposals.is_empty() {
-        sections.push(section(
-            "HOST APPROVED PROPOSALS",
-            false,
-            one_line(format!("  {:?}", context.approved_proposals)),
-        ));
-    }
     sections.push(section(
         "CURRENT GOAL",
         false,
@@ -158,7 +167,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .iter()
             .map(|proposal| {
                 vec![format!(
-                    "  proposal #{} [{}] target={} turn={}: {}",
+                    "  proposal #{} [{}] target={} turn={}{}: {}",
                     proposal.id,
                     format!("{:?}", proposal.kind).to_lowercase(),
                     proposal
@@ -166,6 +175,11 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                     proposal.turn,
+                    if proposal.approved {
+                        " approved"
+                    } else {
+                        " needs host approval"
+                    },
                     proposal.text
                 )]
             })
@@ -192,6 +206,18 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             ));
             for line in digest.lines() {
                 task_lines.push(format!("  record: {line}"));
+            }
+        }
+        if let Some(witness) = &task.witness {
+            task_lines.push(format!("  witness: {witness}"));
+            match (&task.witness_result, task.witness_id) {
+                (Some(result), Some(id)) => {
+                    task_lines.push(format!("  witness evidence #{id}: {result}"))
+                }
+                _ => task_lines.push(
+                    "  witness evidence: not observed — a judgment now would be undecidable"
+                        .to_string(),
+                ),
             }
         }
         if let Some(close) = &task.close {
@@ -243,13 +269,13 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         };
         let mut item = vec![format!(
             "  [{} {}]{}",
-            source_label(observation.source),
+            address_label(&observation.target),
             observation.target,
             selector
         )];
         if let Some(error) = &observation.error {
             item.push(format!("    error: {error}"));
-        } else if observation.source == LookSource::Log
+        } else if observation.target.starts_with("log:")
             && observation.result.get("events").is_some()
         {
             item.push(format!(
@@ -362,17 +388,18 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
 
     // The fold keeps the head whole, so the order is the priority: what this
     // turn is about and what EJA just looked at come before any index.
-    const ORDER: [&str; 13] = [
+    // The self is not an index: goal and identity survive budget pressure, and
+    // the indexes fold first. Nothing here is prose about the subject.
+    const ORDER: [&str; 12] = [
         "NOW (UTC)",
         "CURRENT INPUT",
+        "CURRENT GOAL",
+        "ACTIVE IDENTITY",
         "CURRENT TASK",
         "EVIDENCE",
         "REFUSED",
-        "HOST APPROVED PROPOSALS",
-        "CURRENT GOAL",
         "OPEN COMMITMENTS",
         "PENDING PROPOSALS",
-        "ACTIVE IDENTITY",
         "RECENT CONVERSATION",
         "TASK INDEX",
         "RELATIONS",
@@ -528,10 +555,11 @@ impl Brain for OpenAiBrain {
     }
 }
 
-fn source_label(source: LookSource) -> &'static str {
-    match source {
-        LookSource::Log => "log",
-        LookSource::Aja => "aja",
-        LookSource::World => "world",
-    }
+/// A target's label is derived from what it is: an address scheme, or the host
+/// tool it names. There is no second taxonomy of reads.
+fn address_label(target: &str) -> &str {
+    target
+        .split_once(':')
+        .map(|(scheme, _)| scheme)
+        .unwrap_or("tool")
 }

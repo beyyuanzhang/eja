@@ -51,6 +51,7 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
                     title: "child task".to_string(),
                     request: "child".to_string(),
                     acceptance: "child output".to_string(),
+                    evidence: None,
                     run: false,
                 },
                 Action::LinkTasks {

@@ -1,7 +1,7 @@
 use eja::adapters::{Ports, RecordReader};
 use eja::{
-    turn, Action, Assignment, Brain, Decision, EjaContext, Kind, LookSource, ProposalKind,
-    Selector, Store, TaskStatus, Worker,
+    turn, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, Selector, Store,
+    TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -87,6 +87,7 @@ fn open(run: bool) -> Action {
         title: "task".into(),
         request: "work".into(),
         acceptance: "read the output".into(),
+        evidence: None,
         run,
     }
 }
@@ -120,8 +121,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     let brain = Script::new(vec![
         step(vec![
             Action::Look {
-                source: LookSource::Log,
-                target: format!("event:{}", fact.id),
+                target: format!("log:event:{}", fact.id),
                 arguments: serde_json::Value::Null,
                 selector: Selector::Whole,
             },
@@ -138,14 +138,12 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
             },
         ]),
         step(vec![Action::Look {
-            source: LookSource::Aja,
-            target: "first.md".into(),
+            target: "record:1/first.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
         step(vec![Action::Look {
-            source: LookSource::Aja,
-            target: "second.md".into(),
+            target: "record:1/second.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
@@ -169,14 +167,14 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     let log_look = out
         .evidence
         .iter()
-        .find(|look| look.source == LookSource::Log)
+        .find(|look| look.target.starts_with("log:"))
         .expect("recall");
     assert_eq!(log_look.result["events"][0]["id"], fact.id);
     assert_eq!(log_look.result["events"][0]["kind"], "user");
     let aja_looks = out
         .evidence
         .iter()
-        .filter(|look| look.source == LookSource::Aja)
+        .filter(|look| look.target.starts_with("record:"))
         .count();
     assert_eq!(aja_looks, 2);
     let seen = brain.seen.lock().unwrap();
@@ -190,13 +188,13 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         assert!(context
             .evidence
             .iter()
-            .any(|look| look.source == LookSource::Log));
+            .any(|look| look.target.starts_with("log:")));
         assert!(eja::adapters::render_context(context).contains(&fact.text));
     }
     assert!(seen[4]
         .evidence
         .iter()
-        .any(|look| look.result["text"].as_str() == Some("content of second.md")));
+        .any(|look| look.result["text"].as_str() == Some("content of 1/second.md")));
     let events = store.events().unwrap();
     assert_eq!(
         events
@@ -224,21 +222,18 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
     let brain = Script::new(vec![
         step(vec![open(true)]),
         step(vec![Action::Look {
-            source: LookSource::Log,
-            target: format!("event:{}", fact.id),
+            target: format!("log:event:{}", fact.id),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
         step(vec![Action::Look {
-            source: LookSource::Aja,
-            target: "1.md".into(),
+            target: "record:1/1.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
         step(vec![close(1), open(true)]),
         step(vec![Action::Look {
-            source: LookSource::Aja,
-            target: "2.md".into(),
+            target: "record:1/2.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
@@ -270,11 +265,11 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
     assert!(seen[5]
         .evidence
         .iter()
-        .any(|look| look.source == LookSource::Log));
+        .any(|look| look.target.starts_with("log:")));
     assert!(seen[5]
         .evidence
         .iter()
-        .any(|look| look.result["path"] == "2.md"));
+        .any(|look| look.result["path"] == "1/2.md"));
     assert_eq!(worker.0.lock().unwrap().len(), 2);
 }
 
@@ -289,8 +284,7 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
                 text: "not yet confirmed".into(),
             },
             Action::Look {
-                source: LookSource::Aja,
-                target: "background.md".into(),
+                target: "record:1/background.md".into(),
                 arguments: serde_json::Value::Null,
                 selector: Selector::Whole,
             },
@@ -312,7 +306,11 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
     // The refused confirmation is told once, so EJA gets one more decision.
     assert_eq!(out.decisions, 3);
     assert_eq!(out.refused.len(), 1, "{:?}", out.refused);
-    assert!(out.refused[0].contains("host-recorded user approval"));
+    assert!(
+        out.refused[0].contains("created this turn"),
+        "{:?}",
+        out.refused
+    );
     assert_eq!(out.context.proposals.len(), 1);
     assert!(out.context.commitments.is_empty());
     assert!(!store
@@ -329,8 +327,7 @@ fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
         (0..10)
             .map(|_| {
                 step(vec![Action::Look {
-                    source: LookSource::Aja,
-                    target: "missing.md".into(),
+                    target: "record:1/missing.md".into(),
                     arguments: serde_json::Value::Null,
                     selector: Selector::Whole,
                 }])
@@ -358,14 +355,12 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     let store = store();
     let mut steps: Vec<Decision> = vec![
         step(vec![Action::Look {
-            source: LookSource::Aja,
-            target: "background.md".into(),
+            target: "record:1/background.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
         step(vec![Action::Look {
-            source: LookSource::Aja,
-            target: "second.md".into(),
+            target: "record:1/second.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
@@ -374,8 +369,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     // Keep observing the same artifact until the view stops changing.
     steps.extend((0..8).map(|_| {
         step(vec![Action::Look {
-            source: LookSource::Aja,
-            target: "same.md".into(),
+            target: "record:1/same.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }])
@@ -399,8 +393,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     let restarted = Store::new(store.log_path.parent().unwrap()).unwrap();
     let brain = Script::new(vec![
         step(vec![Action::Look {
-            source: LookSource::Aja,
-            target: "1.md".into(),
+            target: "record:1/1.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),

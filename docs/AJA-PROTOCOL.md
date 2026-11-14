@@ -1,7 +1,8 @@
 # Native AJA protocol
 
 The same executable runs in private `--aja-worker` mode. It starts with an empty
-environment in the project workspace. The host owns model credentials, MCP
+environment in the world the host reserved for this run: the project itself when
+there is one shared world, a worktree when slots are isolated. The host owns model credentials, MCP
 connections, tool grants and all external effects. The aja only runs framed IPC.
 
 ## Startup
@@ -36,7 +37,8 @@ at most 1 KiB from a full result in this aja or its explicit ancestry.
 Context fitting folds the transcript: the system prompt, the assignment, and the
 newest steps stay whole while the budget allows, older steps become one address
 line each, and the oldest fold into one address range. Nothing is deleted from
-the record, and every folded step is read back with its `{aja,entry}` address.
+the record, and every folded step is read back with its `record:<aja>/<entry>`
+address — the same address space as `log:` and `world:`.
 A contract that cannot fit even at that scale ends with budget. Incomplete
 provider responses and invalid tool messages end with error.
 
@@ -50,7 +52,8 @@ already contain inherited start messages treats them as ancestry roots.
 `aja.json` is published by atomic rename after process cleanup and transcript
 sync. It contains assignment, digest, optional checkpoint, checkpoint_error,
 context file/size and frozen:true. Frozen files become read-only. Checkpointing
-captures Git-visible project files; whole/range/match read the same commit.
+captures the Git-visible files of that world; whole/range/match read the same
+commit.
 Checkpoint failure remains visible and does not discard the execution record.
 
 A record is evidence, not acceptance. EJA's later close_task event is the verdict.
@@ -59,14 +62,16 @@ A continuation uses a new aja id and a single explicit predecessor.
 
 ## Lifetime
 
-Native execution is serial over one mutable workspace. Host cancellation/deadline
-propagates through model requests and tool calls. The host kills/reaps the aja,
+Native execution runs in one reserved world per aja. With one slot that world is
+the shared project, so runs are serial; with more slots each run gets its own
+worktree and the host records reports in dispatch order. Host cancellation and
+deadlines propagate through model requests and tool calls. The host kills/reaps the aja,
 joins its IPC reader and revokes its run before publishing the frozen record.
 Waiting for EJA judgment retains no AJA process. All cleanup and checkpoint
 resources belong to the host. Ordinary filesystem permissions and child processes
 are application boundaries, not an OS security sandbox.
 
-MCP connections belong to the command/application, and are shared across serial
-ajas. Cancelling a request asks the server to stop; it cannot undo remote effects.
+MCP connections belong to the command/application, and are shared across the
+ajas of one host. Cancelling a request asks the server to stop; it cannot undo remote effects.
 Legacy host/admin adapters must satisfy the same bounded-output and Control
 contracts to participate in finite execution.

@@ -16,6 +16,9 @@ L' = L ++ events(A, O)               recorded transition
 
 `L` owns identity, task and judgment facts. `R` owns raw execution evidence;
 `K` owns optional frozen workspace evidence. The mutable world `W` is external.
+Every view points at one **address** in one authority — `log:<target>`,
+`record:<aja>/<entry|path>`, `world:<path>` — and any target that is not an
+address is a host read tool. Folding and reading use that one namespace.
 One fact has one authority; keeping a derived index or snapshot does not create
 another authority. Folding never re-executes world effects.
 
@@ -25,10 +28,14 @@ another authority. Folding never re-executes world effects.
    tables, relations, pending proposals, digests and model contexts are derived.
    An assignment freezes a aja's activation contract; it is not a second task.
 2. **Explicit authority.** Typed ids and host grants authorize transitions.
-   Model text does not grant approval. Confirmation requires a recorded host
-   approval for that turn and a pending earlier proposal. One event applies and
-   resolves it. Goal/commitment replacement closes an active same-kind id;
-   correction only withdraws an active goal/commitment id.
+   Model text does not grant approval: an approval is its own event, recorded by
+   the host for one turn, and confirmation needs it plus a pending proposal from
+   an earlier turn. One event applies and resolves the proposal. Goal/commitment
+   replacement closes an active same-kind id; correction only withdraws one. A
+   turn is the unit of waiting: a proposal that needs an approval ends the turn
+   and the next turn carries it, so no journal lease is held for a human.
+   A judgment counts only on evidence the host observed, not on the runner's
+   account: without it the judgment is undecidable, not failed.
 3. **Bounded, addressable views.** One renderer produces every model-facing
    view: EJA's projection and a aja transcript are the same call over different
    spaces (the log; the aja's own record). Regions are shown whole while the
@@ -42,10 +49,11 @@ another authority. Folding never re-executes world effects.
    execute. Continuation has one predecessor. Dependency and containment rules
    are checked against one combined completion-order graph before logging.
 5. **Owned finite execution.** Every turn has decision/action/dispatch/time
-   budgets. Every aja has its own time/context/response budget. One Control
-   hierarchy can only shorten authority's deadline. Native execution owns one
-   process and one mutable workspace at a time. Stop reasons and evidence survive
-   cleanup; recovery never reruns a aja.
+   budgets and a slot budget. Every aja has its own time/context/response budget.
+   One Control hierarchy can only shorten authority's deadline. Each execution
+   reserves one world and owns one process; parallel slots require isolated
+   worlds, and one shared world has one execution owner. Stop reasons and
+   evidence survive cleanup; recovery never reruns a aja.
 
 Protocol-independent work tactics remain model decisions. A global waiting-task
 flag is not an observation capability. Text equality is not a task relationship.
@@ -57,14 +65,32 @@ This selection rule is a projection of ids, never phrase matching. Identity note
 (decisions, relationships and correction reasons) are advisory history, not
 another approval channel.
 
+## Identity
+
+The subject is not described to the model: it is read back from its own record.
+The contract states the protocol — one JSON decision, the action shapes, the
+preconditions, the budgets — and never states who the subject is or how it
+should feel. Goal, commitment, correction, decision and relationship events are
+the only source of self-description, and the projection puts them before the
+indexes so the self is never the first thing a budget folds away.
+
+Three properties are testable, and `tests/identity.rs` holds them:
+
+| Property | Test |
+|---|---|
+| Addressable | any folded region reads back through its address |
+| Self-sourced | the contract contains no claim about the subject's character |
+| Judgeable | a declared witness needs host evidence before a judgment |
+
 ## State transitions
 
 | Entity | Operation | Preconditions / result |
 |---|---|---|
-| Aja | open_task | Open, no execution yet |
+| Aja | open_task | Open, no execution yet; `evidence` fixes the acceptance witness |
 | Aja | dispatch | Open; depends_on targets Done; continues target has a frozen-run report; then Running |
 | Aja | worker report / recovery | Running -> Waiting |
-| Aja | close_task | Waiting -> Done or Failed, EJA's judgment |
+| Aja | close_task | Waiting -> Done or Failed, EJA's judgment; needs the witness evidence when `evidence` was declared |
+| Aja | reconcile | after a report; the host lands the run's world or reports conflicts |
 | Aja | close_task accepted:false | Open -> Failed, cancellation before execution |
 | Group | open_group | Open, never dispatched |
 | Group | close_task accepted:true | Every child terminal; EJA accepts the aggregate contract; then Done |
@@ -123,7 +149,15 @@ transcript or manufacture an acceptance.
 - `Brain::decide`: return a decision under the supplied Control.
 - `Worker::execute`: own and settle one run; return its observed digest. Runs
   execute in action order; each completed report is recorded before the next.
-- `Lookup::look`: read only, bound output, respect Control.
+- `Host::look`: read only, bound output, respect Control; one address space.
+- `Host::witness`: the host's own observation of declared acceptance evidence.
+  A host that declares none is still complete: the default refuses, and the
+  judgment stays undecidable. `Host::reconcile`: land one run's world, or
+  report its conflicts as the recorded outcome.
+- `Worlds`: reserve, settle, reconcile and release the world one execution may
+  change. Isolation is the host's decision; the kernel never assumes a
+  repository. Settlement is the only account of what a run changed: one
+  inventory delta per world, complete or explicitly unobserved.
 - `Model` and `ToolGateway`: host effects under inherited grants/control.
 - `RecordReader` / `Observer`: capabilities composed by Ports, without another
   state store or task authority.
@@ -155,6 +189,12 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | Cloned/independent Store instances cannot recover each other’s live turn | convergence |
 | New states cannot bypass a finite turn budget | convergence |
 | Rendered contexts respect exact UTF-8 byte bounds | convergence + projection |
+| The contract states no character, and goal/identity render before indexes | identity |
+| A folded region reads back through its address | identity |
+| A host approval authorizes only the turn it was recorded in | acceptance |
+| Declared evidence without a host observation leaves judgment undecidable | acceptance |
+| Parallel slots run at once and the log keeps action order | worlds |
+| A worktree world settles and reconciles explicitly; conflicts are reported | worlds |
 
 Repeated projections detect stalls. They are not a convergence proof. The strict
 execution bound comes from the host budgets; solving a natural-language objective

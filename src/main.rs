@@ -1,6 +1,7 @@
 use eja::{
     adapters::{
-        self, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolGateway,
+        self, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, Shared,
+        ToolGateway, Worktrees, Worlds,
     },
     project, tasks, turn_at_with_options, Assignment, Result, Store, Task, TaskStatus, TurnEnd,
     TurnOptions,
@@ -113,6 +114,12 @@ fn run() -> Result<()> {
         path.exists().then_some(path)
     });
     let store = Store::new(&dir)?;
+    // The host's private state is not part of the world it observes: keep it out
+    // of any commit, including a worktree world's.
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, "*\n")?;
+    }
     let startup = eja::Control::new(std::time::Duration::from_secs(300), Default::default());
     match command {
         Command::Turn(input) => {
@@ -121,10 +128,8 @@ fn run() -> Result<()> {
             limits.actions = env("EJA_TURN_ACTIONS", limits.actions)?;
             limits.dispatches = env("EJA_TURN_DISPATCHES", limits.dispatches)?;
             limits.timeout_ms = env("EJA_TURN_TIMEOUT_MS", limits.timeout_ms)?;
+            limits.slots = env("EJA_AJA_SLOTS", limits.slots)?;
             limits.validate()?;
-            if std::env::var("EJA_AJA_SLOTS").is_ok_and(|value| value != "1") {
-                return Err("one mutable workspace has one execution owner".into());
-            }
             let brain = OpenAiBrain::from_env()?
                 .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?;
             let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
@@ -134,6 +139,26 @@ fn run() -> Result<()> {
             let mut aja_limits = eja::aja::Limits::default();
             aja_limits.steps = Some(env("EJA_AJA_STEPS", aja_limits.steps.unwrap())?);
             aja_limits.timeout_ms = env("EJA_AJA_TIMEOUT_MS", aja_limits.timeout_ms)?;
+            // Parallel slots need isolated worlds. Without one the host runs a
+            // single shared world, so only one execution may hold it.
+            let isolated = if limits.slots > 1 {
+                Some(Arc::new(Worktrees::new(
+                    &project,
+                    dir.join("worlds"),
+                    &dir,
+                    &startup,
+                )?))
+            } else {
+                None
+            };
+            let shared = Arc::new(Shared {
+                project: project.clone(),
+                private: dir.clone(),
+            });
+            let worlds: Arc<dyn Worlds> = match &isolated {
+                Some(worlds) => worlds.clone(),
+                None => shared.clone(),
+            };
             let worker = NativeWorker::new(
                 std::env::current_exe()?,
                 &ajas,
@@ -141,11 +166,19 @@ fn run() -> Result<()> {
                 Arc::new(model),
                 tools.clone() as Arc<dyn ToolGateway>,
             )?
-            .with_limits(aja_limits)?;
+            .with_limits(aja_limits)?
+            .with_slots(limits.slots)
+            .with_worlds(worlds);
             let records = RecordFiles::with_checkpoints(ajas, dir.join("checkpoints"));
+            let worlds: Option<&dyn Worlds> = match &isolated {
+                Some(worlds) => Some(worlds.as_ref()),
+                None => Some(shared.as_ref()),
+            };
             let ports = Ports {
                 aja: Some(&records),
                 world: Some(&*tools),
+                witness: Some(&*tools),
+                worlds,
             };
             let outcome = turn_at_with_options(
                 &store,

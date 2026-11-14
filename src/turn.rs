@@ -1,7 +1,8 @@
 //! The single transition path: validate, record, execute, observe, project.
 use crate::domain::{ProposalData, TaskOpen};
 use crate::state::{
-    next_task_id, pending_proposals, relations_with_tasks, task_scope, valid_proposal_target,
+    approvals, next_task_id, pending_proposals, relations_with_tasks, task_scope,
+    valid_proposal_target,
 };
 use crate::*;
 use chrono::{DateTime, Utc};
@@ -58,7 +59,7 @@ fn propose(
 
 fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Result<Option<String>> {
     let events = store.events()?;
-    let Some(proposal) = pending_proposals(&events)
+    let Some(proposal) = pending_proposals(&events, turn)
         .into_iter()
         .find(|proposal| proposal.id == proposal_id)
     else {
@@ -69,6 +70,11 @@ fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Resu
     if proposal.turn >= turn {
         return Ok(Some(format!(
             "confirm refused: proposal {proposal_id} was created this turn; confirm it in a later turn"
+        )));
+    }
+    if !approvals(&events, turn).contains(&proposal_id) {
+        return Ok(Some(format!(
+            "confirm refused: the host recorded no approval for proposal {proposal_id} in this turn"
         )));
     }
     if !valid_proposal_target(&events, proposal.kind, proposal.target_id) {
@@ -100,7 +106,7 @@ fn reject_proposal(
     at: i64,
 ) -> Result<Option<String>> {
     let events = store.events()?;
-    if !pending_proposals(&events)
+    if !pending_proposals(&events, turn)
         .iter()
         .any(|proposal| proposal.id == proposal_id)
     {
@@ -343,23 +349,154 @@ fn record_dispatch(
     Ok(())
 }
 
-/// One execution owner; completed runs are recorded before the next starts.
+/// One execution owner per world. Reports are recorded in dispatch order, so the
+/// journal never depends on thread timing; with more than one slot the worlds run
+/// at once, and each completed run leaves its evidence before the next report.
 fn run_dispatches(
     ctx: &ActionCtx<'_>,
     out: &mut TurnOutcome,
     pending: Vec<Assignment>,
 ) -> Result<()> {
-    for assignment in pending {
+    let slots = ctx.options.limits.slots.max(1);
+    if slots == 1 || pending.len() <= 1 {
+        for assignment in pending {
+            ctx.control.check()?;
+            let task_id = assignment.task_id;
+            let started = Instant::now();
+            let digest = run_one(ctx.worker, &assignment, ctx.control);
+            out.worker_ms += started.elapsed().as_millis();
+            record_dispatch(ctx, out, assignment, digest)?;
+            observe_evidence(ctx, out, task_id)?;
+        }
+        return Ok(());
+    }
+    let started = Instant::now();
+    let worker = ctx.worker;
+    let control = ctx.control.clone();
+    let queue = std::sync::Mutex::new(
+        pending
+            .into_iter()
+            .enumerate()
+            .collect::<std::collections::VecDeque<_>>(),
+    );
+    let results = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..slots {
+            let queue = &queue;
+            let results = &results;
+            let control = &control;
+            scope.spawn(move || loop {
+                let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                let Some((index, assignment)) = next else {
+                    break;
+                };
+                let digest = run_one(worker, &assignment, control);
+                if let Ok(mut results) = results.lock() {
+                    results.push((index, assignment, digest));
+                }
+            });
+        }
+    });
+    out.worker_ms += started.elapsed().as_millis();
+    let mut collected = results
+        .into_inner()
+        .map_err(|_| "dispatch results are unavailable")?;
+    collected.sort_by_key(|(index, _, _)| *index);
+    for (_, assignment, digest) in collected {
         ctx.control.check()?;
-        let started = Instant::now();
-        let digest = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.worker.execute(&assignment, ctx.control)
-        }))
-        .unwrap_or_else(|_| "aja panicked".to_string());
-        out.worker_ms += started.elapsed().as_millis();
+        let task_id = assignment.task_id;
         record_dispatch(ctx, out, assignment, digest)?;
+        observe_evidence(ctx, out, task_id)?;
     }
     Ok(())
+}
+
+fn run_one(worker: &dyn Worker, assignment: &Assignment, control: &Control) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        worker.execute(assignment, control)
+    }))
+    .unwrap_or_else(|_| "aja panicked".to_string())
+}
+
+/// The host's own observation of what a run achieved. Failure is recorded too: a
+/// witness that could not answer leaves the judgment undecidable, and says why.
+fn observe_evidence(ctx: &ActionCtx<'_>, out: &mut TurnOutcome, task_id: TaskId) -> Result<()> {
+    let events = ctx.store.events()?;
+    let Some(task) = tasks(&events).into_iter().find(|task| task.id == task_id) else {
+        return Ok(());
+    };
+    let Some(request) = task.witness.clone() else {
+        return Ok(());
+    };
+    if task.witness_id.is_some() {
+        return Ok(());
+    }
+    let observation = match ctx.host.witness(&request, ctx.control) {
+        Ok(result) => Observation {
+            target: "witness".to_string(),
+            arguments: request,
+            selector: Selector::Whole,
+            result,
+            error: None,
+        },
+        Err(error) => Observation {
+            target: "witness".to_string(),
+            arguments: request,
+            selector: Selector::Whole,
+            result: serde_json::Value::Null,
+            error: Some(error.to_string()),
+        },
+    };
+    ctx.store.append(
+        Kind::Observed,
+        &task_scope(task_id),
+        "",
+        ctx.turn,
+        EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
+    )?;
+    out.evidence.push(observation);
+    Ok(())
+}
+
+/// Reconciling a world is the host's act and its account is evidence. Conflicts
+/// are recorded, never merged away.
+fn reconcile(ctx: &ActionCtx<'_>, out: &mut TurnOutcome, task_id: TaskId) -> Result<bool> {
+    let events = ctx.store.events()?;
+    let Some(task) = tasks(&events).into_iter().find(|task| task.id == task_id) else {
+        out.refused
+            .push(format!("reconcile refused: no task {task_id}"));
+        return Ok(false);
+    };
+    if task.digest.is_none() {
+        out.refused.push(format!(
+            "reconcile refused: task {task_id} has no run to reconcile"
+        ));
+        return Ok(false);
+    }
+    let (result, error) = match ctx.host.reconcile(task_id, ctx.control) {
+        Ok(value) => (value, None),
+        Err(error) => (serde_json::Value::Null, Some(error.to_string())),
+    };
+    if let Some(error) = &error {
+        out.refused.push(format!("reconcile refused: {error}"));
+        return Ok(false);
+    }
+    let observation = Observation {
+        target: "world".to_string(),
+        arguments: serde_json::json!({"task": task_id}),
+        selector: Selector::Whole,
+        result,
+        error: None,
+    };
+    ctx.store.append(
+        Kind::Observed,
+        "eja",
+        "",
+        ctx.turn,
+        EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
+    )?;
+    out.evidence.push(observation);
+    Ok(true)
 }
 
 fn close_task(
@@ -397,6 +534,13 @@ fn close_task(
             task.status.as_str()
         )));
     }
+    // Acceptance evidence is the host's, not the runner's. A declared witness
+    // without evidence leaves the judgment undecidable, which is not a failure.
+    if task.witness.is_some() && task.witness_id.is_none() {
+        return Ok(Some(format!(
+            "close refused: task {task_id} asked for evidence and the host observed none; the judgment is undecidable"
+        )));
+    }
     let data = serde_json::to_value(CloseOutcome {
         accepted,
         note: note.to_string(),
@@ -417,7 +561,7 @@ struct ActionCtx<'a> {
     turn: u64,
     at: i64,
     worker: &'a dyn Worker,
-    lookup: &'a dyn Lookup,
+    host: &'a dyn Host,
     control: &'a Control,
     options: &'a TurnOptions,
 }
@@ -448,11 +592,7 @@ fn apply_actions(
                 }
             }
             Action::Confirm { proposal_id } => {
-                if !ctx.options.approvals.contains(proposal_id) {
-                    out.refused.push(format!("confirm refused: proposal {proposal_id} has no host-recorded user approval"));
-                } else if let Some(note) =
-                    confirm_proposal(ctx.store, *proposal_id, ctx.turn, ctx.at)?
-                {
+                if let Some(note) = confirm_proposal(ctx.store, *proposal_id, ctx.turn, ctx.at)? {
                     out.refused.push(note);
                 }
             }
@@ -472,6 +612,7 @@ fn apply_actions(
                         request: String::new(),
                         origin: ctx.input.into(),
                         acceptance: acceptance.clone(),
+                        evidence: None,
                     },
                 )?;
                 *focus = Some(id);
@@ -481,6 +622,7 @@ fn apply_actions(
                 title,
                 request,
                 acceptance,
+                evidence,
                 run,
             } => {
                 let id = open_task(
@@ -491,6 +633,7 @@ fn apply_actions(
                         request: request.clone(),
                         origin: ctx.input.into(),
                         acceptance: acceptance.clone(),
+                        evidence: evidence.clone(),
                     },
                 )?;
                 *focus = Some(id);
@@ -528,6 +671,11 @@ fn apply_actions(
                     out.refused.push(reason);
                 }
             }
+            Action::Reconcile { task_id } => {
+                if reconcile(ctx, out, *task_id)? {
+                    observed = true;
+                }
+            }
             Action::Focus { task_id } => {
                 if !tasks(&ctx.store.events()?)
                     .iter()
@@ -541,33 +689,31 @@ fn apply_actions(
                 observed = true;
             }
             Action::Look {
-                source,
                 target,
                 arguments,
                 selector,
             } => {
                 let events = ctx.store.events()?;
-                let (result, error) = match ctx.lookup.look(
-                    *source,
-                    target,
-                    arguments,
-                    selector,
-                    &events,
-                    ctx.control,
-                ) {
-                    Ok(value) if serde_json::to_vec(&value)?.len() <= crate::aja::FRAME_LIMIT => {
-                        (value, None)
-                    }
-                    Ok(_) => (
-                        Value::Null,
-                        Some(
-                            "look output exceeds its byte budget; narrow the requested view".into(),
+                let (result, error) =
+                    match ctx
+                        .host
+                        .look(target, arguments, selector, &events, ctx.control)
+                    {
+                        Ok(value)
+                            if serde_json::to_vec(&value)?.len() <= crate::aja::FRAME_LIMIT =>
+                        {
+                            (value, None)
+                        }
+                        Ok(_) => (
+                            Value::Null,
+                            Some(
+                                "look output exceeds its byte budget; narrow the requested view"
+                                    .into(),
+                            ),
                         ),
-                    ),
-                    Err(error) => (Value::Null, Some(error.to_string())),
-                };
+                        Err(error) => (Value::Null, Some(error.to_string())),
+                    };
                 let observation = Observation {
-                    source: *source,
                     target: target.clone(),
                     arguments: arguments.clone(),
                     selector: selector.clone(),
@@ -583,8 +729,7 @@ fn apply_actions(
                 )?;
                 // The view holds one entry per distinct look, not every repeat.
                 out.evidence.retain(|other| {
-                    !(other.source == observation.source
-                        && other.target == observation.target
+                    !(other.target == observation.target
                         && other.arguments == observation.arguments
                         && other.selector == observation.selector)
                 });
@@ -611,9 +756,9 @@ pub fn turn(
     input: &str,
     brain: &dyn Brain,
     worker: &dyn Worker,
-    lookup: &dyn Lookup,
+    host: &dyn Host,
 ) -> Result<TurnOutcome> {
-    turn_at(store, input, brain, worker, lookup, now_utc())
+    turn_at(store, input, brain, worker, host, now_utc())
 }
 
 pub fn turn_at(
@@ -621,7 +766,7 @@ pub fn turn_at(
     input: &str,
     brain: &dyn Brain,
     worker: &dyn Worker,
-    lookup: &dyn Lookup,
+    host: &dyn Host,
     now: DateTime<Utc>,
 ) -> Result<TurnOutcome> {
     turn_at_with_options(
@@ -629,7 +774,7 @@ pub fn turn_at(
         input,
         brain,
         worker,
-        lookup,
+        host,
         now,
         &TurnOptions::default(),
     )
@@ -648,7 +793,7 @@ pub fn turn_at_with_options(
     input: &str,
     brain: &dyn Brain,
     worker: &dyn Worker,
-    lookup: &dyn Lookup,
+    host: &dyn Host,
     now: DateTime<Utc>,
     options: &TurnOptions,
 ) -> Result<TurnOutcome> {
@@ -668,16 +813,21 @@ pub fn turn_at_with_options(
     {
         return Err("focus names an unknown task".into());
     }
-    store.append(
-        Kind::User,
-        "eja",
-        input,
-        turn_no,
-        EventMeta::data(
-            at,
-            serde_json::json!({"approved_proposals": options.approvals}),
-        ),
-    )?;
+    store.append(Kind::User, "eja", input, turn_no, EventMeta::new(at))?;
+    // An approval is a fact, not a caller's flag: it is recorded once, with the
+    // turn it authorizes, and every later read comes from the journal.
+    for proposal_id in &options.approvals {
+        store.append(
+            Kind::Approval,
+            "eja",
+            "",
+            turn_no,
+            EventMeta::data(
+                at,
+                serde_json::json!({"proposal_id": proposal_id, "source": "host"}),
+            ),
+        )?;
+    }
 
     let active: Vec<Task> = existing_tasks
         .into_iter()
@@ -708,7 +858,7 @@ pub fn turn_at_with_options(
         turn: turn_no,
         at,
         worker,
-        lookup,
+        host,
         control: &control,
         options,
     };

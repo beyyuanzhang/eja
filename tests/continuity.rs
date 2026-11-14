@@ -337,6 +337,7 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
                 title: "release".to_string(),
                 request: "write checklist".to_string(),
                 acceptance: "contains build".to_string(),
+                evidence: None,
                 run: true,
             }],
         ),

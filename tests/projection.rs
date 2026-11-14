@@ -40,13 +40,12 @@ fn projection_keeps_every_recorded_commitment_and_says_so() {
 
 #[test]
 fn a_record_that_does_not_fit_is_cut_at_the_budget_and_says_so() {
-    use eja::{LookSource, Observation, Selector};
+    use eja::{Observation, Selector};
     let dir = std::env::temp_dir().join(format!("eja-budget-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::new(&dir).expect("store");
     let evidence = vec![Observation {
-        source: LookSource::Aja,
-        target: "big.json".to_string(),
+        target: "record:1/big.json".to_string(),
         arguments: serde_json::Value::Null,
         selector: Selector::Whole,
         result: serde_json::json!({"text": "a".repeat(5000)}),

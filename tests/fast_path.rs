@@ -48,6 +48,7 @@ fn open_task(title: &str) -> Action {
         title: title.to_string(),
         request: format!("request {title}"),
         acceptance: format!("accept {title}"),
+        evidence: None,
         run: true,
     }
 }
@@ -119,12 +120,14 @@ fn multiple_active_tasks_do_not_use_the_fast_path() {
                     title: "a".to_string(),
                     request: "a".to_string(),
                     acceptance: "a".to_string(),
+                    evidence: None,
                     run: false,
                 },
                 Action::OpenTask {
                     title: "b".to_string(),
                     request: "b".to_string(),
                     acceptance: "b".to_string(),
+                    evidence: None,
                     run: false,
                 },
             ],

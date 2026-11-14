@@ -87,6 +87,20 @@ resource browser or prompt registry.
   Unix, ordinary descendants in their server's process group are killed too.
   Initialization failures clean up servers already started.
 
+## Acceptance witnesses
+
+A server tool may answer an acceptance witness only when its server declares it:
+
+```json
+{ "mcpServers": { "checks": { "command": "...", "witness": ["run_checks"] } } }
+```
+
+The declaration is checked against the server catalog at load time, like
+`read_only`. A witness is an effect-capable host act, so it is the host's
+declaration, never the model's request, that decides which tools may answer; the
+file read tools are always allowed because they cannot have effects. A witness
+call runs under its own 120-second child deadline.
+
 ## Trust boundary
 
 There is no OS sandbox. Use trusted MCP servers: local servers have the host

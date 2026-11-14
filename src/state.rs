@@ -122,6 +122,9 @@ pub fn tasks(events: &[Event]) -> Vec<Task> {
                     closed_at: None,
                     digest: None,
                     close: None,
+                    witness: open.evidence.clone(),
+                    witness_id: None,
+                    witness_result: None,
                 });
             }
             Kind::TaskAssigned => {
@@ -136,6 +139,23 @@ pub fn tasks(events: &[Event]) -> Vec<Task> {
                     task.digest = Some(event.text.clone());
                     task.digest_at = Some(event.at);
                     task.status = TaskStatus::Waiting;
+                }
+            }
+            Kind::Observed => {
+                let Some(task) = out.iter_mut().find(|task| task.id == task_id) else {
+                    continue;
+                };
+                let Some(data) = event.data.as_ref() else {
+                    continue;
+                };
+                let Ok(observation) = serde_json::from_value::<Observation>(data.clone()) else {
+                    continue;
+                };
+                // Acceptance evidence is one observation the host made, scoped to
+                // the task it answers. An observation that failed is not evidence.
+                if observation.target == "witness" && observation.error.is_none() {
+                    task.witness_id = Some(event.id);
+                    task.witness_result = Some(observation.result);
                 }
             }
             Kind::TaskClosed => {
@@ -201,17 +221,10 @@ pub fn project_with_evidence(
     let history_before = events.last().map_or(0, |last| {
         last.turn.saturating_add(u64::from(last.kind == Kind::Eja))
     });
+    let turn = events.last().map_or(0, |last| last.turn);
     Ok(EjaContext {
         now: now.timestamp(),
         input: input.to_string(),
-        approved_proposals: events
-            .iter()
-            .rev()
-            .find(|event| event.kind == Kind::User)
-            .and_then(|event| event.data.as_ref())
-            .and_then(|data| data.get("approved_proposals"))
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default(),
         history: events
             .iter()
             .filter(|event| matches!(event.kind, Kind::User | Kind::Eja))
@@ -226,7 +239,7 @@ pub fn project_with_evidence(
         relations: relations_with_tasks(&events, &all_tasks),
         focus,
         evidence: evidence.to_vec(),
-        proposals: pending_proposals(&events),
+        proposals: pending_proposals(&events, turn),
         refused: turn_refusals(&events),
     })
 }
@@ -242,7 +255,26 @@ fn turn_refusals(events: &[Event]) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn pending_proposals(events: &[Event]) -> Vec<ProposalView> {
+/// Approvals the host recorded for one turn, read back from the journal.
+pub(crate) fn approvals(events: &[Event], turn: u64) -> Vec<u64> {
+    let mut out: Vec<u64> = events
+        .iter()
+        .filter(|event| event.kind == Kind::Approval && event.turn == turn)
+        .filter_map(|event| {
+            event
+                .data
+                .as_ref()
+                .and_then(|data| data.get("proposal_id"))
+                .and_then(Value::as_u64)
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+pub(crate) fn pending_proposals(events: &[Event], turn: u64) -> Vec<ProposalView> {
+    let approved = approvals(events, turn);
     let resolved: HashSet<u64> = events
         .iter()
         .filter(|event| {
@@ -278,6 +310,7 @@ pub(crate) fn pending_proposals(events: &[Event]) -> Vec<ProposalView> {
                 text: event.text.clone(),
                 created_at: event.at,
                 turn: event.turn,
+                approved: approved.contains(&event.id),
             })
         })
         .collect()
