@@ -593,6 +593,47 @@ fn timeout_cancellation_and_busy_slot_release_all_node_resources() {
 }
 
 #[test]
+fn a_node_stopped_mid_run_claims_no_invented_project_change() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Cancelled while the model is working.
+    let f = Fixture::new();
+    std::fs::write(f.0.join("kept.txt"), "work").unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let w = f.worker(
+        Arc::new(Blocking(started.clone())),
+        Arc::new(FileTools),
+        Limits::default(),
+    );
+    let running = w.clone();
+    let join = std::thread::spawn(move || running.execute(&assignment(1), &control()));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !started.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(w.cancel(1));
+    let digest = join.join().unwrap();
+    assert!(digest.contains("ended: budget"), "{digest}");
+    // The run ended before the world could be read again: an incomplete
+    // inventory is not evidence that the project lost its files.
+    assert!(!digest.contains("deleted"), "{digest}");
+    assert!(!digest.contains("created"), "{digest}");
+    assert!(digest.contains("inventory truncated"), "{digest}");
+    // A turn deadline that expires before the node could do anything.
+    let g = Fixture::new();
+    std::fs::write(g.0.join("kept.txt"), "work").unwrap();
+    let w = g.worker(
+        Arc::new(Blocking(Arc::new(AtomicBool::new(false)))),
+        Arc::new(FileTools),
+        Limits::default(),
+    );
+    let parent = Control::new(Duration::from_millis(1), Arc::new(AtomicBool::new(false)));
+    let digest = w.execute(&assignment(1), &parent);
+    assert!(!digest.contains("deleted"), "{digest}");
+    assert!(!digest.contains("created"), "{digest}");
+}
+
+#[test]
 fn many_frozen_nodes_have_no_live_workers_or_growing_pipe_handles() {
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new();

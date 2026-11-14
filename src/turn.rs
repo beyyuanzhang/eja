@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Report tasks left Running by a previous process as unknown rather than
+/// re-running them. Callers must already own the journal turn (a turn calls it
+/// under its lease): this writes facts without taking one itself.
 pub fn recover(store: &Store, turn: u64, at: i64) -> Result<Vec<TaskId>> {
     let mut recovered = Vec::new();
     for task in tasks(&store.events()?) {

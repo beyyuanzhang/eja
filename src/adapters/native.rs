@@ -188,7 +188,7 @@ fn snapshot_project(root: &Path, skip: &Path, control: &Control) -> (ProjectStat
 }
 
 /// What the node did to the project: the world's answer, not the node's claim.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ProjectDelta {
     created: Vec<String>,
     modified: Vec<String>,
@@ -197,21 +197,31 @@ struct ProjectDelta {
 }
 
 impl ProjectDelta {
-    fn between(before: &ProjectState, after: &ProjectState, truncated: bool) -> Self {
+    /// A change is claimed only when the inventory that could observe it is
+    /// complete: an inventory that was cut short (budget, cancellation, entry
+    /// cap) is expressible as "unobserved", never as a created/deleted file.
+    fn between(
+        before: &ProjectState,
+        after: &ProjectState,
+        before_complete: bool,
+        after_complete: bool,
+    ) -> Self {
         let mut delta = Self {
-            truncated,
+            truncated: !(before_complete && after_complete),
             ..Self::default()
         };
         for (name, stamp) in after {
             match before.get(name) {
-                None => delta.created.push(name.clone()),
+                None if before_complete => delta.created.push(name.clone()),
                 Some(was) if was != stamp => delta.modified.push(name.clone()),
-                Some(_) => {}
+                _ => {}
             }
         }
-        for name in before.keys() {
-            if !after.contains_key(name) {
-                delta.deleted.push(name.clone());
+        if after_complete {
+            for name in before.keys() {
+                if !after.contains_key(name) {
+                    delta.deleted.push(name.clone());
+                }
             }
         }
         delta
@@ -260,10 +270,12 @@ impl ProjectDelta {
                 names(&self.deleted)
             ));
         }
-        if self.truncated {
-            parts.push("(truncated)".into());
-        }
-        format!("project: {}", parts.join(", "))
+        let tail = if self.truncated {
+            " (inventory truncated)"
+        } else {
+            ""
+        };
+        format!("project: {}{tail}", parts.join(", "))
     }
 }
 
@@ -669,7 +681,7 @@ impl Worker for NativeWorker {
             self.run(assignment, &control, &mut log, &mut counts);
         let steps = log.assistants;
         let (after, truncated) = snapshot_project(&self.project, &self.state, &control);
-        let delta = ProjectDelta::between(&before.0, &after, truncated || before.1);
+        let delta = ProjectDelta::between(&before.0, &after, !before.1, !truncated);
         cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything
         let (text, reason) = match result {
             Ok(outcome) => outcome,
@@ -700,5 +712,60 @@ impl Worker for NativeWorker {
         .unwrap_or_else(|e| {
             format!("{steps} steps, 0 tool calls, ended: error\nnode could not be frozen: {e}")
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inventory(entries: &[(&str, u64)]) -> ProjectState {
+        entries
+            .iter()
+            .map(|(name, size)| ((*name).to_string(), (*size, 0)))
+            .collect()
+    }
+
+    #[test]
+    fn a_partial_inventory_reports_only_what_it_observed() {
+        let before = inventory(&[("kept.txt", 1), ("other.txt", 1)]);
+        let empty = ProjectState::new();
+        // The second inventory never saw the project: it proves nothing.
+        let delta = ProjectDelta::between(&before, &empty, true, false);
+        assert!(delta.deleted.is_empty(), "{delta:?}");
+        assert!(delta.created.is_empty());
+        assert!(delta.truncated);
+        assert!(
+            delta.line().contains("inventory truncated"),
+            "{}",
+            delta.line()
+        );
+        // An unobserved earlier world cannot invent creations either.
+        let delta = ProjectDelta::between(&empty, &before, false, true);
+        assert!(delta.created.is_empty(), "{delta:?}");
+        assert!(delta.truncated);
+        // What was genuinely compared survives the truncation notice.
+        let after = inventory(&[("kept.txt", 2)]);
+        let delta = ProjectDelta::between(&before, &after, true, false);
+        assert_eq!(delta.modified, vec!["kept.txt".to_string()]);
+        assert!(delta.created.is_empty());
+        assert!(delta.deleted.is_empty());
+        assert!(
+            delta.line().starts_with("project: ~1 modified"),
+            "{}",
+            delta.line()
+        );
+    }
+
+    #[test]
+    fn two_complete_inventories_report_every_change() {
+        let before = inventory(&[("kept.txt", 1), ("gone.txt", 1)]);
+        let after = inventory(&[("kept.txt", 2), ("new.txt", 1)]);
+        let delta = ProjectDelta::between(&before, &after, true, true);
+        assert_eq!(delta.created, vec!["new.txt".to_string()]);
+        assert_eq!(delta.modified, vec!["kept.txt".to_string()]);
+        assert_eq!(delta.deleted, vec!["gone.txt".to_string()]);
+        assert!(!delta.truncated);
+        assert!(!delta.line().contains("truncated"), "{}", delta.line());
     }
 }

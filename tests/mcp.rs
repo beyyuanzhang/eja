@@ -544,7 +544,10 @@ fn host_declared_read_only_tools_are_observable() {
         &control(2000),
     )
     .expect("declared read-only tool is observable");
-    assert!(value.to_string().contains("probe") || !value.is_null());
+    assert!(
+        value.to_string().contains("\"text\":\"probe\""),
+        "the echo payload comes back: {value}"
+    );
     assert!(eja::adapters::Observer::observe(
         &host,
         "mcp__fixture__fail",
