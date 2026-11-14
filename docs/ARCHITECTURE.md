@@ -29,10 +29,15 @@ another authority. Folding never re-executes world effects.
    approval for that turn and a pending earlier proposal. One event applies and
    resolves it. Goal/commitment replacement closes an active same-kind id;
    correction only withdraws an active goal/commitment id.
-3. **Bounded, addressable views.** Live and replayed results use the same view
-   operator. Full payloads remain addressable. Continuation stores parent
-   references, reconstructs a valid prefix, applies the budget before transport,
-   and uses the new assignment and new system budget. Views never change facts.
+3. **Bounded, addressable views.** One renderer produces every model-facing
+   view: EJA's projection and a node transcript are the same call over different
+   spaces (the log; the node's own record). Regions are shown whole while the
+   declared budget allows, one line plus handle after that, and the oldest fold
+   into one address range; a folded region stays addressable, so unfolding is a
+   read, never a re-derivation. Full payloads remain addressable. Continuation
+   stores parent references, reconstructs a valid prefix, applies the budget
+   before transport, and uses the new assignment and new system budget. Views
+   never change facts.
 4. **One execution meaning.** Nodes execute once; groups aggregate and never
    execute. Continuation has one predecessor. Dependency and containment rules
    are checked against one combined completion-order graph before logging.
@@ -89,14 +94,18 @@ provider call ids, arguments and full results. The record's zero-based entry
 index and node id form a stable address.
 
 Reconstruction follows immutable parent manifests, rejects cycles/missing
-records, and folds entries oldest to newest through the same bounded result
-view. An unfinished tool group contributes its complete earlier prefix, not an
+records, and folds entries oldest to newest through the same renderer. An unfinished tool group contributes its complete earlier prefix, not an
 invalid provider message sequence. Its partial raw effects remain in the record.
 Old records whose start already contains inherited history are ancestry roots.
 
 `eja_read_record` may read this node or its explicit ancestors, never arbitrary
 host state. Live model messages use the current system contract even when old
-messages are inherited. No checkpoint is restored during continuation: historical
+messages are inherited.
+
+The fold states its landing scale in the rendered view only when the budget
+forced something out; a view that fits whole carries no notice. A node whose
+transcript cannot fit even as one address line stops with `budget` and continues
+in a new node, so a transcript is never re-sent pinned at the cap. No checkpoint is restored during continuation: historical
 observations must be distinguished from current world observations.
 
 Checkpoint file reads and native record reads share one source resolver for
