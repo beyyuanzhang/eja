@@ -510,8 +510,8 @@ impl NativeWorker {
             };
             control.check()?;
             // A tool result is bounded by the frame budget, not the model's reply
-            // budget: the tool owns its own output bound, and the node's transcript
-            // compacts against its context budget.
+            // budget: the tool owns its own output bound, the record keeps the
+            // whole result, and the transcript folds against its context budget.
             if serde_json::to_vec(&response)?.len() > aja::FRAME_LIMIT {
                 return Err("AJA tool output limit reached".into());
             }
