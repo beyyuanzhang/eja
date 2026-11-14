@@ -25,4 +25,3 @@ Codex 68.34, Hermes 67.35, OpenClaw 66.78, OpenCode 66.24, seven-harness
 average 65.76. Those numbers average over all tasks; this number is over the
 hardest subset, so it is a floor-style reading, not an equal-set comparison.
 The cost gap is the clear one: 1.9-3.6x the tokens per task.
-

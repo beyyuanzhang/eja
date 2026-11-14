@@ -13,8 +13,9 @@ L' = L ++ events(A, O)
 ```
 
 The [architecture contract](docs/ARCHITECTURE.md) defines the invariants and the
-composition laws. The implementation has four core modules: domain, store,
-state, and turn. Adapters own model transport, connectors and record reading.
+composition laws. The implementation has five core modules: domain, store,
+state, turn, and the shared control. Adapters own model transport, connectors and
+record reading.
 
 ## Facts and views
 
@@ -151,6 +152,8 @@ and the [native protocol](docs/AJA-PROTOCOL.md).
 Host resource configuration: `EJA_TURN_DECISIONS`, `EJA_TURN_ACTIONS`,
 `EJA_TURN_DISPATCHES`, `EJA_TURN_TIMEOUT_MS`, `EJA_NODE_STEPS`,
 `EJA_NODE_TIMEOUT_MS`, `EJA_CONTEXT_BYTES`. Limits must be positive.
+`EJA_NODE_SLOTS` must be absent or `1`: one mutable workspace has one execution
+owner, so any other value is refused instead of starting a second runner.
 `--task ID` selects initial focus. `show audit:ID` follows explicit containment
 and continuation edges; matching input text never invents a job relationship.
 

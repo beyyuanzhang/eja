@@ -72,9 +72,10 @@ predecessor. `depends_on` may target a node or a group. Both enter the combined
 completion-order graph with reversed containment edges, so cross-kind cycles
 are refused. Descriptive edges do not change execution state.
 
-Creation is an observation of an allocated id: the next projection exposes the
-new node/group as focus or the new proposal in the pending index. A caller can
-then address it without guessing ids. Open -> dispatch is reserved in action order; the actual worker runs after the
+Creation is an observation of an allocated id: the next projection lists every
+new node/group in its task index (the last one created in that decision also
+becomes the focus) and every new proposal in the pending index. A caller can
+then address them without guessing ids. Open -> dispatch is reserved in action order; the actual worker runs after the
 other actions in that decision. Therefore a continuation is opened with
 run:false, related to its predecessor, then dispatched. A later relation cannot
 retroactively change the assignment. Identical relation insertion is idempotent.
