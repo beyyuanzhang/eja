@@ -1,6 +1,6 @@
 use eja::{
     adapters::{
-        self, HostTools, NativeWorker, NodeFiles, OpenAiBrain, OpenAiModel, Ports, ToolGateway,
+        self, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolGateway,
     },
     project, tasks, turn_at_with_options, Assignment, Result, Store, Task, TaskStatus, TurnEnd,
     TurnOptions,
@@ -15,7 +15,7 @@ enum Command {
     Log,
     Tasks(Option<u64>),
     Tools,
-    Node(u64),
+    Aja(u64),
     Audit(u64),
 }
 
@@ -57,11 +57,11 @@ fn parse(args: Vec<String>) -> Result<(PathBuf, Option<PathBuf>, TurnOptions, Co
             "tasks" => Command::Tasks(None),
             "tools" => Command::Tools,
             target => match target.split_once(':') {
-                Some((kind @ ("task" | "node" | "audit"), id)) => {
+                Some((kind @ ("task" | "aja" | "audit"), id)) => {
                     let id = id.parse().map_err(|_| "show target needs a numeric id")?;
                     match kind {
                         "task" => Command::Tasks(Some(id)),
-                        "node" => Command::Node(id),
+                        "aja" => Command::Aja(id),
                         _ => Command::Audit(id),
                     }
                 }
@@ -98,7 +98,7 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("{USAGE}\n\n  turn      one interaction: project, decide, act, record\n  show X    context, log, tasks, tools, task:ID, node:ID, audit:ID");
+        println!("{USAGE}\n\n  turn      one interaction: project, decide, act, record\n  show X    context, log, tasks, tools, task:ID, aja:ID, audit:ID");
         return Ok(());
     }
     unsafe {
@@ -122,7 +122,7 @@ fn run() -> Result<()> {
             limits.dispatches = env("EJA_TURN_DISPATCHES", limits.dispatches)?;
             limits.timeout_ms = env("EJA_TURN_TIMEOUT_MS", limits.timeout_ms)?;
             limits.validate()?;
-            if std::env::var("EJA_NODE_SLOTS").is_ok_and(|value| value != "1") {
+            if std::env::var("EJA_AJA_SLOTS").is_ok_and(|value| value != "1") {
                 return Err("one mutable workspace has one execution owner".into());
             }
             let brain = OpenAiBrain::from_env()?
@@ -130,21 +130,21 @@ fn run() -> Result<()> {
             let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
             let project = std::env::current_dir()?;
             let tools = Arc::new(HostTools::new(config.as_deref(), &project, &dir, &startup)?);
-            let nodes = dir.join("nodes");
-            let mut node_limits = eja::aja::Limits::default();
-            node_limits.steps = Some(env("EJA_NODE_STEPS", node_limits.steps.unwrap())?);
-            node_limits.timeout_ms = env("EJA_NODE_TIMEOUT_MS", node_limits.timeout_ms)?;
+            let ajas = dir.join("ajas");
+            let mut aja_limits = eja::aja::Limits::default();
+            aja_limits.steps = Some(env("EJA_AJA_STEPS", aja_limits.steps.unwrap())?);
+            aja_limits.timeout_ms = env("EJA_AJA_TIMEOUT_MS", aja_limits.timeout_ms)?;
             let worker = NativeWorker::new(
                 std::env::current_exe()?,
-                &nodes,
+                &ajas,
                 project,
                 Arc::new(model),
                 tools.clone() as Arc<dyn ToolGateway>,
             )?
-            .with_limits(node_limits)?;
-            let records = NodeFiles::with_checkpoints(nodes, dir.join("checkpoints"));
+            .with_limits(aja_limits)?;
+            let records = RecordFiles::with_checkpoints(ajas, dir.join("checkpoints"));
             let ports = Ports {
-                node: Some(&records),
+                aja: Some(&records),
                 world: Some(&*tools),
             };
             let outcome = turn_at_with_options(
@@ -157,7 +157,7 @@ fn run() -> Result<()> {
                 &options,
             )?;
             if eja::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err("interrupted; the node was stopped and its run is recorded".into());
+                return Err("interrupted; the aja was stopped and its run is recorded".into());
             }
             println!("eja: {}", outcome.reply);
             for note in &outcome.refused {
@@ -218,10 +218,10 @@ fn run() -> Result<()> {
                 serde_json::to_string_pretty(&tools.definitions(&assignment))?
             );
         }
-        Command::Node(id) => {
-            let node = dir.join("nodes").join(id.to_string());
-            println!("{}", std::fs::read_to_string(node.join("node.json"))?);
-            let context = node.join("context.jsonl");
+        Command::Aja(id) => {
+            let aja = dir.join("ajas").join(id.to_string());
+            println!("{}", std::fs::read_to_string(aja.join("aja.json"))?);
+            let context = aja.join("context.jsonl");
             match std::fs::metadata(&context) {
                 Ok(meta) => println!("[context: {} bytes — {}]", meta.len(), context.display()),
                 Err(_) => println!("[no frozen context]"),
@@ -287,7 +287,7 @@ fn run() -> Result<()> {
                 if let Some(digest) = &task.digest {
                     println!("  record: {}", digest.lines().next().unwrap_or(""));
                 }
-                match std::fs::metadata(dir.join(format!("nodes/{}/context.jsonl", task.id))) {
+                match std::fs::metadata(dir.join(format!("ajas/{}/context.jsonl", task.id))) {
                     Ok(meta) => println!("  context: {} bytes", meta.len()),
                     Err(_) => println!("  context: (none)"),
                 }

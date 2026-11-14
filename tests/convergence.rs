@@ -57,7 +57,7 @@ impl Worker for WorkerLog {
         "ended: message\nwork recorded".into()
     }
 }
-fn node(title: &str, run: bool) -> Action {
+fn aja(title: &str, run: bool) -> Action {
     Action::OpenTask {
         title: title.into(),
         request: title.into(),
@@ -219,7 +219,7 @@ fn groups_close_from_their_members_without_a_fake_execution() {
                 title: "job".into(),
                 acceptance: "children done".into(),
             },
-            node("child", true),
+            aja("child", true),
             edge(2, 1, RelationKind::PartOf),
         ],
         &worker,
@@ -246,8 +246,8 @@ fn graph_constraints_include_cross_kind_cycles_and_real_dependency_readiness() {
                 title: "job".into(),
                 acceptance: "children".into(),
             },
-            node("a", false),
-            node("b", false),
+            aja("a", false),
+            aja("b", false),
             edge(2, 1, RelationKind::PartOf),
             edge(2, 1, RelationKind::DependsOn),
             edge(3, 2, RelationKind::DependsOn),
@@ -274,7 +274,7 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
     let worker = WorkerLog::default();
     run(
         &store,
-        vec![node("a", true), node("b", true), node("next", false)],
+        vec![aja("a", true), aja("b", true), aja("next", false)],
         &worker,
     );
     let out = run(
@@ -323,7 +323,7 @@ fn unrelated_tasks_do_not_change_world_capabilities() {
         ..Default::default()
     };
     let first = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
-    run(&store, vec![node("unrelated", true)], &worker);
+    run(&store, vec![aja("unrelated", true)], &worker);
     let second = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
     assert_eq!(first.evidence, second.evidence);
     assert!(first.refused.is_empty() && second.refused.is_empty());
@@ -333,7 +333,7 @@ struct Growing;
 impl Brain for Growing {
     fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
         Decision {
-            actions: vec![node("another", true)],
+            actions: vec![aja("another", true)],
             ..Decision::default()
         }
     }
@@ -515,7 +515,7 @@ fn group_verdict_is_not_a_second_quality_authority_over_eja() {
                 title: "best effort".into(),
                 acceptance: "report even tolerated failures".into(),
             },
-            node("optional check", false),
+            aja("optional check", false),
             edge(2, 1, RelationKind::PartOf),
             close(2, false),
         ],
@@ -595,7 +595,7 @@ impl Brain for ReceiptBrain {
     fn decide(&self, context: &EjaContext, _: &eja::Control) -> Decision {
         let mut step = self.0.lock().unwrap();
         let actions = match *step {
-            0 => vec![node("allocated", false)],
+            0 => vec![aja("allocated", false)],
             1 => vec![Action::Dispatch {
                 task_id: context.focus.as_ref().expect("creation returns focus").id,
             }],
@@ -709,7 +709,7 @@ fn cancellation_keeps_prior_refusals_and_reconciles_reserved_dispatches() {
         "run",
         &script(vec![
             Action::Dispatch { task_id: 999 },
-            node("reserved", true),
+            aja("reserved", true),
             look(),
         ]),
         &WorkerLog::default(),
@@ -732,7 +732,7 @@ fn cancellation_keeps_prior_refusals_and_reconciles_reserved_dispatches() {
 }
 
 #[test]
-fn cancellation_between_queued_nodes_preserves_completed_evidence_and_skips_the_next_run() {
+fn cancellation_between_queued_ajas_preserves_completed_evidence_and_skips_the_next_run() {
     struct CancelAfterFirst {
         cancelled: Arc<AtomicBool>,
         seen: Mutex<Vec<u64>>,
@@ -753,8 +753,8 @@ fn cancellation_between_queued_nodes_preserves_completed_evidence_and_skips_the_
     };
     let out = turn_at_with_options(
         &store,
-        "two nodes",
-        &script(vec![node("first", true), node("second", true)]),
+        "two ajas",
+        &script(vec![aja("first", true), aja("second", true)]),
         &worker,
         &Ports::default(),
         now_utc(),

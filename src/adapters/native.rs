@@ -21,9 +21,9 @@ use std::{
     time::Duration,
 };
 
-/// The node's complete context, appended as it happens and frozen with the node.
+/// The aja's complete context, appended as it happens and frozen with the aja.
 /// The host sees every model response and tool call, so freezing the record never
-/// depends on the node cooperating.
+/// depends on the aja cooperating.
 struct ContextLog {
     file: fs::File,
     assistants: usize,
@@ -31,11 +31,11 @@ struct ContextLog {
 }
 
 impl ContextLog {
-    fn create(node: &Path) -> Result<Self> {
+    fn create(aja: &Path) -> Result<Self> {
         let file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(node.join("context.jsonl"))?;
+            .open(aja.join("context.jsonl"))?;
         Ok(Self {
             file,
             assistants: 0,
@@ -133,7 +133,7 @@ const PROJECT_NAMES: usize = 6;
 type ProjectState = std::collections::BTreeMap<String, (u64, i64)>;
 
 /// Every regular file in the project, with its size and modification time. The
-/// worker's own state (`skip`) is not part of what the node did to the project.
+/// worker's own state (`skip`) is not part of what the aja did to the project.
 fn snapshot_project(root: &Path, skip: &Path, control: &Control) -> (ProjectState, bool) {
     let mut state = ProjectState::new();
     let mut truncated = false;
@@ -188,7 +188,7 @@ fn snapshot_project(root: &Path, skip: &Path, control: &Control) -> (ProjectStat
     (state, truncated)
 }
 
-/// What the node did to the project: the world's answer, not the node's claim.
+/// What the aja did to the project: the world's answer, not the aja's claim.
 #[derive(Debug, Default)]
 struct ProjectDelta {
     created: Vec<String>,
@@ -280,7 +280,7 @@ impl ProjectDelta {
     }
 }
 
-/// What one run of a node produced: the transcript's account of it.
+/// What one run of a aja produced: the transcript's account of it.
 struct Outcome<'a> {
     text: &'a str,
     reason: &'a str,
@@ -324,9 +324,9 @@ pub struct NativeWorker {
     model: Arc<dyn Model>,
     tools: Arc<dyn ToolGateway>,
     limits: Limits,
-    /// The shadow repository that keeps one commit per node: the fossils.
+    /// The shadow repository that keeps one commit per aja: the fossils.
     checkpoints: PathBuf,
-    /// The host's own state, never part of what a node did to the project.
+    /// The host's own state, never part of what a aja did to the project.
     state: PathBuf,
     active: Mutex<Option<ActiveRun>>,
 }
@@ -345,7 +345,7 @@ impl NativeWorker {
         let project = project.into().canonicalize()?;
         let state = root
             .parent()
-            .ok_or("node root has no state directory")?
+            .ok_or("aja root has no state directory")?
             .to_path_buf();
         if project.starts_with(&state) {
             return Err(
@@ -370,13 +370,13 @@ impl NativeWorker {
         self.limits = limits;
         Ok(self)
     }
-    pub fn cancel(&self, node_id: u64) -> bool {
+    pub fn cancel(&self, aja_id: u64) -> bool {
         if let Some(flag) = self
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .filter(|run| run.id == node_id)
+            .filter(|run| run.id == aja_id)
         {
             flag.cancelled.store(true, Ordering::SeqCst);
             true
@@ -420,7 +420,7 @@ impl NativeWorker {
         };
         let mut process = Process::start(&self.binary, &self.project, start)?;
         let context = ToolContext {
-            node_id: assignment.task_id,
+            aja_id: assignment.task_id,
             project: &self.project,
             private: self.root.parent().ok_or("missing state root")?,
             control,
@@ -431,11 +431,16 @@ impl NativeWorker {
                 Request::Model { messages } => {
                     steps += 1;
                     if let Some(limit) = self.limits.steps.filter(|limit| steps > *limit) {
-                        return Ok((format!("AJA step budget of {limit} turns exhausted; continue in a new node"), "budget".into()));
+                        return Ok((
+                            format!(
+                                "AJA step budget of {limit} turns exhausted; continue in a new aja"
+                            ),
+                            "budget".into(),
+                        ));
                     }
                     if serde_json::to_vec(&messages)?.len() > self.limits.context_bytes {
                         return Ok((
-                            "AJA context budget exhausted; continue in a new node".into(),
+                            "AJA context budget exhausted; continue in a new aja".into(),
                             "budget".into(),
                         ));
                     }
@@ -503,7 +508,7 @@ impl NativeWorker {
                 Request::Finish { text, reason } => {
                     control.check()?;
                     if !matches!(reason.as_str(), "message" | "budget" | "error") {
-                        return Err("invalid node finish reason".into());
+                        return Err("invalid aja finish reason".into());
                     }
                     return Ok((text, reason));
                 }
@@ -519,8 +524,8 @@ impl NativeWorker {
         }
     }
 
-    /// Freeze the world this node left: one commit in the state's shadow
-    /// repository. The commit is the fossil EJA reads a node's files from.
+    /// Freeze the world this aja left: one commit in the state's shadow
+    /// repository. The commit is the fossil EJA reads a aja's files from.
     fn checkpoint(&self, assignment: &Assignment, control: &Control) -> Result<String> {
         let git = |args: &[&str]| -> Result<String> {
             let mut command = std::process::Command::new("git");
@@ -564,14 +569,14 @@ impl NativeWorker {
             }
         }
         git(&spec.iter().map(String::as_str).collect::<Vec<_>>())?;
-        let message = format!("node {} at {}", assignment.task_id, assignment.issued_at);
+        let message = format!("aja {} at {}", assignment.task_id, assignment.issued_at);
         git(&["commit", "--quiet", "--allow-empty", "-m", &message])?;
         git(&["rev-parse", "HEAD"])
     }
 
     fn seal(
         &self,
-        node: &Path,
+        aja: &Path,
         assignment: &Assignment,
         outcome: Outcome<'_>,
         delta: &ProjectDelta,
@@ -581,7 +586,7 @@ impl NativeWorker {
             Ok(commit) => (Some(commit), None),
             Err(error) => (None, Some(error.to_string())),
         };
-        let context = node.join("context.jsonl");
+        let context = aja.join("context.jsonl");
         if let Ok(file) = fs::OpenOptions::new().write(true).open(&context) {
             file.sync_all()?;
             let mut permissions = file.metadata()?.permissions();
@@ -621,12 +626,12 @@ impl NativeWorker {
             "context_bytes": context_bytes,
             "frozen": true,
         });
-        let temp = node.join("node.json.tmp");
+        let temp = aja.join("aja.json.tmp");
         fs::write(&temp, serde_json::to_vec_pretty(&manifest)?)?;
         fs::File::open(&temp)?.sync_all()?;
-        fs::rename(temp, node.join("node.json"))?;
+        fs::rename(temp, aja.join("aja.json"))?;
         // The manifest is part of the frozen record, like the context and the checkpoint.
-        let manifest = node.join("node.json");
+        let manifest = aja.join("aja.json");
         if let Ok(file) = fs::OpenOptions::new().write(true).open(&manifest) {
             let mut permissions = file.metadata()?.permissions();
             permissions.set_readonly(true);
@@ -641,10 +646,10 @@ impl Worker for NativeWorker {
         if let Err(error) = parent.check() {
             return format!("0 steps, 0 tool calls, ended: budget\n{error}");
         }
-        let node = self.root.join(assignment.task_id.to_string());
-        // Reserve once. Restart or replay cannot overwrite an existing node, even after failure.
+        let aja = self.root.join(assignment.task_id.to_string());
+        // Reserve once. Restart or replay cannot overwrite an existing aja, even after failure.
         if assignment.task_id == 0 {
-            return "0 steps, 0 tool calls, ended: error\ninvalid node id".into();
+            return "0 steps, 0 tool calls, ended: error\ninvalid aja id".into();
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         {
@@ -652,7 +657,7 @@ impl Worker for NativeWorker {
             if active.is_some() {
                 return "0 steps, 0 tool calls, ended: budget\nexecution owner is busy".into();
             }
-            if let Err(e) = fs::create_dir(&node) {
+            if let Err(e) = fs::create_dir(&aja) {
                 return format!(
                     "0 steps, 0 tool calls, ended: error\nnode already reserved or unavailable: {e}"
                 );
@@ -669,7 +674,7 @@ impl Worker for NativeWorker {
             .child(Duration::from_millis(self.limits.timeout_ms))
             .cancelled_by(cancelled.clone());
         let mut counts = std::collections::BTreeMap::new();
-        let mut log = match ContextLog::create(&node) {
+        let mut log = match ContextLog::create(&aja) {
             Ok(log) => log,
             Err(error) => {
                 return format!(
@@ -699,7 +704,7 @@ impl Worker for NativeWorker {
         let _ = log.record(json!({"kind": "finish", "text": &text, "reason": &reason}));
         drop(log);
         self.seal(
-            &node,
+            &aja,
             assignment,
             Outcome {
                 text: &text,

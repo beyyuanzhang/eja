@@ -149,7 +149,7 @@ struct Connection {
     service: RunningService<RoleClient, ClientConfig>,
 }
 
-/// One registry/runtime for the application, shared across disposable nodes.
+/// One registry/runtime for the application, shared across disposable ajas.
 pub struct McpTools {
     runtime: Runtime,
     connections: Vec<Connection>,
@@ -500,7 +500,7 @@ impl Drop for McpTools {
     }
 }
 
-/// The application's one tool entry point. Shared MCP servers outlive nodes.
+/// The application's one tool entry point. Shared MCP servers outlive ajas.
 pub struct HostTools {
     mcp: Option<McpTools>,
     project: PathBuf,
@@ -523,7 +523,7 @@ impl HostTools {
     }
 }
 impl ToolGateway for HostTools {
-    /// A node acts only through the host's declared connectors. There are no
+    /// A aja acts only through the host's declared connectors. There are no
     /// built-in file tools: the workspace is reached the way the host provides
     /// it, so writing a deliverable costs the same as working on it.
     fn definitions(&self, assignment: &Assignment) -> Vec<Value> {
@@ -549,7 +549,7 @@ impl Observer for HostTools {
     fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
         let control = parent.child(Duration::from_secs(60));
         let context = ToolContext {
-            node_id: 0,
+            aja_id: 0,
             project: &self.project,
             private: &self.private,
             control: &control,
@@ -558,7 +558,7 @@ impl Observer for HostTools {
             return FileTools.call(&context, tool, arguments);
         }
         if tool == "write_file" || tool == "edit_file" {
-            return Err("EJA only observes; edits belong to nodes".into());
+            return Err("EJA only observes; edits belong to ajas".into());
         }
         let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
         if !mcp.is_read_only(tool) {

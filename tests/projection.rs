@@ -45,7 +45,7 @@ fn a_record_that_does_not_fit_is_cut_at_the_budget_and_says_so() {
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::new(&dir).expect("store");
     let evidence = vec![Observation {
-        source: LookSource::Node,
+        source: LookSource::Aja,
         target: "big.json".to_string(),
         arguments: serde_json::Value::Null,
         selector: Selector::Whole,

@@ -50,7 +50,7 @@ impl Fixture {
         args: Value,
     ) -> Result<Value> {
         let ctx = ToolContext {
-            node_id: 123,
+            aja_id: 123,
             project: &self.0,
             private: &self.0,
             control,
@@ -139,11 +139,11 @@ fn stdio_discovery_grants_results_and_owned_process_group() {
             &host,
             &control(2000),
             "mcp__fixture__echo",
-            json!({"text":"node-123"}),
+            json!({"text":"aja-123"}),
         )
         .unwrap();
-    assert_eq!(value["content"][0]["text"], "node-123");
-    assert_eq!(value["structuredContent"]["node"], "node-123");
+    assert_eq!(value["content"][0]["text"], "aja-123");
+    assert_eq!(value["structuredContent"]["aja"], "aja-123");
     assert_eq!(
         value["structuredContent"]["marker"],
         std::env::var("PATH").unwrap()
@@ -315,7 +315,7 @@ fn streamable_http_json_sse_headers_session_reinit_once_and_no_replay() {
                 "mcp__remote__echo",
                 json!({"text":text})
             )
-            .unwrap()["structuredContent"]["node"],
+            .unwrap()["structuredContent"]["aja"],
             text
         );
     }
@@ -430,26 +430,26 @@ impl Model for ConnectorModel {
         if messages.last().unwrap()["role"] == "tool" {
             let result: Value =
                 serde_json::from_str(messages.last().unwrap()["content"].as_str().unwrap())?;
-            assert_eq!(result["result"]["structuredContent"]["node"], "native node");
+            assert_eq!(result["result"]["structuredContent"]["aja"], "native aja");
             Ok(
                 json!({"role":"assistant","content":json!({"status":"done","summary":"MCP used","artifacts":[],"evidence":[],"open_questions":[]}).to_string()}),
             )
         } else {
             Ok(
-                json!({"role":"assistant","content":null,"tool_calls":[{"id":"mcp-call","type":"function","function":{"name":"mcp__fixture__echo","arguments":"{\"text\":\"native node\"}"}}]}),
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"mcp-call","type":"function","function":{"name":"mcp__fixture__echo","arguments":"{\"text\":\"native aja\"}"}}]}),
             )
         }
     }
 }
 
 #[test]
-fn native_nodes_share_one_host_connection_and_freeze_independently() {
+fn native_ajas_share_one_host_connection_and_freeze_independently() {
     let _lock = LOCK.lock().unwrap();
     let f = Fixture::new();
     let path = f.config(json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
     let tools = Arc::new(HostTools::new(Some(&path), &f.0, &f.0, &control(300_000)).unwrap());
     let pid = f.pid("fixture", "pid");
-    let root = f.0.join(".eja/nodes");
+    let root = f.0.join(".eja/ajas");
     let worker = NativeWorker::new(
         env!("CARGO_BIN_EXE_eja"),
         &root,
@@ -470,7 +470,7 @@ fn native_nodes_share_one_host_connection_and_freeze_independently() {
         assert_eq!(worker.active_count(), 0);
         assert!(!root.join(format!("{id}/work")).exists());
         let manifest: Value =
-            serde_json::from_slice(&fs::read(root.join(format!("{id}/node.json"))).unwrap())
+            serde_json::from_slice(&fs::read(root.join(format!("{id}/aja.json"))).unwrap())
                 .unwrap();
         assert_eq!(manifest["frozen"], true);
         assert!(alive(pid));
@@ -478,7 +478,7 @@ fn native_nodes_share_one_host_connection_and_freeze_independently() {
     assert_eq!(
         fs::read_dir(fd_dir).unwrap().count(),
         fds,
-        "MCP nodes leaked file descriptors"
+        "MCP ajas leaked file descriptors"
     );
     assert_eq!(
         f.events("fixture")

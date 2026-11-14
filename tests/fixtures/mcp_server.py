@@ -79,7 +79,7 @@ def dispatch(message):
             pending.pop(ident, None)
         if name == "big":
             text = "x" * 300000
-        structured = {"node": text, "marker": os.getenv("MCP_MARKER", "")}
+        structured = {"aja": text, "marker": os.getenv("MCP_MARKER", "")}
         if name == "big":
             structured = {"marker": os.getenv("MCP_MARKER", "")}
         reply["result"] = {

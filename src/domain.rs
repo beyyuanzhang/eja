@@ -116,7 +116,7 @@ impl EventMeta {
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     #[default]
-    Node,
+    Aja,
     Group,
 }
 
@@ -170,14 +170,14 @@ pub struct Edge {
 pub struct Assignment {
     pub task_id: TaskId,
     pub objective: String,
-    /// What the task must satisfy; the node's exit criterion.
+    /// What the task must satisfy; the aja's exit criterion.
     #[serde(default)]
     pub acceptance: String,
-    /// The task exactly as it arrived, so the node works from the source and not
+    /// The task exactly as it arrived, so the aja works from the source and not
     /// only from EJA's reading of it.
     #[serde(default)]
     pub input: String,
-    /// A predecessor whose frozen record this node continues from.
+    /// A predecessor whose frozen record this aja continues from.
     #[serde(default)]
     pub resume: Option<TaskId>,
     pub issued_at: i64,
@@ -322,12 +322,12 @@ pub enum Action {
     },
 }
 
-/// Where a look reads from: EJA's own log, a frozen node record, or the world.
+/// Where a look reads from: EJA's own log, a frozen aja record, or the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LookSource {
     Log,
-    Node,
+    Aja,
     World,
 }
 

@@ -108,7 +108,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
 
 #[test]
 fn one_unreadable_action_does_not_discard_the_rest() {
-    let raw = r#"{"reply":"go","actions":[{"op":"focus","task_id":1},{"op":"look","source":"node","target":"3","selector":{"select":"last"}}]}"#;
+    let raw = r#"{"reply":"go","actions":[{"op":"focus","task_id":1},{"op":"look","source":"aja","target":"3","selector":{"select":"last"}}]}"#;
     let decision = eja::adapters::parse_decision(raw);
     assert_eq!(decision.actions.len(), 1, "{:?}", decision.actions);
     assert_eq!(decision.refused.len(), 1, "{:?}", decision.refused);
@@ -188,7 +188,7 @@ fn json_mode_is_requested_only_where_a_json_object_is_expected() {
     let decision = server.join().expect("server");
     assert_eq!(decision["response_format"]["type"], "json_object");
 
-    // The node's turn acts through tool calls and ends in plain text; asking the
+    // The aja's turn acts through tool calls and ends in plain text; asking the
     // provider for a JSON object there is wrong and a provider may reject it.
     let (url, server) = capture_request(answered);
     let model = OpenAiModel::new(url, "k", "m");
@@ -200,7 +200,7 @@ fn json_mode_is_requested_only_where_a_json_object_is_expected() {
             &control,
             false,
         )
-        .expect("node call");
-    let node = server.join().expect("server");
-    assert!(node.get("response_format").is_none(), "{node}");
+        .expect("aja call");
+    let aja = server.join().expect("server");
+    assert!(aja.get("response_format").is_none(), "{aja}");
 }

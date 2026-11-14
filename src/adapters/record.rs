@@ -10,12 +10,12 @@ use std::{
 
 pub(crate) const READ_TOOL: &str = "eja_read_record";
 pub(crate) fn definition() -> Value {
-    json!({"type":"function","function":{"name":READ_TOOL,"description":"Read a bounded byte passage of a full tool result in this node's record or an inherited record. Use the record node/entry address from a tool result. Offsets address UTF-8 bytes.","parameters":{"type":"object","properties":{"node":{"type":"integer"},"entry":{"type":"integer"},"offset":{"type":"integer","default":0},"bytes":{"type":"integer","default":1024}},"required":["node","entry"],"additionalProperties":false}}})
+    json!({"type":"function","function":{"name":READ_TOOL,"description":"Read a bounded byte passage of a full tool result in this aja's record or an inherited record. Use the record aja/entry address from a tool result. Offsets address UTF-8 bytes.","parameters":{"type":"object","properties":{"aja":{"type":"integer"},"entry":{"type":"integer"},"offset":{"type":"integer","default":0},"bytes":{"type":"integer","default":1024}},"required":["aja","entry"],"additionalProperties":false}}})
 }
 
 fn path(root: &Path, id: u64) -> Result<PathBuf> {
     if id == 0 {
-        return Err("invalid record node".into());
+        return Err("invalid record aja".into());
     }
     super::tools::relative_file(root, &format!("{id}/context.jsonl"))
 }
@@ -50,7 +50,7 @@ pub(crate) fn lineage(
         if !seen.insert(id) {
             return Err("record ancestry cycle".into());
         }
-        let manifest_path = super::tools::relative_file(root, &format!("{id}/node.json"))?;
+        let manifest_path = super::tools::relative_file(root, &format!("{id}/aja.json"))?;
         let manifest: Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
         if manifest["frozen"] != true {
             return Err("predecessor record is not frozen".into());
@@ -75,10 +75,10 @@ pub(crate) fn replay(
     control: &Control,
 ) -> Result<Vec<Value>> {
     let mut messages = Vec::new();
-    for &node in chain.iter().rev() {
+    for &aja in chain.iter().rev() {
         let mut pending = VecDeque::new();
         let mut unfinished = None;
-        for (index, line) in BufReader::new(fs::File::open(path(root, node)?)?)
+        for (index, line) in BufReader::new(fs::File::open(path(root, aja)?)?)
             .lines()
             .enumerate()
         {
@@ -140,7 +140,7 @@ pub(crate) fn replay(
                     {
                         return Err("record tool ids do not match".into());
                     }
-                    messages.push(json!({"role":"tool","tool_call_id":id,"content":fold::tool_result(&entry["result"],node,index).to_string()}));
+                    messages.push(json!({"role":"tool","tool_call_id":id,"content":fold::tool_result(&entry["result"],aja,index).to_string()}));
                     if pending.is_empty() {
                         unfinished = None;
                     }
@@ -168,16 +168,14 @@ pub(crate) fn read(
     arguments: &Value,
     control: &Control,
 ) -> Result<Value> {
-    let node = arguments["node"]
-        .as_u64()
-        .ok_or("record node is required")?;
-    if node != current && !ancestors.contains(&node) {
-        return Err("record is outside this node's ancestry".into());
+    let aja = arguments["aja"].as_u64().ok_or("record aja is required")?;
+    if aja != current && !ancestors.contains(&aja) {
+        return Err("record is outside this aja's ancestry".into());
     }
     let wanted = arguments["entry"]
         .as_u64()
         .ok_or("record entry is required")?;
-    for (index, line) in BufReader::new(fs::File::open(path(root, node)?)?)
+    for (index, line) in BufReader::new(fs::File::open(path(root, aja)?)?)
         .lines()
         .enumerate()
     {
@@ -203,7 +201,7 @@ pub(crate) fn read(
                 .min(usize::MAX as u64) as usize,
             1024,
         );
-        page["node"] = json!(node);
+        page["aja"] = json!(aja);
         page["entry"] = json!(wanted);
         return Ok(page);
     }

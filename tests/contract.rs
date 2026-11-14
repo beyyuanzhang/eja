@@ -92,6 +92,6 @@ fn worker_receives_the_task_contract_and_original_input() {
         .find(|event| event.kind == eja::Kind::TaskAssigned)
         .and_then(|event| event.data)
         .expect("assigned data");
-    // The node gets the task's contract, not just its prose objective.
+    // The aja gets the task's contract, not just its prose objective.
     assert_eq!(assigned["acceptance"], "EJA acceptance only");
 }

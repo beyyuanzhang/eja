@@ -1,4 +1,4 @@
-//! Host tools. Connectors implement this same boundary; nodes never load plugins.
+//! Host tools. Connectors implement this same boundary; ajas never load plugins.
 use super::Control;
 use crate::{aja::FRAME_LIMIT, Result};
 use serde_json::{json, Value};
@@ -9,10 +9,10 @@ use std::{
 };
 
 pub struct ToolContext<'a> {
-    pub node_id: u64,
+    pub aja_id: u64,
     /// The one workspace: the project. There is no second place to write.
     pub project: &'a Path,
-    /// The host's own state, which no node may read or write.
+    /// The host's own state, which no aja may read or write.
     pub private: &'a Path,
     pub control: &'a Control,
 }
@@ -23,7 +23,7 @@ pub trait ToolGateway: Send + Sync {
     fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value>;
 }
 
-/// No absolute paths, parent traversal, or symlinks in a node's file capabilities.
+/// No absolute paths, parent traversal, or symlinks in a aja's file capabilities.
 pub(crate) fn relative_file(root: &Path, name: &str) -> Result<PathBuf> {
     if name.is_empty() || name.len() > 4096 {
         return Err("invalid path".into());

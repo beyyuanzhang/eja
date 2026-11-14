@@ -1,14 +1,14 @@
 # MCP tools
 
 EJA owns the clients. AJA receives tool definitions and sends tool calls over its
-existing IPC. One host tool registry holds connections for all nodes; freezing a
-node retains no node-owned MCP client, server or thread.
+existing IPC. One host tool registry holds connections for all ajas; freezing a
+aja retains no aja-owned MCP client, server or thread.
 
 ## Configuration
 
 The CLI loads `<dir>/mcp.json` when present, or the exact `--mcp-config FILE` path.
 It does not search personal or other project configuration directories.
-No config grants no external connector tools. Each native node still has its host-bound read-only record passage tool. A configured server that fails to initialize or
+No config grants no external connector tools. Each native aja still has its host-bound read-only record passage tool. A configured server that fails to initialize or
 list its granted tools fails startup, rather than silently removing capabilities.
 
 ```json
@@ -70,7 +70,7 @@ resource browser or prompt registry.
   payload plus envelope headroom. A larger result is refused with a clear error.
 - Per-server timeout defaults to 30 seconds (maximum 300 seconds), including
   initialization and discovery. Calls use the smaller of that timeout and the
-  node's remaining deadline. Cancellation is checked while waiting, and sends
+  aja's remaining deadline. Cancellation is checked while waiting, and sends
   an MCP cancellation notification for a pending call.
   Startup also has one inherited deadline of at most 300 seconds across all
   servers. Its remaining time does not become a later tool call's timeout.

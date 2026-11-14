@@ -1,5 +1,5 @@
 //! A single reader/selector path for frozen records and checkpointed files.
-use super::NodeReader;
+use super::RecordReader;
 use crate::{Control, Result, Selector};
 use serde_json::{json, Value};
 use std::{
@@ -10,12 +10,12 @@ use std::{
     process::{Child, ChildStdout, Command, Stdio},
 };
 
-pub struct NodeFiles {
+pub struct RecordFiles {
     root: PathBuf,
     checkpoints: Option<PathBuf>,
     max_bytes: usize,
 }
-impl NodeFiles {
+impl RecordFiles {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -41,14 +41,14 @@ impl NodeFiles {
         let local = super::tools::relative_file(&self.root, path)?;
         if let Some((id, rest)) = path.split_once('/') {
             if let Some(checkpoints) = &self.checkpoints {
-                if rest != "context.jsonl" && rest != "node.json" {
-                    let _: u64 = id.parse().map_err(|_| "node path needs a numeric id")?;
+                if rest != "context.jsonl" && rest != "aja.json" {
+                    let _: u64 = id.parse().map_err(|_| "aja path needs a numeric id")?;
                     let manifest: Value = serde_json::from_slice(&fs::read(
-                        super::tools::relative_file(&self.root, &format!("{id}/node.json"))?,
+                        super::tools::relative_file(&self.root, &format!("{id}/aja.json"))?,
                     )?)?;
                     let commit = manifest["checkpoint"]
                         .as_str()
-                        .ok_or("this node left no checkpoint")?;
+                        .ok_or("this aja left no checkpoint")?;
                     if commit.len() != 40 && commit.len() != 64
                         || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
                     {
@@ -103,12 +103,12 @@ impl Drop for Source {
     }
 }
 
-impl NodeReader for NodeFiles {
+impl RecordReader for RecordFiles {
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value> {
         control.check()?;
         super::tools::relative_file(&self.root, path)?;
         if matches!(selector, Selector::Bytes { .. }) {
-            return Err("node files use whole, range or match".into());
+            return Err("aja files use whole, range or match".into());
         }
         if matches!(selector, Selector::Whole) {
             return super::text_view(

@@ -4,7 +4,7 @@
 //! current input first, the evidence before the index. The renderer keeps the
 //! head whole while the declared budget allows, lists the rest as one line each,
 //! and folds the oldest into one address line. A folded region keeps its handle
-//! in the log or in the node record, so reading it again is an address lookup,
+//! in the log or in the aja record, so reading it again is an address lookup,
 //! never a re-derivation: the space is folded, not summarized.
 //!
 //! EJA's projection and an AJA transcript are the same call with a different
@@ -38,7 +38,7 @@ impl Level {
 /// One addressable region of a space. The caller keeps the bodies; a region is
 /// only what the renderer needs to choose a scale.
 pub struct Region {
-    /// Where the region lives: an event id, a node record entry, a path.
+    /// Where the region lives: an event id, a aja record entry, a path.
     pub handle: String,
     /// One line that stands for the region at index scale.
     pub line: String,
@@ -70,7 +70,7 @@ pub struct View {
 }
 
 /// How much of one tool result a transcript carries. The record keeps the whole
-/// result; the node acts on a view that names the entry that unfolds it.
+/// result; the aja acts on a view that names the entry that unfolds it.
 pub const TOOL_BYTES: usize = 8 * 1024;
 
 fn prefix(text: &str, bytes: usize) -> &str {
@@ -91,9 +91,9 @@ fn suffix(text: &str, bytes: usize) -> &str {
 
 /// Every result carries a stable address, including results that fit whole. The
 /// complete result is written once, in the host's immutable record.
-pub fn tool_result(value: &serde_json::Value, node: u64, entry: usize) -> serde_json::Value {
+pub fn tool_result(value: &serde_json::Value, aja: u64, entry: usize) -> serde_json::Value {
     use serde_json::json;
-    let reference = json!({"node": node, "entry": entry});
+    let reference = json!({"aja": aja, "entry": entry});
     let whole = json!({"record": reference, "result": value});
     let text = value.to_string();
     if whole.to_string().len() <= TOOL_BYTES {
@@ -114,7 +114,7 @@ pub fn tool_result(value: &serde_json::Value, node: u64, entry: usize) -> serde_
 /// Fold a live transcript to its budget. The head (system and assignment) and
 /// the newest steps stay whole; older steps become one address line each; the
 /// oldest fold into a single address. Returns false when even that does not fit,
-/// which is the node's stopping point, not a licence to keep re-sending at the cap.
+/// which is the aja's stopping point, not a licence to keep re-sending at the cap.
 pub(crate) fn transcript(messages: &mut Vec<Value>, budget: usize) -> bool {
     let head = messages
         .iter()
@@ -167,7 +167,7 @@ pub(crate) fn transcript(messages: &mut Vec<Value>, budget: usize) -> bool {
     let head_bytes: usize = messages[..head].iter().map(|m| m.to_string().len()).sum();
     let view = assemble(&regions, budget.saturating_sub(head_bytes + 8));
     let kept: Vec<usize> = view.record.iter().map(|i| steps.len() - 1 - *i).collect();
-    let tail = tail(&view, "Earlier steps of this node, folded:");
+    let tail = tail(&view, "Earlier steps of this aja, folded:");
     let mut rebuilt: Vec<Value> = messages[..head].to_vec();
     if let Some(text) = &tail {
         rebuilt.push(json!({"role":"user","content":text}));
@@ -205,7 +205,7 @@ fn step_line(start: usize, end: usize, messages: &[Value]) -> String {
                 if let Some(record) = value.get("record") {
                     address = format!(
                         "{}/{}",
-                        record["node"].as_u64().unwrap_or(0),
+                        record["aja"].as_u64().unwrap_or(0),
                         record["entry"].as_u64().unwrap_or(0)
                     );
                 }
@@ -241,7 +241,7 @@ pub(crate) fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Va
             )
         },
     );
-    let system = format!("You are AJA, one independent work node. Complete the assigned work using supplied tools. Your workspace is the current project; inherited messages describe earlier observations, not a restored world. {budget} Acceptance is the contract. Stop once it holds and report what you did. Tool results carry record addresses; use eja_read_record to read omitted passages. Never claim a failed tool succeeded.");
+    let system = format!("You are AJA, one independent work aja. Complete the assigned work using supplied tools. Your workspace is the current project; inherited messages describe earlier observations, not a restored world. {budget} Acceptance is the contract. Stop once it holds and report what you did. Tool results carry record addresses; use eja_read_record to read omitted passages. Never claim a failed tool succeeded.");
     let mut brief = assignment.objective.clone();
     if !assignment.input.trim().is_empty() && assignment.input.trim() != brief.trim() {
         brief.push_str("\n\nTask as given:\n");
@@ -252,7 +252,7 @@ pub(crate) fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Va
         brief.push_str(&assignment.acceptance);
     }
     if assignment.resume.is_some() {
-        brief = format!("Continuing as a new node. {brief}");
+        brief = format!("Continuing as a new aja. {brief}");
     }
     vec![
         json!({"role":"system","content":system}),

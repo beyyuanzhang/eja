@@ -199,5 +199,5 @@ fn eja_can_observe_project_files_but_never_write() {
     assert!(edited
         .unwrap_err()
         .to_string()
-        .contains("edits belong to nodes"));
+        .contains("edits belong to ajas"));
 }

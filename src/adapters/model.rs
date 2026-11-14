@@ -1,4 +1,4 @@
-//! Host-owned model transport shared by EJA and its AJA nodes.
+//! Host-owned model transport shared by EJA and its AJA ajas.
 use crate::{aja::Limits, Result};
 use serde_json::{json, Value};
 use std::time::Duration;

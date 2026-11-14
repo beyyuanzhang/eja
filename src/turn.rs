@@ -184,16 +184,16 @@ fn link_tasks(
             }
         }
         RelationKind::Continues | RelationKind::DependsOn => {
-            if source.kind != TaskKind::Node || source.status != TaskStatus::Open {
+            if source.kind != TaskKind::Aja || source.status != TaskStatus::Open {
                 return Ok(Some(
                     "relate refused: execution edges are fixed before dispatch".into(),
                 ));
             }
             if kind == RelationKind::Continues
-                && (target.kind != TaskKind::Node || target.digest.is_none())
+                && (target.kind != TaskKind::Aja || target.digest.is_none())
             {
                 return Ok(Some(
-                    "relate refused: continuation needs a completed node record".into(),
+                    "relate refused: continuation needs a completed aja record".into(),
                 ));
             }
             if kind == RelationKind::Continues
@@ -209,7 +209,7 @@ fn link_tasks(
         _ => {}
     }
     edges.push(edge);
-    // A group completes after its members; a node executes after its explicit
+    // A group completes after its members; a aja executes after its explicit
     // dependencies. One combined dependency graph catches cross-kind cycles.
     let dependency = |edge: &Edge| match edge.kind {
         RelationKind::PartOf => Some((edge.to, edge.from)),
@@ -268,9 +268,9 @@ fn reserve_dispatch(
             task.status.as_str()
         )));
     }
-    if task.kind != TaskKind::Node {
+    if task.kind != TaskKind::Aja {
         return Ok(Err(
-            "dispatch refused: a group is not an execution node".into()
+            "dispatch refused: a group is not an execution aja".into()
         ));
     }
     let events = ctx.store.events()?;
@@ -302,10 +302,10 @@ fn reserve_dispatch(
     let resume = predecessors.first().map(|edge| edge.to);
     if resume.is_some_and(|id| {
         !all.iter()
-            .any(|other| other.id == id && other.kind == TaskKind::Node && other.digest.is_some())
+            .any(|other| other.id == id && other.kind == TaskKind::Aja && other.digest.is_some())
     }) {
         return Ok(Err(
-            "dispatch refused: continuation needs a completed node record".into(),
+            "dispatch refused: continuation needs a completed aja record".into(),
         ));
     }
     let assignment = Assignment {
@@ -355,7 +355,7 @@ fn run_dispatches(
         let digest = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.worker.execute(&assignment, ctx.control)
         }))
-        .unwrap_or_else(|_| "node panicked".to_string());
+        .unwrap_or_else(|_| "aja panicked".to_string());
         out.worker_ms += started.elapsed().as_millis();
         record_dispatch(ctx, out, assignment, digest)?;
     }
@@ -393,7 +393,7 @@ fn close_task(
     } else if task.status != TaskStatus::Waiting && !(task.status == TaskStatus::Open && !accepted)
     {
         return Ok(Some(format!(
-            "close refused: task {task_id} is {}; a node record is required first",
+            "close refused: task {task_id} is {}; a aja record is required first",
             task.status.as_str()
         )));
     }
@@ -486,7 +486,7 @@ fn apply_actions(
                 let id = open_task(
                     ctx,
                     TaskOpen {
-                        kind: TaskKind::Node,
+                        kind: TaskKind::Aja,
                         title: title.clone(),
                         request: request.clone(),
                         origin: ctx.input.into(),

@@ -14,7 +14,7 @@ leaderboard):
 A second run after removing the unused log-search retriever scored 0.612 (3
 zeros, 6 full, 9 at 0.8+), i.e. the same within sampling noise.
 
-Cost split: EJA 7.0 requests (112K tokens, 13%), nodes 17.9 requests (738K
+Cost split: EJA 7.0 requests (112K tokens, 13%), ajas 17.9 requests (738K
 tokens, 87%); EJA looks 15.4 times per task.
 
 Same-subset history: 0.248 (report boundary) -> 0.350 (silent refusals fixed)

@@ -137,7 +137,7 @@ pub(crate) fn validate_assistant(message: &Value) -> Result<()> {
 
 /// A spent budget is a stopping point, not a failed piece of work.
 fn stopped(reason: &str) -> (String, String) {
-    (format!("{reason}; continue in a new node"), "budget".into())
+    (format!("{reason}; continue in a new aja"), "budget".into())
 }
 
 fn request(reader: &mut impl BufRead, writer: &mut impl Write, request: Request) -> Result<Value> {
@@ -174,8 +174,8 @@ fn run(
             .cloned()
             .unwrap_or_default();
         if calls.is_empty() {
-            // The node's last message is text, never a schema: EJA reads it as
-            // the node's account and judges it with the record of its calls.
+            // The aja's last message is text, never a schema: EJA reads it as
+            // the aja's account and judges it with the record of its calls.
             let text = message
                 .get("content")
                 .and_then(Value::as_str)
@@ -262,7 +262,7 @@ mod fold_tests {
             messages.push(assistant_call(&id, "read_file"));
             messages.push(tool_message(
                 &id,
-                &json!({"record": {"node": 1, "entry": round}, "result": "x".repeat(2000)})
+                &json!({"record": {"aja": 1, "entry": round}, "result": "x".repeat(2000)})
                     .to_string(),
             ));
         }
@@ -277,7 +277,7 @@ mod fold_tests {
             .find(|message| {
                 message["content"]
                     .as_str()
-                    .is_some_and(|text| text.starts_with("Earlier steps of this node, folded:"))
+                    .is_some_and(|text| text.starts_with("Earlier steps of this aja, folded:"))
             })
             .expect("a folded map");
         assert!(folded["content"].as_str().unwrap().contains("record 1/"));

@@ -1,4 +1,4 @@
-use eja::adapters::{NodeReader, Ports};
+use eja::adapters::{Ports, RecordReader};
 use eja::{
     turn, Action, Assignment, Brain, Decision, EjaContext, Kind, LookSource, ProposalKind,
     Selector, Store, TaskStatus, Worker,
@@ -60,7 +60,7 @@ impl Worker for CaptureWorker {
 
 struct Reader;
 
-impl NodeReader for Reader {
+impl RecordReader for Reader {
     fn slice(&self, path: &str, _: &Selector, _: &eja::Control) -> eja::Result<serde_json::Value> {
         Ok(serde_json::json!({"path":path,"text":format!("content of {path}"),"truncated":false}))
     }
@@ -112,7 +112,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         &Script::new(vec![step(vec![open(false)]), done()]),
         &worker,
         &Ports {
-            node: Some(&Reader),
+            aja: Some(&Reader),
             ..Default::default()
         },
     )
@@ -138,13 +138,13 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
             },
         ]),
         step(vec![Action::Look {
-            source: LookSource::Node,
+            source: LookSource::Aja,
             target: "first.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
         step(vec![Action::Look {
-            source: LookSource::Node,
+            source: LookSource::Aja,
             target: "second.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
@@ -157,7 +157,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         &brain,
         &worker,
         &Ports {
-            node: Some(&Reader),
+            aja: Some(&Reader),
             ..Default::default()
         },
     )
@@ -173,12 +173,12 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         .expect("recall");
     assert_eq!(log_look.result["events"][0]["id"], fact.id);
     assert_eq!(log_look.result["events"][0]["kind"], "user");
-    let node_looks = out
+    let aja_looks = out
         .evidence
         .iter()
-        .filter(|look| look.source == LookSource::Node)
+        .filter(|look| look.source == LookSource::Aja)
         .count();
-    assert_eq!(node_looks, 2);
+    assert_eq!(aja_looks, 2);
     let seen = brain.seen.lock().unwrap();
     assert!(seen[1]
         .evidence
@@ -230,14 +230,14 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
             selector: Selector::Whole,
         }]),
         step(vec![Action::Look {
-            source: LookSource::Node,
+            source: LookSource::Aja,
             target: "1.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
         step(vec![close(1), open(true)]),
         step(vec![Action::Look {
-            source: LookSource::Node,
+            source: LookSource::Aja,
             target: "2.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
@@ -254,7 +254,7 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
         &brain,
         &worker,
         &Ports {
-            node: Some(&Reader),
+            aja: Some(&Reader),
             ..Default::default()
         },
     )
@@ -289,7 +289,7 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
                 text: "not yet confirmed".into(),
             },
             Action::Look {
-                source: LookSource::Node,
+                source: LookSource::Aja,
                 target: "background.md".into(),
                 arguments: serde_json::Value::Null,
                 selector: Selector::Whole,
@@ -304,7 +304,7 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
         &brain,
         &CaptureWorker::default(),
         &Ports {
-            node: Some(&Reader),
+            aja: Some(&Reader),
             ..Default::default()
         },
     )
@@ -329,7 +329,7 @@ fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
         (0..10)
             .map(|_| {
                 step(vec![Action::Look {
-                    source: LookSource::Node,
+                    source: LookSource::Aja,
                     target: "missing.md".into(),
                     arguments: serde_json::Value::Null,
                     selector: Selector::Whole,
@@ -358,13 +358,13 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     let store = store();
     let mut steps: Vec<Decision> = vec![
         step(vec![Action::Look {
-            source: LookSource::Node,
+            source: LookSource::Aja,
             target: "background.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
         }]),
         step(vec![Action::Look {
-            source: LookSource::Node,
+            source: LookSource::Aja,
             target: "second.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
@@ -374,7 +374,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     // Keep observing the same artifact until the view stops changing.
     steps.extend((0..8).map(|_| {
         step(vec![Action::Look {
-            source: LookSource::Node,
+            source: LookSource::Aja,
             target: "same.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
@@ -387,7 +387,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         &Script::new(steps),
         &worker,
         &Ports {
-            node: Some(&Reader),
+            aja: Some(&Reader),
             ..Default::default()
         },
     )
@@ -399,7 +399,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     let restarted = Store::new(store.log_path.parent().unwrap()).unwrap();
     let brain = Script::new(vec![
         step(vec![Action::Look {
-            source: LookSource::Node,
+            source: LookSource::Aja,
             target: "1.md".into(),
             arguments: serde_json::Value::Null,
             selector: Selector::Whole,
@@ -416,7 +416,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         &brain,
         &worker,
         &Ports {
-            node: Some(&Reader),
+            aja: Some(&Reader),
             ..Default::default()
         },
     )

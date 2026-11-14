@@ -2,7 +2,7 @@
 use crate::{tasks, Event, LookSource, Lookup, Result, Selector};
 use serde_json::Value;
 
-pub trait NodeReader {
+pub trait RecordReader {
     fn slice(&self, path: &str, selector: &Selector, control: &crate::Control) -> Result<Value>;
 }
 
@@ -14,7 +14,7 @@ pub trait Observer: Send + Sync {
 /// Host composition: one lookup over the three sources an EJA deployment has.
 #[derive(Default, Clone, Copy)]
 pub struct Ports<'a> {
-    pub node: Option<&'a dyn NodeReader>,
+    pub aja: Option<&'a dyn RecordReader>,
     pub world: Option<&'a dyn Observer>,
 }
 
@@ -106,9 +106,9 @@ impl Lookup for Ports<'_> {
                     serde_json::json!({"events":selected,"partial_events":partial,"from":from,"next":next,"total":events.len(),"truncated":next<events.len()}),
                 )
             }
-            LookSource::Node => {
-                let node = self.node.ok_or("no node reader is configured")?;
-                node.slice(target, selector, control)
+            LookSource::Aja => {
+                let aja = self.aja.ok_or("no aja reader is configured")?;
+                aja.slice(target, selector, control)
             }
             LookSource::World => {
                 let world = self.world.ok_or("no world reader is configured")?;

@@ -281,7 +281,7 @@ fn impossible_actions_are_refused_visibly_and_change_nothing() {
                 run: true,
             }],
         ),
-        // The task now has a node record: dispatching it again is refused.
+        // The task now has a aja record: dispatching it again is refused.
         decision("again", vec![Action::Dispatch { task_id: 1 }]),
     ]);
     let worker = QueueWorker::new(vec![record("first run")]);
@@ -593,7 +593,7 @@ fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
             std::thread::sleep(std::time::Duration::from_millis(150));
             self.running.fetch_sub(1, Ordering::SeqCst);
             format!(
-                "1 steps, 1 tool calls, project: unchanged, ended: message\nnode {} done",
+                "1 steps, 1 tool calls, project: unchanged, ended: message\naja {} done",
                 assignment.task_id
             )
         }

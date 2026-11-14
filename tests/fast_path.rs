@@ -164,6 +164,6 @@ fn multiple_active_tasks_do_not_use_the_fast_path() {
         eja::now_utc(),
     )
     .expect("close");
-    // Cancelling an open node needs no worker execution or extra observation.
+    // Cancelling an open aja needs no worker execution or extra observation.
     assert_eq!(*focus.lock().expect("focus"), vec![None]);
 }
