@@ -71,6 +71,31 @@ fn section(title: &'static str, counted: bool, items: Vec<Vec<String>>) -> Secti
     }
 }
 
+/// One section rendered at record scale.
+fn section_text(section: &Section) -> String {
+    let mut out = if section.counted {
+        format!("{} ({}):\n", section.title, section.items.len())
+    } else {
+        format!("{}:\n", section.title)
+    };
+    if section.items.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for item in &section.items {
+        for line in item {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// One section at index scale: its title and its size. Unfolding is one address
+/// lookup, which the footer states once instead of repeating on every line.
+fn section_line(section: &Section) -> String {
+    format!("{} ({} item)", section.title, section.items.len())
+}
+
 fn one_line(text: String) -> Vec<Vec<String>> {
     vec![vec![text]]
 }
@@ -335,41 +360,45 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
 
-    fit_sections(&sections, budget)
+    // The fold keeps the head whole, so the order is the priority: what this
+    // turn is about and what EJA just looked at come before any index.
+    const ORDER: [&str; 13] = [
+        "NOW (UTC)",
+        "CURRENT INPUT",
+        "CURRENT TASK",
+        "EVIDENCE",
+        "REFUSED",
+        "HOST APPROVED PROPOSALS",
+        "CURRENT GOAL",
+        "OPEN COMMITMENTS",
+        "PENDING PROPOSALS",
+        "ACTIVE IDENTITY",
+        "RECENT CONVERSATION",
+        "TASK INDEX",
+        "RELATIONS",
+    ];
+    sections.sort_by_key(|section| {
+        ORDER
+            .iter()
+            .position(|title| *title == section.title)
+            .unwrap_or(ORDER.len())
+    });
+    folded(&sections, budget)
 }
 
-/// Assemble the view in priority order. The declared budget is the only limit:
-/// a record that does not fit is cut where the budget ends and the cut is
-/// stated. Section counts describe the uncut projection.
-fn fit_sections(sections: &[Section], budget: usize) -> String {
-    let footer = "\n… view budget reached; use look log history/all or a record address for omitted content\n";
-    let mut full = String::new();
-    for section in sections {
-        let header = if section.counted {
-            format!("{} ({}):\n", section.title, section.items.len())
-        } else {
-            format!("{}:\n", section.title)
-        };
-        full.push_str(&header);
-        if section.items.is_empty() {
-            full.push_str("  (none)\n");
-        }
-        for item in &section.items {
-            for line in item {
-                full.push_str(line);
-                full.push('\n');
-            }
-        }
-        full.push('\n');
-    }
-    if full.len() <= budget {
-        return full.trim_end().to_string();
-    }
-    // The rendered-text cap includes headers, notices and UTF-8 bytes.
-    let kept = budget.saturating_sub(footer.len());
-    let mut out = super::cut_chars(&full, kept).to_string();
-    out.push_str(super::cut_chars(footer, budget.saturating_sub(out.len())));
-    out
+/// The projection is one space: sections in priority order, each whole while the
+/// declared budget allows, listed when it does not, and never cut mid-line.
+fn folded(sections: &[Section], budget: usize) -> String {
+    let bodies: Vec<String> = sections.iter().map(section_text).collect();
+    let regions: Vec<crate::fold::Region> = sections
+        .iter()
+        .zip(&bodies)
+        .map(|(section, body)| {
+            crate::fold::Region::new(section.title, section_line(section), body.len())
+        })
+        .collect();
+    let view = crate::fold::assemble(&regions, budget);
+    crate::fold::text_within(&view, &bodies, "", budget)
 }
 
 pub fn parse_decision(raw: &str) -> Decision {

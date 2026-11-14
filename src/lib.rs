@@ -4,6 +4,7 @@ pub mod adapters;
 pub mod aja;
 mod control;
 mod domain;
+pub mod fold;
 mod state;
 mod store;
 mod turn;

@@ -85,6 +85,26 @@ History is projected newest first; omitted history remains discoverable by id or
 page. Views report truncation and count records. The rendered brain context
 never exceeds its declared UTF-8 byte budget, including notices and headers.
 
+## Fold
+
+One renderer produces every view the model sees, for EJA and for a running node
+alike. A view is a space of regions in priority order — the newest step first,
+the current input first, evidence before the index — and the renderer chooses a
+scale for each region inside the declared budget:
+
+| Scale | What the model gets |
+|---|---|
+| record | the region whole |
+| index | one line, plus the handle that reaches it |
+| map | the region's shortest line, or one line for a folded range of them |
+
+The head stays whole while the budget allows, the rest is listed, and the oldest
+folds into an address. Nothing is summarized by a model and nothing is deleted:
+every folded region keeps its handle in the log or in the node record, so
+reading it again is an address lookup. A node whose transcript no longer fits
+even at map scale **stops** (`ended: budget`) and continues in a new node; it
+never keeps re-sending a transcript pinned at the cap.
+
 ## Execution and resources
 
 A turn runs `project -> decide -> act -> record` until a final decision, repeated

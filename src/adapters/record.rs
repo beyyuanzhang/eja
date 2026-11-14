@@ -148,7 +148,7 @@ pub(crate) fn replay(
                 _ => {}
             }
             if pending.is_empty() {
-                view::fit(&mut messages, budget);
+                crate::aja::fold_transcript(&mut messages, budget);
             }
         }
         // Keep the complete prefix of an interrupted call group. It may have had
@@ -156,7 +156,7 @@ pub(crate) fn replay(
         if let Some(index) = unfinished {
             messages.truncate(index);
         }
-        view::fit(&mut messages, budget);
+        crate::aja::fold_transcript(&mut messages, budget);
     }
     Ok(messages)
 }

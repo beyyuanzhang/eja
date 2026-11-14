@@ -21,20 +21,21 @@ fn projection_keeps_every_recorded_commitment_and_says_so() {
     assert_eq!(context.commitments.len(), 210);
     assert_eq!(store.events().expect("events").len(), 210);
 
-    // Nothing is silently cut: an unbudgeted view shows everything.
+    // Nothing is silently cut: an unbudgeted view shows everything whole.
     let full = render_context(&context);
-    let at = full.find("OPEN COMMITMENTS").unwrap_or(0);
-    assert!(
-        full.contains("OPEN COMMITMENTS (210):"),
-        "{}",
-        &full[at..(at + 220).min(full.len())]
+    assert!(full.contains("OPEN COMMITMENTS (210):"), "{full}");
+    assert_eq!(
+        full.matches("commitment ").count(),
+        210,
+        "every recorded commitment is rendered"
     );
+    assert!(full.contains(" whole,"), "the footer states the scale");
 
-    // A budgeted view reports how many it kept and how many exist.
+    // A budgeted view states its landing scale and stays inside the budget.
     let tight = render_context_within(&context, 400);
-    assert!(tight.contains("OPEN COMMITMENTS ("));
-    assert!(tight.contains("view budget reached"));
-    assert!(tight.len() <= 400);
+    assert!(tight.len() <= 400, "{}", tight.len());
+    assert!(tight.contains("[view "), "{tight}");
+    assert!(tight.contains("unfold by handle"), "{tight}");
 }
 
 #[test]
@@ -54,6 +55,7 @@ fn a_record_that_does_not_fit_is_cut_at_the_budget_and_says_so() {
     let context = eja::project_with_evidence(&store, "go", None, chrono::Utc::now(), &evidence)
         .expect("project");
     let view = render_context_within(&context, 400);
-    assert!(view.contains("view budget reached"), "{view}");
+    assert!(view.contains("[view "), "{view}");
+    assert!(view.contains("unfold by handle"), "{view}");
     assert!(view.len() <= 400, "{}", view.len());
 }
