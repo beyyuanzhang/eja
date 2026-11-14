@@ -37,11 +37,65 @@ impl Observer for Weather {
 }
 
 #[test]
+fn a_world_look_with_nothing_waiting_is_refused() {
+    let dir = std::env::temp_dir().join(format!("eja-observe-nudge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Store::new(&dir).expect("store");
+    let brain = Script(Mutex::new(VecDeque::from(vec![
+        Decision {
+            reply: String::new(),
+            actions: vec![Action::Look {
+                source: LookSource::World,
+                target: "mcp__weather__get".to_string(),
+                arguments: serde_json::json!({"city": "berlin"}),
+                selector: Selector::Whole,
+            }],
+            refused: Vec::new(),
+        },
+        Decision {
+            reply: "then do the work".into(),
+            actions: vec![],
+            refused: Vec::new(),
+        },
+    ])));
+    let out = turn(
+        &store,
+        "what is the sky?",
+        &brain,
+        &EmptyWorker,
+        &Ports {
+            world: Some(&Weather),
+            ..Default::default()
+        },
+    )
+    .expect("turn");
+    assert!(out.evidence.is_empty());
+    assert_eq!(out.refused.len(), 1);
+    assert!(out.refused[0].contains("waiting task"));
+    assert!(store
+        .events()
+        .expect("events")
+        .iter()
+        .any(|event| event.kind == Kind::Refused));
+}
+
+#[test]
 fn observing_a_read_only_tool_records_a_view() {
     let dir = std::env::temp_dir().join(format!("eja-observe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::new(&dir).expect("store");
     let brain = Script(Mutex::new(VecDeque::from(vec![
+        // The world is read while judging, so the task is opened and run first.
+        Decision {
+            reply: String::new(),
+            actions: vec![Action::OpenTask {
+                title: "sky".into(),
+                request: "check the sky".into(),
+                acceptance: String::new(),
+                run: true,
+            }],
+            refused: Vec::new(),
+        },
         Decision {
             reply: String::new(),
             actions: vec![Action::Look {

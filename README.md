@@ -86,7 +86,9 @@ look { source: log|node|world, target, selector }
   `event:<id>` target reads one event by address.
 - `node` — a frozen node record. `whole` reads a bounded file view, `range`
   reads lines, `match` finds a passage with surrounding lines.
-- `world` — a read-only connector tool or a project file.
+- `world` — a read-only connector tool or a project file. A world look is
+  authorised only while a task is waiting for judgment: reading the project is
+  the node's job, judging its result is EJA's.
 
 Selectors: `{"select":"whole"}`,
 `{"select":"range","from":0,"lines":40}`,

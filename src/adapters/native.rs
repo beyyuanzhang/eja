@@ -130,6 +130,11 @@ impl Process {
     }
 }
 
+/// How much of one tool result a node's transcript carries. The record keeps the
+/// whole result; the node acts on a view, and can narrow the call if it needs
+/// more, so the transcript does not grow by everything the node ever read.
+const TOOL_VIEW_BYTES: usize = 8 * 1024;
+
 /// A project larger than this is reported as truncated instead of scanned.
 const PROJECT_ENTRIES: usize = 20_000;
 /// Names shown per change class before the rest are counted.
@@ -262,6 +267,77 @@ impl ProjectDelta {
     }
 }
 
+/// Bound one tool result for the transcript, keeping head and tail so the node
+/// still sees how the result began and ended.
+fn tool_view(value: Value) -> Value {
+    let text = serde_json::to_string(&value).unwrap_or_default();
+    if text.len() <= TOOL_VIEW_BYTES {
+        return value;
+    }
+    let total = text.chars().count();
+    let head: String = text.chars().take(TOOL_VIEW_BYTES * 2 / 3).collect();
+    let tail: String = text
+        .chars()
+        .skip(total.saturating_sub(TOOL_VIEW_BYTES / 3))
+        .collect();
+    json!({
+        "truncated": true,
+        "bytes": text.len(),
+        "note": "the full result stays in the record",
+        "head": head,
+        "tail": tail,
+    })
+}
+
+/// Replay a frozen record into the messages it started from, so a continuation
+/// begins where its predecessor ended instead of re-exploring the same ground.
+fn inherited_messages(record: &Path) -> Vec<Value> {
+    let Ok(text) = fs::read_to_string(record) else {
+        return Vec::new();
+    };
+    let mut messages: Vec<Value> = Vec::new();
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for line in text.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match entry.get("kind").and_then(Value::as_str) {
+            Some("start") => {
+                if let Some(list) = entry.get("messages").and_then(Value::as_array) {
+                    messages = list.clone();
+                }
+            }
+            Some("assistant") => {
+                let message = entry.get("message").cloned().unwrap_or(Value::Null);
+                if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for call in calls {
+                        if let Some(id) = call.get("id").and_then(Value::as_str) {
+                            pending.push_back(id.to_string());
+                        }
+                    }
+                }
+                messages.push(message);
+            }
+            Some("tool") => {
+                let id = pending.pop_front().unwrap_or_default();
+                let result = entry.get("result").cloned().unwrap_or(Value::Null);
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": result.to_string(),
+                }));
+            }
+            _ => {}
+        }
+    }
+    // A record whose last assistant call has no result cannot be replayed.
+    if pending.is_empty() {
+        messages
+    } else {
+        Vec::new()
+    }
+}
+
 /// What one run of a node produced: the transcript's account of it.
 struct Outcome<'a> {
     text: &'a str,
@@ -384,9 +460,14 @@ impl NativeWorker {
         if allowed.len() != definitions.len() {
             return Err("invalid or duplicate host tool definitions".into());
         }
+        let inherited = assignment
+            .resume
+            .map(|id| inherited_messages(&self.root.join(id.to_string()).join("context.jsonl")))
+            .unwrap_or_default();
         let start = Start {
             assignment: assignment.clone(),
             limits: self.limits.clone(),
+            inherited,
         };
         let mut process = Process::start(&self.binary, &self.project, start)?;
         let context = ToolContext {
@@ -450,7 +531,7 @@ impl NativeWorker {
                         "arguments": arguments,
                         "result": value,
                     }))?;
-                    value
+                    tool_view(value)
                 }
                 Request::Finish { text, reason } => {
                     control.check()?;

@@ -86,6 +86,7 @@ fn assignment(id: u64) -> Assignment {
         issued_at: 123,
         acceptance: String::new(),
         input: String::new(),
+        resume: None,
     }
 }
 fn control(ms: u64) -> Control {

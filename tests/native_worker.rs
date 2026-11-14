@@ -72,6 +72,7 @@ fn assignment(id: u64) -> Assignment {
         issued_at: 123,
         acceptance: String::new(),
         input: String::new(),
+        resume: None,
     }
 }
 fn final_message(artifacts: &[&str]) -> Value {
@@ -288,6 +289,95 @@ fn the_node_leaves_a_fossil_of_the_world_it_ended_in() {
         .output()
         .expect("git");
     assert_eq!(String::from_utf8_lossy(&read.stdout), "delivered");
+}
+
+/// A gateway that answers with something far larger than a node should carry.
+struct Big;
+impl ToolGateway for Big {
+    fn definitions(&self, _: &Assignment) -> Vec<Value> {
+        vec![
+            json!({"type":"function","function":{"name":"big","description":"a big result","parameters":{"type":"object","properties":{}}}}),
+        ]
+    }
+    fn call(&self, _: &ToolContext<'_>, _: &str, _: &Value) -> Result<ToolOutput> {
+        Ok(ToolOutput {
+            value: json!({"text": "x".repeat(64 * 1024)}),
+        })
+    }
+}
+
+#[test]
+fn a_large_tool_result_is_a_view_in_the_transcript_and_whole_in_the_record() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let model = Arc::new(Script::new(vec![
+        calls(vec![call("big", json!({}))]),
+        final_message(&[]),
+    ]));
+    let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
+    w.execute(&assignment(1));
+    let record = std::fs::read_to_string(f.0.join(".eja/nodes/1/context.jsonl")).unwrap();
+    assert!(
+        record.contains(&"x".repeat(60 * 1024)),
+        "the record keeps it whole"
+    );
+    let seen = model.seen.lock().unwrap();
+    let carried = seen[1]
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("the node saw a tool result");
+    assert!(carried.contains("truncated"), "{carried:.120}");
+    assert!(carried.contains("the full result stays in the record"));
+    assert!(
+        carried.len() < 16 * 1024,
+        "the view is bounded: {}",
+        carried.len()
+    );
+}
+
+#[test]
+fn a_continuation_starts_from_the_predecessor_record() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let model = Arc::new(Script::new(vec![
+        calls(vec![call(
+            "effect",
+            json!({"kind":"project","path":"first.md"}),
+        )]),
+        final_message(&[]),
+        calls(vec![call(
+            "effect",
+            json!({"kind":"project","path":"second.md"}),
+        )]),
+        final_message(&[]),
+    ]));
+    let w = f.worker(model.clone(), Arc::new(Effects), Limits::default());
+    w.execute(&assignment(1));
+    let mut second = assignment(2);
+    second.resume = Some(1);
+    w.execute(&second);
+    let seen = model.seen.lock().unwrap();
+    let first_call_of_second_node = &seen[2];
+    assert!(
+        first_call_of_second_node[0]["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("You are AJA")),
+        "the predecessor transcript is inherited"
+    );
+    assert!(
+        first_call_of_second_node
+            .iter()
+            .any(|message| message["role"] == "tool"),
+        "the inherited turn carries its tool result"
+    );
+    let brief = first_call_of_second_node
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or_default();
+    assert!(brief.starts_with("Continuing as a new node."), "{brief}");
 }
 
 struct Policy;

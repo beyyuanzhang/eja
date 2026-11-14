@@ -261,6 +261,7 @@ fn main() -> ExitCode {
                     objective: query,
                     acceptance: String::new(),
                     input: String::new(),
+                    resume: None,
                     issued_at: eja::now_utc().timestamp(),
                 };
                 println!(

@@ -48,6 +48,9 @@ impl Limits {
 pub(crate) struct Start {
     pub assignment: Assignment,
     pub limits: Limits,
+    /// The predecessor's transcript, when this node continues it.
+    #[serde(default)]
+    pub inherited: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -174,10 +177,19 @@ fn run(
         brief.push_str("\n\nAcceptance: ");
         brief.push_str(start.assignment.acceptance.trim());
     }
-    let mut messages = vec![
-        json!({"role":"system","content":system}),
-        json!({"role":"user","content":brief}),
-    ];
+    // A continuation starts where the predecessor left off; a fresh node starts
+    // from the system prompt and the brief.
+    let mut messages = if start.inherited.is_empty() {
+        vec![
+            json!({"role":"system","content":system}),
+            json!({"role":"user","content":brief}),
+        ]
+    } else {
+        let mut inherited = start.inherited.clone();
+        inherited
+            .push(json!({"role":"user","content": format!("Continuing as a new node. {brief}")}));
+        inherited
+    };
     let mut turns = 0usize;
     loop {
         if let Some(limit) = start.limits.steps {

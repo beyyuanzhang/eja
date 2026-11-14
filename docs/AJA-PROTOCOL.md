@@ -7,7 +7,7 @@ exists.
 
 ## Startup
 
-The host starts the process in its node work directory with an empty environment.
+The host starts the process in the workspace with an empty environment.
 Only bounded JSON-lines IPC is available on stdin/stdout; stderr is discarded.
 The initial frame contains:
 
@@ -16,14 +16,21 @@ The initial frame contains:
   "assignment": {"task_id": 1, "objective": "write the checklist",
                  "acceptance": "contains build, smoke test and upload",
                  "input": "the request exactly as it arrived",
+                 "resume": null,
                  "issued_at": 1762699200},
-  "limits": {"timeout_ms": 300000, "steps": 16, "context_bytes": 262144, "response_bytes": 65536}
+  "limits": {"timeout_ms": 300000, "steps": 16, "context_bytes": 262144, "response_bytes": 65536},
+  "inherited": []
 }
 ```
 
 `objective` is the specific node request and `acceptance` is its contract: the
 work is done when it holds. The EJA log, the original user history, credentials
 and connector configuration are not sent.
+
+When EJA opened this task as a continuation of an earlier one, `resume` names
+that task and `inherited` carries its frozen transcript: the node starts where
+the predecessor ended instead of re-exploring the same ground. A tool result in
+the transcript is a bounded view; the record keeps it whole.
 
 ## Requests
 

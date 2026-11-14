@@ -278,6 +278,7 @@ fn seed_interrupted(root: &Path, count: usize) -> Store {
             issued_at: 100,
             acceptance: String::new(),
             input: String::new(),
+            resume: None,
         };
         store
             .append(

@@ -192,6 +192,9 @@ pub struct Assignment {
     /// only from EJA's reading of it.
     #[serde(default)]
     pub input: String,
+    /// A predecessor whose frozen record this node continues from.
+    #[serde(default)]
+    pub resume: Option<TaskId>,
     pub issued_at: i64,
 }
 
@@ -1025,11 +1028,29 @@ fn reserve_dispatch(
             task_status_name(task.status)
         )));
     }
+    // A continuation starts from the world the predecessor left: the record is
+    // already on disk, so its transcript is the new node's starting point.
+    let resume = ctx
+        .store
+        .events()?
+        .into_iter()
+        .filter(|event| event.kind == Kind::TaskRelation)
+        .filter_map(|event| event.data)
+        .filter_map(|data| serde_json::from_value::<TaskRelationData>(data).ok())
+        .find(|relation| relation.from == task.id && relation.kind == RelationKind::Continues)
+        .map(|relation| relation.to)
+        .filter(|id| *id != task.id)
+        .filter(|id| {
+            tasks(&ctx.store.events().unwrap_or_default())
+                .iter()
+                .any(|other| other.id == *id && other.digest.is_some())
+        });
     let assignment = Assignment {
         task_id: task.id,
         objective: task.request.clone(),
         input: task.origin.clone(),
         acceptance: task.acceptance.clone(),
+        resume,
         issued_at: ctx.at,
     };
     ctx.store.append(
@@ -1258,6 +1279,27 @@ fn apply_actions(
                 arguments,
                 selector,
             } => {
+                // The world is read to judge work, not to rehearse it: with no
+                // task waiting, reading the project is the node's job.
+                if *source == LookSource::World
+                    && !tasks(&ctx.store.events()?)
+                        .iter()
+                        .any(|task| task.status == TaskStatus::Waiting)
+                {
+                    let note = "a world look needs a waiting task: dispatch first, then judge with the world".to_string();
+                    out.refused.push(note.clone());
+                    ctx.store.append(
+                        Kind::Refused,
+                        "eja",
+                        &note,
+                        ctx.turn,
+                        EventMeta::data(
+                            ctx.at,
+                            serde_json::json!({"action": "look", "source": "world"}),
+                        ),
+                    )?;
+                    continue;
+                }
                 let events = ctx.store.events()?;
                 let (result, error) = match ctx
                     .lookup

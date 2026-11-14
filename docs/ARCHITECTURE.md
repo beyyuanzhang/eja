@@ -19,7 +19,7 @@ S' = commit(S, confirmed actions)
 3. State transitions accept typed actions with ids/refs/timestamps.
 4. A correction withdraws an event by id. A goal/commitment with `closes`
    replaces an active event of the same kind; no phrase matching.
-5. Focus is an explicit task id; a log look returns event ids from an adapter.
+5. Focus is an explicit task id; a log look returns events by address.
 6. Identity changes require a proposal and a later confirmation.
 7. A node record is evidence; the node's last message is its own account. EJA
    decides; nothing else can accept on its behalf.
@@ -33,25 +33,28 @@ S' = commit(S, confirmed actions)
    arguments and result, and the finish entry, all read-only.
    No session survives; retries/continuations are new linked nodes.
 10. Language, prompts and node reading live in adapters.
-11. A crashed `running` task is reconciled to `waiting` with an interrupted
+11. The record is the only whole copy: a node's transcript carries a bounded view
+    of each tool result, and EJA reads the world only to judge, not to rehearse
+    the work a node is about to do.
+12. A crashed `running` task is reconciled to `waiting` with an interrupted
     record; no automatic duplicate dispatch.
-12. The worker receives its node's contract: the request (objective) and the
+13. The worker receives its node's contract: the request (objective) and the
     acceptance. The original input stays in EJA as `origin`. Accepting the result
     remains EJA's responsibility.
-13. If exactly one active task is waiting, the turn starts with that task as
+14. If exactly one active task is waiting, the turn starts with that task as
     focus, avoiding one redundant initial model call.
-14. All actions execute in list order. Observations continue through one loop that
+15. All actions execute in list order. Observations continue through one loop that
     ends at a fixpoint: a decision that observes nothing, or a projection that
     repeats. Recorded results are always retained and a stalled turn is reported
     explicitly; pure state-writing actions can finish.
-15. Prompts carry protocol only: actions, limits and what a node record means. Task
+16. Prompts carry protocol only: actions, limits and what a node record means. Task
     strategy is not written in code or prompt text; it is what EJA records in its
     own identity events (goal, commitment, decision, correction).
-16. A dispatch is reserved in list order and runs after the decision's actions;
+17. A dispatch is reserved in list order and runs after the decision's actions;
     its record then arrives as evidence. Several dispatches in one decision run
     together, bounded by the worker's declared capacity, and their records are
     recorded in dispatch order.
-17. A node's live transcript is a view with a declared budget; the frozen record
+18. A node's live transcript is a view with a declared budget; the frozen record
     is complete. Compaction elides old tool payloads in the view only, never in
     the record.
 
