@@ -116,15 +116,15 @@ transcript or manufacture an acceptance.
   execute in action order; each completed report is recorded before the next.
 - `Lookup::look`: read only, bound output, respect Control.
 - `Model` and `ToolGateway`: host effects under inherited grants/control.
-- `ArtifactReader` / `Observer`: capabilities composed by Ports, without another
+- `NodeReader` / `Observer`: capabilities composed by Ports, without another
   state store or task authority.
 
-Every operation requires an explicit Control, including artifact selection,
+Every operation requires an explicit Control, including node-file selection,
 world observation and connector startup. There is no uncontrolled entry point or
 fallback implementation. Native/model/MCP/project readers honor this contract.
 External adapters are trusted code; their cancellation contracts govern remote effects.
 
-Shared text views bound both bytes read and encoded output. A failed artifact
+Shared text views bound both bytes read and encoded output. A failed node-file
 read uses the same Result/Observation error path as every other lookup. Match
 windows are derived from ordered hit positions, not a second pending-hit state.
 

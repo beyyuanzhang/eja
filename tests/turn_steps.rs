@@ -1,4 +1,4 @@
-use eja::adapters::{ArtifactReader, Ports};
+use eja::adapters::{NodeReader, Ports};
 use eja::{
     turn, Action, Assignment, Brain, Decision, EjaContext, Kind, LookSource, ProposalKind,
     Selector, Store, TaskStatus, Worker,
@@ -52,7 +52,7 @@ impl Worker for CaptureWorker {
     fn execute(&self, assignment: &Assignment, _: &eja::Control) -> String {
         self.0.lock().unwrap().push(assignment.clone());
         format!(
-            "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
+            "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
             "worker claim"
         )
     }
@@ -60,7 +60,7 @@ impl Worker for CaptureWorker {
 
 struct Reader;
 
-impl ArtifactReader for Reader {
+impl NodeReader for Reader {
     fn slice(&self, path: &str, _: &Selector, _: &eja::Control) -> eja::Result<serde_json::Value> {
         Ok(serde_json::json!({"path":path,"text":format!("content of {path}"),"truncated":false}))
     }

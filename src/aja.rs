@@ -1,6 +1,6 @@
 //! Disposable AJA loop. All effects, including model requests, go through the host.
-use crate::{Assignment, Result};
-pub(crate) mod view;
+use crate::fold;
+use crate::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -101,183 +101,6 @@ fn transcript_bytes(messages: &[Value]) -> usize {
         .map(|message| message.to_string().len())
         .sum()
 }
-/// Fold a live transcript to its budget. The head (system and assignment) and
-/// the newest steps stay whole; older steps become one address line each; the
-/// oldest fold into a single address. Returns false when even that does not fit,
-/// which is the node's stopping point, not a licence to keep re-sending at the cap.
-pub(crate) fn fold_transcript(messages: &mut Vec<Value>, budget: usize) -> bool {
-    let head = messages
-        .iter()
-        .take_while(|message| message["role"] == "system" || message["role"] == "user")
-        .count()
-        .min(2);
-    if messages.len() <= head {
-        // Nothing to fold: the assignment itself must fit.
-        return messages
-            .iter()
-            .map(|message| message.to_string().len())
-            .sum::<usize>()
-            + 8
-            <= budget;
-    }
-    // A step is one assistant message with the tool results it asked for.
-    let mut steps: Vec<(usize, usize)> = Vec::new();
-    let mut index = head;
-    while index < messages.len() {
-        let start = index;
-        index += 1;
-        while index < messages.len() && messages[index]["role"] == "tool" {
-            index += 1;
-        }
-        if start < index {
-            steps.push((start, index));
-        }
-    }
-    if steps.is_empty() {
-        return true;
-    }
-    let bodies: Vec<Vec<Value>> = steps
-        .iter()
-        .map(|(start, end)| messages[*start..*end].to_vec())
-        .collect();
-    let regions: Vec<crate::fold::Region> = steps
-        .iter()
-        .zip(&bodies)
-        .enumerate()
-        .rev()
-        .map(|(position, ((start, end), body))| {
-            let bytes = body.iter().map(|m| m.to_string().len()).sum::<usize>();
-            crate::fold::Region::new(
-                format!("step:{}", position + 1),
-                step_line(*start, *end, &messages[*start..*end]),
-                bytes,
-            )
-        })
-        .collect();
-    let head_bytes: usize = messages[..head].iter().map(|m| m.to_string().len()).sum();
-    let view = crate::fold::assemble(&regions, budget.saturating_sub(head_bytes + 8));
-    let kept: Vec<usize> = view.record.iter().map(|i| steps.len() - 1 - *i).collect();
-    let tail = crate::fold::tail(&view, "Earlier steps of this node, folded:");
-    let mut rebuilt: Vec<Value> = messages[..head].to_vec();
-    if let Some(text) = &tail {
-        rebuilt.push(json!({"role":"user","content":text}));
-    }
-    let mut ordered = kept;
-    ordered.sort_unstable();
-    for step in &ordered {
-        let (start, end) = steps[*step];
-        rebuilt.extend_from_slice(&messages[start..end]);
-    }
-    *messages = rebuilt;
-    let size: usize = messages.iter().map(|m| m.to_string().len()).sum();
-    size <= budget
-}
-
-/// One line that stands for a step, naming the record entry that unfolds it.
-fn step_line(start: usize, end: usize, messages: &[Value]) -> String {
-    let mut names: Vec<String> = Vec::new();
-    let mut address = String::new();
-    if let Some(calls) = messages[0]["tool_calls"].as_array() {
-        for call in calls {
-            names.push(
-                call["function"]["name"]
-                    .as_str()
-                    .unwrap_or("tool")
-                    .to_string(),
-            );
-        }
-    }
-    let mut snippet = String::new();
-    for message in messages.iter().skip(1) {
-        let content = message["content"].as_str().unwrap_or("");
-        if address.is_empty() {
-            if let Ok(value) = serde_json::from_str::<Value>(content) {
-                if let Some(record) = value.get("record") {
-                    address = format!(
-                        "{}/{}",
-                        record["node"].as_u64().unwrap_or(0),
-                        record["entry"].as_u64().unwrap_or(0)
-                    );
-                }
-            }
-        }
-        if snippet.is_empty() {
-            snippet = content.replace(['\n', '\r'], " ");
-            snippet.truncate(80);
-        }
-    }
-    let _ = start;
-    let _ = end;
-    let action = if names.is_empty() {
-        "said".to_string()
-    } else {
-        names.join("+")
-    };
-    let suffix = if address.is_empty() {
-        String::new()
-    } else {
-        format!(" (record {address})")
-    };
-    format!("  step: {action}{suffix} → {snippet}")
-}
-
-pub(crate) fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Value> {
-    let budget = limits.steps.map_or_else(
-        || format!("You have {} seconds.", limits.timeout_ms / 1000),
-        |steps| {
-            format!(
-                "You have at most {steps} model turns and {} seconds.",
-                limits.timeout_ms / 1000
-            )
-        },
-    );
-    let system = format!("You are AJA, one independent work node. Complete the assigned work using supplied tools. Your workspace is the current project; inherited messages describe earlier observations, not a restored world. {budget} Acceptance is the contract. Stop once it holds and report what you did. Tool results carry record addresses; use eja_read_record to read omitted passages. Never claim a failed tool succeeded.");
-    let mut brief = assignment.objective.clone();
-    if !assignment.input.trim().is_empty() && assignment.input.trim() != brief.trim() {
-        brief.push_str("\n\nTask as given:\n");
-        brief.push_str(&assignment.input);
-    }
-    if !assignment.acceptance.trim().is_empty() {
-        brief.push_str("\n\nAcceptance: ");
-        brief.push_str(&assignment.acceptance);
-    }
-    if assignment.resume.is_some() {
-        brief = format!("Continuing as a new node. {brief}");
-    }
-    vec![
-        json!({"role":"system","content":system}),
-        json!({"role":"user","content":brief}),
-    ]
-}
-
-#[derive(Debug)]
-pub(crate) struct ContextBudget;
-impl std::fmt::Display for ContextBudget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AJA context budget exhausted: assignment does not fit")
-    }
-}
-impl std::error::Error for ContextBudget {}
-
-pub(crate) fn prepare_messages(
-    assignment: &Assignment,
-    limits: &Limits,
-    inherited: Vec<Value>,
-) -> Result<Vec<Value>> {
-    let fresh = fresh_messages(assignment, limits);
-    let mut messages = vec![fresh[0].clone()];
-    messages.extend(
-        inherited
-            .into_iter()
-            .filter(|message| message["role"] != "system"),
-    );
-    messages.push(fresh[1].clone());
-    if !fold_transcript(&mut messages, limits.context_bytes) {
-        return Err(ContextBudget.into());
-    }
-    Ok(messages)
-}
-
 /// Every model adapter and IPC consumer shares the same assistant contract.
 pub(crate) fn validate_assistant(message: &Value) -> Result<()> {
     if !message.is_object() || message["role"] != "assistant" {
@@ -332,10 +155,9 @@ fn run(
     }
     let mut messages = start.messages;
     loop {
-        // The transcript is a working view, not the record: the host keeps every
-        // tool result in context.jsonl, so the oldest results can be elided in
-        // place once the view outgrows its declared budget.
-        if !fold_transcript(&mut messages, start.context_bytes) {
+        // The transcript is a fold of the record: the host keeps every tool result
+        // in context.jsonl, so the live view can fold older steps to addresses.
+        if !fold::transcript(&mut messages, start.context_bytes) {
             return Ok(stopped("AJA context budget exhausted"));
         }
         let message = request(
@@ -445,7 +267,7 @@ mod fold_tests {
             ));
         }
         let before = transcript_bytes(&messages);
-        assert!(fold_transcript(&mut messages, 20_000));
+        assert!(fold::transcript(&mut messages, 20_000));
         let after = transcript_bytes(&messages);
         assert!(after < before, "{after} !< {before}");
         assert!(after <= 20_000, "{after}");
@@ -477,7 +299,7 @@ mod fold_tests {
         messages.push(assistant_call("call_1", "read_file"));
         messages.push(tool_message("call_1", &"x".repeat(100)));
         let before = messages.clone();
-        assert!(fold_transcript(&mut messages, 10_000));
+        assert!(fold::transcript(&mut messages, 10_000));
         assert_eq!(messages, before);
     }
 }

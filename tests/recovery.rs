@@ -37,7 +37,7 @@ struct NoWorker;
 impl Worker for NoWorker {
     fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
         format!(
-            "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+            "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
             "no worker"
         )
     }

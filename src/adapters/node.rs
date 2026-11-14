@@ -1,5 +1,5 @@
 //! A single reader/selector path for frozen records and checkpointed files.
-use super::ArtifactReader;
+use super::NodeReader;
 use crate::{Control, Result, Selector};
 use serde_json::{json, Value};
 use std::{
@@ -10,12 +10,12 @@ use std::{
     process::{Child, ChildStdout, Command, Stdio},
 };
 
-pub struct FileArtifactReader {
+pub struct NodeFiles {
     root: PathBuf,
     checkpoints: Option<PathBuf>,
     max_bytes: usize,
 }
-impl FileArtifactReader {
+impl NodeFiles {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -103,7 +103,7 @@ impl Drop for Source {
     }
 }
 
-impl ArtifactReader for FileArtifactReader {
+impl NodeReader for NodeFiles {
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value> {
         control.check()?;
         super::tools::relative_file(&self.root, path)?;

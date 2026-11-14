@@ -55,7 +55,7 @@ impl Worker for QueueWorker {
             .pop_front()
             .unwrap_or_else(|| {
                 format!(
-                    "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+                    "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
                     "no scripted record"
                 )
             })
@@ -72,7 +72,7 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
 
 fn record(summary: &str) -> String {
     format!(
-        "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
+        "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
         summary
     )
 }
@@ -244,7 +244,7 @@ fn rejection_fails_the_task_and_keeps_the_report() {
         ),
     ]);
     let digest = format!(
-        "0 steps, 0 tool calls, 0 artifacts, ended: budget\n{}",
+        "0 steps, 0 tool calls, project: unchanged, ended: budget\n{}",
         "only backup and dual-write"
     );
 
@@ -511,7 +511,7 @@ fn worker_failure_stays_waiting_for_eja() {
         decision("worker failed", vec![]),
     ]);
     let digest = format!(
-        "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+        "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
         "failed"
     );
     let outcome = turn_at(
@@ -593,7 +593,7 @@ fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
             std::thread::sleep(std::time::Duration::from_millis(150));
             self.running.fetch_sub(1, Ordering::SeqCst);
             format!(
-                "1 steps, 1 tool calls, 0 artifacts, ended: message\nnode {} done",
+                "1 steps, 1 tool calls, project: unchanged, ended: message\nnode {} done",
                 assignment.task_id
             )
         }

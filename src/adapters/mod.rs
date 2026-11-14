@@ -1,25 +1,25 @@
-//! Language, retrieval, artifact and process adapters.
+//! Language, node-file and process adapters.
 //!
 //! These are outside the core state machine. The core only sees typed ports.
 
-mod artifact;
 mod brain;
 mod mcp;
 mod model;
 mod native;
+mod node;
 mod ports;
 mod process;
 mod record;
 mod tools;
 
-pub use artifact::FileArtifactReader;
 pub use brain::{
     parse_decision, render_context, render_context_within, OpenAiBrain, SYSTEM_PROMPT,
 };
 pub use mcp::{HostTools, McpTools};
 pub use model::{Control, Model, OpenAiModel};
 pub use native::{NativeWorker, INTERRUPTED};
-pub use ports::{ArtifactReader, Observer, Ports};
+pub use node::NodeFiles;
+pub use ports::{NodeReader, Observer, Ports};
 pub use tools::{FileTools, ToolContext, ToolGateway};
 
 use crate::Kind;
@@ -57,7 +57,7 @@ pub(crate) fn cut_chars(line: &str, limit: usize) -> &str {
     &line[..end]
 }
 
-/// Files and frozen artifacts share one text/output budget and one error path.
+/// Node files and records share one text/output budget and one error path.
 fn text_view(
     reader: impl std::io::Read,
     limit: usize,

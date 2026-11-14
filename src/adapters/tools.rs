@@ -26,7 +26,7 @@ pub trait ToolGateway: Send + Sync {
 /// No absolute paths, parent traversal, or symlinks in a node's file capabilities.
 pub(crate) fn relative_file(root: &Path, name: &str) -> Result<PathBuf> {
     if name.is_empty() || name.len() > 4096 {
-        return Err("invalid artifact path".into());
+        return Err("invalid path".into());
     }
     let path = Path::new(name);
     let mut full = root.to_path_buf();

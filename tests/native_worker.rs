@@ -1044,7 +1044,7 @@ fn omitted_tool_passages_remain_addressable_without_expanding_grants() {
 #[test]
 fn checkpoint_whole_range_and_match_resolve_the_same_utf8_file() {
     use eja::{
-        adapters::{ArtifactReader, FileArtifactReader},
+        adapters::{NodeFiles, NodeReader},
         Selector,
     };
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1060,8 +1060,7 @@ fn checkpoint_whole_range_and_match_resolve_the_same_utf8_file() {
     assert!(w
         .execute(&assignment(1), &control())
         .contains("ended: message"));
-    let reader =
-        FileArtifactReader::with_checkpoints(f.0.join(".eja/nodes"), f.0.join(".eja/checkpoints"));
+    let reader = NodeFiles::with_checkpoints(f.0.join(".eja/nodes"), f.0.join(".eja/checkpoints"));
     assert!(reader
         .slice("1/out.txt", &eja::Selector::Whole, &control())
         .unwrap()["text"]

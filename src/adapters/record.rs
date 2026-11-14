@@ -1,5 +1,5 @@
 //! Immutable run records, their ancestry, and bounded working projections.
-use crate::{aja::view, Control, Result};
+use crate::{fold, Control, Result};
 use serde_json::{json, Value};
 use std::{
     collections::{HashSet, VecDeque},
@@ -140,7 +140,7 @@ pub(crate) fn replay(
                     {
                         return Err("record tool ids do not match".into());
                     }
-                    messages.push(json!({"role":"tool","tool_call_id":id,"content":view::tool_result(&entry["result"],node,index).to_string()}));
+                    messages.push(json!({"role":"tool","tool_call_id":id,"content":fold::tool_result(&entry["result"],node,index).to_string()}));
                     if pending.is_empty() {
                         unfinished = None;
                     }
@@ -148,7 +148,7 @@ pub(crate) fn replay(
                 _ => {}
             }
             if pending.is_empty() {
-                crate::aja::fold_transcript(&mut messages, budget);
+                fold::transcript(&mut messages, budget);
             }
         }
         // Keep the complete prefix of an interrupted call group. It may have had
@@ -156,7 +156,7 @@ pub(crate) fn replay(
         if let Some(index) = unfinished {
             messages.truncate(index);
         }
-        crate::aja::fold_transcript(&mut messages, budget);
+        fold::transcript(&mut messages, budget);
     }
     Ok(messages)
 }

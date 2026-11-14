@@ -1,5 +1,6 @@
 //! Single native worker path: same binary, private AJA mode, host-owned effects.
 use super::{Control, Model, ToolContext, ToolGateway};
+use crate::fold;
 use crate::{
     aja::{self, Limits, Request, Start},
     Assignment, Result, Worker,
@@ -408,11 +409,11 @@ impl NativeWorker {
         if allowed.len() != definitions.len() {
             return Err("invalid or duplicate host tool definitions".into());
         }
-        log.record(json!({"kind":"start", "view_version":1, "messages":aja::fresh_messages(assignment,&self.limits)}))?;
+        log.record(json!({"kind":"start", "view_version":1, "messages":fold::fresh_messages(assignment,&self.limits)}))?;
         let ancestors = super::record::lineage(&self.root, assignment.resume, control)?;
         let inherited =
             super::record::replay(&self.root, &ancestors, self.limits.context_bytes, control)?;
-        let messages = aja::prepare_messages(assignment, &self.limits, inherited)?;
+        let messages = fold::prepare_messages(assignment, &self.limits, inherited)?;
         let start = Start {
             context_bytes: self.limits.context_bytes,
             messages,
@@ -497,7 +498,7 @@ impl NativeWorker {
                         "arguments": arguments,
                         "result": value,
                     }))?;
-                    aja::view::tool_result(&value, assignment.task_id, entry)
+                    crate::fold::tool_result(&value, assignment.task_id, entry)
                 }
                 Request::Finish { text, reason } => {
                     control.check()?;
@@ -624,7 +625,7 @@ impl NativeWorker {
         fs::write(&temp, serde_json::to_vec_pretty(&manifest)?)?;
         fs::File::open(&temp)?.sync_all()?;
         fs::rename(temp, node.join("node.json"))?;
-        // The manifest is part of the frozen record, like the context and artifacts.
+        // The manifest is part of the frozen record, like the context and the checkpoint.
         let manifest = node.join("node.json");
         if let Ok(file) = fs::OpenOptions::new().write(true).open(&manifest) {
             let mut permissions = file.metadata()?.permissions();
@@ -687,7 +688,7 @@ impl Worker for NativeWorker {
             Ok(outcome) => outcome,
             Err(error) => {
                 let reason =
-                    if error.is::<aja::ContextBudget>() || error.is::<crate::ControlError>() {
+                    if error.is::<fold::ContextBudget>() || error.is::<crate::ControlError>() {
                         "budget"
                     } else {
                         "error"

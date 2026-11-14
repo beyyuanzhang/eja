@@ -96,7 +96,7 @@ scale for each region inside the declared budget:
 |---|---|
 | record | the region whole |
 | index | one line, plus the handle that reaches it |
-| map | the region's shortest line, or one line for a folded range of them |
+| map | one line for a folded range of regions |
 
 The head stays whole while the budget allows, the rest is listed, and the oldest
 folds into an address. Nothing is summarized by a model and nothing is deleted:

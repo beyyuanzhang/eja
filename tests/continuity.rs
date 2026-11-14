@@ -56,7 +56,7 @@ impl Worker for QueueWorker {
             .pop_front()
             .unwrap_or_else(|| {
                 format!(
-                    "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
+                    "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
                     "no scripted record"
                 )
             })
@@ -73,7 +73,7 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
 
 fn record() -> String {
     format!(
-        "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
+        "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
         "done"
     )
 }

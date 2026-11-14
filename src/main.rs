@@ -1,7 +1,6 @@
 use eja::{
     adapters::{
-        self, FileArtifactReader, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports,
-        ToolGateway,
+        self, HostTools, NativeWorker, NodeFiles, OpenAiBrain, OpenAiModel, Ports, ToolGateway,
     },
     project, tasks, turn_at_with_options, Assignment, Result, Store, Task, TaskStatus, TurnEnd,
     TurnOptions,
@@ -143,9 +142,9 @@ fn run() -> Result<()> {
                 tools.clone() as Arc<dyn ToolGateway>,
             )?
             .with_limits(node_limits)?;
-            let artifacts = FileArtifactReader::with_checkpoints(nodes, dir.join("checkpoints"));
+            let records = NodeFiles::with_checkpoints(nodes, dir.join("checkpoints"));
             let ports = Ports {
-                node: Some(&artifacts),
+                node: Some(&records),
                 world: Some(&*tools),
             };
             let outcome = turn_at_with_options(

@@ -2,7 +2,7 @@
 use crate::{tasks, Event, LookSource, Lookup, Result, Selector};
 use serde_json::Value;
 
-pub trait ArtifactReader {
+pub trait NodeReader {
     fn slice(&self, path: &str, selector: &Selector, control: &crate::Control) -> Result<Value>;
 }
 
@@ -14,7 +14,7 @@ pub trait Observer: Send + Sync {
 /// Host composition: one lookup over the three sources an EJA deployment has.
 #[derive(Default, Clone, Copy)]
 pub struct Ports<'a> {
-    pub node: Option<&'a dyn ArtifactReader>,
+    pub node: Option<&'a dyn NodeReader>,
     pub world: Option<&'a dyn Observer>,
 }
 

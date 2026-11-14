@@ -3,8 +3,8 @@
 //! Run: cargo run --release --example kernel_bench
 
 use chrono::{TimeZone, Utc};
-use eja::adapters::FileArtifactReader;
-use eja::adapters::{ArtifactReader, Ports};
+use eja::adapters::NodeFiles;
+use eja::adapters::{NodeReader, Ports};
 use eja::{
     project, recover, turn_at, Action, Assignment, Brain, Decision, EjaContext, EventMeta, Kind,
     Result, Store, Worker,
@@ -307,7 +307,7 @@ fn bench_artifact(root: &Path, count: usize) -> (f64, f64) {
     fs::create_dir_all(&dir).expect("dir");
     let content = "x".repeat(16 * 1024);
     fs::write(dir.join("artifact.txt"), content).expect("artifact");
-    let reader = FileArtifactReader::with_limit(&dir, 16 * 1024);
+    let reader = NodeFiles::with_limit(&dir, 16 * 1024);
     let mut samples = Vec::new();
     for _ in 0..count {
         let start = Instant::now();

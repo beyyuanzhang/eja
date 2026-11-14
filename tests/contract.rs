@@ -29,7 +29,7 @@ impl Worker for CaptureWorker {
     fn execute(&self, assignment: &Assignment, _: &eja::Control) -> String {
         self.seen.lock().expect("seen").push(assignment.clone());
         format!(
-            "1 steps, 1 tool calls, 0 artifacts, ended: message\n{}",
+            "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
             "done"
         )
     }

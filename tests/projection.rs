@@ -29,7 +29,7 @@ fn projection_keeps_every_recorded_commitment_and_says_so() {
         210,
         "every recorded commitment is rendered"
     );
-    assert!(full.contains(" whole,"), "the footer states the scale");
+    assert!(!full.contains("[view "), "a whole view needs no notice");
 
     // A budgeted view states its landing scale and stays inside the budget.
     let tight = render_context_within(&context, 400);

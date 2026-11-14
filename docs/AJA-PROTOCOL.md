@@ -33,10 +33,12 @@ its `{node,entry}` address. Small results use `{record,result}`; larger ones hav
 an explicit truncated head/tail. `eja_read_record {node,entry,offset,bytes}` reads
 at most 1 KiB from a full result in this node or its explicit ancestry.
 
-Context fitting preserves the current system/assignment and valid tool-call
-message groups. It elides payloads or complete old groups as needed; raw evidence
-is never removed. A contract that cannot fit ends with budget. Incomplete provider
-responses and invalid tool messages end with error.
+Context fitting folds the transcript: the system prompt, the assignment, and the
+newest steps stay whole while the budget allows, older steps become one address
+line each, and the oldest fold into one address range. Nothing is deleted from
+the record, and every folded step is read back with its `{node,entry}` address.
+A contract that cannot fit even at that scale ends with budget. Incomplete
+provider responses and invalid tool messages end with error.
 
 ## Frozen record
 
