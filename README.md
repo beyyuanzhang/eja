@@ -147,6 +147,12 @@ becomes waiting for judgment, and continuation uses a new id. Frozen records
 retain the complete safe prefix of an interrupted tool-call group. Damaged or
 missing predecessor records are explicit errors, never a silent fresh start.
 
+## Compatibility
+
+0.11 renames the execution record from `nodes/` to `ajas/` and the environment
+verbs `EJA_NODE_*` to `EJA_AJA_*`. A state directory written by an older version
+is not read by this one; there is no migration.
+
 ## Run
 
 ```bash
