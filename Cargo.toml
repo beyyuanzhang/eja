@@ -1,6 +1,6 @@
 [package]
 name = "eja"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 description = "EJA/AJA minimal closed loop"
 repository = "https://github.com/beyyuanzhang/eja"

@@ -52,6 +52,8 @@ def dispatch(message):
     elif method == "tools/list":
         cursor = params.get("cursor")
         names = ["echo", "fail"] if cursor is None else ["wait", "big", "a.b", "a-b"]
+        if mode == "files":
+            names = ["write_file"]
         if mode == "collision":
             names = ["a.b", "a/b"]
         reply["result"] = {"tools": [
@@ -59,11 +61,16 @@ def dispatch(message):
              "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}}
             for name in names
         ]}
-        if cursor is None or mode == "repeat_cursor":
+        if mode != "files" and (cursor is None or mode == "repeat_cursor"):
             reply["result"]["nextCursor"] = "page2"
     elif method == "tools/call":
         name = params["name"]
         text = params.get("arguments", {}).get("text", "")
+        delay = params.get("arguments", {}).get("delay_ms", 0)
+        if delay:
+            time.sleep(delay / 1000)
+        if mode == "files" and name == "write_file":
+            (root.parent.parent / params["arguments"]["path"]).write_text(text)
         if name == "wait":
             event = threading.Event()
             if text != "ignore_cancel":

@@ -1,18 +1,8 @@
 use eja::adapters::{
     self, FileArtifactReader, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, ToolGateway,
 };
-use eja::{project, tasks, turn, Store, TaskStatus};
+use eja::{project, tasks, turn_at_with_options, Store, TaskStatus, TurnEnd, TurnOptions};
 use std::process::ExitCode;
-
-fn status_label(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Open => "open",
-        TaskStatus::Running => "running",
-        TaskStatus::Waiting => "waiting",
-        TaskStatus::Done => "done",
-        TaskStatus::Failed => "failed",
-    }
-}
 
 fn counts(items: &[eja::Task]) -> String {
     let mut parts = Vec::new();
@@ -25,7 +15,7 @@ fn counts(items: &[eja::Task]) -> String {
     ] {
         let count = items.iter().filter(|task| task.status == status).count();
         if count > 0 {
-            parts.push(format!("{} {count}", status_label(status)));
+            parts.push(format!("{} {count}", status.as_str()));
         }
     }
     if parts.is_empty() {
@@ -43,7 +33,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn [text...] | show TARGET"
+            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET"
         );
         println!();
         println!("  turn      one interaction: project, decide, act, record");
@@ -62,12 +52,13 @@ fn main() -> ExitCode {
     let mut dir = ".eja".to_string();
     let mut focus: Option<u64> = None;
     let mut mcp_config: Option<std::path::PathBuf> = None;
+    let mut options = TurnOptions::default();
     let mut mode: Option<String> = None;
     let mut words: Vec<String> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--dir" | "--task" | "--mcp-config" => {
+            "--dir" | "--task" | "--mcp-config" | "--confirm" => {
                 if index + 1 >= args.len() {
                     eprintln!("{} requires a value", args[index]);
                     return ExitCode::FAILURE;
@@ -79,7 +70,13 @@ fn main() -> ExitCode {
                     mcp_config = Some(value.into());
                 } else {
                     match value.parse() {
-                        Ok(parsed) => focus = Some(parsed),
+                        Ok(parsed) => {
+                            if args[index] == "--confirm" {
+                                options.approvals.push(parsed);
+                            } else {
+                                focus = Some(parsed);
+                            }
+                        }
                         Err(_) => {
                             eprintln!("invalid task id: {value}");
                             return ExitCode::FAILURE;
@@ -100,14 +97,14 @@ fn main() -> ExitCode {
     }
     let Some(mode) = mode else {
         eprintln!(
-            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn [text...] | show TARGET"
+            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET"
         );
         return ExitCode::FAILURE;
     };
     // One view verb: `eja show <target>`; old names are not accepted.
     if mode != "show" && mode != "turn" {
         eprintln!(
-            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] turn [text...] | show TARGET"
+            "usage: eja --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET"
         );
         return ExitCode::FAILURE;
     }
@@ -121,7 +118,13 @@ fn main() -> ExitCode {
                 Some((kind @ ("node" | "audit" | "task"), id)) => {
                     (kind.to_string(), vec![id.to_string()])
                 }
-                _ => (target.to_string(), Vec::new()),
+                None if matches!(target, "context" | "log" | "tasks" | "tools") => {
+                    (target.to_string(), Vec::new())
+                }
+                _ => {
+                    eprintln!("unknown show target: {target}");
+                    return ExitCode::FAILURE;
+                }
             },
         }
     } else {
@@ -141,9 +144,50 @@ fn main() -> ExitCode {
     };
     let result: eja::Result<()> = match mode.as_str() {
         "turn" => {
-            let Some(brain) = OpenAiBrain::from_env() else {
-                eprintln!("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)");
+            for (name, target) in [
+                ("EJA_TURN_DECISIONS", &mut options.limits.decisions),
+                ("EJA_TURN_ACTIONS", &mut options.limits.actions),
+                ("EJA_TURN_DISPATCHES", &mut options.limits.dispatches),
+            ] {
+                if let Ok(raw) = std::env::var(name) {
+                    match raw.parse() {
+                        Ok(value) => *target = value,
+                        Err(_) => {
+                            eprintln!("invalid {name}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            }
+            if let Ok(raw) = std::env::var("EJA_TURN_TIMEOUT_MS") {
+                match raw.parse() {
+                    Ok(value) => options.limits.timeout_ms = value,
+                    Err(_) => {
+                        eprintln!("invalid EJA_TURN_TIMEOUT_MS");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            if std::env::var("EJA_NODE_SLOTS").is_ok_and(|value| value != "1") {
+                eprintln!("NativeWorker is serial: one mutable workspace has one execution owner");
                 return ExitCode::FAILURE;
+            }
+            if let Err(error) = options.limits.validate() {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+            let brain = match OpenAiBrain::from_env() {
+                Ok(Some(brain)) => brain,
+                Ok(None) => {
+                    eprintln!(
+                        "turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ExitCode::FAILURE;
+                }
             };
             let Some(model) = OpenAiModel::from_env() else {
                 eprintln!("AJA needs the host model configuration");
@@ -185,13 +229,6 @@ fn main() -> ExitCode {
                             std::sync::Arc::new(model),
                             tools.clone() as std::sync::Arc<dyn ToolGateway>,
                         )
-                        .and_then(|worker| {
-                            let slots = std::env::var("EJA_NODE_SLOTS")
-                                .ok()
-                                .and_then(|raw| raw.parse::<usize>().ok())
-                                .unwrap_or(1);
-                            worker.with_slots(slots)
-                        })
                         .and_then(|worker| worker.with_limits(limits))
                         .map_err(|e| e.to_string())
                     }) {
@@ -209,7 +246,16 @@ fn main() -> ExitCode {
                 node: Some(&artifacts),
                 world: Some(&*tools),
             };
-            let result = turn(&store, &query, &brain, &worker, &ports);
+            options.focus = focus;
+            let result = turn_at_with_options(
+                &store,
+                &query,
+                &brain,
+                &worker,
+                &ports,
+                eja::now_utc(),
+                &options,
+            );
             if eja::adapters::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
                 eprintln!("interrupted; the node was stopped and its run is recorded");
                 return ExitCode::FAILURE;
@@ -219,8 +265,8 @@ fn main() -> ExitCode {
                 for note in &outcome.refused {
                     println!("[refused: {note}]");
                 }
-                if outcome.stalled {
-                    println!("[turn stalled: the model repeated a state with no new observation]");
+                if outcome.end != TurnEnd::Complete {
+                    println!("[turn ended: {:?}; {}]",outcome.end,outcome.reason.as_deref().unwrap_or("projection repeated"));
                 }
                 println!(
                     "[{} | focus #{} | dispatched {} | looks {} | decisions {} | worker {}ms | log {}]",
@@ -290,21 +336,20 @@ fn main() -> ExitCode {
                 .parse()
                 .map_err(|_| "audit takes one task id")?;
             let events = store.events()?;
-            let mut edges: Vec<(u64, u64)> = Vec::new();
-            for event in &events {
-                if event.kind != eja::Kind::TaskRelation {
-                    continue;
-                }
-                let Some(data) = event.data.as_ref() else {
-                    continue;
-                };
-                if data["kind"].as_str() != Some("continues") {
-                    continue;
-                }
-                if let (Some(from), Some(to)) = (data["from"].as_u64(), data["to"].as_u64()) {
-                    edges.push((from, to));
-                }
+            let all = tasks(&events);
+            if !all.iter().any(|task| task.id == start) {
+                return Err("audit names an unknown task".into());
             }
+            let edges: Vec<_> = eja::relations(&events)
+                .into_iter()
+                .filter(|edge| {
+                    matches!(
+                        edge.kind,
+                        eja::RelationKind::Continues | eja::RelationKind::PartOf
+                    )
+                })
+                .map(|edge| (edge.from, edge.to))
+                .collect();
             let mut chain = vec![start];
             let mut index = 0;
             while index < chain.len() {
@@ -326,28 +371,17 @@ fn main() -> ExitCode {
                 }
             }
             chain.sort_unstable();
-            let all = tasks(&events);
-            // A continuation is a new task; when EJA did not write an explicit
-            // `continues` edge, tasks opened from the same input are still one job.
-            let mut same_origin: Vec<u64> = Vec::new();
-            if let Some(start_task) = all.iter().find(|task| task.id == start) {
-                for task in &all {
-                    if task.origin == start_task.origin && !chain.contains(&task.id) {
-                        same_origin.push(task.id);
-                    }
-                }
-            }
-            same_origin.sort_unstable();
-            println!("task chain: {} node(s)", chain.len());
+            println!("audit component: {} task(s)", chain.len());
             for id in &chain {
                 let Some(task) = all.iter().find(|task| task.id == *id) else {
                     println!("#{id} (missing task)");
                     continue;
                 };
                 println!(
-                    "#{} [{}] {}",
+                    "#{} [{:?}/{}] {}",
                     task.id,
-                    status_label(task.status),
+                    task.kind,
+                    task.status.as_str(),
                     task.title
                 );
                 if let Some(digest) = &task.digest {
@@ -362,34 +396,32 @@ fn main() -> ExitCode {
                     Err(_) => println!("  context: (none)"),
                 }
             }
-            if !same_origin.is_empty() {
-                println!(
-                    "same input, no continues edge: {} task(s)",
-                    same_origin.len()
-                );
-                for id in &same_origin {
-                    if let Some(task) = all.iter().find(|task| task.id == *id) {
-                        println!(
-                            "#{} [{}] {}",
-                            task.id,
-                            status_label(task.status),
-                            task.title
-                        );
-                    }
-                }
-            }
             Ok(())
         })(),
-        "tasks" => store.events().map(|events| {
-            let only: Option<u64> = query.trim().parse().ok();
+        "tasks" | "task" => (|| -> eja::Result<()> {
+            let events = store.events()?;
+            let only = if mode == "task" {
+                Some(
+                    query
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| "task takes a numeric id")?,
+                )
+            } else {
+                None
+            };
+            if only.is_some_and(|id| !tasks(&events).iter().any(|task| task.id == id)) {
+                return Err("no such task".into());
+            }
             for task in tasks(&events) {
                 if only.is_some_and(|id| task.id != id) {
                     continue;
                 }
                 println!(
-                    "#{} [{}] {}",
+                    "#{} [{:?}/{}] {}",
                     task.id,
-                    status_label(task.status),
+                    task.kind,
+                    task.status.as_str(),
                     task.title
                 );
                 println!("  created: {}", eja::format_utc(task.created_at));
@@ -425,7 +457,8 @@ fn main() -> ExitCode {
                     );
                 }
             }
-        }),
+            Ok(())
+        })(),
         "log" => store.events().map(|events| {
             for event in events {
                 println!("{}", serde_json::to_string(&event).unwrap_or_default());

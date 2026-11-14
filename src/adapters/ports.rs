@@ -5,6 +5,16 @@ use serde_json::Value;
 pub trait ArtifactReader {
     fn read(&self, path: &str) -> ArtifactContent;
 
+    fn slice_controlled(
+        &self,
+        path: &str,
+        selector: &Selector,
+        control: &crate::Control,
+    ) -> Result<Value> {
+        control.check()?;
+        self.slice(path, selector)
+    }
+
     /// A selected view of a node file. Readers that cannot slice still serve whole reads.
     fn slice(&self, path: &str, selector: &Selector) -> Result<Value> {
         if !matches!(selector, Selector::Whole) {
@@ -25,6 +35,15 @@ impl ArtifactReader for NoopArtifactReader {
 /// Read-only observation of an external system. EJA may look; it never acts.
 pub trait Observer: Send + Sync {
     fn observe(&self, tool: &str, arguments: &Value) -> Result<Value>;
+    fn observe_controlled(
+        &self,
+        tool: &str,
+        arguments: &Value,
+        control: &crate::Control,
+    ) -> Result<Value> {
+        control.check()?;
+        self.observe(tool, arguments)
+    }
 }
 
 pub struct NoopObserver;
@@ -53,32 +72,80 @@ impl Lookup for Ports<'_> {
     ) -> Result<Value> {
         match source {
             LookSource::Log => {
-                match selector {
-                    Selector::Whole => {
-                        // A log look always answers with events, so the shape does
-                        // not depend on how the target was named.
+                let events: Vec<&Event> = match target {
+                    "history" | "all" => log
+                        .iter()
+                        .filter(|event| {
+                            target == "all"
+                                || matches!(event.kind, crate::Kind::User | crate::Kind::Eja)
+                        })
+                        .collect(),
+                    _ => {
                         if let Some(raw) = target.strip_prefix("task:") {
                             let id: u64 = raw.parse().map_err(|_| "task target needs an id")?;
                             if !tasks(log).iter().any(|task| task.id == id) {
                                 return Err("no such task".into());
                             }
                             let scope = format!("task:{id}");
-                            let events: Vec<&Event> =
-                                log.iter().filter(|event| event.scope == scope).collect();
-                            return Ok(serde_json::json!({"events": events}));
-                        }
-                        if let Some(raw) = target.strip_prefix("event:") {
+                            log.iter().filter(|event| event.scope == scope).collect()
+                        } else if let Some(raw) = target.strip_prefix("event:") {
                             let id: u64 = raw.parse().map_err(|_| "event target needs an id")?;
-                            let event = log
+                            vec![log
                                 .iter()
                                 .find(|event| event.id == id)
-                                .ok_or("no such event")?;
-                            return Ok(serde_json::json!({"events": [event]}));
+                                .ok_or("no such event")?]
+                        } else {
+                            return Err("log targets history, all, task:<id> or event:<id>".into());
                         }
-                        Err("a log look targets task:<id> or event:<id>".into())
                     }
-                    _ => Err("a log look uses whole".into()),
+                };
+                if let Selector::Bytes { from, bytes } = selector {
+                    if !target.starts_with("event:") {
+                        return Err("byte views target event:<id>".into());
+                    }
+                    let mut page = super::text_page(
+                        &serde_json::to_string(events[0])?,
+                        *from,
+                        *bytes,
+                        crate::aja::FRAME_LIMIT / 8,
+                    );
+                    page["event_id"] = serde_json::json!(events[0].id);
+                    return Ok(page);
                 }
+                let (from, count) = match selector {
+                    Selector::Whole => (events.len().saturating_sub(40), 40),
+                    Selector::Range { from, lines } => {
+                        ((*from).min(events.len()), (*lines).min(1000))
+                    }
+                    _ => return Err("log pages use whole or range".into()),
+                };
+                let end = from.saturating_add(count).min(events.len());
+                let mut selected = Vec::new();
+                let mut partial = Vec::new();
+                let mut bytes = 512;
+                let mut next = from;
+                for event in &events[from..end] {
+                    let size = serde_json::to_vec(event)?.len() + 1;
+                    if size > crate::aja::FRAME_LIMIT - 512 {
+                        let locator = serde_json::json!({"id":event.id,"bytes":size - 1});
+                        let size = locator.to_string().len() + 1;
+                        if size > crate::aja::FRAME_LIMIT.saturating_sub(bytes) {
+                            break;
+                        }
+                        bytes += size;
+                        partial.push(locator);
+                    } else {
+                        if size > crate::aja::FRAME_LIMIT.saturating_sub(bytes) {
+                            break;
+                        }
+                        bytes += size;
+                        selected.push(*event);
+                    }
+                    next += 1;
+                }
+                Ok(
+                    serde_json::json!({"events":selected,"partial_events":partial,"from":from,"next":next,"total":events.len(),"truncated":next<events.len()}),
+                )
             }
             LookSource::Node => {
                 let node = self.node.ok_or("no node reader is configured")?;
@@ -86,8 +153,36 @@ impl Lookup for Ports<'_> {
             }
             LookSource::World => {
                 let world = self.world.ok_or("no world reader is configured")?;
+                if !matches!(selector, Selector::Whole) {
+                    return Err("world tools select their result through arguments".into());
+                }
                 world.observe(target, arguments)
             }
+        }
+    }
+    fn look_controlled(
+        &self,
+        source: LookSource,
+        target: &str,
+        arguments: &Value,
+        selector: &Selector,
+        log: &[Event],
+        control: &crate::Control,
+    ) -> Result<Value> {
+        control.check()?;
+        if source == LookSource::World {
+            if !matches!(selector, Selector::Whole) {
+                return Err("world tools select through arguments".into());
+            }
+            self.world
+                .ok_or("no world reader is configured")?
+                .observe_controlled(target, arguments, control)
+        } else if source == LookSource::Node {
+            self.node
+                .ok_or("no node reader is configured")?
+                .slice_controlled(target, selector, control)
+        } else {
+            self.look(source, target, arguments, selector, log)
         }
     }
 }

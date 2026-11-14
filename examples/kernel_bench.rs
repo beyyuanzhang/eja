@@ -251,7 +251,7 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
             actions: vec![Action::Confirm { proposal_id }],
             refused: Vec::new(),
         }]);
-        turn_at(
+        eja::turn_at_with_options(
             &store,
             "confirm",
             &confirm,
@@ -261,6 +261,10 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
                 ..Default::default()
             },
             now() + chrono::Duration::seconds(index as i64 * 2 + 1),
+            &eja::TurnOptions {
+                approvals: vec![proposal_id],
+                ..Default::default()
+            },
         )
         .expect("confirm");
     }

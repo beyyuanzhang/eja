@@ -36,7 +36,7 @@ impl Worker for CaptureWorker {
 }
 
 #[test]
-fn worker_receives_its_node_task_and_origin_remains_in_eja() {
+fn worker_receives_the_task_contract_and_original_input() {
     let dir = std::env::temp_dir().join(format!("eja-contract-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::new(&dir).expect("store");
@@ -78,6 +78,7 @@ fn worker_receives_its_node_task_and_origin_remains_in_eja() {
     let assignments = seen.lock().expect("seen");
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].objective, "EJA expanded request");
+    assert_eq!(assignments[0].input, "raw user task");
     let task = &outcome.tasks[0];
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.origin, "raw user task");

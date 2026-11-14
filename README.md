@@ -1,206 +1,128 @@
-# eja — a language-free continuity core
+# eja — a persistent subject with disposable work nodes
 
-EJA is one persistent subject. It owns **1:n AJA sessions**:
-
-- **EJA**: the one persistent subject
-- **AJA**: one disposable session box, one assignment, then closed
-- **AJAS**: multiple AJA sessions (plural)
-
-The core is a typed state machine over an append-only log. **It does not read language.**
+EJA owns durable identity, task structure and acceptance decisions. An AJA is one
+bounded execution node. AJAS is the plural. A group collects nodes; it never
+starts a process. The core treats language as opaque data.
 
 ```
-L' = L + e
-S  = fold(L)
-C  = project(S, input, focus, evidence)
-d  = Model(C)              // language: adapter
-p  = Propose(d)            // identity changes are proposals
-S' = commit(S, confirmed actions)
+S = fold(L)
+C = view_B(S, input, evidence)
+A = model(C)
+(O, W') = execute(A, W, grants, control)
+L' = L ++ events(A, O)
 ```
 
-## Layers
+The [architecture contract](docs/ARCHITECTURE.md) defines the invariants and the
+composition laws. The implementation has four core modules: domain, store,
+state, and turn. Adapters own model transport, connectors and record reading.
 
-| Layer | Owns | Must not do |
-|---|---|---|
-| core | log, fold, projection, typed actions, ids, UTC, recovery | tokenize, match phrases, render prompts |
-| brain adapter | language, prompt, proposal JSON | write state directly |
-| node reader | bounded read of a node record and its checkpoint | write state |
-| node reader | bounded read of a node's record and the world it left | decide acceptance |
-| worker adapter | assignment (objective + acceptance) → AJA run → its record | write identity |
-| AJA loop | local transcript, model/tool continuation, last message | access host state or configuration directly |
+## Facts and views
 
-```
-core/       domain, fold, project, turn, ports
-aja/        disposable model/tool loop
-adapters/   brain, node reader, worker
-app/        CLI and wiring
-```
+- `log.jsonl` is the authority for identity, task lifecycles, graph edges,
+  observations and judgments. Task tables and the graph are projections.
+- `<dir>/nodes/<id>/context.jsonl` records that node's own start messages,
+  assistant messages and full tool results. A continuation stores its parent
+  address, rather than copying the parent's payload into its record.
+- `node.json` freezes the assignment, digest and optional checkpoint address.
+  The digest is an index into evidence, not a verdict.
+- Working contexts are bounded views. Live tool results and replayed tool results
+  use the same view function. Every tool result has a `{node, entry}` address;
+  `eja_read_record` reads a bounded passage from this node or its ancestry.
+- A checkpoint captures Git-visible workspace files. It is evidence about the
+  world at that time; a continuation inherits observations, not a restored world.
+  Missing checkpoints are reported in both manifest and digest.
 
-## Core state
-
-- `Event`: `id, at (UTC seconds), turn, scope, kind, text, closes, data`
-- `Kind`: user, eja, goal, commitment, correction, proposal,
-  proposal_confirmed, proposal_rejected, decision, relationship, task events
-  (opened, relation, assigned, worker_report, closed), observed, refused
-- `ArtifactContent`: path, text, truncated, error
-- `Proposal`: typed goal/commitment/correction, pending until confirmed
-
-Text is opaque payload. A correction targets an **event id**. Focus is an
-explicit `task_id`. Recall returns **event ids**. Artifact reads return
-**bounded content**.
-
-The current goal comes only from an active, confirmed `Goal` event. Context
-includes that event with its id, or `null` when absent; current input is separate.
-
-## Authority
-
-Identity changes are gated:
+## Tasks and authority
 
 ```
-model proposes
-  → proposal event (no identity change)
-  → user confirmation
-  → confirm(proposal_id)
-  → goal/commitment/correction event
+node:  open -> running -> waiting -> done | failed
+       open -> failed                 (cancel before dispatch)
+group: open -> done | failed           (after children settle)
 ```
 
-A proposal cannot be confirmed in the same turn it was created.
+Use `open_task` for executable work, and `open_group` for a container. A group
+cannot dispatch. Closing a group requires its children to have settled. EJA judges the group
+against its acceptance contract; a failed child does not automatically determine
+the group verdict. Empty groups need no dummy execution. Containment has
+one parent per task. Dependency cycles include both execution dependencies and
+the fact that a group completes after its children.
 
-- `goal`/`commitment` without `target_id` adds a new entry.
-- `goal`/`commitment` with `target_id` replaces an active entry of the same kind.
-  One new event carries the replacement text and `closes` the old event.
-- `correction` with `target_id` withdraws an active goal or commitment;
-  its text records the reason, not a replacement.
+`continues` has one frozen predecessor. `depends_on` requires an accepted
+predecessor before dispatch. Both are fixed before dispatch. Relations are
+validated before entering the log. `relates_to`, `supersedes` and `contradicts`
+are descriptive edges; they do not silently change task state.
 
-Targets are checked at proposal and confirmation time. A stale or mismatched
-target cannot change state. Old events remain in the log for reconstruction.
+Goals, commitments and corrections start as proposals. Confirmation requires an
+explicit approval id supplied by the host in `TurnOptions.approvals`, recorded
+with that turn's user event, and a proposal from an earlier turn. Model output
+alone cannot authorize confirmation. One identity event applies the change and
+resolves the proposal atomically. Existing confirmation events remain readable.
 
-## Look
+EJA may observe any host-granted read-only capability. Its ability to observe
+never depends on unrelated tasks. Effects occur through an AJA's host gateway.
+MCP read-only declarations are scoped to their server and tool.
 
-Every act of reading is one action:
-
-```
-look { source: log|node|world, target, selector }
-```
-
-- `log` — EJA's own log. A `task:<id>` target reads that task's events, an
-  `event:<id>` target reads one event by address.
-- `node` — a frozen node record. `whole` reads a bounded file view, `range`
-  reads lines, `match` finds a passage with surrounding lines.
-- `world` — a read-only connector tool or a project file. A world look is
-  authorised only while a task is waiting for judgment: reading the project is
-  the node's job, judging its result is EJA's.
-
-Selectors: `{"select":"whole"}`,
-`{"select":"range","from":0,"lines":40}`,
-`{"select":"match","text":"PO-1010","before":2,"after":4}`.
-
-A look creates one `Observed` event and one EVIDENCE entry. Evidence belongs to
-the turn that asked for it; the log keeps every look forever. `focus {task_id}`
-is navigation, not reading: it chooses the task the turn is about.
-
-A look has no item cap. The model adapter declares how much context it can take,
-and the renderer fills the view in priority order; a record that does not fit is
-cut where the budget ends and the cut is stated with counts.
-
-## Turn loop
-
-Each decision's actions execute in order through one loop:
+## Reading and continuity
 
 ```
-project → decide → act → append results → project
+look {source: log | node | world, target, selector}
 ```
 
-Every look and every AJA dispatch continue through that loop, in any order. A final reply with only state-writing
-actions (or no actions) ends the turn. Task focus and recalled evidence remain
-available across steps. A turn ends when a decision observes nothing, or when the
-projection stops changing: repeated observations that carry no new information are
-not spun into an arbitrary cap. Recorded results are always retained, a stalled
-turn is logged (`stalled`) and reported by the CLI, and no intermediate reply is
-presented as a final answer.
+- Log targets: `task:<id>`, `event:<id>`, `history`, `all`. Discovery uses event
+  indices with `range`; whole returns the latest 40 matching events. Pages expose
+  `from`, `next`, `total` and `truncated`. Oversized events expose their id in
+  `partial_events`; `event:<id>` supports byte views so paging always advances.
+- Node targets: `<id>/context.jsonl`, `<id>/node.json`, `<id>/<workspace-file>`.
+  Whole, range and match use the same source resolver, including checkpoints.
+- World targets: `read_file`, `list_dir`, or a granted read-only connector.
+  World tools select content through their own arguments.
 
-## Judgment
+Selectors are `{"select":"whole"}`, `{"select":"range","from":0,"lines":40}`,
+`{"select":"match","text":"passage","before":2,"after":4}`, and
+`{"select":"bytes","from":0,"bytes":4096}` for a serialized log event.
+History is projected newest first; omitted history remains discoverable by id or
+page. Views report truncation and count records. The rendered brain context
+never exceeds its declared UTF-8 byte budget, including notices and headers.
 
-EJA judges worker output itself:
+## Execution and resources
 
-```
-node record (what the host saw it do) → EJA decides → close_task { accepted, note }
-```
+A turn runs `project -> decide -> act -> record` until a final decision, repeated
+projection, cancellation, or a host budget. `TurnEnd` distinguishes these cases.
+Creating a node, group or proposal returns its allocated id through the next
+projection, so the model never needs to guess a new id. Budget/cancellation results are explicit; intermediate replies are never final.
+Every reserved running task is reconciled when execution stops.
 
-A dispatch returns the host's digest of the node's record — steps, tool calls,
-what changed in the project (created, modified, deleted), how it ended, and the
-node's last message; the node also records a checkpoint of the world it ended in. A look is optional:
-EJA can read the node's whole record, the world it left behind, or the world as
-it is now, and decide for
-itself. Nothing is required before `close_task`, and there is no separate
-verifier. A look at a read-only connector tool lets EJA check the work against
-the world when the host grants that view; it never gets an effect tool.
+Default host budgets:
 
-`node.json` keeps the assignment and the digest; the node's whole record — the
-start messages, every assistant turn, every tool call with arguments and result,
-and its last message — is frozen next to it as `context.jsonl`. The digest is
-what the host saw; the last message is the node's own account. Neither is a gate.
+| Resource | Default |
+|---|---:|
+| Turn decisions / actions / dispatches | 128 / 4096 / 128 |
+| Turn elapsed time | 30 minutes |
+| Node model steps / elapsed time | 256 / 300 seconds |
+| Node context / model response | 252 KiB / 64 KiB |
+| IPC JSON payload | 256 KiB |
+| One tool-result working view | 8 KiB, including address |
+| Record passage read | at most 1 KiB of UTF-8 text |
+| Brain rendered context | 200,000 bytes |
 
-## Prompt and strategy
-
-The model prompt carries protocol only: the action vocabulary, the budget and what
-a node record means. It does not carry task tactics. What EJA learns about how to
-work is recorded in its own identity events — goal, commitment, decision,
-correction — and projected back into the next decision. The harness generalizes by
-never encoding a per-task hint: if a strategy is worth keeping, EJA writes it down
-as identity.
-
-## Tasks and typed graph
-
-```
-open → running → waiting → done | failed
-```
-
-An AJA **is** the task point. There is no Task↔AJA 1:n layer:
-`EJA : AJA = 1:n`, and `AJA : task = 1:1`. The `Task` record and its
-`Assignment` envelope describe the same node; the Assignment is only the
-activation message, not a second entity.
-
-A long task is not one Task with many AJAs. It is a connected graph of AJA
-nodes. A retry or continuation is a new AJA node linked by `continues` or
-`supersedes`, not a second AJA under the same task.
-
-```
-child -part_of-> parent
-task  -depends_on-> task
-aja   -continues-> previous aja
-task  -relates_to|supersedes|contradicts-> task
-```
-
-The graph is a **projection** of the same event log.
-There is no graph database, scheduler, or worker pool. Containment is added
-with `relate {kind: part_of}`; `part_of` is containment;
-`depends_on`/`continues` are execution order; `relates_to`/`supersedes`/
-`contradicts` are association edges.
-
-- one native Rust AJA process per node, started through the same executable;
-- the host sends only the node assignment and limits, with an empty environment;
-- the node's `request` is its work instruction; `origin` stays in EJA as provenance;
-- model access and tools are injected through host IPC; the node has no credentials,
-  plugin discovery, MCP client, shell executor, or state-log access;
-- one workspace: a node writes the project itself, and its writes are the work;
-- the runtime kills/reaps the process, joins its IPC reader and revokes the run
-  before committing a checkpoint and atomically publishing `node.json`;
-- waiting for EJA's acceptance consumes no AJA process; records remain evidence;
-- a node's live transcript compacts against its declared budget; the frozen record
-  keeps every tool result;
-- the prompt states the node's turn/time budget, and a spent budget ends the
-  record with `ended: budget` for a new node instead of a false failure;
-- `node.json` also freezes the node's complete context (`context.jsonl`: the start
-  messages, every assistant turn, every tool call with arguments and result, and
-  the finish entry), read-only. A task that runs through several nodes is audited
-  end to end with `eja audit <task>`; one frozen record with `eja node <id>`.
+One `Control` hierarchy propagates the turn deadline/cancellation to the brain,
+nodes, observations and model/tool calls. A child may shorten the deadline, never
+extend it. Native execution is serial: one mutable workspace has one execution
+owner. Generic worker ports may declare a capacity when their host can actually
+own independent executions; NativeWorker has no parallel-slots API.
 
 ## Recovery
 
-- every append is flushed and `sync_all`'d;
-- a torn tail is ignored by the reader;
-- on each turn, tasks left `running` by a crash get an interrupted record;
-- they are not re-dispatched automatically.
+A newline commits an event. Appends are serialized, flushed and synced. An
+uncommitted final fragment is discarded under the writer lock before more
+appends; malformed committed records are errors. Stale Store instances refuse
+to append. The journal allows only one active turn, including across separate Store instances. These guards fail closed; they
+are not a distributed multi-writer system.
+
+Interrupted nodes are never dispatched again under the same id. Their task
+becomes waiting for judgment, and continuation uses a new id. Frozen records
+retain the complete safe prefix of an interrupted tool-call group. Damaged or
+missing predecessor records are explicit errors, never a silent fresh start.
 
 ## Run
 
@@ -208,112 +130,50 @@ with `relate {kind: part_of}`; `part_of` is containment;
 export LNA_BASE_URL=https://your-provider/v1
 export LNA_API_KEY=...
 export LNA_MODEL=...
-# Optional separate model for work nodes and recall:
-# export EJA_AJA_MODEL=...
-# export LNA_RETRIEVER_MODEL=...
+# Optional node model: EJA_AJA_MODEL
 
-cargo run -- --dir /tmp/eja turn "write a release checklist"
+cargo run -- --dir /tmp/eja turn "draft a release checklist"
 cargo run -- --dir /tmp/eja show tasks
-cargo run -- --dir /tmp/eja show context
-cargo run -- --dir /tmp/eja show log
 cargo run -- --dir /tmp/eja show task:1
 cargo run -- --dir /tmp/eja show node:1
 cargo run -- --dir /tmp/eja show audit:1
+cargo run -- --dir /tmp/eja show context
+cargo run -- --dir /tmp/eja --confirm 12 turn "apply the approved proposal"
 ```
 
-The current directory is the read-only project input. A node writes only its
-project itself. On completion the host commits the workspace to a shadow
-repository at `<dir>/checkpoints` and records that commit in the node's manifest;
-`look node <id>/<path>` reads a file from that commit.
-`<dir>/nodes`. A node id is reserved once and cannot be rerun or overwritten.
-Interrupted directories remain reserved; continuation uses a new linked node.
+Configure connectors in `<dir>/mcp.json`, or pass `--mcp-config FILE`.
+`eja --dir DIR show tools` lists connector grants without model credentials.
+Without connectors, a node has its record reader and can produce a reply; it
+has no filesystem-write or external-effect capability. See [MCP setup](docs/MCP.md)
+and the [native protocol](docs/AJA-PROTOCOL.md).
 
-`NativeWorker` runs one node at a time by default; `with_slots`/`EJA_NODE_SLOTS`
-declares its capacity, and a decision that dispatches several tasks groups them
-by that capacity. Historical nodes are files, not sessions, processes or threads.
-`Limits` defaults to 300 seconds, no model-step cap (`EJA_NODE_STEPS` sets one),
-256 KiB serialized context/frame, and a 64 KiB model reply. A checkpoint commit is at
-most 256 KiB. `with_limits` and `cancel(node_id)` are host APIs; cancellation is
-also checked during HTTP requests. These are byte/step limits, not exact model
-token limits.
+Host resource configuration: `EJA_TURN_DECISIONS`, `EJA_TURN_ACTIONS`,
+`EJA_TURN_DISPATCHES`, `EJA_TURN_TIMEOUT_MS`, `EJA_NODE_STEPS`,
+`EJA_NODE_TIMEOUT_MS`, `EJA_CONTEXT_BYTES`. Limits must be positive.
+`--task ID` selects initial focus. `show audit:ID` follows explicit containment
+and continuation edges; matching input text never invents a job relationship.
 
-## Tools and connectors
-
-`ToolGateway` is the single host interface. Its per-assignment tool definitions
-are snapshotted for a run and checked again on invocation. The gateway receives
-the bound node id, work/project roots and cancellation/deadline control. A node
-cannot select another id or expand its own grants.
-
-A node acts only through its host's declared connectors: there are no built-in
-file tools. The workspace is reached the way the host provides it, so writing a
-deliverable costs the same as working on it — one interface, no cheap path
-around the work. `FileTools` (read_file, list_dir, and one-exact-match edits)
-stays as EJA's bounded observation surface: EJA may read the project and nothing
-else.
-
-`HostTools` exposes the optional MCP tools to nodes. The host owns the MCP
-configuration, credentials, runtime and connections; all nodes reuse them through
-the same gateway. Both stdio and Streamable HTTP (JSON/SSE) are supported by the
-official Rust SDK. Put `mcp.json` in the chosen `--dir`, or pass
-`--mcp-config FILE`. `eja --dir DIR tools` connects, prints the granted tool catalog
-and closes the connections without needing model credentials. See [MCP setup](docs/MCP.md).
-
-Trusted adapters must honor `Control`, bound outputs, and own/settle any resources
-or operations they create. Ordinary same-user child processes and read-only file
-permissions are not an operating-system security sandbox. Native AJA itself only
-performs IPC and has no tool-created descendants; its pipe closes when the host
-exits. External side effects require the connector's own cancellation semantics.
-
-## Tests
+## Validation and limits
 
 ```bash
-cargo test
+cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-Covers the closed loop, look sources and selectors, proposals/confirmation, recall by
-event id, recovery, UTC, projection bounds, worker timeout/cancellation/process cleanup,
-the per-node task contract, the native worker IPC and tool loop, bounded/cancelled
-HTTP, frozen records, replay protection, resource cleanup, the waiting-task fast
-path, and the shared model adapter. MCP integration tests use a local Python 3
-fixture (no Python dependencies), covering stdio/HTTP, cancellation, grants,
-shared connections and process/session cleanup.
+Composition regressions cover unrelated-task invariance, large-result replay,
+record addressability, aggregate completion, relation uniqueness and cross-kind
+cycles, host authorization, atomic confirmation, torn-tail recovery, UTF-8 byte
+budgets, deadlines and always-changing model states. Native/MCP tests also cover
+real local HTTP, cancellation, process cleanup and frozen checkpoints.
 
-## Benchmark
+Trusted adapters must honor Control, own their resources and bound their output.
+An ordinary child process is not an OS security sandbox. Cancellation cannot
+undo remote side effects. The kernel guarantees bounded host execution under
+these port contracts; it cannot prove a model will solve an arbitrary objective.
+Identity and task state can be replayed; world effects are never replayed by
+folding the log. Legacy records/logs remain readable; past invalid relationships
+are not retroactively authorized, and dispatch refuses ambiguous ancestry.
 
-One run, current code, 23 hardest tasks of HarnessBench (the `refusal-subset`
-tasks that scored zero before the structural fixes), model
-`deepseek-v4-flash-0731` (the "DeepSeek-V4-Flash" row of the public
-leaderboard):
-
-| | score | zeros | full | >=0.8 | requests/task | tokens/task |
-|---|---:|---:|---:|---:|---:|---:|
-| EJA-AJA, hardest 23 | 0.618 | 1/23 | 5/23 | 8/23 | 25.0 | 851K |
-
-A second run after removing the unused log-search retriever scored 0.612 (3
-zeros, 6 full, 9 at 0.8+), i.e. the same within sampling noise.
-
-Cost split: EJA 7.0 requests (112K tokens, 13%), nodes 17.9 requests (738K
-tokens, 87%); EJA looks 15.4 times per task.
-
-Same-subset history: 0.248 (report boundary) -> 0.350 (silent refusals fixed)
--> 0.539 (transcript economics) -> 0.618.
-
-Public leaderboard, same model family, full 274 tasks (not this subset):
-Codex 68.34, Hermes 67.35, OpenClaw 66.78, OpenCode 66.24, seven-harness
-average 65.76. Those numbers average over all tasks; this number is over the
-hardest subset, so it is a floor-style reading, not an equal-set comparison.
-The cost gap is the clear one: 1.9-3.6x the tokens per task.
-
-## Not built
-
-- EJA compaction: the log is never summarized; the projection is complete and the
-  renderer fits a byte budget the model adapter declares, reporting what it kept.
-- tokenizer/pattern matching in core.
-- separate verifier authority over EJA.
-- parallel workers, multi-writer locks, auth, multi-user.
-- MCP startup: servers initialize in order, and the tool catalog is a snapshot
-  taken at startup; restart to pick up a changed server.
-- typed errors: boundary failures are opaque strings (`Box<dyn Error>`); the CLI
-  prints them and adapters keep their context.
-- streaming progress/cancel to the user.
+Historical, pre-0.11 model measurements are kept separately in
+[benchmark history](docs/BENCHMARKS.md); they are not measurements of this revision.

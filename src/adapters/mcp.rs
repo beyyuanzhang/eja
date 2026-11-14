@@ -156,7 +156,6 @@ pub struct McpTools {
     connections: Vec<Connection>,
     children: Vec<LocalServer>,
     tools: BTreeMap<String, RemoteTool>,
-    read_only: HashSet<String>,
 }
 
 impl McpTools {
@@ -164,11 +163,16 @@ impl McpTools {
     pub fn is_read_only(&self, public: &str) -> bool {
         self.tools
             .get(public)
-            .is_some_and(|remote| remote.read_only || self.read_only.contains(remote.name.as_str()))
+            .is_some_and(|remote| remote.read_only)
     }
 
     /// Explicit host config only; no home/project auto-discovery or shell expansion.
     pub fn load(path: &Path, project: &Path) -> Result<Self> {
+        let control = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
+        Self::load_controlled(path, project, &control)
+    }
+    pub fn load_controlled(path: &Path, project: &Path, parent: &Control) -> Result<Self> {
+        parent.check()?;
         let mut bytes = Vec::new();
         fs::File::open(path)?
             .take(FRAME_LIMIT as u64 + 1)
@@ -177,6 +181,9 @@ impl McpTools {
             return Err("MCP config exceeds limit".into());
         }
         let config: Config = serde_json::from_slice(&bytes)?;
+        if config.servers.len() > 32 {
+            return Err("MCP config exceeds 32 servers".into());
+        }
         let mut host = Self {
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -185,9 +192,10 @@ impl McpTools {
             connections: vec![],
             children: vec![],
             tools: BTreeMap::new(),
-            read_only: HashSet::new(),
         };
+        let startup = parent.child(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
         for (name, config) in config.servers {
+            startup.check()?;
             if !config.enabled {
                 continue;
             }
@@ -202,9 +210,13 @@ impl McpTools {
                         .into(),
                 );
             }
-            if config.timeout_ms == 0 {
+            if config.timeout_ms == 0 || config.timeout_ms > 300_000 {
                 return Err(format!("invalid MCP timeout for {name}").into());
             }
+            let control = startup.child(
+                Duration::from_millis(config.timeout_ms),
+                Arc::new(AtomicBool::new(false)),
+            );
             let timeout = Duration::from_millis(config.timeout_ms);
             let client = ClientConfig::new(
                 ClientCapabilities::default(),
@@ -250,11 +262,15 @@ impl McpTools {
                     });
                     let transport = AsyncRwTransport::new_client(output, input)
                         .with_max_line_length(FRAME_LIMIT * 2);
-                    host.runtime
-                        .block_on(async {
-                            tokio::time::timeout(timeout, client.serve(transport)).await
-                        })?
-                        .map_err(|_| format!("MCP {name}: stdio initialization failed"))?
+                    host.runtime.block_on(async {
+                        super::controlled(&control, async {
+                            Ok(client
+                                .serve(transport)
+                                .await
+                                .map_err(|_| format!("MCP {name}: stdio initialization failed"))?)
+                        })
+                        .await
+                    })?
                 }
                 (None, Some(url)) => {
                     if !config.args.is_empty() || !config.env.is_empty() || config.cwd.is_some() {
@@ -292,20 +308,24 @@ impl McpTools {
                         .redirect(reqwest::redirect::Policy::none())
                         .connect_timeout(timeout)
                         .build()?;
-                    host.runtime
-                        .block_on(async {
-                            let transport = StreamableHttpClientTransport::with_client(
-                                http,
-                                StreamableHttpClientTransportConfig::with_uri(url.clone())
-                                    .custom_headers(headers)
-                                    .max_sse_event_size(FRAME_LIMIT * 2)
-                                    .max_concurrent_requests(1)
-                                    .control_request_timeout(Duration::from_millis(500))
-                                    .reinit_on_expired_session(true),
-                            );
-                            tokio::time::timeout(timeout, client.serve(transport)).await
-                        })?
-                        .map_err(|_| format!("MCP {name}: HTTP initialization failed"))?
+                    host.runtime.block_on(async {
+                        let transport = StreamableHttpClientTransport::with_client(
+                            http,
+                            StreamableHttpClientTransportConfig::with_uri(url.clone())
+                                .custom_headers(headers)
+                                .max_sse_event_size(FRAME_LIMIT * 2)
+                                .max_concurrent_requests(1)
+                                .control_request_timeout(Duration::from_millis(500))
+                                .reinit_on_expired_session(true),
+                        );
+                        super::controlled(&control, async {
+                            Ok(client
+                                .serve(transport)
+                                .await
+                                .map_err(|_| format!("MCP {name}: HTTP initialization failed"))?)
+                        })
+                        .await
+                    })?
                 }
                 _ => return Err(format!("MCP {name} needs exactly one command or url").into()),
             };
@@ -316,7 +336,7 @@ impl McpTools {
                 service,
             });
             let listed = host.runtime.block_on(async {
-                tokio::time::timeout(timeout, async {
+                super::controlled(&control, async {
                     let mut all = Vec::new();
                     let mut cursor = None;
                     let mut seen = HashSet::new();
@@ -328,6 +348,9 @@ impl McpTools {
                             .await?;
                         bytes += serde_json::to_vec(&page.tools)?.len();
                         all.extend(page.tools);
+                        if all.len() > 256 || seen.len() >= 256 {
+                            return Err("MCP catalog exceeds 256 tools/pages".into());
+                        }
                         if bytes > FRAME_LIMIT {
                             return Err("MCP tool catalog exceeds limit".into());
                         }
@@ -341,7 +364,7 @@ impl McpTools {
                         }
                     }
                 })
-                .await?
+                .await
             })?;
             let requested: Option<HashSet<_>> = config
                 .tools
@@ -367,7 +390,6 @@ impl McpTools {
                 )
                 .into());
             }
-            host.read_only.extend(config.read_only.iter().cloned());
             for tool in listed {
                 if requested
                     .as_ref()
@@ -392,11 +414,15 @@ impl McpTools {
                             server: index,
                             name: tool.name.to_string(),
                             definition,
-                            read_only: tool
-                                .annotations
-                                .as_ref()
-                                .and_then(|annotations| annotations.read_only_hint)
-                                .unwrap_or(false),
+                            read_only: config
+                                .read_only
+                                .iter()
+                                .any(|name| name == tool.name.as_ref())
+                                || tool
+                                    .annotations
+                                    .as_ref()
+                                    .and_then(|annotations| annotations.read_only_hint)
+                                    .unwrap_or(false),
                         },
                     )
                     .is_some()
@@ -439,15 +465,13 @@ impl ToolGateway for McpTools {
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(
                 CallToolRequestParams::new(tool.name.clone()).with_arguments(args),
             ));
-            let mut handle = tokio::time::timeout(remaining,
-                peer.send_cancellable_request(request, PeerRequestOptions::with_timeout(remaining)),
-            ).await??;
-            let deadline = tokio::time::Instant::now() + remaining;
+            let call_control=ctx.control.child(remaining,Arc::new(AtomicBool::new(false)));
+            let mut handle=super::controlled(&call_control,async {Ok(peer.send_cancellable_request(request,PeerRequestOptions::with_timeout(remaining)).await?) }).await?;
             loop {
                 tokio::select! {
                     response = &mut handle.rx => break Ok::<ServerResult, Box<dyn std::error::Error>>(response??),
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        let error = ctx.control.check().err().map(|e| e.to_string()).or_else(|| (tokio::time::Instant::now() >= deadline).then(|| "MCP tool timed out".to_string()));
+                        let error = call_control.check().err().map(|e|e.to_string());
                         if let Some(error) = error {
                             let _ = tokio::time::timeout(Duration::from_millis(500), handle.cancel(Some(error.clone()))).await;
                             return Err::<ServerResult, Box<dyn std::error::Error>>(error.into());
@@ -494,8 +518,8 @@ impl HostTools {
     pub fn new(config: Option<&Path>, project: &Path, private: &Path) -> Result<Self> {
         Ok(Self {
             mcp: config.map(|p| McpTools::load(p, project)).transpose()?,
-            project: project.to_path_buf(),
-            private: private.to_path_buf(),
+            project: project.canonicalize()?,
+            private: private.canonicalize()?,
         })
     }
 }
@@ -525,6 +549,10 @@ impl Observer for HostTools {
     /// the project, connector tools only when declared read-only.
     fn observe(&self, tool: &str, arguments: &Value) -> Result<Value> {
         let control = Control::new(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));
+        self.observe_controlled(tool, arguments, &control)
+    }
+    fn observe_controlled(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
+        let control = parent.child(Duration::from_secs(60), Arc::new(AtomicBool::new(false)));
         let context = ToolContext {
             node_id: 0,
             project: &self.project,

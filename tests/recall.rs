@@ -84,13 +84,17 @@ fn recall_is_an_id_result_not_text_matching() {
         "confirmed",
         vec![Action::Confirm { proposal_id }],
     )]);
-    turn_at(
+    eja::turn_at_with_options(
         &store,
         "confirm",
         &confirm,
         &NoWorker,
         &Ports::default(),
         eja::now_utc(),
+        &eja::TurnOptions {
+            approvals: vec![proposal_id],
+            ..Default::default()
+        },
     )
     .expect("confirm");
     let commitment = open_commitments(&store.events().expect("events"))[0].clone();

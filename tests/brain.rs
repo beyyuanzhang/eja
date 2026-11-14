@@ -79,7 +79,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         })
         .to_string();
         let body = serde_json::json!({
-            "choices": [{"message": {"content": content}}]
+            "choices": [{"message": {"content": content}, "finish_reason":"stop"}]
         })
         .to_string();
         let response = format!(

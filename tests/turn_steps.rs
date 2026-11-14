@@ -114,7 +114,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     turn(
         &store,
         "create task",
-        &Script::new(vec![step(vec![open(false)])]),
+        &Script::new(vec![step(vec![open(false)]), done()]),
         &worker,
         &Ports {
             node: Some(&Reader),
@@ -169,7 +169,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     .unwrap();
     assert_eq!(out.decisions, 5);
     assert_eq!(out.reply, "final answer");
-    assert!(!out.stalled);
+    assert!(out.end != eja::TurnEnd::Stalled);
     assert_eq!(out.context.focus.as_ref().unwrap().id, 1);
     let log_look = out
         .evidence
@@ -317,7 +317,7 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
     // The refused confirmation is told once, so EJA gets one more decision.
     assert_eq!(out.decisions, 3);
     assert_eq!(out.refused.len(), 1, "{:?}", out.refused);
-    assert!(out.refused[0].contains("created this turn"));
+    assert!(out.refused[0].contains("host-recorded user approval"));
     assert_eq!(out.context.proposals.len(), 1);
     assert!(out.context.commitments.is_empty());
     assert!(!store
@@ -344,18 +344,18 @@ fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
     );
     let worker = CaptureWorker::default();
     let out = turn(&store, "inspect", &brain, &worker, &Ports::default()).unwrap();
-    assert!(out.stalled);
+    assert!(out.end == eja::TurnEnd::Stalled);
     // The same read twice: the second look carries no new information.
     assert_eq!(out.decisions, 2);
-    assert!(out.reply.is_empty());
+    assert!(out.reply.starts_with("[turn Stalled]"));
     assert_eq!(out.evidence.len(), 1);
     assert!(out.context.evidence.iter().all(|look| look.error.is_some()));
     let events = store.events().unwrap();
     assert_eq!(
-        events.last().unwrap().data.as_ref().unwrap()["stalled"],
-        true
+        events.last().unwrap().data.as_ref().unwrap()["end"],
+        "stalled"
     );
-    assert!(events.last().unwrap().text.is_empty());
+    assert!(events.last().unwrap().text.starts_with("[turn Stalled]"));
 }
 
 #[test]
@@ -397,8 +397,8 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         },
     )
     .unwrap();
-    assert!(out.stalled);
-    assert!(out.reply.is_empty());
+    assert!(out.end == eja::TurnEnd::Stalled);
+    assert!(out.reply.starts_with("[turn Stalled]"));
     assert_eq!(out.tasks[0].status, TaskStatus::Waiting);
     assert_eq!(out.dispatched.len(), 1);
     let restarted = Store::new(store.log_path.parent().unwrap()).unwrap();
@@ -426,7 +426,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         },
     )
     .unwrap();
-    assert!(!resumed.stalled);
+    assert!(resumed.end != eja::TurnEnd::Stalled);
     assert_eq!(resumed.tasks[0].status, TaskStatus::Done);
     assert_eq!(brain.seen.lock().unwrap()[0].focus.as_ref().unwrap().id, 1);
     assert_eq!(worker.0.lock().unwrap().len(), 1);

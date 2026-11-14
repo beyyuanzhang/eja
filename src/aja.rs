@@ -1,5 +1,6 @@
 //! Disposable AJA loop. All effects, including model requests, go through the host.
 use crate::{Assignment, Result};
+pub(crate) mod view;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -22,7 +23,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             timeout_ms: 300_000,
-            steps: None,
+            steps: Some(256),
             context_bytes: FRAME_LIMIT - FRAME_ENVELOPE,
             response_bytes: 64 * 1024,
         }
@@ -46,19 +47,27 @@ impl Limits {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Start {
-    pub assignment: Assignment,
     pub limits: Limits,
-    /// The predecessor's transcript, when this node continues it.
-    #[serde(default)]
-    pub inherited: Vec<Value>,
+    /// The final bounded starting view, prepared by the host before transport.
+    pub messages: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(crate) enum Request {
-    Model { messages: Vec<Value> },
-    Tool { name: String, arguments: Value },
-    Finish { text: String, reason: String },
+    Model {
+        messages: Vec<Value>,
+    },
+    Tool {
+        #[serde(default)]
+        id: String,
+        name: String,
+        arguments: Value,
+    },
+    Finish {
+        text: String,
+        reason: String,
+    },
 }
 
 pub(crate) fn send(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
@@ -85,60 +94,104 @@ pub(crate) fn receive<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead)
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+#[cfg(test)]
 fn transcript_bytes(messages: &[Value]) -> usize {
-    serde_json::to_vec(messages)
-        .map(|bytes| bytes.len())
-        .unwrap_or(0)
+    view::size(messages)
+}
+#[cfg(test)]
+fn compact(messages: &mut Vec<Value>, budget: usize) {
+    view::fit(messages, budget);
 }
 
-/// Elide the oldest tool results until the transcript fits its budget. The tool
-/// call and its result message stay in place, so the provider's turn structure
-/// is untouched; only the payload is replaced by an accounted-for marker.
-fn compact(messages: &mut [Value], budget: usize) {
-    if transcript_bytes(messages) <= budget {
-        return;
+pub(crate) fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Value> {
+    let budget = limits.steps.map_or_else(
+        || format!("You have {} seconds.", limits.timeout_ms / 1000),
+        |steps| {
+            format!(
+                "You have at most {steps} model turns and {} seconds.",
+                limits.timeout_ms / 1000
+            )
+        },
+    );
+    let system = format!("You are AJA, one independent work node. Complete the assigned work using supplied tools. Your workspace is the current project; inherited messages describe earlier observations, not a restored world. {budget} Acceptance is the contract. Stop once it holds and report what you did. Tool results carry record addresses; use eja_read_record to read omitted passages. Never claim a failed tool succeeded.");
+    let mut brief = assignment.objective.clone();
+    if !assignment.input.trim().is_empty() && assignment.input.trim() != brief.trim() {
+        brief.push_str("\n\nTask as given:\n");
+        brief.push_str(&assignment.input);
     }
-    let mut names = std::collections::HashMap::new();
-    for message in messages.iter() {
-        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
-            for call in calls {
-                if let (Some(id), Some(name)) = (
-                    call.get("id").and_then(Value::as_str),
-                    call.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str),
-                ) {
-                    names.insert(id.to_string(), name.to_string());
-                }
+    if !assignment.acceptance.trim().is_empty() {
+        brief.push_str("\n\nAcceptance: ");
+        brief.push_str(&assignment.acceptance);
+    }
+    if assignment.resume.is_some() {
+        brief = format!("Continuing as a new node. {brief}");
+    }
+    vec![
+        json!({"role":"system","content":system}),
+        json!({"role":"user","content":brief}),
+    ]
+}
+
+#[derive(Debug)]
+pub(crate) struct ContextBudget;
+impl std::fmt::Display for ContextBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AJA context budget exhausted: assignment does not fit")
+    }
+}
+impl std::error::Error for ContextBudget {}
+
+pub(crate) fn prepare_messages(
+    assignment: &Assignment,
+    limits: &Limits,
+    inherited: Vec<Value>,
+) -> Result<Vec<Value>> {
+    let fresh = fresh_messages(assignment, limits);
+    let mut messages = vec![fresh[0].clone()];
+    messages.extend(
+        inherited
+            .into_iter()
+            .filter(|message| message["role"] != "system"),
+    );
+    messages.push(fresh[1].clone());
+    if !view::fit(&mut messages, limits.context_bytes) {
+        return Err(ContextBudget.into());
+    }
+    Ok(messages)
+}
+
+/// Every model adapter and IPC consumer shares the same assistant contract.
+pub(crate) fn validate_assistant(message: &Value) -> Result<()> {
+    if !message.is_object() || message["role"] != "assistant" {
+        return Err("model message must be an assistant object".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    if let Some(calls) = message.get("tool_calls").filter(|value| !value.is_null()) {
+        for call in calls.as_array().ok_or("invalid tool_calls")? {
+            let id = call["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or("invalid tool id")?;
+            if !ids.insert(id)
+                || call["type"] != "function"
+                || call["function"]["name"].as_str().is_none_or(str::is_empty)
+            {
+                return Err("invalid or duplicate tool call".into());
+            }
+            let arguments: Value = serde_json::from_str(
+                call["function"]["arguments"]
+                    .as_str()
+                    .ok_or("missing tool arguments")?,
+            )?;
+            if !arguments.is_object() {
+                return Err("tool arguments must be an object".into());
             }
         }
     }
-    let tools: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| message.get("role").and_then(Value::as_str) == Some("tool"))
-        .map(|(index, _)| index)
-        .collect();
-    // Keep the newest result that still fits: a fixed number of recent results
-    // can itself exceed the budget and stop the node for no reason.
-    for &index in tools.iter().rev().skip(1).rev() {
-        let id = messages[index]
-            .get("tool_call_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let name = names.get(id).map(String::as_str).unwrap_or("tool");
-        let bytes = messages[index]
-            .get("content")
-            .and_then(Value::as_str)
-            .map(str::len)
-            .unwrap_or(0);
-        messages[index]["content"] = json!(format!(
-            "<elided {bytes} bytes from {name}; the full result stays in the record>"
-        ));
-        if transcript_bytes(messages) <= budget {
-            return;
-        }
+    if ids.is_empty() && !message.get("content").is_some_and(Value::is_string) {
+        return Err("a final assistant message needs text content".into());
     }
+    Ok(())
 }
 
 /// A spent budget is a stopping point, not a failed piece of work.
@@ -157,39 +210,7 @@ fn run(
     writer: &mut impl Write,
 ) -> Result<(String, String)> {
     start.limits.validate()?;
-    let budget = match start.limits.steps {
-        Some(steps) => format!(
-            "You have at most {steps} model turns and {} seconds.",
-            start.limits.timeout_ms / 1000
-        ),
-        None => format!("You have {} seconds.", start.limits.timeout_ms / 1000),
-    };
-    let system = format!(
-        "You are AJA, one independent work node. Complete only the assigned work using the supplied tools. Your workspace is the project itself: everything you write stays where you put it, and EJA reads the record of your calls and the world you leave behind. {budget} The Acceptance line is the contract: the work is done when it holds. Stop calling tools then; your last message is read by EJA as your account of what you did, alongside the record of your calls. Never claim a tool succeeded when it failed.",
-    );
-    let mut brief = start.assignment.objective.clone();
-    let given = start.assignment.input.trim();
-    if !given.is_empty() && given != brief.trim() {
-        brief.push_str("\n\nTask as given:\n");
-        brief.push_str(given);
-    }
-    if !start.assignment.acceptance.trim().is_empty() {
-        brief.push_str("\n\nAcceptance: ");
-        brief.push_str(start.assignment.acceptance.trim());
-    }
-    // A continuation starts where the predecessor left off; a fresh node starts
-    // from the system prompt and the brief.
-    let mut messages = if start.inherited.is_empty() {
-        vec![
-            json!({"role":"system","content":system}),
-            json!({"role":"user","content":brief}),
-        ]
-    } else {
-        let mut inherited = start.inherited.clone();
-        inherited
-            .push(json!({"role":"user","content": format!("Continuing as a new node. {brief}")}));
-        inherited
-    };
+    let mut messages = start.messages;
     let mut turns = 0usize;
     loop {
         if let Some(limit) = start.limits.steps {
@@ -204,8 +225,7 @@ fn run(
         // tool result in context.jsonl, so the oldest results can be elided in
         // place once the view outgrows its declared budget.
         let budget = start.limits.context_bytes.min(FRAME_LIMIT - FRAME_ENVELOPE);
-        compact(&mut messages, budget);
-        if serde_json::to_vec(&messages)?.len() > budget {
+        if !view::fit(&mut messages, budget) {
             return Ok(stopped("AJA context budget exhausted"));
         }
         let message = request(
@@ -215,6 +235,7 @@ fn run(
                 messages: messages.clone(),
             },
         )?;
+        validate_assistant(&message)?;
         let calls = message
             .get("tool_calls")
             .and_then(Value::as_array)
@@ -244,6 +265,7 @@ fn run(
                 reader,
                 writer,
                 Request::Tool {
+                    id: call["id"].as_str().unwrap_or_default().into(),
                     name: name.into(),
                     arguments,
                 },
@@ -319,7 +341,10 @@ mod compact_tests {
             .filter_map(|m| m.get("content").and_then(Value::as_str))
             .collect();
         assert_eq!(tool_contents.len(), 12, "no message is removed");
-        assert!(tool_contents[0].starts_with("<elided 2000 bytes from read_file"));
+        assert_eq!(
+            serde_json::from_str::<Value>(tool_contents[0]).unwrap()["elided"],
+            true
+        );
         assert!(tool_contents.iter().any(|c| c.len() == 2000));
         assert!(after <= 20_000, "{after}");
     }

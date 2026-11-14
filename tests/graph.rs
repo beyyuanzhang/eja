@@ -43,11 +43,9 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
         queue: Mutex::new(VecDeque::from(vec![Decision {
             reply: "structure".to_string(),
             actions: vec![
-                Action::OpenTask {
+                Action::OpenGroup {
                     title: "long task".to_string(),
-                    request: "parent".to_string(),
                     acceptance: "child done".to_string(),
-                    run: false,
                 },
                 Action::OpenTask {
                     title: "child task".to_string(),
@@ -59,11 +57,6 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
                     from: 2,
                     to: 1,
                     kind: RelationKind::PartOf,
-                },
-                Action::LinkTasks {
-                    from: 2,
-                    to: 1,
-                    kind: RelationKind::DependsOn,
                 },
             ],
             refused: Vec::new(),
@@ -81,17 +74,10 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
 
     assert_eq!(
         outcome.context.relations,
-        vec![
-            Edge {
-                from: 2,
-                to: 1,
-                kind: RelationKind::PartOf,
-            },
-            Edge {
-                from: 2,
-                to: 1,
-                kind: RelationKind::DependsOn,
-            },
-        ]
+        vec![Edge {
+            from: 2,
+            to: 1,
+            kind: RelationKind::PartOf,
+        },]
     );
 }

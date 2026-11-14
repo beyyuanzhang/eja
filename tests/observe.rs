@@ -37,7 +37,7 @@ impl Observer for Weather {
 }
 
 #[test]
-fn a_world_look_with_nothing_waiting_is_refused() {
+fn a_world_look_does_not_depend_on_waiting_tasks() {
     let dir = std::env::temp_dir().join(format!("eja-observe-nudge-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::new(&dir).expect("store");
@@ -69,12 +69,11 @@ fn a_world_look_with_nothing_waiting_is_refused() {
         },
     )
     .expect("turn");
-    assert!(out.evidence.is_empty());
-    assert_eq!(out.refused.len(), 1);
-    assert!(out.refused[0].contains("waiting task"));
-    assert!(store
+    assert_eq!(out.evidence.len(), 1);
+    assert!(out.refused.is_empty());
+    assert!(!store
         .events()
-        .expect("events")
+        .unwrap()
         .iter()
         .any(|event| event.kind == Kind::Refused));
 }

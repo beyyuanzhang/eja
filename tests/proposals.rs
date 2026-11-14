@@ -88,13 +88,17 @@ fn proposal_does_not_change_identity_until_confirmed() {
         "confirmed",
         vec![Action::Confirm { proposal_id }],
     )]);
-    let confirmed = turn_at(
+    let confirmed = eja::turn_at_with_options(
         &store,
         "confirm",
         &confirm,
         &NoWorker,
         &Ports::default(),
         eja::now_utc(),
+        &eja::TurnOptions {
+            approvals: vec![proposal_id],
+            ..Default::default()
+        },
     )
     .expect("confirm");
     assert!(confirmed.context.proposals.is_empty());
@@ -209,13 +213,17 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
             Action::Confirm { proposal_id: stale },
         ],
     )]);
-    let out = turn_at(
+    let out = eja::turn_at_with_options(
         &store,
         "confirm",
         &confirm,
         &NoWorker,
         &Ports::default(),
         eja::now_utc(),
+        &eja::TurnOptions {
+            approvals: vec![first, stale],
+            ..Default::default()
+        },
     )
     .unwrap();
     assert_eq!(out.context.commitments.len(), 1);
@@ -227,7 +235,10 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
     assert_eq!(
         events
             .iter()
-            .filter(|e| e.kind == Kind::ProposalConfirmed)
+            .filter(|e| e.kind == Kind::Commitment
+                && e.data
+                    .as_ref()
+                    .is_some_and(|data| data.get("proposal_id").is_some()))
             .count(),
         1
     );

@@ -8,7 +8,7 @@ node retains no node-owned MCP client, server or thread.
 
 The CLI loads `<dir>/mcp.json` when present, or the exact `--mcp-config FILE` path.
 It does not search personal or other project configuration directories.
-No config means file tools only. A configured server that fails to initialize or
+No config grants no external connector tools. Each native node still has its host-bound read-only record passage tool. A configured server that fails to initialize or
 list its granted tools fails startup, rather than silently removing capabilities.
 
 ```json
@@ -48,7 +48,7 @@ headers. Protocol/session headers belong to the SDK. URL credentials and
 redirects are rejected. This implementation does not perform interactive OAuth.
 
 ```bash
-eja --dir .eja tools
+eja --dir .eja show tools
 eja --dir .eja --mcp-config /path/to/mcp.json turn "use the connector"
 ```
 
@@ -65,13 +65,15 @@ EJA supplies no sampling, elicitation or task-continuation capabilities. This
 adapter exposes MCP tools; it does not add a second agent loop, plugin system,
 resource browser or prompt registry.
 
-- Maximum 32 configured servers, 256 tools/pages, 256 KiB config/catalog/stdio frame,
+- Maximum 32 configured servers, 256 tools/pages per server, 256 KiB config/catalog/stdio frame,
   frame-sized (256 KiB) returned tool result; the transport allows one frame of
   payload plus envelope headroom. A larger result is refused with a clear error.
 - Per-server timeout defaults to 30 seconds (maximum 300 seconds), including
   initialization and discovery. Calls use the smaller of that timeout and the
   node's remaining deadline. Cancellation is checked while waiting, and sends
   an MCP cancellation notification for a pending call.
+  Startup also has one inherited deadline of at most 300 seconds across all
+  servers. Its remaining time does not become a later tool call's timeout.
 - Results retain MCP `content`, `structuredContent` and `isError`; remote resource
   references stay data and are not automatically fetched or made local artifacts.
 - `read_only` lists server tool names the host declares safe for EJA to observe.

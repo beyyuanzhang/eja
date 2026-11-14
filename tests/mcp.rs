@@ -419,7 +419,7 @@ impl Model for ConnectorModel {
         if messages.last().unwrap()["role"] == "tool" {
             let result: Value =
                 serde_json::from_str(messages.last().unwrap()["content"].as_str().unwrap())?;
-            assert_eq!(result["structuredContent"]["node"], "native node");
+            assert_eq!(result["result"]["structuredContent"]["node"], "native node");
             Ok(
                 json!({"role":"assistant","content":json!({"status":"done","summary":"MCP used","artifacts":[],"evidence":[],"open_questions":[]}).to_string()}),
             )
@@ -438,7 +438,7 @@ fn native_nodes_share_one_host_connection_and_freeze_independently() {
     let path = f.config(json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
     let tools = Arc::new(HostTools::new(Some(&path), &f.0, &f.0).unwrap());
     let pid = f.pid("fixture", "pid");
-    let root = f.0.join("nodes");
+    let root = f.0.join(".eja/nodes");
     let worker = NativeWorker::new(
         env!("CARGO_BIN_EXE_eja"),
         &root,
@@ -510,6 +510,7 @@ fn cli_catalog_uses_owned_default_config_and_fails_explicit_missing_path() {
             f.0.to_str().unwrap(),
             "--mcp-config",
             f.0.join("missing").to_str().unwrap(),
+            "show",
             "tools",
         ])
         .output()
@@ -530,4 +531,62 @@ fn host_declared_read_only_tools_are_observable() {
             .expect("declared read-only tool is observable");
     assert!(value.to_string().contains("probe") || !value.is_null());
     assert!(eja::adapters::Observer::observe(&host, "mcp__fixture__fail", &json!({})).is_err());
+}
+
+#[test]
+fn host_read_only_declarations_do_not_cross_server_namespaces() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let mut a = f.stdio("read-a", "normal");
+    a["tools"] = json!(["echo"]);
+    a["read_only"] = json!(["echo"]);
+    let mut b = f.stdio("write-b", "normal");
+    b["tools"] = json!(["echo"]);
+    let config = f.config(json!({"mcpServers":{"a":a,"b":b}}));
+    let tools = McpTools::load(&config, &f.0).unwrap();
+    assert!(tools.is_read_only("mcp__a__echo"));
+    assert!(!tools.is_read_only("mcp__b__echo"));
+}
+
+#[test]
+fn explicit_cancellation_interrupts_initialization_and_reaps_the_child() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let mut server = f.stdio("hang", "hang_init");
+    server["timeout_ms"] = json!(5000);
+    let path = f.config(json!({"mcpServers":{"fixture":server}}));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let control = Control::new(Duration::from_secs(10), cancelled.clone());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            until(|| f.0.join("hang/pid").exists());
+            cancelled.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let error = McpTools::load_controlled(&path, &f.0, &control)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    });
+    assert!(!alive(f.pid("hang", "pid")));
+}
+
+#[test]
+fn initialization_deadline_does_not_shorten_future_call_timeouts() {
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let mut server = f.stdio("fixture", "stdio");
+    server["timeout_ms"] = json!(3000);
+    let path = f.config(json!({"mcpServers":{"fixture":server}}));
+    let host = McpTools::load_controlled(&path, &f.0, &control(1000)).unwrap();
+    let value = f
+        .call(
+            &host,
+            &control(3000),
+            "mcp__fixture__echo",
+            json!({"text":"later call", "delay_ms":1500}),
+        )
+        .unwrap();
+    assert_eq!(value["content"][0]["text"], "later call");
 }

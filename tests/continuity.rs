@@ -127,13 +127,17 @@ fn propose_and_confirm(
         "confirmed",
         vec![Action::Confirm { proposal_id }],
     )]);
-    turn_at(
+    eja::turn_at_with_options(
         store,
         "confirm",
         &confirm,
         &QueueWorker::new(vec![]),
         &Ports::default(),
         at,
+        &eja::TurnOptions {
+            approvals: vec![proposal_id],
+            ..Default::default()
+        },
     )
     .expect("confirm");
 }

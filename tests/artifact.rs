@@ -288,3 +288,13 @@ fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
     assert!(ambiguous.contains("found 2"), "{ambiguous}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn oversized_artifact_target_fails_before_content_trimming() {
+    let reader = eja::adapters::FileArtifactReader::new(std::env::temp_dir());
+    let started = std::time::Instant::now();
+    assert!(reader
+        .slice(&"x".repeat(eja::aja::FRAME_LIMIT + 1), &Selector::Whole)
+        .is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}

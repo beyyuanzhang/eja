@@ -6,7 +6,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     io::{BufReader, Write},
     path::{Path, PathBuf},
@@ -25,8 +25,8 @@ use std::{
 /// depends on the node cooperating.
 struct ContextLog {
     file: fs::File,
-    started: bool,
     assistants: usize,
+    entries: usize,
 }
 
 impl ContextLog {
@@ -37,8 +37,8 @@ impl ContextLog {
             .open(node.join("context.jsonl"))?;
         Ok(Self {
             file,
-            started: false,
             assistants: 0,
+            entries: 0,
         })
     }
 
@@ -54,12 +54,13 @@ impl ContextLog {
         line.push(b'\n');
         self.file.write_all(&line)?;
         self.file.flush()?;
+        self.entries += 1;
         Ok(())
     }
 }
 
 /// Set by the host on SIGINT: cancellation is a host capability, not a model action.
-pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+pub use crate::INTERRUPTED;
 
 struct Process {
     child: Child,
@@ -112,9 +113,6 @@ impl Process {
     fn next(&self, control: &Control) -> Result<Request> {
         loop {
             control.check()?;
-            if INTERRUPTED.load(Ordering::SeqCst) {
-                return Err("AJA interrupted".into());
-            }
             match self
                 .receiver
                 .as_ref()
@@ -130,11 +128,6 @@ impl Process {
     }
 }
 
-/// How much of one tool result a node's transcript carries. The record keeps the
-/// whole result; the node acts on a view, and can narrow the call if it needs
-/// more, so the transcript does not grow by everything the node ever read.
-const TOOL_VIEW_BYTES: usize = 8 * 1024;
-
 /// A project larger than this is reported as truncated instead of scanned.
 const PROJECT_ENTRIES: usize = 20_000;
 /// Names shown per change class before the rest are counted.
@@ -144,25 +137,32 @@ type ProjectState = std::collections::BTreeMap<String, (u64, i64)>;
 
 /// Every regular file in the project, with its size and modification time. The
 /// worker's own state (`skip`) is not part of what the node did to the project.
-fn snapshot_project(root: &Path, skip: &Path) -> (ProjectState, bool) {
+fn snapshot_project(root: &Path, skip: &Path, control: &Control) -> (ProjectState, bool) {
     let mut state = ProjectState::new();
     let mut truncated = false;
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
+        if control.check().is_err() {
+            truncated = true;
+            break;
+        }
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            if state.len() >= PROJECT_ENTRIES {
+            if control.check().is_err() || state.len() >= PROJECT_ENTRIES {
                 truncated = true;
                 break;
             }
             let path = entry.path();
-            let Ok(metadata) = entry.metadata() else {
+            let Ok(metadata) = entry.path().symlink_metadata() else {
                 continue;
             };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
             if metadata.is_dir() {
-                if path != skip {
+                if path != skip && entry.file_name() != ".git" {
                     pending.push(path);
                 }
                 continue;
@@ -222,7 +222,11 @@ impl ProjectDelta {
     }
     fn line(&self) -> String {
         if self.created.is_empty() && self.modified.is_empty() && self.deleted.is_empty() {
-            return "project: unchanged".into();
+            return if self.truncated {
+                "project: no change observed (inventory truncated)".into()
+            } else {
+                "project: unchanged".into()
+            };
         }
         let names = |list: &[String]| {
             let shown: Vec<&str> = list
@@ -267,77 +271,6 @@ impl ProjectDelta {
     }
 }
 
-/// Bound one tool result for the transcript, keeping head and tail so the node
-/// still sees how the result began and ended.
-fn tool_view(value: Value) -> Value {
-    let text = serde_json::to_string(&value).unwrap_or_default();
-    if text.len() <= TOOL_VIEW_BYTES {
-        return value;
-    }
-    let total = text.chars().count();
-    let head: String = text.chars().take(TOOL_VIEW_BYTES * 2 / 3).collect();
-    let tail: String = text
-        .chars()
-        .skip(total.saturating_sub(TOOL_VIEW_BYTES / 3))
-        .collect();
-    json!({
-        "truncated": true,
-        "bytes": text.len(),
-        "note": "the full result stays in the record",
-        "head": head,
-        "tail": tail,
-    })
-}
-
-/// Replay a frozen record into the messages it started from, so a continuation
-/// begins where its predecessor ended instead of re-exploring the same ground.
-fn inherited_messages(record: &Path) -> Vec<Value> {
-    let Ok(text) = fs::read_to_string(record) else {
-        return Vec::new();
-    };
-    let mut messages: Vec<Value> = Vec::new();
-    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    for line in text.lines() {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        match entry.get("kind").and_then(Value::as_str) {
-            Some("start") => {
-                if let Some(list) = entry.get("messages").and_then(Value::as_array) {
-                    messages = list.clone();
-                }
-            }
-            Some("assistant") => {
-                let message = entry.get("message").cloned().unwrap_or(Value::Null);
-                if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
-                    for call in calls {
-                        if let Some(id) = call.get("id").and_then(Value::as_str) {
-                            pending.push_back(id.to_string());
-                        }
-                    }
-                }
-                messages.push(message);
-            }
-            Some("tool") => {
-                let id = pending.pop_front().unwrap_or_default();
-                let result = entry.get("result").cloned().unwrap_or(Value::Null);
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": result.to_string(),
-                }));
-            }
-            _ => {}
-        }
-    }
-    // A record whose last assistant call has no result cannot be replayed.
-    if pending.is_empty() {
-        messages
-    } else {
-        Vec::new()
-    }
-}
-
 /// What one run of a node produced: the transcript's account of it.
 struct Outcome<'a> {
     text: &'a str,
@@ -347,18 +280,14 @@ struct Outcome<'a> {
 }
 
 struct Lease<'a> {
-    active: &'a Mutex<HashMap<u64, Arc<AtomicBool>>>,
-    id: u64,
+    active: &'a Mutex<Option<ActiveRun>>,
     flag: Arc<AtomicBool>,
 }
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
         self.flag.store(true, Ordering::SeqCst);
-        self.active
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
+        self.active.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
@@ -374,6 +303,11 @@ impl Drop for Process {
     }
 }
 
+struct ActiveRun {
+    id: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
 pub struct NativeWorker {
     binary: PathBuf,
     root: PathBuf,
@@ -381,15 +315,11 @@ pub struct NativeWorker {
     model: Arc<dyn Model>,
     tools: Arc<dyn ToolGateway>,
     limits: Limits,
-    /// Declared concurrent node capacity. Nodes are independent processes, so the
-    /// host decides how many run at once.
-    slots: usize,
     /// The shadow repository that keeps one commit per node: the fossils.
     checkpoints: PathBuf,
     /// The host's own state, never part of what a node did to the project.
     state: PathBuf,
-    checkpoint_lock: std::sync::Mutex<()>,
-    active: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    active: Mutex<Option<ActiveRun>>,
 }
 
 impl NativeWorker {
@@ -402,26 +332,29 @@ impl NativeWorker {
     ) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        let root = root.canonicalize()?;
+        let project = project.into().canonicalize()?;
+        let state = root
+            .parent()
+            .ok_or("node root has no state directory")?
+            .to_path_buf();
+        if project.starts_with(&state) {
+            return Err(
+                "the private state directory must not contain the project workspace".into(),
+            );
+        }
+        let checkpoints = state.join("checkpoints");
         Ok(Self {
             binary: binary.into().canonicalize()?,
-            root: root.canonicalize()?,
-            project: project.into().canonicalize()?,
+            root,
+            project,
             model,
             tools,
             limits: Limits::default(),
-            slots: 1,
-            checkpoints: root.parent().unwrap_or(&root).join("checkpoints"),
-            state: root.parent().unwrap_or(&root).to_path_buf(),
-            checkpoint_lock: std::sync::Mutex::new(()),
-            active: Mutex::new(HashMap::new()),
+            checkpoints,
+            state,
+            active: Mutex::new(None),
         })
-    }
-    pub fn with_slots(mut self, slots: usize) -> Result<Self> {
-        if slots == 0 {
-            return Err("the node capacity must be at least one".into());
-        }
-        self.slots = slots;
-        Ok(self)
     }
     pub fn with_limits(mut self, limits: Limits) -> Result<Self> {
         limits.validate()?;
@@ -433,16 +366,22 @@ impl NativeWorker {
             .active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&node_id)
+            .as_ref()
+            .filter(|run| run.id == node_id)
         {
-            flag.store(true, Ordering::SeqCst);
+            flag.cancelled.store(true, Ordering::SeqCst);
             true
         } else {
             false
         }
     }
     pub fn active_count(&self) -> usize {
-        self.active.lock().unwrap_or_else(|e| e.into_inner()).len()
+        usize::from(
+            self.active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+        )
     }
 
     fn run(
@@ -452,7 +391,8 @@ impl NativeWorker {
         log: &mut ContextLog,
         counts: &mut std::collections::BTreeMap<String, usize>,
     ) -> Result<(String, String)> {
-        let definitions = self.tools.definitions(assignment);
+        let mut definitions = self.tools.definitions(assignment);
+        definitions.push(super::record::definition());
         let allowed: HashSet<String> = definitions
             .iter()
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
@@ -460,14 +400,14 @@ impl NativeWorker {
         if allowed.len() != definitions.len() {
             return Err("invalid or duplicate host tool definitions".into());
         }
-        let inherited = assignment
-            .resume
-            .map(|id| inherited_messages(&self.root.join(id.to_string()).join("context.jsonl")))
-            .unwrap_or_default();
+        log.record(json!({"kind":"start", "view_version":1, "messages":aja::fresh_messages(assignment,&self.limits)}))?;
+        let ancestors = super::record::lineage(&self.root, assignment.resume, control)?;
+        let inherited =
+            super::record::replay(&self.root, &ancestors, self.limits.context_bytes, control)?;
+        let messages = aja::prepare_messages(assignment, &self.limits, inherited)?;
         let start = Start {
-            assignment: assignment.clone(),
             limits: self.limits.clone(),
-            inherited,
+            messages,
         };
         let mut process = Process::start(&self.binary, &self.project, start)?;
         let context = ToolContext {
@@ -480,10 +420,6 @@ impl NativeWorker {
         loop {
             let response = match process.next(control)? {
                 Request::Model { messages } => {
-                    if !log.started {
-                        log.started = true;
-                        log.record(json!({"kind": "start", "messages": messages}))?;
-                    }
                     steps += 1;
                     if self.limits.steps.is_some_and(|limit| steps > limit)
                         || serde_json::to_vec(&messages)?.len() > self.limits.context_bytes
@@ -503,20 +439,36 @@ impl NativeWorker {
                     if serde_json::to_vec(&value)?.len() > self.limits.response_bytes {
                         return Err("AJA model output limit reached".into());
                     }
+                    if let Err(error) = aja::validate_assistant(&value) {
+                        log.record(
+                            json!({"kind":"model_error","message":value,"error":error.to_string()}),
+                        )?;
+                        return Err(error);
+                    }
                     log.record(json!({
                         "kind": "assistant",
-                        "message": value
-                            .pointer("/choices/0/message")
-                            .cloned()
-                            .unwrap_or_else(|| value.clone()),
+                        "message": value,
                     }))?;
                     value
                 }
-                Request::Tool { name, arguments } => {
+                Request::Tool {
+                    id,
+                    name,
+                    arguments,
+                } => {
                     control.check()?;
                     *counts.entry(name.clone()).or_insert(0) += 1;
                     let value = if !allowed.contains(&name) {
                         json!({"error":"tool not allowed"})
+                    } else if name == super::record::READ_TOOL {
+                        super::record::read(
+                            &self.root,
+                            assignment.task_id,
+                            &ancestors,
+                            &arguments,
+                            control,
+                        )
+                        .unwrap_or_else(|error| json!({"error":error.to_string()}))
                     } else {
                         match self.tools.call(&context, &name, &arguments) {
                             Ok(output) => output.value,
@@ -525,16 +477,24 @@ impl NativeWorker {
                             }
                         }
                     };
+                    if serde_json::to_vec(&value)?.len() > aja::FRAME_LIMIT {
+                        return Err("AJA tool output limit reached".into());
+                    }
+                    let entry = log.entries;
                     log.record(json!({
                         "kind": "tool",
+                        "id": id,
                         "name": name,
                         "arguments": arguments,
                         "result": value,
                     }))?;
-                    tool_view(value)
+                    aja::view::tool_result(&value, assignment.task_id, entry)
                 }
                 Request::Finish { text, reason } => {
                     control.check()?;
+                    if !matches!(reason.as_str(), "message" | "budget" | "error") {
+                        return Err("invalid node finish reason".into());
+                    }
                     return Ok((text, reason));
                 }
             };
@@ -551,48 +511,52 @@ impl NativeWorker {
 
     /// Freeze the world this node left: one commit in the state's shadow
     /// repository. The commit is the fossil EJA reads a node's files from.
-    fn checkpoint(&self, assignment: &Assignment) -> Option<String> {
-        let _guard = self
-            .checkpoint_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    fn checkpoint(&self, assignment: &Assignment, control: &Control) -> Result<String> {
         let git = |args: &[&str]| -> Result<String> {
-            let output = std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            command
                 .arg("--git-dir")
                 .arg(&self.checkpoints)
                 .arg("--work-tree")
                 .arg(&self.project)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
                 .args(args)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_AUTHOR_NAME", "eja")
                 .env("GIT_AUTHOR_EMAIL", "eja@local")
                 .env("GIT_COMMITTER_NAME", "eja")
-                .env("GIT_COMMITTER_EMAIL", "eja@local")
-                .output()?;
-            if !output.status.success() {
-                return Err(String::from_utf8_lossy(&output.stderr)
-                    .trim()
-                    .to_string()
-                    .into());
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .env("GIT_COMMITTER_EMAIL", "eja@local");
+            let bytes = super::process::output(&mut command, control, aja::FRAME_LIMIT)?;
+            Ok(String::from_utf8_lossy(&bytes).trim().to_string())
         };
         if !self.checkpoints.join("HEAD").exists() {
-            fs::create_dir_all(&self.checkpoints).ok()?;
-            git(&["init", "--quiet"]).ok()?;
+            fs::create_dir_all(&self.checkpoints)?;
+            git(&["init", "--quiet"])?;
         }
-        let mut spec = vec!["add", "-A", "--", ".", ":!.git"];
+        let mut spec = vec![
+            "add".to_string(),
+            "-A".into(),
+            "--".into(),
+            ".".into(),
+            ":!.git".into(),
+        ];
         if let Ok(relative) = self.state.strip_prefix(&self.project) {
             let relative = relative.to_string_lossy().to_string();
             if !relative.is_empty() {
                 let exclude = format!(":!{relative}");
-                spec.push(Box::leak(exclude.into_boxed_str()));
+                spec.push(exclude);
             }
         }
-        git(&spec).ok()?;
+        git(&spec.iter().map(String::as_str).collect::<Vec<_>>())?;
         let message = format!("node {} at {}", assignment.task_id, assignment.issued_at);
-        git(&["commit", "--quiet", "--allow-empty", "-m", &message]).ok()?;
-        git(&["rev-parse", "HEAD"]).ok()
+        git(&["commit", "--quiet", "--allow-empty", "-m", &message])?;
+        git(&["rev-parse", "HEAD"])
     }
 
     fn seal(
@@ -601,8 +565,12 @@ impl NativeWorker {
         assignment: &Assignment,
         outcome: Outcome<'_>,
         delta: &ProjectDelta,
+        control: &Control,
     ) -> Result<String> {
-        let checkpoint = self.checkpoint(assignment);
+        let (checkpoint, checkpoint_error) = match self.checkpoint(assignment, control) {
+            Ok(commit) => (Some(commit), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         let context = node.join("context.jsonl");
         if let Ok(file) = fs::OpenOptions::new().write(true).open(&context) {
             file.sync_all()?;
@@ -622,7 +590,7 @@ impl NativeWorker {
         };
         let (text, reason) = (outcome.text, outcome.reason);
         let steps = outcome.steps;
-        let digest = format!(
+        let mut digest = format!(
             "{steps} steps, {calls} tool calls{}, {}, ended: {reason}\n{text}",
             if histogram.is_empty() {
                 String::new()
@@ -631,10 +599,14 @@ impl NativeWorker {
             },
             delta.line(),
         );
+        if let Some(error) = &checkpoint_error {
+            digest.push_str(&format!("\ncheckpoint unavailable: {error}"));
+        }
         let manifest = json!({
             "assignment": assignment,
             "digest": digest,
             "checkpoint": checkpoint,
+            "checkpoint_error": checkpoint_error,
             "context": "context.jsonl",
             "context_bytes": context_bytes,
             "frozen": true,
@@ -655,39 +627,44 @@ impl NativeWorker {
 }
 
 impl Worker for NativeWorker {
-    fn capacity(&self) -> usize {
-        self.slots
+    fn execute(&self, assignment: &Assignment) -> String {
+        let control = Control::new(
+            Duration::from_millis(self.limits.timeout_ms),
+            Arc::new(AtomicBool::new(false)),
+        );
+        self.execute_controlled(assignment, &control)
     }
 
-    fn execute(&self, assignment: &Assignment) -> String {
+    fn execute_controlled(&self, assignment: &Assignment, parent: &Control) -> String {
+        if let Err(error) = parent.check() {
+            return format!("0 steps, 0 tool calls, ended: budget\n{error}");
+        }
         let node = self.root.join(assignment.task_id.to_string());
         // Reserve once. Restart or replay cannot overwrite an existing node, even after failure.
         if assignment.task_id == 0 {
             return "0 steps, 0 tool calls, ended: error\ninvalid node id".into();
         }
-        if INTERRUPTED.load(Ordering::SeqCst) {
-            return "0 steps, 0 tool calls, ended: budget\ninterrupted before the node started"
-                .into();
-        }
         let cancelled = Arc::new(AtomicBool::new(false));
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            if !active.is_empty() {
-                return "0 steps, 0 tool calls, ended: budget\nexecution slot is busy".into();
+            if active.is_some() {
+                return "0 steps, 0 tool calls, ended: budget\nexecution owner is busy".into();
             }
             if let Err(e) = fs::create_dir(&node) {
                 return format!(
                     "0 steps, 0 tool calls, ended: error\nnode already reserved or unavailable: {e}"
                 );
             }
-            active.insert(assignment.task_id, cancelled.clone());
+            *active = Some(ActiveRun {
+                id: assignment.task_id,
+                cancelled: cancelled.clone(),
+            });
         }
         let _lease = Lease {
             active: &self.active,
-            id: assignment.task_id,
             flag: cancelled.clone(),
         };
-        let control = Control::new(
+        let control = parent.child(
             Duration::from_millis(self.limits.timeout_ms),
             cancelled.clone(),
         );
@@ -700,16 +677,24 @@ impl Worker for NativeWorker {
                 )
             }
         };
-        let before = snapshot_project(&self.project, &self.state);
+        let before = snapshot_project(&self.project, &self.state, &control);
         let result: Result<(String, String)> =
             self.run(assignment, &control, &mut log, &mut counts);
         let steps = log.assistants();
-        let (after, truncated) = snapshot_project(&self.project, &self.state);
+        let (after, truncated) = snapshot_project(&self.project, &self.state, &control);
         let delta = ProjectDelta::between(&before.0, &after, truncated || before.1);
         cancelled.store(true, Ordering::SeqCst); // revoke this run before publishing anything
         let (text, reason) = match result {
             Ok(outcome) => outcome,
-            Err(error) => (error.to_string(), "error".to_string()),
+            Err(error) => {
+                let reason =
+                    if error.is::<aja::ContextBudget>() || error.is::<crate::ControlError>() {
+                        "budget"
+                    } else {
+                        "error"
+                    };
+                (error.to_string(), reason.to_string())
+            }
         };
         let _ = log.record(json!({"kind": "finish", "text": &text, "reason": &reason}));
         drop(log);
@@ -723,6 +708,7 @@ impl Worker for NativeWorker {
                 counts: &counts,
             },
             &delta,
+            parent,
         )
         .unwrap_or_else(|e| {
             format!("{steps} steps, 0 tool calls, ended: error\nnode could not be frozen: {e}")

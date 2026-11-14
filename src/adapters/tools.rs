@@ -61,7 +61,11 @@ pub(crate) fn workspace_path(root: &Path, name: &str) -> Result<PathBuf> {
         let inside = path
             .strip_prefix(root)
             .map_err(|_| "absolute paths must stay inside the workspace")?;
-        return relative_file(root, &inside.to_string_lossy());
+        return if inside.as_os_str().is_empty() {
+            Ok(root.to_path_buf())
+        } else {
+            relative_file(root, &inside.to_string_lossy())
+        };
     }
     relative_file(root, name)
 }
@@ -94,19 +98,29 @@ impl ToolGateway for FileTools {
                 file.take(FRAME_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
                 let truncated = bytes.len() > FRAME_LIMIT;
                 bytes.truncate(FRAME_LIMIT);
-                json!({"text":String::from_utf8_lossy(&bytes),"truncated":truncated})
+                let mut text = String::from_utf8_lossy(&bytes).to_string();
+                let mut truncated = truncated;
+                loop {
+                    let value = json!({"text":text,"truncated":truncated});
+                    if serde_json::to_vec(&value)?.len() <= FRAME_LIMIT {
+                        break value;
+                    }
+                    text = super::cut_chars(&text, text.len() / 2).to_string();
+                    truncated = true;
+                }
             }
             "list_dir" => {
                 let full = workspace_path(ctx.project, path)?;
                 if full.starts_with(ctx.private) {
                     return Err("the host's private state is not readable".into());
                 }
-                let mut entries: Vec<String> = Vec::new();
-                let mut shown = 0usize;
-                let mut bytes = 0usize;
-                let listing: Vec<_> = fs::read_dir(&full)?.collect::<std::io::Result<Vec<_>>>()?;
-                let total = listing.len();
-                for entry in listing {
+                let mut entries = Vec::new();
+                let mut total = 0usize;
+                let mut bytes = 256usize;
+                for entry in fs::read_dir(&full)? {
+                    ctx.control.check()?;
+                    let entry = entry?;
+                    total += 1;
                     let metadata = entry.metadata()?;
                     let name = entry.file_name().to_string_lossy().to_string();
                     let line = if metadata.is_dir() {
@@ -114,14 +128,14 @@ impl ToolGateway for FileTools {
                     } else {
                         format!("{name} ({} bytes)", metadata.len())
                     };
-                    bytes += line.len() + 1;
-                    if bytes > FRAME_LIMIT {
-                        break;
+                    let size = serde_json::to_vec(&line)?.len() + 1;
+                    if bytes.saturating_add(size) < FRAME_LIMIT {
+                        bytes += size;
+                        entries.push(line);
                     }
-                    entries.push(line);
-                    shown += 1;
                 }
-                json!({"path":path,"entries":entries,"showing":shown,"total":total,"truncated":shown < total})
+                let shown = entries.len();
+                json!({"path":path,"entries":entries,"showing":shown,"total":total,"truncated":shown<total})
             }
             "edit_file" => {
                 let find = args["find"].as_str().ok_or("missing find")?;
@@ -130,7 +144,14 @@ impl ToolGateway for FileTools {
                 if full.starts_with(ctx.private) {
                     return Err("the host's private state is not writable".into());
                 }
-                let mut text = fs::read_to_string(&full)?;
+                if fs::metadata(&full)?.len() > FRAME_LIMIT as u64 {
+                    return Err("file is too large to edit".into());
+                }
+                let mut bytes = Vec::new();
+                fs::File::open(&full)?
+                    .take(FRAME_LIMIT as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                let mut text = String::from_utf8(bytes)?;
                 if text.len() > FRAME_LIMIT {
                     return Err("file is too large to edit".into());
                 }

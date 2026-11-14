@@ -127,13 +127,17 @@ fn propose_and_confirm(
         "confirmed",
         vec![Action::Confirm { proposal_id }],
     )]);
-    turn_at(
+    eja::turn_at_with_options(
         store,
         "confirm",
         &confirm,
         &QueueWorker::new(vec![]),
         &Ports::default(),
         at,
+        &eja::TurnOptions {
+            approvals: vec![proposal_id],
+            ..Default::default()
+        },
     )
     .expect("confirm");
 }
@@ -194,7 +198,7 @@ fn closed_loop_dispatches_reports_and_accepts() {
         ]
     );
 
-    let names: Vec<String> = std::fs::read_dir(&dir)
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("read")
         .map(|entry| {
             entry
@@ -204,7 +208,16 @@ fn closed_loop_dispatches_reports_and_accepts() {
                 .to_string()
         })
         .collect();
-    assert_eq!(names, vec!["log.jsonl".to_string()]);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["log.jsonl".to_string(), "log.turn.lock".to_string()]
+    );
+    assert_eq!(
+        std::fs::metadata(dir.join("log.turn.lock")).unwrap().len(),
+        0,
+        "the lease stores no second state"
+    );
 }
 
 #[test]
@@ -369,6 +382,7 @@ fn task_index_and_read_task_are_structured() {
                 run: false,
             }],
         ),
+        decision("opened A", vec![]),
         decision(
             "open B",
             vec![Action::OpenTask {
@@ -415,6 +429,7 @@ fn explicit_dispatch_runs_an_open_task() {
                 run: false,
             }],
         ),
+        decision("opened", vec![]),
         decision("start", vec![Action::Dispatch { task_id: 1 }]),
         decision(
             "done",

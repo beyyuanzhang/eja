@@ -33,7 +33,8 @@ fn projection_keeps_every_recorded_commitment_and_says_so() {
     // A budgeted view reports how many it kept and how many exist.
     let tight = render_context_within(&context, 400);
     assert!(tight.contains("OPEN COMMITMENTS ("));
-    assert!(tight.contains("of 210"));
+    assert!(tight.contains("view budget reached"));
+    assert!(tight.len() <= 400);
 }
 
 #[test]
@@ -54,5 +55,5 @@ fn a_record_that_does_not_fit_is_cut_at_the_budget_and_says_so() {
         .expect("project");
     let view = render_context_within(&context, 400);
     assert!(view.contains("view budget reached"), "{view}");
-    assert!(view.len() < 900, "{}", view.len());
+    assert!(view.len() <= 400, "{}", view.len());
 }

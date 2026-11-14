@@ -2,7 +2,7 @@ use crate::{format_utc, Action, Brain, Decision, EjaContext, LookSource, Selecto
 use serde_json::json;
 use std::time::Duration;
 
-use super::{label, llm_env, status, Control, OpenAiModel};
+use super::{label, llm_env, Control, Model, OpenAiModel};
 
 fn relation(kind: crate::RelationKind) -> &'static str {
     match kind {
@@ -21,25 +21,26 @@ task index; you do not execute work. AJA sessions execute one assignment each an
 leave a record of what they did. The record is yours to read: a dispatch returns the \
 host's digest of it, and you may look deeper at any node. Treat the node's last \
 message as its account, not a verified outcome; the record and the decision are yours. You observe, you never execute: you may read the log, node records, and the project itself (read_file, list_dir), and every effect happens inside an AJA node. There is no fallback executor. A correction targets an explicit event id; never invent one. Identity changes \
-(goal, commitment, correction) are proposals: propose them, then confirm only \
-after the user has confirmed. Never confirm a proposal in the same turn it was \
+(goal, commitment, correction) are proposals: propose them, then confirm \
+only when its id is in HOST APPROVED PROPOSALS. Never confirm a proposal in the same turn it was \
 created. \
 The current input is separate from the persistent goal. Use a goal/commitment \
 proposal without target_id to add one; with target_id to replace an active event \
 of the same kind. Use correction with target_id only to withdraw that event. \
 The proposal text is the replacement content, or the withdrawal reason. \
-Actions execute in their listed order. Every read is one action: a look names \
+Actions execute in their listed order. Creating a node, group or proposal returns its allocated id in the next projection and continues this turn; use that id rather than guessing it. Every read is one action: a look names \
 a source (log, node or world), a target and a selector. A node look reads that \
 node's own files or the workspace it left behind. Dispatching an AJA also \
 returns an observation, and several dispatches in one decision run together. A continuation is represented as a new task related to \
 the previous one with \
 {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
-To finish, return your final reply with no observation-producing actions. \
+Tasks are execution nodes; open_group creates a non-executable container. part_of targets a group. A group can be closed after its children settle; judge its own acceptance contract. Execution edges are fixed before dispatch; continues has exactly one finished predecessor, and depends_on requires an accepted predecessor before dispatch. Open a continuation with run:false, relate it, then dispatch it. World reads are governed only by host capabilities. Read older conversation with look log history or all, using range to page event indices. To finish, return your final reply with no observation-producing actions. \
 Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes: \
 {\"op\":\"propose\",\"kind\":\"goal|commitment|correction\",\"target_id\":1,\"text\":\"...\"}; \
 {\"op\":\"confirm\",\"proposal_id\":1}; \
 {\"op\":\"reject\",\"proposal_id\":1,\"note\":\"...\"}; \
 {\"op\":\"decision|relationship\",\"text\":\"...\"}; \
+{\"op\":\"open_group\",\"title\":\"...\",\"acceptance\":\"...\"}; \
 {\"op\":\"open_task\",\"title\":\"...\",\"request\":\"...\",\"acceptance\":\"...\",\"run\":true}; \
 {\"op\":\"dispatch\",\"task_id\":1}; \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
@@ -53,8 +54,8 @@ Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes:
 {\"op\":\"look\",\"source\":\"world\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
 Preconditions: dispatch runs only a task in open state; a task that has a node \
 record is waiting for your judgment, so close it or open a new task for more \
-work. close_task needs a waiting task. confirm needs a pending proposal from an \
-earlier turn.";
+work. close_task requires a waiting node, an open node being cancelled, or a group whose children are terminal. confirm needs a host-approved pending proposal from an \
+earlier turn. Log pages expose from/next/total; continue at next. Oversized events are listed in partial_events: read event:<id> with selector {\"select\":\"bytes\",\"from\":0,\"bytes\":4096}, then continue at next_offset. Byte views contain serialized event text.";
 
 struct Section {
     title: &'static str,
@@ -78,9 +79,8 @@ pub fn render_context(context: &EjaContext) -> String {
     render_context_within(context, usize::MAX)
 }
 
-/// Render the projection under a byte budget. A truncated section reports how
-/// many items were kept and how many exist, so nothing is silently dropped and
-/// the model can fetch the rest with recall or read_task.
+/// Render a bounded projection with total section counts and an explicit cut
+/// notice. Omitted records remain discoverable through typed log lookups.
 pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     let mut sections = Vec::new();
     sections.push(section(
@@ -93,6 +93,13 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         false,
         one_line(format!("  {}", context.input)),
     ));
+    if !context.approved_proposals.is_empty() {
+        sections.push(section(
+            "HOST APPROVED PROPOSALS",
+            false,
+            one_line(format!("  {:?}", context.approved_proposals)),
+        ));
+    }
     sections.push(section(
         "CURRENT GOAL",
         false,
@@ -102,12 +109,50 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         )),
     ));
 
+    sections.push(section(
+        "OPEN COMMITMENTS",
+        true,
+        context
+            .commitments
+            .iter()
+            .map(|event| {
+                vec![format!(
+                    "  #{} {}: {}",
+                    event.id,
+                    format_utc(event.at),
+                    event.text
+                )]
+            })
+            .collect(),
+    ));
+    sections.push(section(
+        "PENDING PROPOSALS",
+        true,
+        context
+            .proposals
+            .iter()
+            .map(|proposal| {
+                vec![format!(
+                    "  proposal #{} [{}] target={} turn={}: {}",
+                    proposal.id,
+                    format!("{:?}", proposal.kind).to_lowercase(),
+                    proposal
+                        .target_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    proposal.turn,
+                    proposal.text
+                )]
+            })
+            .collect(),
+    ));
     let mut task_lines = Vec::new();
     if let Some(task) = &context.focus {
         task_lines.push(format!(
-            "  #{} [{}] {}",
+            "  #{} [{:?}/{}] {}",
             task.id,
-            status(task.status),
+            task.kind,
+            task.status.as_str(),
             task.title
         ));
         task_lines.push(format!("  created: {}", format_utc(task.created_at)));
@@ -168,6 +213,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         let selector = match &observation.selector {
             Selector::Whole => String::new(),
             Selector::Range { from, lines } => format!(" range {from}+{lines}"),
+            Selector::Bytes { from, bytes } => format!(" bytes {from}+{bytes}"),
             Selector::Match { text, .. } => format!(" match \"{text}\""),
         };
         let mut item = vec![format!(
@@ -178,7 +224,21 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         )];
         if let Some(error) = &observation.error {
             item.push(format!("    error: {error}"));
-        } else if observation.source == LookSource::Log {
+        } else if observation.source == LookSource::Log
+            && observation.result.get("events").is_some()
+        {
+            item.push(format!(
+                "    page from={} next={} total={} truncated={}",
+                observation.result["from"],
+                observation.result["next"],
+                observation.result["total"],
+                observation.result["truncated"]
+            ));
+            if let Some(partial) = observation.result.get("partial_events") {
+                item.push(format!(
+                    "    oversized events (read event:<id> with bytes): {partial}"
+                ));
+            }
             let events: Vec<crate::Event> = observation
                 .result
                 .get("events")
@@ -213,6 +273,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         context
             .identity
             .iter()
+            .rev()
             .map(|event| {
                 vec![format!(
                     "  #{} [{}] {}: {}",
@@ -225,38 +286,17 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
     sections.push(section(
-        "OPEN COMMITMENTS",
+        "RECENT CONVERSATION",
         true,
         context
-            .commitments
+            .history
             .iter()
             .map(|event| {
                 vec![format!(
-                    "  #{} {}: {}",
+                    "  #{} [{}] {}",
                     event.id,
-                    format_utc(event.at),
+                    label(event.kind),
                     event.text
-                )]
-            })
-            .collect(),
-    ));
-    sections.push(section(
-        "PENDING PROPOSALS",
-        true,
-        context
-            .proposals
-            .iter()
-            .map(|proposal| {
-                vec![format!(
-                    "  proposal #{} [{}] target={} turn={}: {}",
-                    proposal.id,
-                    format!("{:?}", proposal.kind).to_lowercase(),
-                    proposal
-                        .target_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    proposal.turn,
-                    proposal.text
                 )]
             })
             .collect(),
@@ -269,9 +309,10 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .iter()
             .map(|task| {
                 vec![format!(
-                    "  #{} [{}] {}",
+                    "  #{} [{:?}/{}] {}",
                     task.id,
-                    status(task.status),
+                    task.kind,
+                    task.status.as_str(),
                     task.title
                 )]
             })
@@ -297,70 +338,38 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     fit_sections(&sections, budget)
 }
 
-fn item_size(item: &[String]) -> usize {
-    item.iter().map(|line| line.len() + 1).sum::<usize>() + 1
-}
-
 /// Assemble the view in priority order. The declared budget is the only limit:
 /// a record that does not fit is cut where the budget ends and the cut is
-/// stated, with counts, instead of being silently shortened.
+/// stated. Section counts describe the uncut projection.
 fn fit_sections(sections: &[Section], budget: usize) -> String {
-    let mut out = String::new();
+    let footer = "\n… view budget reached; use look log history/all or a record address for omitted content\n";
+    let mut full = String::new();
     for section in sections {
-        let total = section.items.len();
-        let mut shown = 0usize;
-        let mut remaining = budget.saturating_sub(out.len());
-        for item in &section.items {
-            let size = item_size(item);
-            if size <= remaining {
-                shown += 1;
-                remaining = remaining.saturating_sub(size);
-            } else {
-                break;
-            }
-        }
-        let header = match (section.counted, total == 0, shown >= total) {
-            (false, _, _) => format!("{}:", section.title),
-            (true, true, _) => format!("{} (0):", section.title),
-            (true, false, true) => format!("{} ({}):", section.title, total),
-            (true, false, false) => format!("{} ({} of {}):", section.title, shown, total),
+        let header = if section.counted {
+            format!("{} ({}):\n", section.title, section.items.len())
+        } else {
+            format!("{}:\n", section.title)
         };
-        out.push_str(&header);
-        out.push('\n');
-        if total == 0 {
-            out.push_str("  (none)\n\n");
-            continue;
+        full.push_str(&header);
+        if section.items.is_empty() {
+            full.push_str("  (none)\n");
         }
-        for item in section.items.iter().take(shown) {
+        for item in &section.items {
             for line in item {
-                out.push_str(line);
-                out.push('\n');
+                full.push_str(line);
+                full.push('\n');
             }
         }
-        if shown < total {
-            for line in &section.items[shown] {
-                if out.len() + line.len() < budget {
-                    out.push_str(line);
-                    out.push('\n');
-                    continue;
-                }
-                let left = budget.saturating_sub(out.len());
-                if left > 8 {
-                    out.push_str(super::cut_chars(line, left - 4));
-                    out.push('…');
-                    out.push('\n');
-                }
-                break;
-            }
-            let rest = total - shown;
-            out.push_str(&format!(
-                "  … view budget reached: {} of {} records fit, {} more stay in the log or the frozen record\n",
-                shown, total, rest
-            ));
-        }
-        out.push('\n');
+        full.push('\n');
     }
-    out.trim_end().to_string()
+    if full.len() <= budget {
+        return full.trim_end().to_string();
+    }
+    // The rendered-text cap includes headers, notices and UTF-8 bytes.
+    let kept = budget.saturating_sub(footer.len());
+    let mut out = super::cut_chars(&full, kept).to_string();
+    out.push_str(super::cut_chars(footer, budget.saturating_sub(out.len())));
+    out
 }
 
 pub fn parse_decision(raw: &str) -> Decision {
@@ -432,40 +441,62 @@ pub struct OpenAiBrain {
 }
 
 impl OpenAiBrain {
-    pub fn from_env() -> Option<Self> {
-        let (base, key, model) = llm_env()?;
-        Some(Self::new(base, key, model))
+    pub fn from_env() -> crate::Result<Option<Self>> {
+        let Some((base, key, model)) = llm_env() else {
+            return Ok(None);
+        };
+        let mut brain = Self::new(base, key, model);
+        if let Ok(raw) = std::env::var("EJA_CONTEXT_BYTES") {
+            let budget = raw.parse().map_err(|_| "invalid EJA_CONTEXT_BYTES")?;
+            brain = brain.with_context_budget(budget)?;
+        }
+        Ok(Some(brain))
     }
     pub fn new(base: impl Into<String>, key: impl Into<String>, model: impl Into<String>) -> Self {
-        // The consumer decides how much context it can take; core never picks a size.
-        let context_budget = std::env::var("EJA_CONTEXT_BYTES")
-            .ok()
-            .and_then(|raw| raw.parse().ok())
-            .unwrap_or(DEFAULT_CONTEXT_BYTES);
         Self {
             model: OpenAiModel::new(base, key, model),
-            context_budget,
+            context_budget: DEFAULT_CONTEXT_BYTES,
         }
+    }
+    pub fn with_context_budget(mut self, budget: usize) -> crate::Result<Self> {
+        if budget == 0 {
+            return Err("EJA_CONTEXT_BYTES must be positive".into());
+        }
+        self.context_budget = budget;
+        Ok(self)
     }
 }
 
 impl Brain for OpenAiBrain {
     fn decide(&self, context: &EjaContext) -> Decision {
-        let messages = vec![
-            json!({"role":"system","content":SYSTEM_PROMPT}),
-            json!({"role":"user","content":render_context_within(context, self.context_budget)}),
-        ];
         let control = Control::new(
             DECIDE_TIMEOUT,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
-        match self
-            .model
-            .request(&messages, &[], crate::aja::FRAME_LIMIT, &control, true)
-        {
+        self.decide_controlled(context, &control)
+    }
+    fn decide_controlled(&self, context: &EjaContext, parent: &Control) -> Decision {
+        let messages = vec![
+            json!({"role":"system","content":SYSTEM_PROMPT}),
+            json!({"role":"user","content":render_context_within(context, self.context_budget)}),
+        ];
+        let control = parent.child(
+            DECIDE_TIMEOUT,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        match self.model.complete(
+            &messages,
+            &[],
+            &crate::aja::Limits {
+                response_bytes: crate::aja::FRAME_LIMIT,
+                ..Default::default()
+            },
+            &control,
+            true,
+        ) {
             Ok(value) => parse_decision(
                 value
-                    .pointer("/choices/0/message/content")
+                    .get("content")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
             ),

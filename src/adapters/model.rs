@@ -1,54 +1,16 @@
 //! Host-owned model transport shared by EJA and its AJA nodes.
 use crate::{aja::Limits, Result};
 use serde_json::{json, Value};
-use std::{
-    future::Future,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant},
-};
+use std::{future::Future, time::Duration};
 
-#[derive(Clone)]
-pub struct Control {
-    deadline: Instant,
-    cancelled: Arc<AtomicBool>,
-}
+pub use crate::Control;
 
 impl Control {
-    pub fn new(timeout: Duration, cancelled: Arc<AtomicBool>) -> Self {
-        Self {
-            deadline: Instant::now() + timeout,
-            cancelled,
-        }
-    }
-    pub fn check(&self) -> Result<()> {
-        if self.cancelled.load(Ordering::SeqCst) {
-            return Err("AJA cancelled".into());
-        }
-        if Instant::now() >= self.deadline {
-            return Err("AJA timed out".into());
-        }
-        Ok(())
-    }
-    pub fn remaining(&self) -> Result<Duration> {
-        self.check()?;
-        Ok(self.deadline.saturating_duration_since(Instant::now()))
-    }
     fn wait<F: Future<Output = Result<Value>>>(&self, future: F) -> Result<Value> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        rt.block_on(async {
-            tokio::pin!(future);
-            loop {
-                tokio::select! {
-                    result = &mut future => return result,
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => self.check()?,
-                }
-            }
-        })
+        rt.block_on(super::controlled(self, future))
     }
 }
 
@@ -187,30 +149,12 @@ impl Model for OpenAiModel {
             return Err("model message must be an object".into());
         }
         message["role"] = json!("assistant");
-        let mut ids = std::collections::HashSet::new();
-        if let Some(calls) = message.get("tool_calls").filter(|v| !v.is_null()) {
-            for call in calls.as_array().ok_or("invalid tool_calls")? {
-                let id = call["id"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .ok_or("invalid tool id")?;
-                if !ids.insert(id)
-                    || call["type"] != "function"
-                    || call["function"]["name"].as_str().is_none_or(str::is_empty)
-                {
-                    return Err("invalid or duplicate tool call".into());
-                }
-                let args: Value = serde_json::from_str(
-                    call["function"]["arguments"]
-                        .as_str()
-                        .ok_or("missing tool arguments")?,
-                )?;
-                if !args.is_object() {
-                    return Err("tool arguments must be an object".into());
-                }
-            }
-        }
-        if (reason == "tool_calls") == ids.is_empty() {
+        crate::aja::validate_assistant(&message)?;
+        let has_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        if (reason == "tool_calls") != has_calls {
             return Err("inconsistent tool finish reason".into());
         }
         Ok(message)
