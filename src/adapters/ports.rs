@@ -2,18 +2,6 @@
 use crate::{tasks, ArtifactContent, Event, LookSource, Lookup, Result, Selector};
 use serde_json::Value;
 
-pub trait Retriever {
-    fn retrieve(&self, query: &str, events: &[Event]) -> Result<Vec<u64>>;
-}
-
-pub struct NoopRetriever;
-
-impl Retriever for NoopRetriever {
-    fn retrieve(&self, _query: &str, _events: &[Event]) -> Result<Vec<u64>> {
-        Ok(Vec::new())
-    }
-}
-
 pub trait ArtifactReader {
     fn read(&self, path: &str) -> ArtifactContent;
 
@@ -50,7 +38,6 @@ impl Observer for NoopObserver {
 /// Host composition: one lookup over the three sources an EJA deployment has.
 #[derive(Default, Clone, Copy)]
 pub struct Ports<'a> {
-    pub log: Option<&'a dyn Retriever>,
     pub node: Option<&'a dyn ArtifactReader>,
     pub world: Option<&'a dyn Observer>,
 }
@@ -66,22 +53,19 @@ impl Lookup for Ports<'_> {
     ) -> Result<Value> {
         match source {
             LookSource::Log => {
-                let retriever = self.log.ok_or("no log reader is configured")?;
                 match selector {
-                    Selector::Search { query } => {
-                        let ids = retriever.retrieve(query, log)?;
-                        let events: Vec<&Event> =
-                            log.iter().filter(|event| ids.contains(&event.id)).collect();
-                        Ok(serde_json::json!({"matches": events.len(), "events": events}))
-                    }
                     Selector::Whole => {
+                        // A log look always answers with events, so the shape does
+                        // not depend on how the target was named.
                         if let Some(raw) = target.strip_prefix("task:") {
                             let id: u64 = raw.parse().map_err(|_| "task target needs an id")?;
-                            let task = tasks(log)
-                                .into_iter()
-                                .find(|task| task.id == id)
-                                .ok_or("no such task")?;
-                            return Ok(serde_json::to_value(task)?);
+                            if !tasks(log).iter().any(|task| task.id == id) {
+                                return Err("no such task".into());
+                            }
+                            let scope = format!("task:{id}");
+                            let events: Vec<&Event> =
+                                log.iter().filter(|event| event.scope == scope).collect();
+                            return Ok(serde_json::json!({"events": events}));
                         }
                         if let Some(raw) = target.strip_prefix("event:") {
                             let id: u64 = raw.parse().map_err(|_| "event target needs an id")?;
@@ -89,11 +73,11 @@ impl Lookup for Ports<'_> {
                                 .iter()
                                 .find(|event| event.id == id)
                                 .ok_or("no such event")?;
-                            return Ok(serde_json::to_value(event)?);
+                            return Ok(serde_json::json!({"events": [event]}));
                         }
-                        Err("a log look targets task:<id>, event:<id>, or a search".into())
+                        Err("a log look targets task:<id> or event:<id>".into())
                     }
-                    _ => Err("a log look uses whole or search".into()),
+                    _ => Err("a log look uses whole".into()),
                 }
             }
             LookSource::Node => {

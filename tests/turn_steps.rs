@@ -1,7 +1,7 @@
-use eja::adapters::{ArtifactReader, NoopRetriever, Ports, Retriever};
+use eja::adapters::{ArtifactReader, Ports};
 use eja::{
-    turn, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, Event, Kind,
-    LookSource, ProposalKind, Result, Selector, Store, TaskStatus, Worker,
+    turn, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, Kind, LookSource,
+    ProposalKind, Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -55,14 +55,6 @@ impl Worker for CaptureWorker {
             "1 steps, 1 tool calls, 1 artifacts, ended: message\n{}",
             "worker claim"
         )
-    }
-}
-
-struct FixedRecall(u64);
-
-impl Retriever for FixedRecall {
-    fn retrieve(&self, _: &str, _: &[Event]) -> Result<Vec<u64>> {
-        Ok(vec![self.0, self.0, u64::MAX])
     }
 }
 
@@ -125,7 +117,6 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         &Script::new(vec![step(vec![open(false)])]),
         &worker,
         &Ports {
-            log: Some(&NoopRetriever),
             node: Some(&Reader),
             ..Default::default()
         },
@@ -135,11 +126,9 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         step(vec![
             Action::Look {
                 source: LookSource::Log,
-                target: String::new(),
+                target: format!("event:{}", fact.id),
                 arguments: serde_json::Value::Null,
-                selector: Selector::Search {
-                    query: "old fact".into(),
-                },
+                selector: Selector::Whole,
             },
             Action::RecordDecision {
                 text: "written once".into(),
@@ -173,7 +162,6 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         &brain,
         &worker,
         &Ports {
-            log: Some(&FixedRecall(fact.id)),
             node: Some(&Reader),
             ..Default::default()
         },
@@ -188,9 +176,8 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         .iter()
         .find(|look| look.source == LookSource::Log)
         .expect("recall");
-    let events = log_look.result["events"].as_array().expect("events");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["id"], fact.id);
+    assert_eq!(log_look.result["events"][0]["id"], fact.id);
+    assert_eq!(log_look.result["events"][0]["kind"], "user");
     let node_looks = out
         .evidence
         .iter()
@@ -198,9 +185,10 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         .count();
     assert_eq!(node_looks, 2);
     let seen = brain.seen.lock().unwrap();
-    assert!(seen[1].evidence.iter().any(|look| look.result["events"]
-        .as_array()
-        .is_some_and(|events| events.iter().any(|event| event["id"] == fact.id))));
+    assert!(seen[1]
+        .evidence
+        .iter()
+        .any(|look| look.result["events"][0]["id"] == fact.id));
     assert_eq!(seen[2].proposals.len(), 1);
     for context in &seen[2..] {
         assert_eq!(context.focus.as_ref().unwrap().id, 1);
@@ -242,11 +230,9 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
         step(vec![open(true)]),
         step(vec![Action::Look {
             source: LookSource::Log,
-            target: String::new(),
+            target: format!("event:{}", fact.id),
             arguments: serde_json::Value::Null,
-            selector: Selector::Search {
-                query: "old evidence".into(),
-            },
+            selector: Selector::Whole,
         }]),
         step(vec![Action::Look {
             source: LookSource::Node,
@@ -273,7 +259,6 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
         &brain,
         &worker,
         &Ports {
-            log: Some(&FixedRecall(fact.id)),
             node: Some(&Reader),
             ..Default::default()
         },
@@ -324,7 +309,6 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
         &brain,
         &CaptureWorker::default(),
         &Ports {
-            log: Some(&NoopRetriever),
             node: Some(&Reader),
             ..Default::default()
         },
@@ -408,7 +392,6 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         &Script::new(steps),
         &worker,
         &Ports {
-            log: Some(&NoopRetriever),
             node: Some(&Reader),
             ..Default::default()
         },
@@ -438,7 +421,6 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         &brain,
         &worker,
         &Ports {
-            log: Some(&NoopRetriever),
             node: Some(&Reader),
             ..Default::default()
         },

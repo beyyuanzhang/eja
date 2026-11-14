@@ -28,11 +28,9 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         .unwrap();
     let evidence = vec![Observation {
         source: LookSource::Log,
-        target: String::new(),
+        target: format!("event:{}", old.id),
         arguments: serde_json::Value::Null,
-        selector: Selector::Search {
-            query: "old".to_string(),
-        },
+        selector: Selector::Whole,
         result: serde_json::json!({"matches": 1, "events": [old]}),
         error: None,
     }];

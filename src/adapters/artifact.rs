@@ -185,7 +185,6 @@ impl ArtifactReader for FileArtifactReader {
                     "matches": matches,
                 }))
             }
-            Selector::Search { .. } => Err("a node look does not search".into()),
         }
     }
 }

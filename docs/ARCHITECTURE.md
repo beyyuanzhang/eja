@@ -32,7 +32,7 @@ S' = commit(S, confirmed actions)
    assignment, the start messages, every assistant turn, every tool call with
    arguments and result, and the finish entry, all read-only.
    No session survives; retries/continuations are new linked nodes.
-10. Language, prompts, retrieval and node reading live in adapters.
+10. Language, prompts and node reading live in adapters.
 11. A crashed `running` task is reconciled to `waiting` with an interrupted
     record; no automatic duplicate dispatch.
 12. The worker receives its node's contract: the request (objective) and the
@@ -87,14 +87,14 @@ S' = commit(S, confirmed actions)
 | `dispatch {task_id}` | run an open task |
 | `close_task {task_id, accepted, note}` | verdict on a waiting task |
 | `focus {task_id}` | structured task focus (navigation, not reading) |
-| `look {source,target,selector}` | one read: log search or task/event by id, node file whole/range/match, read-only world tool |
+| `look {source,target,selector}` | one read: task/event events by id, node file whole/range/match, read-only world tool |
 
 ## Modules
 
 ```
 core/       src/lib.rs
 aja/        src/aja.rs (temporary model/tool loop)
-adapters/   brain, retriever, model, node reader, tools, mcp, native
+adapters/   brain, model, node reader, tools, mcp, native
 app/        src/main.rs
 ```
 

@@ -23,7 +23,7 @@ S' = commit(S, confirmed actions)
 |---|---|---|
 | core | log, fold, projection, typed actions, ids, UTC, recovery | tokenize, match phrases, render prompts |
 | brain adapter | language, prompt, proposal JSON | write state directly |
-| retriever adapter | semantic query + graph/time expansion → event ids | write state |
+| node reader | bounded read of a node record and its checkpoint | write state |
 | node reader | bounded read of a node's record and the world it left | decide acceptance |
 | worker adapter | assignment (objective + acceptance) → AJA run → its record | write identity |
 | AJA loop | local transcript, model/tool continuation, last message | access host state or configuration directly |
@@ -31,7 +31,7 @@ S' = commit(S, confirmed actions)
 ```
 core/       domain, fold, project, turn, ports
 aja/        disposable model/tool loop
-adapters/   brain, retriever, node reader, worker
+adapters/   brain, node reader, worker
 app/        CLI and wiring
 ```
 
@@ -82,16 +82,15 @@ Every act of reading is one action:
 look { source: log|node|world, target, selector }
 ```
 
-- `log` — EJA's own log. A `search` selector asks the retriever for event ids; a
-  `task:<id>` or `event:<id>` target reads one record by address.
+- `log` — EJA's own log. A `task:<id>` target reads that task's events, an
+  `event:<id>` target reads one event by address.
 - `node` — a frozen node record. `whole` reads a bounded file view, `range`
   reads lines, `match` finds a passage with surrounding lines.
 - `world` — a read-only connector tool or a project file.
 
 Selectors: `{"select":"whole"}`,
 `{"select":"range","from":0,"lines":40}`,
-`{"select":"match","text":"PO-1010","before":2,"after":4}`,
-`{"select":"search","query":"what did we decide?"}`.
+`{"select":"match","text":"PO-1010","before":2,"after":4}`.
 
 A look creates one `Observed` event and one EVIDENCE entry. Evidence belongs to
 the turn that asked for it; the log keeps every look forever. `focus {task_id}`

@@ -1,6 +1,5 @@
 use eja::adapters::{
-    self, FileArtifactReader, HostTools, ModelRetriever, NativeWorker, NoopRetriever, OpenAiBrain,
-    OpenAiModel, Ports, Retriever, ToolGateway,
+    self, FileArtifactReader, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, ToolGateway,
 };
 use eja::{project, tasks, turn, Store, TaskStatus};
 use std::process::ExitCode;
@@ -202,16 +201,11 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-            let retriever: Box<dyn Retriever> = match ModelRetriever::from_env() {
-                Some(retriever) => Box::new(retriever),
-                None => Box::new(NoopRetriever),
-            };
             let artifacts = FileArtifactReader::with_checkpoints(
                 nodes,
                 std::path::Path::new(&dir).join("checkpoints"),
             );
             let ports = Ports {
-                log: Some(&*retriever),
                 node: Some(&artifacts),
                 world: Some(&*tools),
             };

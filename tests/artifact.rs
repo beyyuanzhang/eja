@@ -1,4 +1,4 @@
-use eja::adapters::{ArtifactReader, NoopRetriever, Ports};
+use eja::adapters::{ArtifactReader, Ports};
 use eja::{
     turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext, LookSource,
     Selector, Store, TaskStatus, Worker,
@@ -121,7 +121,6 @@ fn eja_reads_artifact_content_then_decides() {
         &brain,
         &QueueWorker::new(vec![record()]),
         &Ports {
-            log: Some(&NoopRetriever),
             node: Some(&FakeReader),
             ..Default::default()
         },

@@ -4,7 +4,7 @@
 
 use chrono::{TimeZone, Utc};
 use eja::adapters::FileArtifactReader;
-use eja::adapters::{ArtifactReader, NoopRetriever, Ports};
+use eja::adapters::{ArtifactReader, Ports};
 use eja::{
     project, recover, turn_at, Action, ArtifactContent, Assignment, Brain, Decision, EjaContext,
     EventMeta, Kind, Result, Store, Worker,
@@ -159,7 +159,6 @@ fn bench_empty_turns(root: &Path, count: usize) -> (f64, f64) {
             &NoBrain,
             &DoneWorker,
             &Ports {
-                log: Some(&NoopRetriever),
                 node: Some(&NoArtifacts),
                 ..Default::default()
             },
@@ -204,7 +203,6 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
             &brain,
             &DoneWorker,
             &Ports {
-                log: Some(&NoopRetriever),
                 node: Some(&NoArtifacts),
                 ..Default::default()
             },
@@ -241,7 +239,6 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
             &propose,
             &DoneWorker,
             &Ports {
-                log: Some(&NoopRetriever),
                 node: Some(&NoArtifacts),
                 ..Default::default()
             },
@@ -260,7 +257,6 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
             &confirm,
             &DoneWorker,
             &Ports {
-                log: Some(&NoopRetriever),
                 node: Some(&NoArtifacts),
                 ..Default::default()
             },

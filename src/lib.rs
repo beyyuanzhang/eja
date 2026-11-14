@@ -728,9 +728,6 @@ pub enum Selector {
         before: usize,
         after: usize,
     },
-    Search {
-        query: String,
-    },
 }
 
 /// One look, recorded once. This is the only shape an EJA observation has.

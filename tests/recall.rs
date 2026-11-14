@@ -1,7 +1,7 @@
-use eja::adapters::{NoopArtifactReader, Ports, Retriever};
+use eja::adapters::{NoopArtifactReader, Ports};
 use eja::{
-    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Event, Kind,
-    LookSource, ProposalKind, Result, Selector, Store, Worker,
+    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, LookSource,
+    ProposalKind, Selector, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -40,16 +40,6 @@ impl Worker for NoWorker {
             "0 steps, 0 tool calls, 0 artifacts, ended: error\n{}",
             "no worker"
         )
-    }
-}
-
-struct FakeRetriever {
-    ids: Vec<u64>,
-}
-
-impl Retriever for FakeRetriever {
-    fn retrieve(&self, _query: &str, _events: &[Event]) -> Result<Vec<u64>> {
-        Ok(self.ids.clone())
     }
 }
 
@@ -110,11 +100,9 @@ fn recall_is_an_id_result_not_text_matching() {
             "searching",
             vec![Action::Look {
                 source: LookSource::Log,
-                target: String::new(),
+                target: format!("event:{}", commitment.id),
                 arguments: serde_json::Value::Null,
-                selector: Selector::Search {
-                    query: "what did we decide?".to_string(),
-                },
+                selector: Selector::Whole,
             }],
         ),
         decision("found it", vec![]),
@@ -125,9 +113,6 @@ fn recall_is_an_id_result_not_text_matching() {
         &brain,
         &NoWorker,
         &Ports {
-            log: Some(&FakeRetriever {
-                ids: vec![commitment.id],
-            }),
             node: Some(&NoopArtifactReader),
             ..Default::default()
         },
@@ -141,6 +126,7 @@ fn recall_is_an_id_result_not_text_matching() {
         .expect("events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["id"], commitment.id);
+    assert_eq!(events[0]["kind"], "commitment");
     assert_eq!(outcome.context.evidence.len(), 1);
     assert!(store
         .events()

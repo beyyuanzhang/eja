@@ -44,7 +44,6 @@ Return ONLY a JSON object: {\"reply\":\"...\",\"actions\":[...]}. Action shapes:
 {\"op\":\"dispatch\",\"task_id\":1}; \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
 {\"op\":\"focus\",\"task_id\":1}; \
-{\"op\":\"look\",\"source\":\"log\",\"selector\":{\"select\":\"search\",\"query\":\"what did we decide?\"}}; \
 {\"op\":\"look\",\"source\":\"log\",\"target\":\"task:1\"}; \
 {\"op\":\"look\",\"source\":\"node\",\"target\":\"1/report/out.md\"}; \
 {\"op\":\"look\",\"source\":\"node\",\"target\":\"3/context.jsonl\",\"selector\":{\"select\":\"match\",\"text\":\"PO-1010\",\"before\":2,\"after\":4}}; \
@@ -170,7 +169,6 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             Selector::Whole => String::new(),
             Selector::Range { from, lines } => format!(" range {from}+{lines}"),
             Selector::Match { text, .. } => format!(" match \"{text}\""),
-            Selector::Search { query } => format!(" search \"{query}\""),
         };
         let mut item = vec![format!(
             "  [{} {}]{}",
