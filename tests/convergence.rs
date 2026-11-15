@@ -669,6 +669,7 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
     assert_eq!(page["next"], 2);
     assert_eq!(page["partial_events"][0]["id"], first.id);
     assert_eq!(page["events"][0]["text"], "later fact");
+    // The frame cap bounds the serialized page, so measure it as sent.
     assert!(page.to_string().len() <= aja::FRAME_LIMIT);
     let target = format!("log:event:{}", first.id);
     let text = serde_json::to_string(&first).unwrap();

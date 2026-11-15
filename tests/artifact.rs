@@ -396,6 +396,7 @@ fn world_and_frozen_text_reads_share_encoding_bounds_and_cancellation() {
     assert_eq!(aja["text"], world["text"]);
     for value in [aja, world] {
         assert_eq!(value["truncated"], true);
+        // The frame cap bounds the serialized page, so measure it as sent.
         assert!(value.to_string().len() <= eja::aja::FRAME_LIMIT);
         assert!(value["text"].as_str().unwrap().contains('\u{fffd}'));
     }

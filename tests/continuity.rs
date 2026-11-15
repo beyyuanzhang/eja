@@ -4,6 +4,7 @@ use eja::{
     turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, State, Store,
     TaskStatus, Worker,
 };
+use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -377,7 +378,7 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
         .iter()
         .find(|event| event.kind == Kind::TaskAssigned)
         .and_then(|event| event.data.as_ref())
-        .and_then(|data| serde_json::from_value::<Assignment>(data.clone()).ok())
+        .and_then(|data| Assignment::deserialize(data).ok())
         .expect("assignment");
     assert_eq!(assignment.issued_at, at.timestamp());
 }

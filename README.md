@@ -199,6 +199,14 @@ missing predecessor records are explicit errors, never a silent fresh start.
 
 ## Compatibility
 
+0.14 gives each fact one owner: a projection borrows the fold instead of copying
+it, one record module owns the manifest, the path resolver, the reader and the
+shadow repository that freezes a run, a task that executes carries its run facts
+in one type a group does not have, and the three bounded address spaces admit and
+stop through one budget helper. A committed observation this version cannot decode
+is counted in the evidence section rather than dropped. 0.13 logs stay readable:
+a task without a run is a group, and an unreadable observation is a count.
+
 0.13 makes the fold a value: a turn reads the journal once and pushes every event
 it commits into the same `State`, so one derivation serves validation and the
 projection. Evidence is that fold's output instead of a second copy a caller
