@@ -100,8 +100,11 @@ pub(crate) fn text_page(text: &str, from: usize, bytes: usize, cap: usize) -> se
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    if end == offset && offset < text.len() {
-        end += text[offset..].chars().next().unwrap().len_utf8();
+    if end == offset {
+        // A byte that would cut the first character: widen to it instead.
+        if let Some(first) = text[offset..].chars().next() {
+            end += first.len_utf8();
+        }
     }
     serde_json::json!({"offset":offset,"next_offset":end,"total_bytes":text.len(),"truncated":end<text.len(),"text":&text[offset..end]})
 }

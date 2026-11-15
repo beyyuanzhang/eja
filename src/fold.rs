@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 /// The scale a region is shown at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
+pub(crate) enum Level {
     /// The region's whole body.
     Record,
     /// One line with the region's handle.
@@ -26,7 +26,7 @@ pub enum Level {
 }
 
 impl Level {
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Level::Record => "record",
             Level::Index => "index",
@@ -37,7 +37,7 @@ impl Level {
 
 /// One addressable region of a space. The caller keeps the bodies; a region is
 /// only what the renderer needs to choose a scale.
-pub struct Region {
+pub(crate) struct Region {
     /// Where the region lives: an event id, a aja record entry, a path.
     pub handle: String,
     /// One line that stands for the region at index scale.
@@ -47,7 +47,7 @@ pub struct Region {
 }
 
 impl Region {
-    pub fn new(handle: impl Into<String>, line: impl Into<String>, bytes: usize) -> Self {
+    pub(crate) fn new(handle: impl Into<String>, line: impl Into<String>, bytes: usize) -> Self {
         Self {
             handle: handle.into(),
             line: line.into(),
@@ -58,15 +58,13 @@ impl Region {
 
 /// A space rendered within a budget: the head whole, the rest listed, the
 /// oldest folded into one address line.
-pub struct View {
+pub(crate) struct View {
     /// Indices of the regions kept whole, in order.
     pub record: Vec<usize>,
     pub index: Vec<(String, String)>,
     pub map: Vec<(String, String)>,
     /// The scale the last region landed at.
     pub level: Level,
-    /// Size of everything the view shows.
-    pub bytes: usize,
 }
 
 /// How much of one tool result a transcript carries. The record keeps the whole
@@ -310,7 +308,7 @@ const FOOTER: usize = 80;
 /// one line each for the rest, and — when even the lines do not fit — one address
 /// range for the tail. The result is deterministic and fits the budget, except
 /// for a budget smaller than the fold line itself.
-pub fn assemble(regions: &[Region], budget: usize) -> View {
+pub(crate) fn assemble(regions: &[Region], budget: usize) -> View {
     let count = regions.len();
     if count == 0 {
         return build(regions, Vec::new(), Vec::new(), 0, budget);
@@ -402,12 +400,11 @@ fn build(
         index,
         map,
         level,
-        bytes,
     }
 }
 
 /// Render a view as text within its declared budget.
-pub fn text_within(view: &View, bodies: &[String], title: &str, budget: usize) -> String {
+pub(crate) fn text_within(view: &View, bodies: &[String], title: &str, budget: usize) -> String {
     let rendered = text(view, bodies, title);
     if rendered.len() <= budget {
         return rendered;
@@ -421,7 +418,7 @@ pub fn text_within(view: &View, bodies: &[String], title: &str, budget: usize) -
 }
 
 /// Render a view as text: whole bodies first, then lines, then folded addresses.
-pub fn text(view: &View, bodies: &[String], title: &str) -> String {
+pub(crate) fn text(view: &View, bodies: &[String], title: &str) -> String {
     let mut out = String::new();
     if !title.is_empty() {
         out.push_str(title);
@@ -458,7 +455,7 @@ pub fn text(view: &View, bodies: &[String], title: &str) -> String {
 
 /// The folded part of a transcript: one address line per region that did not
 /// stay whole.
-pub fn tail(view: &View, title: &str) -> Option<String> {
+pub(crate) fn tail(view: &View, title: &str) -> Option<String> {
     if view.index.is_empty() && view.map.is_empty() {
         return None;
     }
@@ -517,14 +514,16 @@ mod tests {
     }
 
     #[test]
-    fn a_view_never_exceeds_its_budget() {
+    fn a_rendered_view_never_exceeds_its_budget() {
         for budget in [200usize, 500, 1_000, 4_000] {
             for count in [1usize, 3, 40, 400] {
                 let view = assemble(&regions(count, 64), budget);
+                let bodies: Vec<String> = (0..count).map(|_| "x".repeat(64)).collect();
+                let rendered = text(&view, &bodies, "");
                 assert!(
-                    view.bytes <= budget,
-                    "count={count} budget={budget} bytes={}",
-                    view.bytes
+                    rendered.len() <= budget,
+                    "count={count} budget={budget} rendered={}",
+                    rendered.len()
                 );
             }
         }
