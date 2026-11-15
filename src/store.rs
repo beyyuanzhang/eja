@@ -30,9 +30,8 @@ const LOCK_WAIT_MS: u32 = 100;
 /// lock alive until the child execs; that is not a second writer, so a short wait
 /// tells the two apart instead of failing a turn.
 fn lock_log(path: &Path, file: &fs::File) -> Result<()> {
-    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
     {
-        use std::os::fd::AsRawFd;
         let mut waited = 0;
         loop {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -50,11 +49,6 @@ fn lock_log(path: &Path, file: &fs::File) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(1));
             waited += 1;
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, file);
-        Ok(())
     }
 }
 
