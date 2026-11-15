@@ -340,6 +340,7 @@ fn reconciling_a_run_is_one_recorded_observation() {
     )
     .expect("reconcile");
     let account = out
+        .context
         .evidence
         .iter()
         .find(|view| view.target == "world")
@@ -374,11 +375,12 @@ fn reconciling_a_run_is_one_recorded_observation() {
     .expect("refusal");
     assert!(
         refused
+            .context
             .refused
             .iter()
             .any(|note| note.contains("reconcile refused")),
         "{:?}",
-        refused.refused
+        refused.context.refused
     );
 }
 #[test]

@@ -10,10 +10,7 @@ struct CountingBrain {
 
 impl Brain for CountingBrain {
     fn decide(&self, context: &EjaContext, _: &eja::Control) -> Decision {
-        self.focus
-            .lock()
-            .expect("focus")
-            .push(context.focus.as_ref().map(|task| task.id));
+        self.focus.lock().expect("focus").push(context.focus);
         self.queue
             .lock()
             .expect("brain")
@@ -80,7 +77,7 @@ fn single_waiting_task_is_focused_without_the_extra_initial_call() {
         eja::now_utc(),
     )
     .expect("open");
-    assert_eq!(first.tasks[0].status, TaskStatus::Waiting);
+    assert_eq!(first.context.tasks[0].status, TaskStatus::Waiting);
 
     let focus = Arc::new(Mutex::new(Vec::new()));
     let close = CountingBrain {
@@ -106,7 +103,7 @@ fn single_waiting_task_is_focused_without_the_extra_initial_call() {
     .expect("close");
     assert_eq!(second.decisions, 1);
     assert_eq!(*focus.lock().expect("focus"), vec![Some(1)]);
-    assert_eq!(second.tasks[0].status, TaskStatus::Done);
+    assert_eq!(second.context.tasks[0].status, TaskStatus::Done);
 }
 
 #[test]

@@ -233,15 +233,6 @@ pub struct Task {
     pub witness_result: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskSummary {
-    pub kind: TaskKind,
-    pub id: TaskId,
-    pub title: String,
-    pub status: TaskStatus,
-    pub created_at: i64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct EjaContext {
     pub now: i64,
@@ -250,9 +241,10 @@ pub struct EjaContext {
     pub goal: Option<Event>,
     pub identity: Vec<Event>,
     pub commitments: Vec<Event>,
-    pub tasks: Vec<TaskSummary>,
+    pub tasks: Vec<Task>,
     pub relations: Vec<Edge>,
-    pub focus: Option<Task>,
+    /// The task the projection is about; it is one of `tasks`.
+    pub focus: Option<TaskId>,
     pub evidence: Vec<Observation>,
     pub proposals: Vec<ProposalView>,
     /// Actions this turn that the host could not carry out.
@@ -474,12 +466,10 @@ pub struct TurnOptions {
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
     pub reply: String,
+    /// Everything the turn produced, folded once: tasks, evidence and refusals
+    /// are read from here, not kept in a second copy.
     pub context: EjaContext,
-    pub tasks: Vec<Task>,
     pub dispatched: Vec<TaskId>,
-    /// Actions EJA asked for that the state did not allow; nothing was dropped silently.
-    pub refused: Vec<String>,
-    pub evidence: Vec<Observation>,
     pub decisions: usize,
     pub worker_ms: u128,
     pub end: TurnEnd,

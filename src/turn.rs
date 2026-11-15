@@ -355,6 +355,7 @@ fn record_dispatch(
 fn run_dispatches(
     ctx: &ActionCtx<'_>,
     out: &mut TurnOutcome,
+    log: &mut TurnLog,
     pending: Vec<Assignment>,
 ) -> Result<()> {
     let slots = ctx.options.limits.slots.max(1);
@@ -366,7 +367,7 @@ fn run_dispatches(
             let digest = run_one(ctx.worker, &assignment, ctx.control);
             out.worker_ms += started.elapsed().as_millis();
             record_dispatch(ctx, out, assignment, digest)?;
-            observe_evidence(ctx, out, task_id)?;
+            observe_evidence(ctx, log, task_id)?;
         }
         return Ok(());
     }
@@ -406,7 +407,7 @@ fn run_dispatches(
         ctx.control.check()?;
         let task_id = assignment.task_id;
         record_dispatch(ctx, out, assignment, digest)?;
-        observe_evidence(ctx, out, task_id)?;
+        observe_evidence(ctx, log, task_id)?;
     }
     Ok(())
 }
@@ -420,7 +421,7 @@ fn run_one(worker: &dyn Worker, assignment: &Assignment, control: &Control) -> S
 
 /// The host's own observation of what a run achieved. Failure is recorded too: a
 /// witness that could not answer leaves the judgment undecidable, and says why.
-fn observe_evidence(ctx: &ActionCtx<'_>, out: &mut TurnOutcome, task_id: TaskId) -> Result<()> {
+fn observe_evidence(ctx: &ActionCtx<'_>, log: &mut TurnLog, task_id: TaskId) -> Result<()> {
     let events = ctx.store.events()?;
     let Some(task) = tasks(&events).into_iter().find(|task| task.id == task_id) else {
         return Ok(());
@@ -454,21 +455,21 @@ fn observe_evidence(ctx: &ActionCtx<'_>, out: &mut TurnOutcome, task_id: TaskId)
         ctx.turn,
         EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
     )?;
-    out.evidence.push(observation);
+    log.evidence.push(observation);
     Ok(())
 }
 
 /// Reconciling a world is the host's act and its account is evidence. Conflicts
 /// are recorded, never merged away.
-fn reconcile(ctx: &ActionCtx<'_>, out: &mut TurnOutcome, task_id: TaskId) -> Result<bool> {
+fn reconcile(ctx: &ActionCtx<'_>, log: &mut TurnLog, task_id: TaskId) -> Result<bool> {
     let events = ctx.store.events()?;
     let Some(task) = tasks(&events).into_iter().find(|task| task.id == task_id) else {
-        out.refused
+        log.refused
             .push(format!("reconcile refused: no task {task_id}"));
         return Ok(false);
     };
     if task.digest.is_none() {
-        out.refused.push(format!(
+        log.refused.push(format!(
             "reconcile refused: task {task_id} has no run to reconcile"
         ));
         return Ok(false);
@@ -478,7 +479,7 @@ fn reconcile(ctx: &ActionCtx<'_>, out: &mut TurnOutcome, task_id: TaskId) -> Res
         Err(error) => (serde_json::Value::Null, Some(error.to_string())),
     };
     if let Some(error) = &error {
-        out.refused.push(format!("reconcile refused: {error}"));
+        log.refused.push(format!("reconcile refused: {error}"));
         return Ok(false);
     }
     let observation = Observation {
@@ -495,7 +496,7 @@ fn reconcile(ctx: &ActionCtx<'_>, out: &mut TurnOutcome, task_id: TaskId) -> Res
         ctx.turn,
         EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
     )?;
-    out.evidence.push(observation);
+    log.evidence.push(observation);
     Ok(true)
 }
 
@@ -557,6 +558,15 @@ fn close_task(
     Ok(None)
 }
 
+/// What one turn has observed and refused so far. The same facts are in the
+/// journal, so the turn does not also return a second copy of them: the folded
+/// context is the single read.
+#[derive(Default)]
+struct TurnLog {
+    evidence: Vec<Observation>,
+    refused: Vec<String>,
+}
+
 struct ActionCtx<'a> {
     store: &'a Store,
     input: &'a str,
@@ -572,6 +582,7 @@ fn apply_actions(
     actions: &[Action],
     ctx: &ActionCtx<'_>,
     out: &mut TurnOutcome,
+    log: &mut TurnLog,
     focus: &mut Option<TaskId>,
 ) -> Result<bool> {
     let mut observed = false;
@@ -588,21 +599,21 @@ fn apply_actions(
                 text,
             } => {
                 if let Some(note) = propose(ctx.store, *kind, *target_id, text, ctx.turn, ctx.at)? {
-                    out.refused.push(note);
+                    log.refused.push(note);
                 } else {
                     observed = true;
                 }
             }
             Action::Confirm { proposal_id } => {
                 if let Some(note) = confirm_proposal(ctx.store, *proposal_id, ctx.turn, ctx.at)? {
-                    out.refused.push(note);
+                    log.refused.push(note);
                 }
             }
             Action::Reject { proposal_id, note } => {
                 if let Some(note) =
                     reject_proposal(ctx.store, *proposal_id, note, ctx.turn, ctx.at)?
                 {
-                    out.refused.push(note);
+                    log.refused.push(note);
                 }
             }
             Action::OpenGroup { title, acceptance } => {
@@ -645,7 +656,7 @@ fn apply_actions(
                         Ok(assignment) => {
                             pending.push(assignment);
                         }
-                        Err(note) => out.refused.push(note),
+                        Err(note) => log.refused.push(note),
                     }
                 }
             }
@@ -655,11 +666,11 @@ fn apply_actions(
                     pending.push(assignment);
                     observed = true;
                 }
-                Err(note) => out.refused.push(note),
+                Err(note) => log.refused.push(note),
             },
             Action::LinkTasks { from, to, kind } => {
                 if let Some(note) = link_tasks(ctx.store, *from, *to, *kind, ctx.turn, ctx.at)? {
-                    out.refused.push(note);
+                    log.refused.push(note);
                 }
             }
             Action::CloseTask {
@@ -670,11 +681,11 @@ fn apply_actions(
                 if let Some(reason) =
                     close_task(ctx.store, *task_id, *accepted, note, ctx.turn, ctx.at)?
                 {
-                    out.refused.push(reason);
+                    log.refused.push(reason);
                 }
             }
             Action::Reconcile { task_id } => {
-                if reconcile(ctx, out, *task_id)? {
+                if reconcile(ctx, log, *task_id)? {
                     observed = true;
                 }
             }
@@ -683,7 +694,7 @@ fn apply_actions(
                     .iter()
                     .any(|task| task.id == *task_id)
                 {
-                    out.refused
+                    log.refused
                         .push(format!("focus refused: no task {task_id}"));
                     continue;
                 }
@@ -730,17 +741,17 @@ fn apply_actions(
                     EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
                 )?;
                 // The view holds one entry per distinct look, not every repeat.
-                out.evidence.retain(|other| {
+                log.evidence.retain(|other| {
                     !(other.target == observation.target
                         && other.arguments == observation.arguments
                         && other.selector == observation.selector)
                 });
-                out.evidence.push(observation);
+                log.evidence.push(observation);
                 observed = true;
             }
         }
     }
-    run_dispatches(ctx, out, pending)?;
+    run_dispatches(ctx, out, log, pending)?;
     Ok(observed)
 }
 
@@ -845,10 +856,7 @@ pub fn turn_at_with_options(
     let mut out = TurnOutcome {
         reply: String::new(),
         context: project(store, input, focus, now)?,
-        tasks: Vec::new(),
         dispatched: Vec::new(),
-        refused: Vec::new(),
-        evidence: Vec::new(),
         decisions: 0,
         worker_ms: 0,
         end: TurnEnd::Complete,
@@ -864,6 +872,7 @@ pub fn turn_at_with_options(
         control: &control,
         options,
     };
+    let mut log = TurnLog::default();
     let mut seen = HashSet::new();
     seen.insert(fingerprint(&out.context));
     let mut actions_used = 0usize;
@@ -909,16 +918,16 @@ pub fn turn_at_with_options(
             break;
         }
         actions_used += decision.actions.len();
-        let notes = out.refused.len();
-        out.refused.extend(decision.refused.iter().cloned());
-        let actions_result = apply_actions(&decision.actions, &ctx, &mut out, &mut focus);
+        let notes = log.refused.len();
+        log.refused.extend(decision.refused.iter().cloned());
+        let actions_result = apply_actions(&decision.actions, &ctx, &mut out, &mut log, &mut focus);
         // A refusal is information, not a no-op: it tells EJA what the state did
         // not allow. A new note re-opens the projection so EJA can decide again;
         // a repeated note changes nothing and the fixpoint ends the turn.
         let mut told = false;
-        for index in notes..out.refused.len() {
-            let note = &out.refused[index];
-            if out.refused[..index].contains(note) {
+        for index in notes..log.refused.len() {
+            let note = &log.refused[index];
+            if log.refused[..index].contains(note) {
                 continue;
             }
             store.append(Kind::Refused, "eja", note, ctx.turn, EventMeta::new(at))?;
@@ -935,7 +944,7 @@ pub fn turn_at_with_options(
             }
         };
         let observed = acted || told;
-        out.context = project_with_evidence(store, input, focus, now, &out.evidence)?;
+        out.context = project_with_evidence(store, input, focus, now, &log.evidence)?;
         if !observed {
             out.reply = decision.reply.trim().to_string();
             break;
@@ -959,7 +968,6 @@ pub fn turn_at_with_options(
     }
     recover(store, turn_no, at)?;
     store.append(Kind::Eja, "eja", &out.reply, turn_no, meta)?;
-    out.context = project_with_evidence(store, input, focus, now, &out.evidence)?;
-    out.tasks = tasks(&store.events()?);
+    out.context = project_with_evidence(store, input, focus, now, &log.evidence)?;
     Ok(out)
 }

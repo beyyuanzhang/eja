@@ -186,7 +186,11 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
     let mut task_lines = Vec::new();
-    if let Some(task) = &context.focus {
+    // The focus is one of the tasks, not a second copy of it.
+    let focused = context
+        .focus
+        .and_then(|id| context.tasks.iter().find(|task| task.id == id));
+    if let Some(task) = focused {
         task_lines.push(format!(
             "  #{} [{:?}/{}] {}",
             task.id,
@@ -352,11 +356,18 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             })
             .collect(),
     ));
+    // The index leads with the tasks that still need judgment, then the rest.
+    let mut index: Vec<&crate::Task> = context.tasks.iter().collect();
+    index.sort_by(|a, b| {
+        b.status
+            .is_active()
+            .cmp(&a.status.is_active())
+            .then_with(|| b.id.cmp(&a.id))
+    });
     sections.push(section(
         "TASK INDEX",
         true,
-        context
-            .tasks
+        index
             .iter()
             .map(|task| {
                 vec![format!(

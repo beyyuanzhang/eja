@@ -361,7 +361,7 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
     .expect("turn");
 
     assert_eq!(outcome.context.now, at.timestamp());
-    let task = &outcome.tasks[0];
+    let task = &outcome.context.tasks[0];
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.created_at, at.timestamp());
     assert_eq!(task.digest_at, Some(at.timestamp()));

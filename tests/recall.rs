@@ -120,8 +120,8 @@ fn recall_is_an_id_result_not_text_matching() {
     )
     .expect("recall");
 
-    assert_eq!(outcome.evidence.len(), 1);
-    let events = outcome.evidence[0].result["events"]
+    assert_eq!(outcome.context.evidence.len(), 1);
+    let events = outcome.context.evidence[0].result["events"]
         .as_array()
         .expect("events");
     assert_eq!(events.len(), 1);

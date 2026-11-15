@@ -201,23 +201,7 @@ pub fn project_with_evidence(
 ) -> Result<EjaContext> {
     let events = store.events()?;
     let all_tasks = tasks(&events);
-    let focus = focus_task.and_then(|id| all_tasks.iter().find(|task| task.id == id).cloned());
-    let mut summaries: Vec<TaskSummary> = all_tasks
-        .iter()
-        .map(|task| TaskSummary {
-            kind: task.kind,
-            id: task.id,
-            title: task.title.clone(),
-            status: task.status,
-            created_at: task.created_at,
-        })
-        .collect();
-    summaries.sort_by(|a, b| {
-        b.status
-            .is_active()
-            .cmp(&a.status.is_active())
-            .then_with(|| b.id.cmp(&a.id))
-    });
+    let focus = focus_task.filter(|id| all_tasks.iter().any(|task| task.id == *id));
     let history_before = events.last().map_or(0, |last| {
         last.turn.saturating_add(u64::from(last.kind == Kind::Eja))
     });
@@ -235,8 +219,8 @@ pub fn project_with_evidence(
         goal: goal_event(&events).cloned(),
         identity: active_identity(&events),
         commitments: open_commitments(&events),
-        tasks: summaries,
         relations: relations_with_tasks(&events, &all_tasks),
+        tasks: all_tasks,
         focus,
         evidence: evidence.to_vec(),
         proposals: pending_proposals(&events, turn),

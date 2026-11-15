@@ -124,14 +124,20 @@ fn eja_reads_artifact_content_then_decides() {
     )
     .expect("turn");
 
-    assert_eq!(outcome.evidence.len(), 1);
-    assert_eq!(outcome.evidence[0].result["path"], "1/out.md");
-    assert!(outcome.evidence[0].result["text"]
+    assert_eq!(outcome.context.evidence.len(), 1);
+    assert_eq!(outcome.context.evidence[0].result["path"], "1/out.md");
+    assert!(outcome.context.evidence[0].result["text"]
         .as_str()
         .expect("text")
         .contains("upload"));
-    assert_eq!(outcome.tasks[0].status, TaskStatus::Done);
-    assert!(outcome.tasks[0].close.as_ref().expect("close").accepted);
+    assert_eq!(outcome.context.tasks[0].status, TaskStatus::Done);
+    assert!(
+        outcome.context.tasks[0]
+            .close
+            .as_ref()
+            .expect("close")
+            .accepted
+    );
 }
 
 #[test]

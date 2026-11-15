@@ -80,7 +80,7 @@ fn worker_receives_the_task_contract_and_original_input() {
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].objective, "EJA expanded request");
     assert_eq!(assignments[0].input, "raw user task");
-    let task = &outcome.tasks[0];
+    let task = &outcome.context.tasks[0];
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.origin, "raw user task");
     assert_eq!(task.request, "EJA expanded request");

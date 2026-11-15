@@ -73,8 +73,8 @@ fn a_world_look_does_not_depend_on_waiting_tasks() {
         },
     )
     .expect("turn");
-    assert_eq!(out.evidence.len(), 1);
-    assert!(out.refused.is_empty());
+    assert_eq!(out.context.evidence.len(), 1);
+    assert!(out.context.refused.is_empty());
     assert!(!store
         .events()
         .unwrap()

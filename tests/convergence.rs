@@ -205,6 +205,7 @@ fn an_approval_cannot_confirm_a_proposal_in_its_creation_turn() {
     .unwrap();
     assert!(out.context.commitments.is_empty());
     assert!(out
+        .context
         .refused
         .iter()
         .any(|note| note.contains("created this turn")));
@@ -228,13 +229,17 @@ fn groups_close_from_their_members_without_a_fake_execution() {
         &worker,
     );
     let premature = run(&store, vec![close(1, true)], &worker);
-    assert_eq!(premature.tasks[0].status, TaskStatus::Open);
+    assert_eq!(premature.context.tasks[0].status, TaskStatus::Open);
     let out = run(&store, vec![close(2, true), close(1, true)], &worker);
-    assert!(out.refused.is_empty());
-    assert!(out.tasks.iter().all(|task| task.status == TaskStatus::Done));
+    assert!(out.context.refused.is_empty());
+    assert!(out
+        .context
+        .tasks
+        .iter()
+        .all(|task| task.status == TaskStatus::Done));
     assert_eq!(worker.0.lock().unwrap().len(), 1);
     let refused = run(&store, vec![Action::Dispatch { task_id: 1 }], &worker);
-    assert!(!refused.refused.is_empty());
+    assert!(!refused.context.refused.is_empty());
 }
 
 #[test]
@@ -261,7 +266,17 @@ fn graph_constraints_include_cross_kind_cycles_and_real_dependency_readiness() {
         &worker,
     );
     assert_eq!(out.context.relations.len(), 2);
-    assert_eq!(out.refused.len(), 4);
+    // Four actions are refused; two of them are the same cause (a cycle through
+    // the group), and a refusal is told once per distinct note.
+    assert_eq!(out.context.refused.len(), 3);
+    assert_eq!(
+        out.context
+            .refused
+            .iter()
+            .filter(|note| note.contains("dependency cycle"))
+            .count(),
+        1
+    );
     let blocked = run(&store, vec![Action::Dispatch { task_id: 3 }], &worker);
     assert!(blocked.dispatched.is_empty());
     run(&store, vec![Action::Dispatch { task_id: 2 }], &worker);
@@ -299,7 +314,7 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
         1
     );
     assert_eq!(worker.0.lock().unwrap().last().unwrap().resume, Some(1));
-    assert_eq!(out.refused.len(), 2);
+    assert_eq!(out.context.refused.len(), 2);
 }
 
 struct World;
@@ -327,8 +342,8 @@ fn unrelated_tasks_do_not_change_world_capabilities() {
     let first = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
     run(&store, vec![aja("unrelated", true)], &worker);
     let second = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
-    assert_eq!(first.evidence, second.evidence);
-    assert!(first.refused.is_empty() && second.refused.is_empty());
+    assert_eq!(first.context.evidence, second.context.evidence);
+    assert!(first.context.refused.is_empty() && second.context.refused.is_empty());
 }
 
 struct Growing;
@@ -366,6 +381,7 @@ fn endlessly_novel_states_stop_at_the_turn_budget_with_all_records_retained() {
     assert_eq!(out.decisions, 3);
     assert_eq!(out.dispatched.len(), 3);
     assert!(out
+        .context
         .tasks
         .iter()
         .all(|task| task.status == TaskStatus::Waiting));
@@ -523,9 +539,9 @@ fn group_verdict_is_not_a_second_quality_authority_over_eja() {
         &worker,
     );
     let out = run(&store, vec![close(1, true)], &worker);
-    assert_eq!(out.tasks[0].status, TaskStatus::Done);
-    assert_eq!(out.tasks[1].status, TaskStatus::Failed);
-    assert!(out.refused.is_empty());
+    assert_eq!(out.context.tasks[0].status, TaskStatus::Done);
+    assert_eq!(out.context.tasks[1].status, TaskStatus::Failed);
+    assert!(out.context.refused.is_empty());
     let empty = run(
         &store,
         vec![
@@ -537,7 +553,7 @@ fn group_verdict_is_not_a_second_quality_authority_over_eja() {
         ],
         &worker,
     );
-    assert_eq!(empty.tasks[2].status, TaskStatus::Done);
+    assert_eq!(empty.context.tasks[2].status, TaskStatus::Done);
     assert!(worker.0.lock().unwrap().is_empty());
 }
 
@@ -598,9 +614,9 @@ impl Brain for ReceiptBrain {
         let actions = match *step {
             0 => vec![aja("allocated", false)],
             1 => vec![Action::Dispatch {
-                task_id: context.focus.as_ref().expect("creation returns focus").id,
+                task_id: context.focus.expect("creation returns focus"),
             }],
-            2 => vec![close(context.focus.as_ref().unwrap().id, true)],
+            2 => vec![close(context.focus.unwrap(), true)],
             _ => panic!("unexpected decision"),
         };
         *step += 1;
@@ -624,8 +640,8 @@ fn allocation_returns_an_id_before_the_model_has_to_address_the_new_entity() {
     )
     .unwrap();
     assert_eq!(out.decisions, 3);
-    assert_eq!(out.tasks[0].status, TaskStatus::Done);
-    assert!(out.refused.is_empty());
+    assert_eq!(out.context.tasks[0].status, TaskStatus::Done);
+    assert!(out.context.refused.is_empty());
 }
 
 #[test]
@@ -717,7 +733,7 @@ fn cancellation_keeps_prior_refusals_and_reconciles_reserved_dispatches() {
         .unwrap()
         .iter()
         .any(|e| e.kind == Kind::Refused && e.text.contains("999")));
-    assert_eq!(out.tasks[0].status, TaskStatus::Waiting);
+    assert_eq!(out.context.tasks[0].status, TaskStatus::Waiting);
     assert!(out.dispatched.is_empty());
 }
 
@@ -758,15 +774,16 @@ fn cancellation_between_queued_ajas_preserves_completed_evidence_and_skips_the_n
     assert_eq!(*worker.seen.lock().unwrap(), vec![1]);
     assert_eq!(out.dispatched, vec![1]);
     assert_eq!(
-        out.tasks[0].digest.as_deref(),
+        out.context.tasks[0].digest.as_deref(),
         Some("first execution completed")
     );
-    assert!(out.tasks[1]
+    assert!(out.context.tasks[1]
         .digest
         .as_deref()
         .unwrap()
         .contains("interrupted"));
     assert!(out
+        .context
         .tasks
         .iter()
         .all(|task| task.status == TaskStatus::Waiting));
@@ -817,11 +834,12 @@ fn a_rejection_is_recorded_and_the_proposal_leaves_the_view() {
     );
     assert!(
         again
+            .context
             .refused
             .iter()
             .any(|note| note.contains("not pending")),
         "{:?}",
-        again.refused
+        again.context.refused
     );
 }
 

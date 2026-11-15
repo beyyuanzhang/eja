@@ -163,8 +163,9 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     assert_eq!(out.decisions, 5);
     assert_eq!(out.reply, "final answer");
     assert!(out.end != eja::TurnEnd::Stalled);
-    assert_eq!(out.context.focus.as_ref().unwrap().id, 1);
+    assert_eq!(out.context.focus.unwrap(), 1);
     let log_look = out
+        .context
         .evidence
         .iter()
         .find(|look| look.target.starts_with("log:"))
@@ -172,6 +173,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     assert_eq!(log_look.result["events"][0]["id"], fact.id);
     assert_eq!(log_look.result["events"][0]["kind"], "user");
     let aja_looks = out
+        .context
         .evidence
         .iter()
         .filter(|look| look.target.starts_with("record:"))
@@ -184,7 +186,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
         .any(|look| look.result["events"][0]["id"] == fact.id));
     assert_eq!(seen[2].proposals.len(), 1);
     for context in &seen[2..] {
-        assert_eq!(context.focus.as_ref().unwrap().id, 1);
+        assert_eq!(context.focus.unwrap(), 1);
         assert!(context
             .evidence
             .iter()
@@ -258,10 +260,19 @@ fn worker_reports_use_the_same_loop_and_allow_sequential_assignments() {
     assert_eq!(out.decisions, 6);
     assert_eq!(out.dispatched, vec![1, 2]);
     assert_eq!(out.dispatched.len(), 2);
-    assert!(out.tasks.iter().all(|task| task.status == TaskStatus::Done));
+    assert!(out
+        .context
+        .tasks
+        .iter()
+        .all(|task| task.status == TaskStatus::Done));
     let seen = brain.seen.lock().unwrap();
-    assert_eq!(seen[1].focus.as_ref().unwrap().status, TaskStatus::Waiting);
-    assert_eq!(seen[5].focus.as_ref().unwrap().id, 2);
+    let focused = seen[1]
+        .tasks
+        .iter()
+        .find(|task| Some(task.id) == seen[1].focus)
+        .expect("focus is one of the tasks");
+    assert_eq!(focused.status, TaskStatus::Waiting);
+    assert_eq!(seen[5].focus.unwrap(), 2);
     assert!(seen[5]
         .evidence
         .iter()
@@ -305,11 +316,11 @@ fn observations_do_not_allow_confirmation_in_the_proposals_own_turn() {
     .unwrap();
     // The refused confirmation is told once, so EJA gets one more decision.
     assert_eq!(out.decisions, 3);
-    assert_eq!(out.refused.len(), 1, "{:?}", out.refused);
+    assert_eq!(out.context.refused.len(), 1, "{:?}", out.context.refused);
     assert!(
-        out.refused[0].contains("created this turn"),
+        out.context.refused[0].contains("created this turn"),
         "{:?}",
-        out.refused
+        out.context.refused
     );
     assert_eq!(out.context.proposals.len(), 1);
     assert!(out.context.commitments.is_empty());
@@ -340,7 +351,7 @@ fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
     // The same read twice: the second look carries no new information.
     assert_eq!(out.decisions, 2);
     assert!(out.reply.starts_with("[turn Stalled]"));
-    assert_eq!(out.evidence.len(), 1);
+    assert_eq!(out.context.evidence.len(), 1);
     assert!(out.context.evidence.iter().all(|look| look.error.is_some()));
     let events = store.events().unwrap();
     assert_eq!(
@@ -388,7 +399,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     .unwrap();
     assert!(out.end == eja::TurnEnd::Stalled);
     assert!(out.reply.starts_with("[turn Stalled]"));
-    assert_eq!(out.tasks[0].status, TaskStatus::Waiting);
+    assert_eq!(out.context.tasks[0].status, TaskStatus::Waiting);
     assert_eq!(out.dispatched.len(), 1);
     let restarted = Store::new(store.log_path.parent().unwrap()).unwrap();
     let brain = Script::new(vec![
@@ -415,8 +426,8 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     )
     .unwrap();
     assert!(resumed.end != eja::TurnEnd::Stalled);
-    assert_eq!(resumed.tasks[0].status, TaskStatus::Done);
-    assert_eq!(brain.seen.lock().unwrap()[0].focus.as_ref().unwrap().id, 1);
+    assert_eq!(resumed.context.tasks[0].status, TaskStatus::Done);
+    assert_eq!(brain.seen.lock().unwrap()[0].focus.unwrap(), 1);
     assert_eq!(worker.0.lock().unwrap().len(), 1);
     assert!(resumed.dispatched.is_empty());
 }

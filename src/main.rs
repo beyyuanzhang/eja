@@ -189,7 +189,7 @@ fn run() -> Result<()> {
                 return Err("interrupted; the aja was stopped and its run is recorded".into());
             }
             println!("eja: {}", outcome.reply);
-            for note in &outcome.refused {
+            for note in &outcome.context.refused {
                 println!("[refused: {note}]");
             }
             if outcome.end != TurnEnd::Complete {
@@ -201,14 +201,13 @@ fn run() -> Result<()> {
             }
             println!(
                 "[{} | focus #{} | dispatched {} | looks {} | decisions {} | worker {}ms | log {}]",
-                counts(&outcome.tasks),
+                counts(&outcome.context.tasks),
                 outcome
                     .context
                     .focus
-                    .as_ref()
-                    .map_or("-".into(), |task| task.id.to_string()),
+                    .map_or("-".into(), |id| id.to_string()),
                 outcome.dispatched.len(),
-                outcome.evidence.len(),
+                outcome.context.evidence.len(),
                 outcome.decisions,
                 outcome.worker_ms,
                 store.events()?.len()
@@ -220,10 +219,7 @@ fn run() -> Result<()> {
             println!(
                 "[{} tasks | focus #{}]",
                 context.tasks.len(),
-                context
-                    .focus
-                    .as_ref()
-                    .map_or("-".into(), |task| task.id.to_string())
+                context.focus.map_or("-".into(), |id| id.to_string())
             );
         }
         Command::Log => {
