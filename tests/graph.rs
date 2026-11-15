@@ -81,4 +81,10 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
             kind: RelationKind::PartOf,
         },]
     );
+    // The edge is one event, scoped to its source task, not two task mutations.
+    assert!(store
+        .events()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == eja::Kind::TaskRelation && event.scope == "task:2"));
 }

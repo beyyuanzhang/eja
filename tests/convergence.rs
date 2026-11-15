@@ -771,3 +771,81 @@ fn cancellation_between_queued_ajas_preserves_completed_evidence_and_skips_the_n
         .iter()
         .all(|task| task.status == TaskStatus::Waiting));
 }
+#[test]
+fn a_rejection_is_recorded_and_the_proposal_leaves_the_view() {
+    let f = Fixture::new();
+    let store = f.store();
+    let worker = WorkerLog::default();
+    let proposed = run(
+        &store,
+        vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "later".into(),
+        }],
+        &worker,
+    );
+    let id = proposed.context.proposals[0].id;
+    let rejected = run(
+        &store,
+        vec![Action::Reject {
+            proposal_id: id,
+            note: "not now".into(),
+        }],
+        &worker,
+    );
+    assert!(
+        rejected.context.proposals.is_empty(),
+        "a rejected proposal is no longer pending"
+    );
+    let events = store.events().unwrap();
+    let rejection = events
+        .iter()
+        .find(|event| event.kind == Kind::ProposalRejected)
+        .expect("a rejection is a fact");
+    let data = rejection.data.as_ref().expect("data");
+    assert_eq!(data["proposal_id"], json!(id));
+    assert_eq!(data["note"], json!("not now"));
+    // Rejecting twice is refused: the fact is already resolved.
+    let again = run(
+        &store,
+        vec![Action::Reject {
+            proposal_id: id,
+            note: "again".into(),
+        }],
+        &worker,
+    );
+    assert!(
+        again
+            .refused
+            .iter()
+            .any(|note| note.contains("not pending")),
+        "{:?}",
+        again.refused
+    );
+}
+
+#[test]
+fn a_recorded_relationship_is_identity_content() {
+    let f = Fixture::new();
+    let store = f.store();
+    let worker = WorkerLog::default();
+    let text = "the bench answers to the scheduler";
+    run(
+        &store,
+        vec![Action::RecordRelationship { text: text.into() }],
+        &worker,
+    );
+    let events = store.events().unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == Kind::Relationship && event.text == text));
+    let context = project(&store, "", None, now_utc()).unwrap();
+    assert!(
+        context.identity.iter().any(|event| event.text == text),
+        "a relationship is identity content, not a task edge"
+    );
+    let view = render_context_within(&context, usize::MAX);
+    assert!(view.contains("ACTIVE IDENTITY"), "{view}");
+    assert!(view.contains(text), "{view}");
+}
