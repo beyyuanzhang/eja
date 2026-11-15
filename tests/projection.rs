@@ -1,11 +1,13 @@
+mod support;
+
 use eja::adapters::{render_context, render_context_within};
-use eja::{EventMeta, Kind, Observation, ObservationKind, Selector, State, Store};
+use eja::{EventMeta, Kind, Observation, ObservationKind, Selector, State};
+use support::State as Fixture;
 
 #[test]
 fn projection_keeps_every_recorded_commitment_and_says_so() {
-    let dir = std::env::temp_dir().join(format!("eja-projection-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
+    let fixture = Fixture::new("projection");
+    let store = fixture.store();
     for index in 0..210 {
         store
             .append(
@@ -43,9 +45,8 @@ fn projection_keeps_every_recorded_commitment_and_says_so() {
 
 #[test]
 fn evidence_is_folded_from_the_journal_never_from_the_caller() {
-    let dir = std::env::temp_dir().join(format!("eja-budget-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
+    let fixture = Fixture::new("budget");
+    let store = fixture.store();
     // The only way an observation exists is as a committed fact. A projection
     // reads it back from the journal like every other fact.
     let result = serde_json::json!({"text": "a".repeat(5000)});

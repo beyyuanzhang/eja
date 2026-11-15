@@ -1,61 +1,15 @@
+//! Aja files, frozen records and tool reads: what a run may see, and how the
+//! view budget bounds it.
+
 mod support;
+
 use eja::adapters::{Ports, RecordReader};
-use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, Selector, Store, TaskStatus, Worker,
-};
-use std::collections::VecDeque;
+use eja::{turn_at, Action, Selector, TaskStatus};
 use std::fmt::Write as _;
-use std::sync::Mutex;
-use support::control;
+use support::{aja, control, decision, Done, Script, State};
 
-struct QueueBrain {
-    queue: Mutex<VecDeque<Decision>>,
-}
-
-impl QueueBrain {
-    fn new(decisions: Vec<Decision>) -> Self {
-        Self {
-            queue: Mutex::new(decisions.into()),
-        }
-    }
-}
-
-impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct QueueWorker {
-    queue: Mutex<VecDeque<String>>,
-}
-
-impl QueueWorker {
-    fn new(reports: Vec<String>) -> Self {
-        Self {
-            queue: Mutex::new(reports.into()),
-        }
-    }
-}
-
-impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
-        self.queue
-            .lock()
-            .expect("worker")
-            .pop_front()
-            .unwrap_or_else(|| format!("0 steps, 0 tool calls, ended: error\n{}", "no record"))
-    }
-}
-
+/// The host's answer for a record read: fixed text, so the assertion is about
+/// EJA's handling of the observation and never about a file on disk.
 struct FakeReader;
 
 impl RecordReader for FakeReader {
@@ -64,59 +18,28 @@ impl RecordReader for FakeReader {
     }
 }
 
-fn decision(reply: &str, actions: Vec<Action>) -> Decision {
-    Decision {
-        reply: reply.to_string(),
-        actions,
-        refused: Vec::new(),
-    }
-}
-
-fn record() -> String {
-    format!(
-        "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
-        "checklist written"
-    )
-}
-
 #[test]
 fn eja_reads_artifact_content_then_decides() {
-    let dir = std::env::temp_dir().join(format!("eja-artifact-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
-    let brain = QueueBrain::new(vec![
-        decision(
-            "start",
-            vec![Action::OpenTask {
-                title: "release checklist".to_string(),
-                request: "write a checklist".to_string(),
-                acceptance: "contains build, smoke test, upload".to_string(),
-                evidence: None,
-                run: true,
-            }],
-        ),
-        decision(
-            "read",
-            vec![Action::Look {
-                target: "record:1/out.md".to_string(),
-                arguments: serde_json::Value::Null,
-                selector: Selector::Whole,
-            }],
-        ),
-        decision(
-            "accepted",
-            vec![Action::CloseTask {
-                task_id: 1,
-                accepted: true,
-                note: "read it".to_string(),
-            }],
-        ),
+    let state = State::new("artifact-read");
+    let store = state.store();
+    let brain = Script::new(vec![
+        decision(vec![aja("release checklist")]),
+        decision(vec![Action::Look {
+            target: "record:1/out.md".to_string(),
+            arguments: serde_json::Value::Null,
+            selector: Selector::Whole,
+        }]),
+        decision(vec![Action::CloseTask {
+            task_id: 1,
+            accepted: true,
+            note: "read it".to_string(),
+        }]),
     ]);
     let outcome = turn_at(
         &store,
         "do the task",
         &brain,
-        &QueueWorker::new(vec![record()]),
+        &Done("checklist written"),
         &Ports {
             aja: Some(&FakeReader),
             ..Default::default()
@@ -144,15 +67,14 @@ fn eja_reads_artifact_content_then_decides() {
 #[test]
 fn aja_files_answer_a_range_and_a_match() {
     use eja::adapters::RecordFiles;
-    let dir = std::env::temp_dir().join(format!("eja-slice-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
+    let state = State::new("slice");
+    std::fs::create_dir_all(state.path()).expect("dir");
     let mut body = String::new();
     for n in 0..20 {
         writeln!(body, "line {n}").expect("string writer");
     }
-    std::fs::write(dir.join("note.txt"), body).expect("write");
-    let reader = RecordFiles::new(&dir);
+    std::fs::write(state.path().join("note.txt"), body).expect("write");
+    let reader = RecordFiles::new(state.path());
     let range = reader
         .slice(
             "note.txt",
@@ -194,15 +116,14 @@ fn aja_files_answer_a_range_and_a_match() {
 #[test]
 fn a_match_returns_every_hit_and_the_view_budget_is_the_only_limit() {
     use eja::adapters::RecordFiles;
-    let dir = std::env::temp_dir().join(format!("eja-match-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
+    let state = State::new("match");
+    std::fs::create_dir_all(state.path()).expect("dir");
     let mut body = String::new();
     for n in 0..30 {
         writeln!(body, "hit {n}").expect("string writer");
     }
-    std::fs::write(dir.join("note.txt"), body).expect("write");
-    let reader = RecordFiles::new(&dir);
+    std::fs::write(state.path().join("note.txt"), body).expect("write");
+    let reader = RecordFiles::new(state.path());
     let hit = reader
         .slice(
             "note.txt",
@@ -221,18 +142,14 @@ fn a_match_returns_every_hit_and_the_view_budget_is_the_only_limit() {
 fn list_dir_reads_the_project_and_reports_what_it_hid() {
     use eja::adapters::{FileTools, ToolContext, ToolGateway};
     use std::io::Write;
-    let root = std::env::temp_dir().join(format!("eja-list-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let project = root.join("project");
-    let private = root.join("private");
+    let state = State::new("list");
+    let project = state.path().join("project");
+    let private = state.path().join("private");
     std::fs::create_dir_all(project.join("docs")).unwrap();
     std::fs::create_dir_all(&private).unwrap();
     let mut file = std::fs::File::create(project.join("README.md")).unwrap();
     file.write_all(b"hello").unwrap();
-    let control = eja::adapters::Control::new(
-        std::time::Duration::from_secs(5),
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    );
+    let control = control();
     let ctx = ToolContext {
         aja_id: 1,
         project: &project,
@@ -248,26 +165,22 @@ fn list_dir_reads_the_project_and_reports_what_it_hid() {
         .any(|e| e.as_str().unwrap().starts_with("README.md")));
     assert!(entries.iter().any(|e| e.as_str().unwrap() == "docs/"));
     assert_eq!(listing["truncated"], false);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
     use eja::adapters::{FileTools, ToolContext, ToolGateway};
-    let root = std::env::temp_dir().join(format!("eja-edit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let work = root.join("work");
+    let state = State::new("edit");
+    let work = state.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
-    std::fs::create_dir_all(root.join("state")).unwrap();
+    let private = state.path().join("state");
+    std::fs::create_dir_all(&private).unwrap();
     std::fs::write(work.join("a.txt"), "alpha beta gamma").unwrap();
-    let control = eja::adapters::Control::new(
-        std::time::Duration::from_secs(5),
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    );
+    let control = control();
     let ctx = ToolContext {
         aja_id: 1,
         project: &work,
-        private: &root.join("state"),
+        private: &private,
         control: &control,
     };
     let ok = FileTools
@@ -301,12 +214,13 @@ fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
         Err(error) => error.to_string(),
     };
     assert!(ambiguous.contains("found 2"), "{ambiguous}");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn oversized_artifact_target_fails_before_content_trimming() {
-    let reader = eja::adapters::RecordFiles::new(std::env::temp_dir());
+    let state = State::new("oversized");
+    std::fs::create_dir_all(state.path()).unwrap();
+    let reader = eja::adapters::RecordFiles::new(state.path());
     let started = std::time::Instant::now();
     assert!(reader
         .slice(
@@ -321,10 +235,14 @@ fn oversized_artifact_target_fails_before_content_trimming() {
 #[test]
 fn overlapping_match_windows_follow_hit_positions_including_the_file_end() {
     use eja::adapters::RecordFiles;
-    let root = std::env::temp_dir().join(format!("eja-overlap-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("hits.txt"), "hit 0\nhit 1\nhit 2\nhit 3\nhit 4\n").unwrap();
-    let reader = RecordFiles::new(&root);
+    let state = State::new("overlap");
+    std::fs::create_dir_all(state.path()).unwrap();
+    std::fs::write(
+        state.path().join("hits.txt"),
+        "hit 0\nhit 1\nhit 2\nhit 3\nhit 4\n",
+    )
+    .unwrap();
+    let reader = RecordFiles::new(state.path());
     let value = reader
         .slice(
             "hits.txt",
@@ -360,29 +278,28 @@ fn overlapping_match_windows_follow_hit_positions_including_the_file_end() {
         ]
     );
     assert_eq!(value["truncated"], false);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn world_and_frozen_text_reads_share_encoding_bounds_and_cancellation() {
     use eja::adapters::{FileTools, RecordFiles, ToolContext, ToolGateway};
-    let root = std::env::temp_dir().join(format!("eja-text-budget-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
+    let state = State::new("text-budget");
+    std::fs::create_dir_all(state.path()).unwrap();
     std::fs::write(
-        root.join("escaped.txt"),
+        state.path().join("escaped.txt"),
         [b'"', b'\\', 0, 0xff, b'\n'].repeat(60_000),
     )
     .unwrap();
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let control = eja::Control::new(std::time::Duration::from_secs(5), cancelled.clone());
-    let private = root.join(".eja");
+    let control = control().cancelled_by(cancelled.clone());
+    let private = state.path().join(".eja");
     let context = ToolContext {
         aja_id: 1,
-        project: &root,
+        project: state.path(),
         private: &private,
         control: &control,
     };
-    let reader = RecordFiles::new(&root);
+    let reader = RecordFiles::new(state.path());
     let aja = reader
         .slice("escaped.txt", &Selector::Whole, &control)
         .unwrap();
@@ -411,5 +328,4 @@ fn world_and_frozen_text_reads_share_encoding_bounds_and_cancellation() {
             &serde_json::json!({"path":"escaped.txt"})
         )
         .is_err());
-    let _ = std::fs::remove_dir_all(root);
 }

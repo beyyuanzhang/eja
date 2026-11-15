@@ -1,47 +1,9 @@
+mod support;
+
 use eja::adapters::{Capabilities, Ports};
-use eja::{
-    turn_at, turn_at_with_options, Action, Assignment, Brain, Decision, EjaContext, Kind, Store,
-    TaskStatus, TurnOptions,
-};
+use eja::{Action, Decision, Host, Kind, Store, TaskStatus, TurnOptions, TurnOutcome};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
-use std::sync::Mutex;
-
-struct Queue(Mutex<VecDeque<Decision>>);
-impl Queue {
-    fn new(steps: Vec<Vec<Action>>) -> Self {
-        Self(Mutex::new(
-            steps
-                .into_iter()
-                .map(|actions| Decision {
-                    reply: "ok".to_string(),
-                    actions,
-                    refused: Vec::new(),
-                })
-                .collect(),
-        ))
-    }
-}
-impl Brain for Queue {
-    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.0
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct NoWorker;
-impl eja::Worker for NoWorker {
-    fn execute(&self, _: &Assignment, _: &eja::Control) -> String {
-        "1 steps, 0 tool calls, ended: message\ndone".to_string()
-    }
-}
+use support::{decision, Done, Script, State};
 
 /// Acceptance evidence is a host act, declared as one capability call.
 struct Checks;
@@ -51,17 +13,9 @@ impl Capabilities for Checks {
     }
 }
 
-static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-fn store() -> Store {
-    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("eja-accept-{}-{}", std::process::id(), serial));
-    let _ = std::fs::remove_dir_all(&dir);
-    Store::new(&dir).expect("store")
-}
-
-fn run_steps() -> Vec<Vec<Action>> {
+fn run_steps() -> Vec<Decision> {
     vec![
-        vec![
+        decision(vec![
             Action::OpenTask {
                 title: "ship".into(),
                 request: "ship it".into(),
@@ -70,28 +24,55 @@ fn run_steps() -> Vec<Vec<Action>> {
                 run: false,
             },
             Action::Dispatch { task_id: 1 },
-        ],
-        vec![],
+        ]),
+        decision(vec![]),
     ]
+}
+
+/// One scripted turn against the host this file chooses.
+fn turn(
+    store: &Store,
+    input: &'static str,
+    steps: Vec<Decision>,
+    host: &dyn Host,
+) -> TurnOutcome<'static> {
+    let brain = Script::new(steps);
+    eja::turn(store, input, &brain, &Done::default(), host).expect("turn")
+}
+
+/// The one thing the kit does not cover: a turn the host authorizes in advance.
+fn approved(
+    store: &Store,
+    input: &'static str,
+    steps: Vec<Decision>,
+    approvals: Vec<u64>,
+) -> TurnOutcome<'static> {
+    let brain = Script::new(steps);
+    eja::turn_at_with_options(
+        store,
+        input,
+        &brain,
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            approvals,
+            ..Default::default()
+        },
+    )
+    .expect("turn")
 }
 
 #[test]
 fn declared_evidence_is_a_host_observation_and_the_judgment_can_use_it() {
-    let store = store();
+    let fixture = State::new("accept");
+    let store = fixture.store();
     let checks = Checks;
     let ports = Ports {
         capabilities: Some(&checks),
         ..Default::default()
     };
-    let out = turn_at(
-        &store,
-        "do it",
-        &Queue::new(run_steps()),
-        &NoWorker,
-        &ports,
-        eja::now_utc(),
-    )
-    .expect("turn");
+    let out = turn(&store, "do it", run_steps(), &ports);
     let task = &out.context().tasks[0];
     assert_eq!(task.status, TaskStatus::Waiting);
     assert_eq!(task.evidence().expect("request")["tool"], json!("checks"));
@@ -123,34 +104,24 @@ fn declared_evidence_is_a_host_observation_and_the_judgment_can_use_it() {
         "the task points at the observation"
     );
 
-    let closed = turn_at(
+    let closed = turn(
         &store,
         "accept",
-        &Queue::new(vec![vec![Action::CloseTask {
+        vec![decision(vec![Action::CloseTask {
             task_id: 1,
             accepted: true,
             note: "evidence passed".into(),
-        }]]),
-        &NoWorker,
+        }])],
         &ports,
-        eja::now_utc(),
-    )
-    .expect("close");
+    );
     assert_eq!(closed.context().tasks[0].status, TaskStatus::Done);
 }
 
 #[test]
 fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
-    let store = store();
-    let out = turn_at(
-        &store,
-        "do it",
-        &Queue::new(run_steps()),
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("turn");
+    let fixture = State::new("accept-no-evidence");
+    let store = fixture.store();
+    let out = turn(&store, "do it", run_steps(), &Ports::default());
     assert!(
         out.context().tasks[0].evidence().is_some(),
         "the request is a fact"
@@ -161,19 +132,16 @@ fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
         .and_then(|run| run.evidence_result.as_ref())
         .is_none());
 
-    let closed = turn_at(
+    let closed = turn(
         &store,
         "accept",
-        &Queue::new(vec![vec![Action::CloseTask {
+        vec![decision(vec![Action::CloseTask {
             task_id: 1,
             accepted: true,
             note: "looks fine".into(),
-        }]]),
-        &NoWorker,
+        }])],
         &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("close");
+    );
     assert_eq!(closed.context().tasks[0].status, TaskStatus::Waiting);
     assert!(
         closed
@@ -187,19 +155,16 @@ fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
 
     // Rejecting needs no evidence: a witness that never answers cannot strand
     // the task in the index.
-    let rejected = turn_at(
+    let rejected = turn(
         &store,
         "reject",
-        &Queue::new(vec![vec![Action::CloseTask {
+        vec![decision(vec![Action::CloseTask {
             task_id: 1,
             accepted: false,
             note: "evidence unavailable".into(),
-        }]]),
-        &NoWorker,
+        }])],
         &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("reject");
+    );
     assert_eq!(rejected.context().tasks[0].status, TaskStatus::Failed);
     assert!(rejected.context().tasks[0]
         .close
@@ -215,21 +180,14 @@ fn a_host_that_cannot_answer_leaves_the_reason_in_the_log() {
             Err("the checker is offline".into())
         }
     }
-    let store = store();
+    let fixture = State::new("accept-broken");
+    let store = fixture.store();
     let broken = Broken;
     let ports = Ports {
         capabilities: Some(&broken),
         ..Default::default()
     };
-    turn_at(
-        &store,
-        "do it",
-        &Queue::new(run_steps()),
-        &NoWorker,
-        &ports,
-        eja::now_utc(),
-    )
-    .expect("turn");
+    turn(&store, "do it", run_steps(), &ports);
     let observation = store
         .events()
         .expect("events")
@@ -243,20 +201,18 @@ fn a_host_that_cannot_answer_leaves_the_reason_in_the_log() {
 
 #[test]
 fn an_approval_authorizes_only_the_turn_it_was_recorded_in() {
-    let store = store();
-    let first = turn_at(
+    let fixture = State::new("accept-approval");
+    let store = fixture.store();
+    let first = turn(
         &store,
         "propose",
-        &Queue::new(vec![vec![Action::Propose {
+        vec![decision(vec![Action::Propose {
             kind: eja::ProposalKind::Commitment,
             target_id: None,
             text: "answer first".into(),
-        }]]),
-        &NoWorker,
+        }])],
         &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("propose");
+    );
     let id = first.context().proposals[0].id;
     assert!(
         first
@@ -266,28 +222,18 @@ fn an_approval_authorizes_only_the_turn_it_was_recorded_in() {
             .all(|proposal| !proposal.approved),
         "nothing is approved until the host records it"
     );
-    turn_at_with_options(
+    approved(
         &store,
         "approve but do not confirm",
-        &Queue::new(vec![vec![]]),
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-        &TurnOptions {
-            approvals: vec![id],
-            ..Default::default()
-        },
-    )
-    .expect("approve");
-    let stale = turn_at(
+        vec![decision(vec![])],
+        vec![id],
+    );
+    let stale = turn(
         &store,
         "confirm late",
-        &Queue::new(vec![vec![Action::Confirm { proposal_id: id }]]),
-        &NoWorker,
+        vec![decision(vec![Action::Confirm { proposal_id: id }])],
         &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("confirm");
+    );
     assert!(stale.context().commitments.is_empty());
     assert!(
         stale

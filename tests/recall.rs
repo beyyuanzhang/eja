@@ -1,124 +1,66 @@
+mod support;
+
 use eja::adapters::Ports;
-use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, Selector, State,
-    Store, Worker,
-};
-use std::collections::VecDeque;
-use std::sync::Mutex;
+use eja::{Action, Decision, Kind, ProposalKind, Selector, State, Store, TurnOptions, TurnOutcome};
+use support::{decision, turn_at, Done, Script, State as Fixture};
 
-struct QueueBrain {
-    queue: Mutex<VecDeque<Decision>>,
-}
-
-impl QueueBrain {
-    fn new(decisions: Vec<Decision>) -> Self {
-        Self {
-            queue: Mutex::new(decisions.into()),
-        }
-    }
-}
-
-impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct NoWorker;
-
-impl Worker for NoWorker {
-    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
-        format!(
-            "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
-            "no worker"
-        )
-    }
-}
-
-fn decision(reply: &str, actions: Vec<Action>) -> Decision {
-    Decision {
-        reply: reply.to_string(),
-        actions,
-        refused: Vec::new(),
-    }
-}
-
-fn temp_store() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("eja-recall-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
+/// The one thing the kit does not cover: a turn the host authorizes in advance.
+fn approved(
+    store: &Store,
+    input: &'static str,
+    decisions: Vec<Decision>,
+    approvals: Vec<u64>,
+) -> TurnOutcome<'static> {
+    let brain = Script::new(decisions);
+    eja::turn_at_with_options(
+        store,
+        input,
+        &brain,
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            approvals,
+            ..Default::default()
+        },
+    )
+    .expect("turn")
 }
 
 #[test]
 fn recall_is_an_id_result_not_text_matching() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let propose = QueueBrain::new(vec![decision(
-        "proposed",
-        vec![Action::Propose {
-            kind: ProposalKind::Commitment,
-            target_id: None,
-            text: "arbitrary old fact".to_string(),
-        }],
-    )]);
+    let fixture = Fixture::new("recall");
+    let store = fixture.store();
     let proposed = turn_at(
         &store,
         "commit",
-        &propose,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("propose");
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "arbitrary old fact".to_string(),
+        }])],
+    );
     let proposal_id = proposed.context().proposals.last().expect("proposal").id;
-    let confirm = QueueBrain::new(vec![decision(
-        "confirmed",
-        vec![Action::Confirm { proposal_id }],
-    )]);
-    eja::turn_at_with_options(
+    approved(
         &store,
         "confirm",
-        &confirm,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-        &eja::TurnOptions {
-            approvals: vec![proposal_id],
-            ..Default::default()
-        },
-    )
-    .expect("confirm");
+        vec![decision(vec![Action::Confirm { proposal_id }])],
+        vec![proposal_id],
+    );
     let commitment = State::load(&store).expect("state").commitments()[0].clone();
 
-    let brain = QueueBrain::new(vec![
-        decision(
-            "searching",
-            vec![Action::Look {
-                target: format!("log:event:{}", commitment.id),
-                arguments: serde_json::Value::Null,
-                selector: Selector::Whole,
-            }],
-        ),
-        decision("found it", vec![]),
-    ]);
     let outcome = turn_at(
         &store,
         "what did we decide?",
-        &brain,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("recall");
+        vec![
+            decision(vec![Action::Look {
+                target: format!("log:event:{}", commitment.id),
+                arguments: serde_json::Value::Null,
+                selector: Selector::Whole,
+            }]),
+            decision(vec![]),
+        ],
+    );
 
     assert_eq!(outcome.context().evidence.len(), 1);
     let events = outcome.context().evidence[0].result["events"]

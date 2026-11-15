@@ -1,40 +1,16 @@
+//! The worlds a run may change: one shared, one per run, settled and reconciled.
+
 mod support;
-use eja::adapters::{Shared, Worktrees, Worlds};
-use eja::{
-    turn_at_with_options, Action, Assignment, Brain, Control, Decision, EjaContext, Kind, Store,
-    TurnOptions, Worker,
-};
-use std::collections::VecDeque;
+
+use eja::adapters::{Ports, Shared, Worktrees, Worlds};
+use eja::{turn_at_with_options, Action, Assignment, Control, Kind, TurnOptions, Worker};
+use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 use std::time::Duration;
-use support::control;
-
-struct Queue(Mutex<VecDeque<Decision>>);
-impl Queue {
-    fn one(actions: Vec<Action>) -> Self {
-        Self(Mutex::new(VecDeque::from(vec![Decision {
-            reply: "ok".into(),
-            actions,
-            refused: Vec::new(),
-        }])))
-    }
-}
-impl Brain for Queue {
-    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.0
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
+use support::{control, Done, Script, State};
 
 /// Records how many runs were alive at once. A run waits for a sibling so a
 /// serial host is reported as serial instead of being hidden by timing.
@@ -44,10 +20,14 @@ struct Overlap {
     arrived: AtomicUsize,
     peak: AtomicUsize,
 }
+
+/// The one worker these tests need: a run that can prove it was alive beside a
+/// sibling, and that reports which task it was.
 struct Probe {
     inner: Arc<Overlap>,
     patience: Duration,
 }
+
 impl Worker for Probe {
     fn execute(&self, assignment: &Assignment, _: &Control) -> String {
         let live = self.inner.live.fetch_add(1, Ordering::SeqCst) + 1;
@@ -66,6 +46,8 @@ impl Worker for Probe {
     }
 }
 
+/// The task these tests dispatch: the worktree account is measured against this
+/// stated contract, so the request and acceptance are named here.
 fn open(index: u64) -> Action {
     Action::OpenTask {
         title: format!("job {index}"),
@@ -76,22 +58,40 @@ fn open(index: u64) -> Action {
     }
 }
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
-fn temp_dir(name: &str) -> std::path::PathBuf {
-    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("eja-worlds-{name}-{}-{serial}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir.canonicalize().expect("canonical")
+/// The fixture's one directory, resolved: a git world records absolute paths, so
+/// a test must name the tree the way git reports it.
+fn tree(state: &State) -> PathBuf {
+    std::fs::create_dir_all(state.path()).expect("dir");
+    state.path().canonicalize().expect("canonical")
+}
+
+fn git(cwd: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["-c", "user.name=eja", "-c", "user.email=eja@local"])
+        .args(args)
+        .status()
+        .expect("git");
+    assert!(status.success(), "git {args:?}");
+}
+
+fn project_with_one_commit(state: &State) -> PathBuf {
+    let project = tree(state);
+    git(&project, &["init", "--quiet"]);
+    std::fs::create_dir_all(project.join(".eja")).unwrap();
+    std::fs::write(project.join(".eja/.gitignore"), "*\n").unwrap();
+    std::fs::write(project.join("base.txt"), "one\n").unwrap();
+    git(&project, &["add", "-A"]);
+    git(&project, &["commit", "--quiet", "-m", "base"]);
+    project
 }
 
 #[test]
 fn parallel_slots_run_at_once_and_the_log_keeps_action_order() {
-    let dir = temp_dir("parallel");
-    let store = Store::new(&dir).expect("store");
+    let state = State::new("parallel");
+    let store = state.store();
     let overlap = Arc::new(Overlap::default());
-    let brain = Queue::one(vec![
+    let brain = Script::once(vec![
         open(1),
         open(2),
         Action::Dispatch { task_id: 1 },
@@ -112,7 +112,7 @@ fn parallel_slots_run_at_once_and_the_log_keeps_action_order() {
             inner: overlap.clone(),
             patience: Duration::from_secs(5),
         },
-        &eja::adapters::Ports::default(),
+        &Ports::default(),
         eja::now_utc(),
         &options,
     )
@@ -123,9 +123,8 @@ fn parallel_slots_run_at_once_and_the_log_keeps_action_order() {
         2,
         "both worlds were live"
     );
-    let reports: Vec<u64> = store
+    let reports: Vec<u64> = state
         .events()
-        .unwrap()
         .into_iter()
         .filter(|event| event.kind == Kind::WorkerReport)
         .filter_map(|event| event.scope.strip_prefix("task:")?.parse().ok())
@@ -135,10 +134,10 @@ fn parallel_slots_run_at_once_and_the_log_keeps_action_order() {
 
 #[test]
 fn one_slot_stays_sequential() {
-    let dir = temp_dir("serial");
-    let store = Store::new(&dir).expect("store");
+    let state = State::new("serial");
+    let store = state.store();
     let overlap = Arc::new(Overlap::default());
-    let brain = Queue::one(vec![
+    let brain = Script::once(vec![
         open(1),
         open(2),
         Action::Dispatch { task_id: 1 },
@@ -152,7 +151,7 @@ fn one_slot_stays_sequential() {
             inner: overlap.clone(),
             patience: Duration::from_millis(200),
         },
-        &eja::adapters::Ports::default(),
+        &Ports::default(),
         eja::now_utc(),
         &TurnOptions::default(),
     )
@@ -160,30 +159,10 @@ fn one_slot_stays_sequential() {
     assert_eq!(overlap.peak.load(Ordering::SeqCst), 1);
 }
 
-fn git(cwd: &std::path::Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .current_dir(cwd)
-        .args(["-c", "user.name=eja", "-c", "user.email=eja@local"])
-        .args(args)
-        .status()
-        .expect("git");
-    assert!(status.success(), "git {args:?}");
-}
-
-fn project_with_one_commit(name: &str) -> std::path::PathBuf {
-    let project = temp_dir(name);
-    git(&project, &["init", "--quiet"]);
-    std::fs::create_dir_all(project.join(".eja")).unwrap();
-    std::fs::write(project.join(".eja/.gitignore"), "*\n").unwrap();
-    std::fs::write(project.join("base.txt"), "one\n").unwrap();
-    git(&project, &["add", "-A"]);
-    git(&project, &["commit", "--quiet", "-m", "base"]);
-    project
-}
-
 #[test]
 fn a_worktree_world_is_settled_and_reconciled_explicitly() {
-    let project = project_with_one_commit("worktree");
+    let state = State::new("worktree");
+    let project = project_with_one_commit(&state);
     let control = control();
     let worlds = Worktrees::new(
         &project,
@@ -217,7 +196,8 @@ fn a_worktree_world_is_settled_and_reconciled_explicitly() {
 
 #[test]
 fn a_conflicting_world_is_reported_and_never_merged_silently() {
-    let project = project_with_one_commit("conflict");
+    let state = State::new("conflict");
+    let project = project_with_one_commit(&state);
     let control = control();
     let worlds = Worktrees::new(
         &project,
@@ -253,7 +233,8 @@ fn a_conflicting_world_is_reported_and_never_merged_silently() {
 
 #[test]
 fn an_isolated_world_starts_at_the_commit_not_at_the_working_tree() {
-    let project = project_with_one_commit("dirty");
+    let state = State::new("dirty");
+    let project = project_with_one_commit(&state);
     std::fs::write(project.join("base.txt"), "uncommitted\n").unwrap();
     let control = control();
     let worlds = Worktrees::new(
@@ -281,7 +262,8 @@ fn an_isolated_world_starts_at_the_commit_not_at_the_working_tree() {
 
 #[test]
 fn a_shared_world_needs_no_reconciliation() {
-    let project = temp_dir("shared");
+    let state = State::new("shared");
+    let project = tree(&state);
     let shared = Shared::new(project.clone(), project.join(".eja"));
     let control = control();
     let world = shared.reserve(1, &control).expect("reserve");
@@ -292,35 +274,29 @@ fn a_shared_world_needs_no_reconciliation() {
     assert_eq!(outcome["merged"], serde_json::json!(true));
     shared.release(&world);
 }
+
 /// A run that left an isolated world comes back only when asked, and the host's
 /// account is one recorded observation — never a silent merge.
-struct Done;
-impl Worker for Done {
-    fn execute(&self, _: &Assignment, _: &eja::Control) -> String {
-        "1 steps, 0 tool calls, ended: message\ndone".into()
-    }
-}
-
 #[test]
 fn reconciling_a_run_is_one_recorded_observation() {
-    let dir = temp_dir("reconcile");
-    let project = dir.join("project");
+    let state = State::new("reconcile");
+    let project = state.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let store = Store::new(&dir).expect("store");
-    let worlds = Shared::new(project, dir.join(".eja"));
-    let ports = eja::adapters::Ports {
+    let store = state.store();
+    let worlds = Shared::new(project, state.path().join(".eja"));
+    let ports = Ports {
         worlds: Some(&worlds),
         ..Default::default()
     };
     let options = TurnOptions::default();
 
     // Turn one: the aja runs; its record exists but the world is still shared.
-    let brain = Queue::one(vec![open(1), Action::Dispatch { task_id: 1 }]);
+    let brain = Script::once(vec![open(1), Action::Dispatch { task_id: 1 }]);
     turn_at_with_options(
         &store,
         "run",
         &brain,
-        &Done,
+        &Done::default(),
         &ports,
         eja::now_utc(),
         &options,
@@ -328,12 +304,12 @@ fn reconciling_a_run_is_one_recorded_observation() {
     .expect("dispatch");
 
     // Turn two: EJA asks for the world to come back.
-    let brain = Queue::one(vec![Action::Reconcile { task_id: 1 }]);
+    let brain = Script::once(vec![Action::Reconcile { task_id: 1 }]);
     let out = turn_at_with_options(
         &store,
         "bring it back",
         &brain,
-        &Done,
+        &Done::default(),
         &ports,
         eja::now_utc(),
         &options,
@@ -351,7 +327,7 @@ fn reconciling_a_run_is_one_recorded_observation() {
         "{account:?}"
     );
     assert!(
-        store.events().unwrap().iter().any(|event| {
+        state.events().iter().any(|event| {
             event.kind == Kind::Observed
                 && event
                     .data
@@ -362,12 +338,12 @@ fn reconciling_a_run_is_one_recorded_observation() {
     );
 
     // A task with no run has no world to bring back.
-    let brain = Queue::one(vec![Action::Reconcile { task_id: 2 }]);
+    let brain = Script::once(vec![Action::Reconcile { task_id: 2 }]);
     let refused = turn_at_with_options(
         &store,
         "nothing to reconcile",
         &brain,
-        &Done,
+        &Done::default(),
         &ports,
         eja::now_utc(),
         &options,
@@ -383,9 +359,11 @@ fn reconciling_a_run_is_one_recorded_observation() {
         refused.context().refused
     );
 }
+
 #[test]
 fn two_state_directories_on_one_project_keep_separate_branches() {
-    let project = project_with_one_commit("two-instances");
+    let state = State::new("two-instances");
+    let project = project_with_one_commit(&state);
     let control = control();
     let first = Worktrees::new(
         &project,
@@ -421,12 +399,13 @@ fn two_state_directories_on_one_project_keep_separate_branches() {
     first.release(&a);
     second.release(&b);
 }
+
 #[test]
 fn the_shared_world_has_one_owner() {
-    let dir = temp_dir("owner");
-    let project = dir.join("project");
+    let state = State::new("owner");
+    let project = state.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let shared = Shared::new(project, dir.join(".eja"));
+    let shared = Shared::new(project, state.path().join(".eja"));
     let control = control();
     let first = shared.reserve(1, &control).expect("first reservation");
     // A second run may not write the same directory while the first holds it.
@@ -441,10 +420,10 @@ fn the_shared_world_has_one_owner() {
 
 #[test]
 fn settling_a_world_twice_is_refused() {
-    let dir = temp_dir("twice");
-    let project = dir.join("project");
+    let state = State::new("twice");
+    let project = state.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let shared = Shared::new(project, dir.join(".eja"));
+    let shared = Shared::new(project, state.path().join(".eja"));
     let control = control();
     let world = shared.reserve(1, &control).expect("reserve");
     shared.settle(&world, &control).expect("settle");
@@ -456,7 +435,8 @@ fn settling_a_world_twice_is_refused() {
 
 #[test]
 fn a_world_per_run_needs_a_git_project() {
-    let dir = temp_dir("no-git");
+    let state = State::new("no-git");
+    let dir = tree(&state);
     let refused = Worktrees::new(&dir, dir.join("worlds"), dir.join(".eja"), &control());
     let error = refused.err().expect("a plain directory cannot be forked");
     assert!(error.to_string().contains("git"), "{error}");

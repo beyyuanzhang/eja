@@ -274,6 +274,12 @@ The crate holds itself to clippy's pedantic and nursery groups, declared in
 the contract, not in a generated list) and `too_many_lines` (the turn loop and
 the projection are each one sequence a reader follows top to bottom).
 
+Every integration test builds its scenario with `tests/support/`: one temporary
+state, one scripted brain, one worker, one turn. A test body is a construction
+and its assertions, never its own copy of the harness. A test that only restates
+what another test already proves, or what the type system already guarantees, is
+deleted rather than maintained.
+
 Composition regressions cover unrelated-task invariance, large-result replay,
 record addressability, aggregate completion, relation uniqueness and cross-kind
 cycles, host authorization, atomic confirmation, torn-tail recovery, UTF-8 byte

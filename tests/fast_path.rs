@@ -1,169 +1,70 @@
+mod support;
+
 use eja::adapters::Ports;
-use eja::{turn_at, Action, Assignment, Brain, Decision, EjaContext, Store, TaskStatus, Worker};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
-struct CountingBrain {
-    queue: Mutex<VecDeque<Decision>>,
-    focus: Arc<Mutex<Vec<Option<u64>>>>,
-}
-
-impl Brain for CountingBrain {
-    fn decide(&self, context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.focus.lock().expect("focus").push(context.focus);
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct DoneWorker;
-
-impl Worker for DoneWorker {
-    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
-        format!(
-            "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
-            "done"
-        )
-    }
-}
-
-fn store(name: &str) -> Store {
-    let dir = std::env::temp_dir().join(format!("eja-fast-{}-{}", std::process::id(), name));
-    let _ = std::fs::remove_dir_all(&dir);
-    Store::new(&dir).expect("store")
-}
-
-fn open_task(title: &str) -> Action {
-    Action::OpenTask {
-        title: title.to_string(),
-        request: format!("request {title}"),
-        acceptance: format!("accept {title}"),
-        evidence: None,
-        run: true,
-    }
-}
+use eja::{Action, TaskStatus};
+use support::{aja, decision, task, Done, Script, State};
 
 #[test]
 fn single_waiting_task_is_focused_without_the_extra_initial_call() {
-    let store = store("waiting");
-    let open = CountingBrain {
-        queue: Mutex::new(VecDeque::from(vec![
-            Decision {
-                reply: "open".to_string(),
-                actions: vec![open_task("one")],
-                refused: Vec::new(),
-            },
-            Decision {
-                reply: "waiting".to_string(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            },
-        ])),
-        focus: Arc::new(Mutex::new(Vec::new())),
-    };
-    let first = turn_at(
-        &store,
-        "open",
-        &open,
-        &DoneWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("open");
+    let fixture = State::new("fast-waiting");
+    let store = fixture.store();
+    let open = Script::new(vec![decision(vec![aja("one")]), decision(vec![])]);
+    let first =
+        eja::turn(&store, "open", &open, &Done::default(), &Ports::default()).expect("open");
     assert_eq!(first.context().tasks[0].status, TaskStatus::Waiting);
 
-    let focus = Arc::new(Mutex::new(Vec::new()));
-    let close = CountingBrain {
-        queue: Mutex::new(VecDeque::from(vec![Decision {
-            reply: "closed".to_string(),
-            actions: vec![Action::CloseTask {
-                task_id: 1,
-                accepted: true,
-                note: "ok".to_string(),
-            }],
-            refused: Vec::new(),
-        }])),
-        focus: focus.clone(),
-    };
-    let second = turn_at(
+    let close = Script::new(vec![decision(vec![Action::CloseTask {
+        task_id: 1,
+        accepted: true,
+        note: "ok".to_string(),
+    }])]);
+    let second = eja::turn(
         &store,
         "continue",
         &close,
-        &DoneWorker,
+        &Done::default(),
         &Ports::default(),
-        eja::now_utc(),
     )
     .expect("close");
     assert_eq!(second.decisions, 1);
-    assert_eq!(*focus.lock().expect("focus"), vec![Some(1)]);
+    assert_eq!(
+        close
+            .seen()
+            .iter()
+            .map(|seen| seen.focus)
+            .collect::<Vec<_>>(),
+        vec![Some(1)]
+    );
     assert_eq!(second.context().tasks[0].status, TaskStatus::Done);
 }
 
 #[test]
 fn multiple_active_tasks_do_not_use_the_fast_path() {
-    let store = store("multiple");
-    let open = CountingBrain {
-        queue: Mutex::new(VecDeque::from(vec![Decision {
-            reply: "open".to_string(),
-            actions: vec![
-                Action::OpenTask {
-                    title: "a".to_string(),
-                    request: "a".to_string(),
-                    acceptance: "a".to_string(),
-                    evidence: None,
-                    run: false,
-                },
-                Action::OpenTask {
-                    title: "b".to_string(),
-                    request: "b".to_string(),
-                    acceptance: "b".to_string(),
-                    evidence: None,
-                    run: false,
-                },
-            ],
-            refused: Vec::new(),
-        }])),
-        focus: Arc::new(Mutex::new(Vec::new())),
-    };
-    turn_at(
+    let fixture = State::new("fast-multiple");
+    let store = fixture.store();
+    let open = Script::new(vec![decision(vec![task("a"), task("b")])]);
+    eja::turn(
         &store,
         "open two",
         &open,
-        &DoneWorker,
+        &Done::default(),
         &Ports::default(),
-        eja::now_utc(),
     )
     .expect("open");
 
-    let focus = Arc::new(Mutex::new(Vec::new()));
-    let close = CountingBrain {
-        queue: Mutex::new(VecDeque::from(vec![Decision {
-            reply: "close".to_string(),
-            actions: vec![Action::CloseTask {
-                task_id: 1,
-                accepted: false,
-                note: "no".to_string(),
-            }],
-            refused: Vec::new(),
-        }])),
-        focus: focus.clone(),
-    };
-    turn_at(
-        &store,
-        "close",
-        &close,
-        &DoneWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("close");
+    let close = Script::new(vec![decision(vec![Action::CloseTask {
+        task_id: 1,
+        accepted: false,
+        note: "no".to_string(),
+    }])]);
+    eja::turn(&store, "close", &close, &Done::default(), &Ports::default()).expect("close");
     // Cancelling an open aja needs no worker execution or extra observation.
-    assert_eq!(*focus.lock().expect("focus"), vec![None]);
+    assert_eq!(
+        close
+            .seen()
+            .iter()
+            .map(|seen| seen.focus)
+            .collect::<Vec<_>>(),
+        vec![None]
+    );
 }

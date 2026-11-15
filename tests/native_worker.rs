@@ -1,5 +1,10 @@
+//! The native worker as a real child process: the record it leaves, the digest
+//! it reports, and the processes and pipes it releases.
+
 #![allow(clippy::significant_drop_tightening)] // a guard held for one test block is contention-free
+
 mod support;
+
 use eja::{
     adapters::{Control, FileTools, Model, NativeWorker, OpenAiModel, ToolContext, ToolGateway},
     aja::Limits,
@@ -13,57 +18,52 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
-use support::control;
+use support::{control, State};
 
-static SERIAL: AtomicU64 = AtomicU64::new(0);
+// The worker is a child process and the tests read this process's children, so
+// one test at a time keeps that observation about this process alone.
 static LOCK: Mutex<()> = Mutex::new(());
 
-struct Fixture(PathBuf);
-impl Fixture {
-    fn new() -> Self {
-        let p = std::env::temp_dir().join(format!(
-            "eja-native-{}-{}",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        Self(p.canonicalize().unwrap())
-    }
-    fn worker(
-        &self,
-        model: Arc<dyn Model>,
-        tools: Arc<dyn ToolGateway>,
-        limits: Limits,
-    ) -> Arc<NativeWorker> {
-        Arc::new(
-            NativeWorker::new(
-                env!("CARGO_BIN_EXE_eja"),
-                self.0.join(".eja/ajas"),
-                &self.0,
-                model,
-                tools,
-            )
-            .unwrap()
-            .with_limits(limits)
-            .unwrap(),
-        )
-    }
-    fn manifest(&self, id: u64) -> Value {
-        serde_json::from_slice(
-            &std::fs::read(self.0.join(format!(".eja/ajas/{id}/aja.json"))).unwrap(),
+/// A workspace on disk. The shared fixture owns the directory; the native worker
+/// canonicalizes its project before it starts, so the directory must exist first.
+fn workspace(tag: &str) -> State {
+    let state = State::new(tag);
+    std::fs::create_dir_all(state.path()).expect("workspace");
+    state
+}
+
+/// The worker under test, over one workspace and its own private state.
+fn worker_for(
+    state: &State,
+    model: Arc<dyn Model>,
+    tools: Arc<dyn ToolGateway>,
+    limits: Limits,
+) -> Arc<NativeWorker> {
+    Arc::new(
+        NativeWorker::new(
+            env!("CARGO_BIN_EXE_eja"),
+            state.path().join(".eja/ajas"),
+            state.path(),
+            model,
+            tools,
         )
         .unwrap()
-    }
+        .with_limits(limits)
+        .unwrap(),
+    )
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+
+/// The frozen manifest of one aja record in this workspace.
+fn manifest_of(state: &State, id: u64) -> Value {
+    serde_json::from_slice(
+        &std::fs::read(state.path().join(format!(".eja/ajas/{id}/aja.json"))).unwrap(),
+    )
+    .unwrap()
 }
 
 fn assignment(id: u64) -> Assignment {
@@ -160,7 +160,7 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("native-loop");
     let model = Arc::new(Script::new(vec![
         calls(vec![
             call("write_file", json!({"path":"out.txt","text":"aja result"})),
@@ -168,7 +168,7 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
         ]),
         final_message(&["out.txt"]),
     ]));
-    let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("ended: message"), "{digest}");
     assert!(
@@ -176,21 +176,21 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
         "{digest}"
     );
     assert_eq!(
-        std::fs::read_to_string(f.0.join("out.txt")).unwrap(),
+        std::fs::read_to_string(f.path().join("out.txt")).unwrap(),
         "aja result",
         "the aja writes the workspace itself"
     );
-    assert!(f.manifest(1)["checkpoint"].as_str().is_some());
-    assert_eq!(f.manifest(1)["frozen"], true);
-    assert_eq!(f.manifest(1)["context"], "context.jsonl");
+    assert!(manifest_of(&f, 1)["checkpoint"].as_str().is_some());
+    assert_eq!(manifest_of(&f, 1)["frozen"], true);
+    assert_eq!(manifest_of(&f, 1)["context"], "context.jsonl");
     assert!(
-        std::fs::metadata(f.0.join(".eja/ajas/1/aja.json"))
+        std::fs::metadata(f.path().join(".eja/ajas/1/aja.json"))
             .unwrap()
             .permissions()
             .readonly(),
         "the frozen manifest is read-only"
     );
-    let context = std::fs::read_to_string(f.0.join(".eja/ajas/1/context.jsonl")).unwrap();
+    let context = std::fs::read_to_string(f.path().join(".eja/ajas/1/context.jsonl")).unwrap();
     for kind in ["start", "assistant", "tool", "finish"] {
         assert!(
             context.contains(&format!("\"kind\":\"{kind}\"")),
@@ -219,11 +219,11 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     assert!(!w.cancel(1));
     assert!(!model.pids.lock().unwrap().is_empty());
     assert_reaped(&model.pids.lock().unwrap());
-    let before = f.manifest(1);
+    let before = manifest_of(&f, 1);
     assert!(w
         .execute(&assignment(1), &control())
         .contains("ended: error"));
-    assert_eq!(f.manifest(1), before);
+    assert_eq!(manifest_of(&f, 1), before);
 }
 
 /// Effects that reach past the work area, so the digest can be checked against
@@ -260,7 +260,7 @@ fn the_digest_reports_what_the_project_gained() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("digest");
     let model = Arc::new(Script::new(vec![
         calls(vec![
             call("effect", json!({"kind":"project","path":"delivered.txt"})),
@@ -268,7 +268,7 @@ fn the_digest_reports_what_the_project_gained() {
         ]),
         final_message(&[]),
     ]));
-    let w = f.worker(model, Arc::new(Effects), Limits::default());
+    let w = worker_for(&f, model, Arc::new(Effects), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     assert!(
         digest.contains("world: shared: +2 created (delivered.txt, nested/also.txt)"),
@@ -281,7 +281,7 @@ fn the_aja_leaves_a_fossil_of_the_world_it_ended_in() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("fossil");
     let model = Arc::new(Script::new(vec![
         calls(vec![call(
             "effect",
@@ -289,17 +289,17 @@ fn the_aja_leaves_a_fossil_of_the_world_it_ended_in() {
         )]),
         final_message(&[]),
     ]));
-    let w = f.worker(model, Arc::new(Effects), Limits::default());
+    let w = worker_for(&f, model, Arc::new(Effects), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("+1 created"), "{digest}");
-    let manifest = f.manifest(1);
+    let manifest = manifest_of(&f, 1);
     let commit = manifest["checkpoint"]
         .as_str()
         .expect("a aja records its checkpoint");
     assert_eq!(commit.len(), 40, "{commit}");
     let read = std::process::Command::new("git")
         .arg("--git-dir")
-        .arg(f.0.join(".eja/checkpoints"))
+        .arg(f.path().join(".eja/checkpoints"))
         .arg("show")
         .arg(format!("{commit}:report.md"))
         .output()
@@ -325,14 +325,14 @@ fn a_large_tool_result_is_a_view_in_the_transcript_and_whole_in_the_record() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("large-result");
     let model = Arc::new(Script::new(vec![
         calls(vec![call("big", json!({}))]),
         final_message(&[]),
     ]));
-    let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(Big), Limits::default());
     w.execute(&assignment(1), &control());
-    let record = std::fs::read_to_string(f.0.join(".eja/ajas/1/context.jsonl")).unwrap();
+    let record = std::fs::read_to_string(f.path().join(".eja/ajas/1/context.jsonl")).unwrap();
     assert!(
         record.contains(&"x".repeat(60 * 1024)),
         "the record keeps it whole"
@@ -357,7 +357,7 @@ fn a_continuation_starts_from_the_predecessor_record() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("continuation");
     let model = Arc::new(Script::new(vec![
         calls(vec![call(
             "effect",
@@ -370,7 +370,7 @@ fn a_continuation_starts_from_the_predecessor_record() {
         )]),
         final_message(&[]),
     ]));
-    let w = f.worker(model.clone(), Arc::new(Effects), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(Effects), Limits::default());
     w.execute(&assignment(1), &control());
     let mut second = assignment(2);
     second.resume = Some(1);
@@ -417,7 +417,7 @@ fn ajas_share_the_workspace_and_grants_still_differ() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("shared-workspace");
     let model = Arc::new(Script::new(vec![
         calls(vec![call(
             "write_file",
@@ -430,7 +430,7 @@ fn ajas_share_the_workspace_and_grants_still_differ() {
         ]),
         final_message(&[]),
     ]));
-    let w = f.worker(model.clone(), Arc::new(Policy), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(Policy), Limits::default());
     assert!(w
         .execute(&assignment(1), &control())
         .contains("ended: message"));
@@ -448,7 +448,7 @@ fn ajas_share_the_workspace_and_grants_still_differ() {
     // The grant, not the filesystem, is what a aja may not cross.
     assert!(results[1].contains("not allowed"), "{}", results[1]);
     assert_eq!(
-        std::fs::read_to_string(f.0.join("same.txt")).unwrap(),
+        std::fs::read_to_string(f.path().join("same.txt")).unwrap(),
         "one"
     );
 }
@@ -458,11 +458,12 @@ fn traversal_private_state_and_symlinks_are_not_file_capabilities() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
-    std::fs::create_dir_all(f.0.join(".eja")).unwrap();
-    std::fs::write(f.0.join(".eja/secret.txt"), "private").unwrap();
+    let f = workspace("traversal");
+    std::fs::create_dir_all(f.path().join(".eja")).unwrap();
+    std::fs::write(f.path().join(".eja/secret.txt"), "private").unwrap();
     #[cfg(unix)]
-    std::os::unix::fs::symlink(f.0.join(".eja/secret.txt"), f.0.join("alias.txt")).unwrap();
+    std::os::unix::fs::symlink(f.path().join(".eja/secret.txt"), f.path().join("alias.txt"))
+        .unwrap();
     let model = Arc::new(Script::new(vec![
         calls(vec![
             call("write_file", json!({"path":"../escape.txt","text":"bad"})),
@@ -471,12 +472,12 @@ fn traversal_private_state_and_symlinks_are_not_file_capabilities() {
         ]),
         final_message(&["../escape.txt"]),
     ]));
-    let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     // The claim mentions an escaping path; the world did not move.
     assert!(digest.contains("world: shared: unchanged"), "{digest}");
-    assert!(!f.0.join("escape.txt").exists());
-    assert_eq!(f.manifest(1)["frozen"], true);
+    assert!(!f.path().join("escape.txt").exists());
+    assert_eq!(manifest_of(&f, 1)["frozen"], true);
     assert_eq!(
         model.seen.lock().unwrap()[1]
             .iter()
@@ -491,12 +492,13 @@ fn step_context_and_output_limits_stop_the_aja_and_preserve_partial_work() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("limits");
     let model = Arc::new(Script::new(vec![calls(vec![call(
         "write_file",
         json!({"path":"partial.txt","text":"kept"}),
     )])]));
-    let w = f.worker(
+    let w = worker_for(
+        &f,
         model,
         Arc::new(FileTools),
         Limits {
@@ -509,7 +511,7 @@ fn step_context_and_output_limits_stop_the_aja_and_preserve_partial_work() {
     assert!(r.contains("ended: budget"), "{r}");
     assert!(r.contains("budget"), "{r}");
     assert!(r.contains("world: shared: +1 created (partial.txt)"), "{r}");
-    assert!(f.manifest(1)["digest"]
+    assert!(manifest_of(&f, 1)["digest"]
         .as_str()
         .unwrap()
         .contains("ended: budget"));
@@ -518,18 +520,19 @@ fn step_context_and_output_limits_stop_the_aja_and_preserve_partial_work() {
         ..Limits::default()
     };
     let context_model = Arc::new(Script::new(vec![]));
-    let w = f.worker(context_model, Arc::new(FileTools), context_limits);
+    let w = worker_for(&f, context_model, Arc::new(FileTools), context_limits);
     let r = w.execute(&assignment(2), &control());
     assert!(r.contains("ended: budget"), "{r}");
     assert!(r.contains("context budget"), "{r}");
     assert_eq!(w.active_count(), 0);
-    assert_eq!(f.manifest(2)["frozen"], true);
+    assert_eq!(manifest_of(&f, 2)["frozen"], true);
     // A protocol breach is an error, not a budget the aja spent.
     let oversized = Arc::new(Script::new(vec![json!({
         "role": "assistant",
         "content": "x".repeat(129),
     })]));
-    let w = f.worker(
+    let w = worker_for(
+        &f,
         oversized,
         Arc::new(FileTools),
         Limits {
@@ -541,12 +544,12 @@ fn step_context_and_output_limits_stop_the_aja_and_preserve_partial_work() {
     assert!(r.contains("ended: error"), "{r}");
     assert!(r.contains("output limit"), "{r}");
     assert_eq!(w.active_count(), 0);
-    assert_eq!(f.manifest(3)["frozen"], true);
+    assert_eq!(manifest_of(&f, 3)["frozen"], true);
     // A plain-text final message is a claim, not a schema breach.
     let plain = Arc::new(Script::new(vec![
         json!({"role":"assistant","content":"not a digest"}),
     ]));
-    let w = f.worker(plain.clone(), Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, plain.clone(), Arc::new(FileTools), Limits::default());
     let r = w.execute(&assignment(5), &control());
     assert!(r.contains("ended: message"), "{r}");
     assert!(r.contains("not a digest"), "{r}");
@@ -577,9 +580,10 @@ fn timeout_cancellation_and_busy_slot_release_all_aja_resources() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for cancel in [false, true] {
-        let f = Fixture::new();
+        let f = workspace("timeout");
         let started = Arc::new(AtomicBool::new(false));
-        let w = f.worker(
+        let w = worker_for(
+            &f,
             Arc::new(Blocking(started.clone())),
             Arc::new(FileTools),
             Limits {
@@ -601,7 +605,7 @@ fn timeout_cancellation_and_busy_slot_release_all_aja_resources() {
         let refused = w.execute(&assignment(2), &control());
         assert!(refused.contains("ended: error"), "{refused}");
         assert!(refused.contains("one owner"), "{refused}");
-        assert!(!f.0.join(".eja/ajas/2").exists());
+        assert!(!f.path().join(".eja/ajas/2").exists());
         if cancel {
             assert!(w.cancel(1));
         }
@@ -612,7 +616,7 @@ fn timeout_cancellation_and_busy_slot_release_all_aja_resources() {
             "{r}"
         );
         assert_eq!(w.active_count(), 0);
-        assert_eq!(f.manifest(1)["frozen"], true);
+        assert_eq!(manifest_of(&f, 1)["frozen"], true);
         assert_reaped(&pids);
     }
 }
@@ -623,10 +627,11 @@ fn a_aja_stopped_mid_run_claims_no_invented_project_change() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Cancelled while the model is working.
-    let f = Fixture::new();
-    std::fs::write(f.0.join("kept.txt"), "work").unwrap();
+    let f = workspace("stopped");
+    std::fs::write(f.path().join("kept.txt"), "work").unwrap();
     let started = Arc::new(AtomicBool::new(false));
-    let w = f.worker(
+    let w = worker_for(
+        &f,
         Arc::new(Blocking(started.clone())),
         Arc::new(FileTools),
         Limits::default(),
@@ -650,9 +655,10 @@ fn a_aja_stopped_mid_run_claims_no_invented_project_change() {
         "{digest}"
     );
     // A turn deadline that expires before the aja could do anything.
-    let g = Fixture::new();
-    std::fs::write(g.0.join("kept.txt"), "work").unwrap();
-    let w = g.worker(
+    let g = workspace("stopped-deadline");
+    std::fs::write(g.path().join("kept.txt"), "work").unwrap();
+    let w = worker_for(
+        &g,
         Arc::new(Blocking(Arc::new(AtomicBool::new(false)))),
         Arc::new(FileTools),
         Limits::default(),
@@ -668,9 +674,9 @@ fn many_frozen_ajas_have_no_live_workers_or_growing_pipe_handles() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("many-frozen");
     let model = Arc::new(Script::new((0..25).map(|_| final_message(&[])).collect()));
-    let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
     let fd_path = if cfg!(target_os = "linux") {
         "/proc/self/fd"
     } else {
@@ -687,7 +693,9 @@ fn many_frozen_ajas_have_no_live_workers_or_growing_pipe_handles() {
     assert!(worker_pids().is_empty());
     assert_reaped(&model.pids.lock().unwrap());
     assert_eq!(
-        std::fs::read_dir(f.0.join(".eja/ajas")).unwrap().count(),
+        std::fs::read_dir(f.path().join(".eja/ajas"))
+            .unwrap()
+            .count(),
         25
     );
 }
@@ -775,12 +783,13 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("real-http");
     let (url, server) = serve(vec![
         json!({"choices":[{"finish_reason":"tool_calls","message":calls(vec![call("write_file",json!({"path":"http.txt","text":"real host round trip"}))])}]}),
         json!({"choices":[{"finish_reason":"stop","message":final_message(&["http.txt"])}]}),
     ]);
-    let w = f.worker(
+    let w = worker_for(
+        &f,
         Arc::new(OpenAiModel::new(url, "test-key", "test-model")),
         Arc::new(FileTools),
         Limits::default(),
@@ -878,9 +887,9 @@ fn oversized_start_is_rejected_without_leaving_a_process() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("oversized-start");
     let model = Arc::new(Script::default());
-    let worker = f.worker(model, Arc::new(FileTools), Limits::default());
+    let worker = worker_for(&f, model, Arc::new(FileTools), Limits::default());
     let mut input = assignment(1);
     input.objective = "x".repeat(eja::aja::FRAME_LIMIT);
     let digest = worker.execute(&input, &control());
@@ -888,7 +897,7 @@ fn oversized_start_is_rejected_without_leaving_a_process() {
     assert!(digest.contains("context budget"), "{digest}");
     assert_eq!(worker.active_count(), 0);
     assert!(worker_pids().is_empty());
-    assert_eq!(f.manifest(1)["frozen"], true);
+    assert_eq!(manifest_of(&f, 1)["frozen"], true);
 }
 
 #[test]
@@ -896,10 +905,10 @@ fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
-    let fixture = f.0.join(".eja/fixture");
+    let f = workspace("cli");
+    let fixture = f.path().join(".eja/fixture");
     std::fs::create_dir_all(&fixture).unwrap();
-    std::fs::write(f.0.join(".eja/mcp.json"), json!({"mcpServers":{"files":{
+    std::fs::write(f.path().join(".eja/mcp.json"), json!({"mcpServers":{"files":{
         "command":"/usr/bin/python3",
         "args":[PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_server.py"),fixture,"files"],
         "tools":["write_file"]
@@ -938,7 +947,7 @@ fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
         ),
     ]);
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
-        .current_dir(&f.0)
+        .current_dir(f.path())
         .env("LNA_BASE_URL", url)
         .env("LNA_API_KEY", "test-key")
         .env("LNA_MODEL", "test-model")
@@ -961,8 +970,8 @@ fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
         .as_str()
         .unwrap()
         .contains("build"));
-    assert_eq!(f.manifest(1)["frozen"], true);
-    let log = std::fs::read_to_string(f.0.join(".eja/log.jsonl")).unwrap();
+    assert_eq!(manifest_of(&f, 1)["frozen"], true);
+    let log = std::fs::read_to_string(f.path().join(".eja/log.jsonl")).unwrap();
     let events: Vec<Value> = log
         .lines()
         .map(|s| serde_json::from_str(s).unwrap())
@@ -982,7 +991,7 @@ fn live_and_replayed_results_share_one_view_and_large_records_still_resume() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("live-replay");
     let mut many = Vec::new();
     for index in 0..5 {
         let mut item = call("big", json!({}));
@@ -994,7 +1003,7 @@ fn live_and_replayed_results_share_one_view_and_large_records_still_resume() {
         final_message(&[]),
         final_message(&[]),
     ]));
-    let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(Big), Limits::default());
     let first = w.execute(&assignment(1), &control());
     assert!(first.contains("ended: message"), "{first}");
     let mut next = assignment(2);
@@ -1015,7 +1024,7 @@ fn live_and_replayed_results_share_one_view_and_large_records_still_resume() {
         "replay must use the same result views as live execution"
     );
     assert!(serde_json::to_vec(&seen[2]).unwrap().len() <= Limits::default().context_bytes);
-    let record = std::fs::read_to_string(f.0.join(".eja/ajas/2/context.jsonl")).unwrap();
+    let record = std::fs::read_to_string(f.path().join(".eja/ajas/2/context.jsonl")).unwrap();
     assert!(
         !record.contains(&"x".repeat(1000)),
         "a continuation stores a parent reference, not a copied payload"
@@ -1078,8 +1087,9 @@ fn omitted_tool_passages_remain_addressable_without_expanding_grants() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
-    let w = f.worker(
+    let f = workspace("passage");
+    let w = worker_for(
+        &f,
         Arc::new(ReadPassage(Mutex::new(0))),
         Arc::new(Passage),
         Limits::default(),
@@ -1098,7 +1108,7 @@ fn checkpoint_whole_range_and_match_resolve_the_same_utf8_file() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("checkpoint");
     let model = Arc::new(Script::new(vec![
         calls(vec![call(
             "write_file",
@@ -1106,11 +1116,14 @@ fn checkpoint_whole_range_and_match_resolve_the_same_utf8_file() {
         )]),
         final_message(&[]),
     ]));
-    let w = f.worker(model, Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, model, Arc::new(FileTools), Limits::default());
     assert!(w
         .execute(&assignment(1), &control())
         .contains("ended: message"));
-    let reader = RecordFiles::with_checkpoints(f.0.join(".eja/ajas"), f.0.join(".eja/checkpoints"));
+    let reader = RecordFiles::with_checkpoints(
+        f.path().join(".eja/ajas"),
+        f.path().join(".eja/checkpoints"),
+    );
     assert!(reader
         .slice("1/out.txt", &eja::Selector::Whole, &control())
         .unwrap()["text"]
@@ -1144,10 +1157,10 @@ fn a_continuation_keeps_the_complete_prefix_of_an_interrupted_call_group() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("prefix");
     // The host records the assistant call before an over-sized model response
     // can be sent over IPC. Simulate a frozen, interrupted record explicitly.
-    let aja = f.0.join(".eja/ajas/1");
+    let aja = f.path().join(".eja/ajas/1");
     std::fs::create_dir_all(&aja).unwrap();
     let start = json!({"kind":"start","view_version":1,"messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":"old brief"}]});
     let completed =
@@ -1164,7 +1177,7 @@ fn a_continuation_keeps_the_complete_prefix_of_an_interrupted_call_group() {
     )
     .unwrap();
     let model = Arc::new(Script::new(vec![final_message(&[])]));
-    let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(Big), Limits::default());
     let mut next = assignment(2);
     next.resume = Some(1);
     assert!(w.execute(&next, &control()).contains("ended: message"));
@@ -1182,9 +1195,10 @@ fn a_turn_deadline_cannot_be_extended_by_a_ajas_own_timeout() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("deadline");
     let started = Arc::new(AtomicBool::new(false));
-    let w = f.worker(
+    let w = worker_for(
+        &f,
         Arc::new(Blocking(started)),
         Arc::new(Big),
         Limits {
@@ -1199,8 +1213,8 @@ fn a_turn_deadline_cannot_be_extended_by_a_ajas_own_timeout() {
     assert!(digest.contains("ended: budget"), "{digest}");
     assert!(digest.contains("timed out"));
     assert_eq!(w.active_count(), 0);
-    assert_eq!(f.manifest(1)["frozen"], true);
-    assert!(f.manifest(1)["checkpoint_error"]
+    assert_eq!(manifest_of(&f, 1)["frozen"], true);
+    assert!(manifest_of(&f, 1)["checkpoint_error"]
         .as_str()
         .unwrap()
         .contains("timed out"));
@@ -1211,12 +1225,12 @@ fn record_addresses_cannot_expand_a_ajas_ancestry_grant() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("ancestry");
     let model = Arc::new(Script::new(vec![
         calls(vec![call("eja_read_record", json!({"aja":999,"entry":0}))]),
         final_message(&[]),
     ]));
-    let w = f.worker(model.clone(), Arc::new(Big), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(Big), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("ended: message"));
     let seen = model.seen.lock().unwrap();
@@ -1232,34 +1246,34 @@ fn relative_private_root_is_canonical_and_excluded_from_project_evidence() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
-    std::fs::create_dir_all(f.0.join(".eja")).unwrap();
-    std::fs::write(f.0.join(".eja/secret"), "private-token").unwrap();
-    std::fs::write(f.0.join("public.txt"), "public").unwrap();
+    let f = workspace("relative-root");
+    std::fs::create_dir_all(f.path().join(".eja")).unwrap();
+    std::fs::write(f.path().join(".eja/secret"), "private-token").unwrap();
+    std::fs::write(f.path().join("public.txt"), "public").unwrap();
     let cwd = std::env::current_dir().unwrap();
     let mut relative = PathBuf::new();
     for _ in cwd.components().skip(1) {
         relative.push("..");
     }
-    relative.push(f.0.strip_prefix("/").unwrap());
+    relative.push(f.path().strip_prefix("/").unwrap());
     relative.push(".eja/ajas");
     assert!(relative.is_relative());
     let model = Arc::new(Script::new(vec![final_message(&[])]));
     let worker = NativeWorker::new(
         env!("CARGO_BIN_EXE_eja"),
         relative,
-        &f.0,
+        f.path(),
         model,
         Arc::new(FileTools),
     )
     .unwrap();
     let digest = worker.execute(&assignment(1), &control());
     assert!(digest.contains("world: shared: unchanged"), "{digest}");
-    let manifest = f.manifest(1);
+    let manifest = manifest_of(&f, 1);
     let commit = manifest["checkpoint"].as_str().unwrap();
     let tree = Command::new("git")
         .arg("--git-dir")
-        .arg(f.0.join(".eja/checkpoints"))
+        .arg(f.path().join(".eja/checkpoints"))
         .args(["ls-tree", "-r", "--name-only", commit])
         .output()
         .unwrap();
@@ -1272,9 +1286,9 @@ fn a_valid_long_assignment_crosses_start_ipc_once() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("long-assignment");
     let model = Arc::new(Script::new(vec![final_message(&[])]));
-    let worker = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
+    let worker = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
     let mut input = assignment(1);
     input.objective = "x".repeat(200 * 1024);
     let digest = worker.execute(&input, &control());
@@ -1287,15 +1301,15 @@ fn malformed_custom_model_messages_are_recorded_as_errors_and_not_replayed() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("malformed");
     let model = Arc::new(Script::new(vec![
         json!({"role":"assistant","content":null}),
         final_message(&[]),
     ]));
-    let worker = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
+    let worker = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
     let first = worker.execute(&assignment(1), &control());
     assert!(first.contains("ended: error"), "{first}");
-    let record = std::fs::read_to_string(f.0.join(".eja/ajas/1/context.jsonl")).unwrap();
+    let record = std::fs::read_to_string(f.path().join(".eja/ajas/1/context.jsonl")).unwrap();
     assert!(record.contains("model_error"));
     let mut next = assignment(2);
     next.resume = Some(1);
@@ -1308,18 +1322,18 @@ fn malformed_custom_model_messages_are_recorded_as_errors_and_not_replayed() {
 
 #[test]
 fn cli_show_cannot_enter_turn_and_invalid_context_budget_is_explicit() {
-    let f = Fixture::new();
+    let f = workspace("cli-show");
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
-        .args(["--dir", f.0.to_str().unwrap(), "show", "turn"])
+        .args(["--dir", f.path().to_str().unwrap(), "show", "turn"])
         .env("LNA_BASE_URL", "http://127.0.0.1:1")
         .env("LNA_API_KEY", "test")
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown show target"));
-    assert!(!f.0.join("log.jsonl").exists());
+    assert!(!f.path().join("log.jsonl").exists());
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
-        .current_dir(&f.0)
+        .current_dir(f.path())
         .args(["--dir", ".eja", "turn", "hi"])
         .env("LNA_BASE_URL", "http://127.0.0.1:1")
         .env("LNA_API_KEY", "test")
@@ -1339,12 +1353,12 @@ fn empty_tool_lists_are_final_messages_and_a_missing_record_start_is_an_error() 
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("empty-calls");
     let model = Arc::new(Script::new(vec![
         json!({"role":"assistant","content":"completed prefix","tool_calls":[]}),
         final_message(&[]),
     ]));
-    let worker = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
+    let worker = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
     assert!(worker
         .execute(&assignment(1), &control())
         .contains("ended: message"));
@@ -1354,7 +1368,7 @@ fn empty_tool_lists_are_final_messages_and_a_missing_record_start_is_an_error() 
     assert!(model.seen.lock().unwrap()[1]
         .iter()
         .any(|m| m["content"] == "completed prefix"));
-    let damaged = f.0.join(".eja/ajas/3");
+    let damaged = f.path().join(".eja/ajas/3");
     std::fs::create_dir_all(&damaged).unwrap();
     std::fs::write(
         damaged.join("aja.json"),
@@ -1376,8 +1390,8 @@ fn a_continuation_refuses_a_predecessor_that_never_froze() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
-    let aja = f.0.join(".eja/ajas/1");
+    let f = workspace("unfrozen");
+    let aja = f.path().join(".eja/ajas/1");
     std::fs::create_dir_all(&aja).unwrap();
     let start = json!({"kind":"start","view_version":1,"messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":"old brief"}]});
     std::fs::write(aja.join("context.jsonl"), format!("{start}\n")).unwrap();
@@ -1388,7 +1402,7 @@ fn a_continuation_refuses_a_predecessor_that_never_froze() {
     )
     .unwrap();
     let model = Arc::new(Script::new(vec![final_message(&[])]));
-    let w = f.worker(model, Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, model, Arc::new(FileTools), Limits::default());
     let mut next = assignment(2);
     next.resume = Some(1);
     let digest = w.execute(&next, &control());
@@ -1403,8 +1417,8 @@ fn a_legacy_start_entry_is_its_own_ancestry_root() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
-    let aja = f.0.join(".eja/ajas/1");
+    let f = workspace("legacy");
+    let aja = f.path().join(".eja/ajas/1");
     std::fs::create_dir_all(&aja).unwrap();
     // A record written before view_version 1 already holds its whole starting view.
     let start = json!({"kind":"start","messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":"legacy brief"}]});
@@ -1417,7 +1431,7 @@ fn a_legacy_start_entry_is_its_own_ancestry_root() {
     )
     .unwrap();
     let model = Arc::new(Script::new(vec![final_message(&[])]));
-    let w = f.worker(model.clone(), Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
     let mut next = assignment(2);
     next.resume = Some(1);
     let digest = w.execute(&next, &control());
@@ -1435,9 +1449,9 @@ fn a_record_ancestry_cycle_is_refused() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = Fixture::new();
+    let f = workspace("cycle");
     for id in [1u64, 2] {
-        let aja = f.0.join(format!(".eja/ajas/{id}"));
+        let aja = f.path().join(format!(".eja/ajas/{id}"));
         std::fs::create_dir_all(&aja).unwrap();
         let start = json!({"kind":"start","view_version":1,"messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":format!("brief {id}")}]});
         std::fs::write(aja.join("context.jsonl"), format!("{start}\n")).unwrap();
@@ -1451,7 +1465,7 @@ fn a_record_ancestry_cycle_is_refused() {
         .unwrap();
     }
     let model = Arc::new(Script::new(vec![final_message(&[])]));
-    let w = f.worker(model, Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, model, Arc::new(FileTools), Limits::default());
     let mut next = assignment(3);
     next.resume = Some(1);
     let digest = w.execute(&next, &control());

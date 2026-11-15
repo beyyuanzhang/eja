@@ -1,7 +1,8 @@
 mod support;
+
 use eja::adapters::{render_context, render_context_within, Ports, SYSTEM_PROMPT};
-use eja::{EventMeta, Host, Kind, Selector, State, Store};
-use support::control;
+use eja::{EventMeta, Host, Kind, Selector, State};
+use support::{control, State as Fixture};
 
 /// The contract states the protocol; the projection states the history. Neither
 /// states who the subject is.
@@ -18,9 +19,8 @@ fn the_contract_is_protocol_not_character() {
 
 #[test]
 fn the_self_survives_budget_pressure_before_the_indexes_do() {
-    let dir = std::env::temp_dir().join(format!("eja-identity-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
+    let fixture = Fixture::new("identity");
+    let store = fixture.store();
     store
         .append_simple(Kind::Goal, "ship the release", 1, 1)
         .unwrap();
@@ -62,9 +62,8 @@ fn the_self_survives_budget_pressure_before_the_indexes_do() {
 
 #[test]
 fn a_folded_region_is_still_read_by_its_address() {
-    let dir = std::env::temp_dir().join(format!("eja-address-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
+    let fixture = Fixture::new("identity-address");
+    let store = fixture.store();
     let mut ids = Vec::new();
     for index in 0..40 {
         let event = store

@@ -1,30 +1,16 @@
 mod support;
+
 use eja::adapters::{Capabilities, Ports};
-use eja::{turn, Action, Brain, Decision, EjaContext, Kind, Result, Selector, Store, Worker};
-use std::collections::VecDeque;
-use std::sync::Mutex;
-use support::control;
+use eja::{Action, Decision, Kind, Result, Selector};
+use support::{control, decision, Done, Script, State};
 
-struct Script(Mutex<VecDeque<Decision>>);
-
-impl Brain for Script {
-    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.0
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("scripted decision")
-    }
-}
-
-struct EmptyWorker;
-
-impl Worker for EmptyWorker {
-    fn execute(&self, _: &eja::Assignment, _: &eja::Control) -> String {
-        format!(
-            "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
-            "no work expected"
-        )
+/// A decision whose reply the turn states. The kit's `decision` always says
+/// "structure"; this file asserts what the turn answered.
+fn say(reply: &str, actions: Vec<Action>) -> Decision {
+    Decision {
+        reply: reply.to_string(),
+        actions,
+        refused: Vec::new(),
     }
 }
 
@@ -43,30 +29,21 @@ impl Capabilities for Weather {
 
 #[test]
 fn a_world_look_does_not_depend_on_waiting_tasks() {
-    let dir = std::env::temp_dir().join(format!("eja-observe-nudge-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
-    let brain = Script(Mutex::new(VecDeque::from(vec![
-        Decision {
-            reply: String::new(),
-            actions: vec![Action::Look {
-                target: "mcp__weather__get".to_string(),
-                arguments: serde_json::json!({"city": "berlin"}),
-                selector: Selector::Whole,
-            }],
-            refused: Vec::new(),
-        },
-        Decision {
-            reply: "then do the work".into(),
-            actions: vec![],
-            refused: Vec::new(),
-        },
-    ])));
-    let out = turn(
+    let fixture = State::new("observe-nudge");
+    let store = fixture.store();
+    let brain = Script::new(vec![
+        decision(vec![Action::Look {
+            target: "mcp__weather__get".to_string(),
+            arguments: serde_json::json!({"city": "berlin"}),
+            selector: Selector::Whole,
+        }]),
+        decision(vec![]),
+    ]);
+    let out = eja::turn(
         &store,
         "what is the sky?",
         &brain,
-        &EmptyWorker,
+        &Done::default(),
         &Ports {
             capabilities: Some(&Weather),
             ..Default::default()
@@ -84,42 +61,29 @@ fn a_world_look_does_not_depend_on_waiting_tasks() {
 
 #[test]
 fn observing_a_read_only_tool_records_a_view() {
-    let dir = std::env::temp_dir().join(format!("eja-observe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
-    let brain = Script(Mutex::new(VecDeque::from(vec![
+    let fixture = State::new("observe");
+    let store = fixture.store();
+    let brain = Script::new(vec![
         // The world is read while judging, so the task is opened and run first.
-        Decision {
-            reply: String::new(),
-            actions: vec![Action::OpenTask {
-                title: "sky".into(),
-                request: "check the sky".into(),
-                acceptance: String::new(),
-                evidence: None,
-                run: true,
-            }],
-            refused: Vec::new(),
-        },
-        Decision {
-            reply: String::new(),
-            actions: vec![Action::Look {
-                target: "mcp__weather__get".to_string(),
-                arguments: serde_json::json!({"city": "berlin"}),
-                selector: Selector::Whole,
-            }],
-            refused: Vec::new(),
-        },
-        Decision {
-            reply: "it is clear".into(),
-            actions: vec![],
-            refused: Vec::new(),
-        },
-    ])));
-    let out = turn(
+        decision(vec![Action::OpenTask {
+            title: "sky".into(),
+            request: "check the sky".into(),
+            acceptance: String::new(),
+            evidence: None,
+            run: true,
+        }]),
+        decision(vec![Action::Look {
+            target: "mcp__weather__get".to_string(),
+            arguments: serde_json::json!({"city": "berlin"}),
+            selector: Selector::Whole,
+        }]),
+        say("it is clear", vec![]),
+    ]);
+    let out = eja::turn(
         &store,
         "what is the sky?",
         &brain,
-        &EmptyWorker,
+        &Done::default(),
         &Ports {
             capabilities: Some(&Weather),
             ..Default::default()
@@ -147,10 +111,9 @@ fn observing_a_read_only_tool_records_a_view() {
 #[test]
 fn eja_can_observe_project_files_but_never_write() {
     use eja::adapters::HostTools;
-    let root = std::env::temp_dir().join(format!("eja-observe-fs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let project = root.join("project");
-    let private = root.join("state");
+    let fixture = State::new("observe-fs");
+    let project = fixture.path().join("project");
+    let private = fixture.path().join("state");
     std::fs::create_dir_all(&project).expect("project");
     std::fs::create_dir_all(&private).expect("private");
     std::fs::write(project.join("note.txt"), "hello from the project").expect("write");

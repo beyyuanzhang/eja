@@ -1,77 +1,21 @@
-use eja::adapters::Ports;
-use eja::{
-    turn_at, Action, Assignment, Brain, Decision, Edge, EjaContext, RelationKind, Store, Worker,
-};
-use std::collections::VecDeque;
-use std::sync::Mutex;
+//! The graph a turn folds: containment, typed relations, cycles and group closure.
 
-struct QueueBrain {
-    queue: Mutex<VecDeque<Decision>>,
-}
+mod support;
 
-impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct DoneWorker;
-
-impl Worker for DoneWorker {
-    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
-        format!(
-            "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
-            "done"
-        )
-    }
-}
+use eja::{Action, Edge, RelationKind, TaskStatus};
+use support::{decision, group, link, task, turn, State};
 
 #[test]
 fn parent_and_typed_relation_are_folded_into_the_graph() {
-    let dir = std::env::temp_dir().join(format!("eja-graph-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
-    let brain = QueueBrain {
-        queue: Mutex::new(VecDeque::from(vec![Decision {
-            reply: "structure".to_string(),
-            actions: vec![
-                Action::OpenGroup {
-                    title: "long task".to_string(),
-                    acceptance: "child done".to_string(),
-                },
-                Action::OpenTask {
-                    title: "child task".to_string(),
-                    request: "child".to_string(),
-                    acceptance: "child output".to_string(),
-                    evidence: None,
-                    run: false,
-                },
-                Action::LinkTasks {
-                    from: 2,
-                    to: 1,
-                    kind: RelationKind::PartOf,
-                },
-            ],
-            refused: Vec::new(),
-        }])),
-    };
-    let outcome = turn_at(
-        &store,
-        "build a long task",
-        &brain,
-        &DoneWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("turn");
+    let state = State::new("graph");
+    let outcome = turn(
+        &state.store(),
+        vec![decision(vec![
+            group("long task"),
+            task("child task"),
+            link(2, 1, RelationKind::PartOf),
+        ])],
+    );
 
     assert_eq!(
         outcome.context().relations,
@@ -79,91 +23,28 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
             from: 2,
             to: 1,
             kind: RelationKind::PartOf,
-        },]
+        }]
     );
     // The edge is one event, scoped to its source task, not two task mutations.
-    assert!(store
+    assert!(state
         .events()
-        .unwrap()
         .iter()
         .any(|event| event.kind == eja::Kind::TaskRelation && event.scope == "task:2"));
 }
 
-fn store(tag: &str) -> Store {
-    let dir = std::env::temp_dir().join(format!("eja-graph-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    Store::new(&dir).expect("store")
-}
-
-fn run(store: &Store, decisions: Vec<Decision>) -> eja::TurnOutcome<'static> {
-    let brain = QueueBrain {
-        queue: Mutex::new(VecDeque::from(decisions)),
-    };
-    turn_at(
-        store,
-        "structure",
-        &brain,
-        &DoneWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("turn")
-}
-
-fn group(title: &str) -> Action {
-    Action::OpenGroup {
-        title: title.to_string(),
-        acceptance: "members done".to_string(),
-    }
-}
-
-fn task(title: &str, run: bool) -> Action {
-    Action::OpenTask {
-        title: title.to_string(),
-        request: title.to_string(),
-        acceptance: "output".to_string(),
-        evidence: None,
-        run,
-    }
-}
-
-fn decision(actions: Vec<Action>) -> Decision {
-    Decision {
-        reply: "structure".to_string(),
-        actions,
-        refused: Vec::new(),
-    }
-}
-
 #[test]
 fn containment_needs_an_open_group() {
-    let store = store("containment");
+    let state = State::new("containment");
     // A aja is not a container, and a task belongs to one group.
-    let outcome = run(
-        &store,
+    let outcome = turn(
+        &state.store(),
         vec![
-            decision(vec![task("solo", false), group("first"), group("second")]),
+            decision(vec![task("solo"), group("first"), group("second")]),
             decision(vec![
-                Action::LinkTasks {
-                    from: 1,
-                    to: 1,
-                    kind: RelationKind::PartOf,
-                },
-                Action::LinkTasks {
-                    from: 1,
-                    to: 1,
-                    kind: RelationKind::DependsOn,
-                },
-                Action::LinkTasks {
-                    from: 1,
-                    to: 2,
-                    kind: RelationKind::PartOf,
-                },
-                Action::LinkTasks {
-                    from: 1,
-                    to: 3,
-                    kind: RelationKind::PartOf,
-                },
+                link(1, 1, RelationKind::PartOf),
+                link(1, 1, RelationKind::DependsOn),
+                link(1, 2, RelationKind::PartOf),
+                link(1, 3, RelationKind::PartOf),
             ]),
         ],
     );
@@ -190,30 +71,21 @@ fn containment_needs_an_open_group() {
 
 #[test]
 fn relating_the_same_edge_twice_is_one_fact() {
-    let store = store("idempotent");
-    let outcome = run(
-        &store,
+    let state = State::new("idempotent");
+    let outcome = turn(
+        &state.store(),
         vec![
-            decision(vec![group("g"), task("member", false)]),
+            decision(vec![group("g"), task("member")]),
             decision(vec![
-                Action::LinkTasks {
-                    from: 2,
-                    to: 1,
-                    kind: RelationKind::PartOf,
-                },
-                Action::LinkTasks {
-                    from: 2,
-                    to: 1,
-                    kind: RelationKind::PartOf,
-                },
+                link(2, 1, RelationKind::PartOf),
+                link(2, 1, RelationKind::PartOf),
             ]),
         ],
     );
     assert_eq!(outcome.context().relations.len(), 1);
     assert_eq!(
-        store
+        state
             .events()
-            .expect("events")
             .iter()
             .filter(|event| event.kind == eja::Kind::TaskRelation)
             .count(),
@@ -224,18 +96,14 @@ fn relating_the_same_edge_twice_is_one_fact() {
 
 #[test]
 fn a_group_with_an_active_member_refuses_to_close() {
-    let store = store("group-close");
-    let outcome = run(
-        &store,
+    let state = State::new("group-close");
+    let outcome = turn(
+        &state.store(),
         vec![
-            decision(vec![group("g"), task("member", false)]),
+            decision(vec![group("g"), task("member")]),
             // One decision: a successful relation alone ends the turn.
             decision(vec![
-                Action::LinkTasks {
-                    from: 2,
-                    to: 1,
-                    kind: RelationKind::PartOf,
-                },
+                link(2, 1, RelationKind::PartOf),
                 Action::CloseTask {
                     task_id: 1,
                     accepted: true,
@@ -250,14 +118,14 @@ fn a_group_with_an_active_member_refuses_to_close() {
         .refused
         .iter()
         .any(|note| note.contains("still has active children")));
-    assert_eq!(context.tasks[0].status, eja::TaskStatus::Open);
+    assert_eq!(context.tasks[0].status, TaskStatus::Open);
 }
 
 #[test]
 fn a_group_closed_unaccepted_is_failed() {
-    let store = store("group-reject");
-    let outcome = run(
-        &store,
+    let state = State::new("group-reject");
+    let outcome = turn(
+        &state.store(),
         vec![
             decision(vec![group("g")]),
             decision(vec![Action::CloseTask {
@@ -268,7 +136,7 @@ fn a_group_closed_unaccepted_is_failed() {
         ],
     );
     let context = outcome.context();
-    assert_eq!(context.tasks[0].status, eja::TaskStatus::Failed);
+    assert_eq!(context.tasks[0].status, TaskStatus::Failed);
     assert_eq!(
         context.tasks[0].close.as_ref().expect("close").note,
         "not wanted"
@@ -277,22 +145,14 @@ fn a_group_closed_unaccepted_is_failed() {
 
 #[test]
 fn a_dependency_cycle_is_refused() {
-    let store = store("cycle");
-    let outcome = run(
-        &store,
+    let state = State::new("cycle");
+    let outcome = turn(
+        &state.store(),
         vec![
-            decision(vec![task("a", false), task("b", false)]),
+            decision(vec![task("a"), task("b")]),
             decision(vec![
-                Action::LinkTasks {
-                    from: 1,
-                    to: 2,
-                    kind: RelationKind::DependsOn,
-                },
-                Action::LinkTasks {
-                    from: 2,
-                    to: 1,
-                    kind: RelationKind::DependsOn,
-                },
+                link(1, 2, RelationKind::DependsOn),
+                link(2, 1, RelationKind::DependsOn),
             ]),
         ],
     );

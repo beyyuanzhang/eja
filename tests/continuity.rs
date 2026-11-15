@@ -1,97 +1,39 @@
+//! Continuity: the facts a later turn still reads, and the one clock they carry.
+
+mod support;
+
 use chrono::{TimeZone, Utc};
 use eja::adapters::Ports;
 use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, State, Store,
-    TaskStatus, Worker,
+    Action, Assignment, Decision, Kind, ProposalKind, State, Store, TaskStatus, TurnOptions,
+    TurnOutcome,
 };
 use serde::Deserialize;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-struct QueueBrain {
-    queue: Mutex<VecDeque<Decision>>,
-}
-
-impl QueueBrain {
-    fn new(decisions: Vec<Decision>) -> Self {
-        Self {
-            queue: Mutex::new(decisions.into()),
-        }
-    }
-}
-
-impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct QueueWorker {
-    queue: Mutex<VecDeque<String>>,
-}
-
-impl QueueWorker {
-    fn new(reports: Vec<String>) -> Self {
-        Self {
-            queue: Mutex::new(reports.into()),
-        }
-    }
-}
-
-impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
-        self.queue
-            .lock()
-            .expect("worker")
-            .pop_front()
-            .unwrap_or_else(|| {
-                format!(
-                    "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
-                    "no scripted record"
-                )
-            })
-    }
-}
-
-fn decision(reply: &str, actions: Vec<Action>) -> Decision {
-    Decision {
-        reply: reply.to_string(),
-        actions,
-        refused: Vec::new(),
-    }
-}
-
-fn record() -> String {
-    format!(
-        "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
-        "done"
-    )
-}
-
-fn temp_store() -> std::path::PathBuf {
-    let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("eja-continuity-{}-{}", std::process::id(), serial));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
-}
+use support::{aja, decision, Done, Script};
 
 fn day(year: i32, month: u32, day: u32, hour: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(year, month, day, hour, 0, 0)
         .single()
         .expect("valid UTC time")
+}
+
+/// One turn at a stated instant. The kit's turns read the host clock; continuity
+/// is about what a later turn reads, so this file states the time instead.
+fn turn_at_time(
+    store: &Store,
+    input: &'static str,
+    decisions: Vec<Decision>,
+    at: chrono::DateTime<Utc>,
+) -> TurnOutcome<'static> {
+    eja::turn_at(
+        store,
+        input,
+        &Script::new(decisions),
+        &Done::default(),
+        &Ports::default(),
+        at,
+    )
+    .expect("turn")
 }
 
 fn propose_and_confirm(
@@ -101,41 +43,30 @@ fn propose_and_confirm(
     target_id: Option<u64>,
     at: chrono::DateTime<Utc>,
 ) {
-    let propose = QueueBrain::new(vec![decision(
-        "proposed",
-        vec![Action::Propose {
+    let outcome = turn_at_time(
+        store,
+        "propose",
+        vec![decision(vec![Action::Propose {
             kind,
             target_id,
             text: text.to_string(),
-        }],
-    )]);
-    let outcome = turn_at(
-        store,
-        "propose",
-        &propose,
-        &QueueWorker::new(vec![]),
-        &Ports::default(),
+        }])],
         at,
-    )
-    .expect("propose");
+    );
     let proposal_id = outcome
         .context()
         .proposals
         .last()
         .expect("pending proposal")
         .id;
-    let confirm = QueueBrain::new(vec![decision(
-        "confirmed",
-        vec![Action::Confirm { proposal_id }],
-    )]);
     eja::turn_at_with_options(
         store,
         "confirm",
-        &confirm,
-        &QueueWorker::new(vec![]),
+        &Script::new(vec![decision(vec![Action::Confirm { proposal_id }])]),
+        &Done::default(),
         &Ports::default(),
         at,
-        &eja::TurnOptions {
+        &TurnOptions {
             approvals: vec![proposal_id],
             ..Default::default()
         },
@@ -145,28 +76,24 @@ fn propose_and_confirm(
 
 #[test]
 fn user_input_does_not_become_a_goal() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let outcome = turn_at(
-        &store,
+    let state = support::State::new("continuity-input");
+    let outcome = turn_at_time(
+        &state.store(),
         "what is the weather?",
-        &QueueBrain::new(vec![decision("a reply", vec![])]),
-        &QueueWorker::new(vec![]),
-        &Ports::default(),
+        vec![decision(vec![])],
         day(2026, 11, 9, 9),
-    )
-    .expect("turn");
+    );
     assert_eq!(outcome.context().input, "what is the weather?");
     assert!(outcome.context().goal.is_none());
-    let restarted = Store::new(&dir).expect("restart");
+    let restarted = state.reopen();
     assert!(State::load(&restarted).expect("state").goal().is_none());
     assert!(eja::adapters::render_context(&outcome.context()).contains("CURRENT GOAL:\n  (none)"));
 }
 
 #[test]
 fn unrelated_input_preserves_a_confirmed_goal() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
+    let state = support::State::new("continuity-goal");
+    let store = state.store();
     propose_and_confirm(
         &store,
         ProposalKind::Goal,
@@ -174,15 +101,12 @@ fn unrelated_input_preserves_a_confirmed_goal() {
         None,
         day(2026, 11, 9, 9),
     );
-    let outcome = turn_at(
+    let outcome = turn_at_time(
         &store,
         "what is the weather?",
-        &QueueBrain::new(vec![decision("a reply", vec![])]),
-        &QueueWorker::new(vec![]),
-        &Ports::default(),
+        vec![decision(vec![])],
         day(2026, 11, 9, 10),
-    )
-    .expect("turn");
+    );
     let context = outcome.context();
     let goal = context.goal.as_ref().expect("goal");
     assert_eq!(goal.text, "ship the release");
@@ -193,8 +117,8 @@ fn unrelated_input_preserves_a_confirmed_goal() {
 
 #[test]
 fn restart_and_model_switch_preserve_identity() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
+    let state = support::State::new("continuity-identity");
+    let store = state.store();
     propose_and_confirm(
         &store,
         ProposalKind::Commitment,
@@ -203,20 +127,16 @@ fn restart_and_model_switch_preserve_identity() {
         day(2026, 11, 9, 9),
     );
 
-    let store = Store::new(&dir).expect("restart");
-    let other_model = QueueBrain::new(vec![decision("continue", vec![])]);
-    turn_at(
+    let store = state.reopen();
+    turn_at_time(
         &store,
         "what did I commit to?",
-        &other_model,
-        &QueueWorker::new(vec![]),
-        &Ports::default(),
+        vec![decision(vec![])],
         day(2026, 11, 10, 9),
-    )
-    .expect("continue");
+    );
 
-    let state = State::load(&store).expect("state");
-    let context = state.project("what did I commit to?", None, day(2026, 11, 10, 10));
+    let fold = State::load(&store).expect("state");
+    let context = fold.project("what did I commit to?", None, day(2026, 11, 10, 10));
     assert_eq!(context.commitments.len(), 1);
     assert_eq!(
         context.commitments[0].text,
@@ -226,8 +146,8 @@ fn restart_and_model_switch_preserve_identity() {
 
 #[test]
 fn correction_by_id_survives_restart() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
+    let state = support::State::new("continuity-correction");
+    let store = state.store();
     propose_and_confirm(
         &store,
         ProposalKind::Commitment,
@@ -245,7 +165,7 @@ fn correction_by_id_survives_restart() {
         day(2026, 11, 9, 10),
     );
 
-    let store = Store::new(&dir).expect("restart");
+    let store = state.reopen();
     let events = store.events().expect("events");
     assert!(State::fold(events.clone()).commitments().is_empty());
     assert!(events
@@ -255,8 +175,8 @@ fn correction_by_id_survives_restart() {
 
 #[test]
 fn correction_can_close_a_goal_without_language_matching() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
+    let state = support::State::new("continuity-withdraw");
+    let store = state.store();
     propose_and_confirm(
         &store,
         ProposalKind::Goal,
@@ -285,8 +205,8 @@ fn correction_can_close_a_goal_without_language_matching() {
 #[test]
 fn replacements_preserve_their_kind_and_revision_chain_across_restart() {
     for kind in [ProposalKind::Goal, ProposalKind::Commitment] {
-        let dir = temp_store();
-        let store = Store::new(&dir).expect("store");
+        let state = support::State::new("continuity-replace");
+        let store = state.store();
         let event_kind = match kind {
             ProposalKind::Goal => Kind::Goal,
             ProposalKind::Commitment => Kind::Commitment,
@@ -305,9 +225,9 @@ fn replacements_preserve_their_kind_and_revision_chain_across_restart() {
             assert_eq!(entry.closes, previous);
             previous = Some(entry.id);
         }
-        let restarted = Store::new(&dir).expect("restart");
-        let state = State::load(&restarted).expect("state");
-        let context = state.project("unrelated input", None, day(2026, 11, 10, 9));
+        let restarted = state.reopen();
+        let fold = State::load(&restarted).expect("state");
+        let context = fold.project("unrelated input", None, day(2026, 11, 10, 9));
         if kind == ProposalKind::Goal {
             assert_eq!(context.goal.as_ref().expect("goal").text, "latest");
         } else {
@@ -321,7 +241,7 @@ fn replacements_preserve_their_kind_and_revision_chain_across_restart() {
             previous,
             day(2026, 11, 10, 10),
         );
-        let events = Store::new(&dir).unwrap().events().unwrap();
+        let events = state.events();
         assert!(State::fold(events.clone()).goal().is_none());
         assert!(State::fold(events.clone()).commitments().is_empty());
         assert_eq!(events.iter().filter(|e| e.kind == event_kind).count(), 3);
@@ -330,38 +250,22 @@ fn replacements_preserve_their_kind_and_revision_chain_across_restart() {
 
 #[test]
 fn utc_time_is_one_source_for_turn_task_and_worker() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
+    let state = support::State::new("continuity-clock");
+    let store = state.store();
     let at = day(2026, 11, 9, 12);
-    let brain = QueueBrain::new(vec![
-        decision(
-            "start",
-            vec![Action::OpenTask {
-                title: "release".to_string(),
-                request: "write checklist".to_string(),
-                acceptance: "contains build".to_string(),
-                evidence: None,
-                run: true,
-            }],
-        ),
-        decision(
-            "done",
-            vec![Action::CloseTask {
+    let outcome = turn_at_time(
+        &store,
+        "make a checklist",
+        vec![
+            decision(vec![aja("release")]),
+            decision(vec![Action::CloseTask {
                 task_id: 1,
                 accepted: true,
                 note: "ok".to_string(),
-            }],
-        ),
-    ]);
-    let outcome = turn_at(
-        &store,
-        "make a checklist",
-        &brain,
-        &QueueWorker::new(vec![record()]),
-        &Ports::default(),
+            }]),
+        ],
         at,
-    )
-    .expect("turn");
+    );
 
     assert_eq!(outcome.context().now, at.timestamp());
     let task = &outcome.context().tasks[0];
@@ -385,8 +289,8 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
 
 #[test]
 fn temporal_gap_is_numeric_and_language_free() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
+    let state = support::State::new("continuity-gap");
+    let store = state.store();
     propose_and_confirm(
         &store,
         ProposalKind::Commitment,
@@ -396,8 +300,8 @@ fn temporal_gap_is_numeric_and_language_free() {
     );
 
     let later = day(2026, 11, 12, 18);
-    let state = State::load(&store).expect("state");
-    let context = state.project("what is due?", None, later);
+    let fold = State::load(&store).expect("state");
+    let context = fold.project("what is due?", None, later);
     assert_eq!(context.now, later.timestamp());
     assert_eq!(context.commitments[0].at, day(2026, 11, 9, 9).timestamp());
 }

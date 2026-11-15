@@ -2,17 +2,15 @@ mod support;
 use eja::adapters::{render_context, OpenAiBrain};
 use eja::{
     Action, Brain, EventMeta, Kind, Observation, ObservationKind, ProposalKind, Selector, State,
-    Store,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use support::control;
+use support::{control, State as Fixture};
 
 #[test]
 fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
-    let dir = std::env::temp_dir().join(format!("eja-brain-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
+    let fixture = Fixture::new("brain");
+    let store = fixture.store();
     let goal = store
         .append_simple(Kind::Goal, "original goal", 1, 1)
         .unwrap();

@@ -7,49 +7,26 @@ use eja::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
-use support::control;
-static SERIAL: AtomicU64 = AtomicU64::new(0);
-struct Fixture(std::path::PathBuf);
-impl Fixture {
-    fn new() -> Self {
-        Self(std::env::temp_dir().join(format!(
-            "eja-laws-{}-{}",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        )))
-    }
-    fn store(&self) -> Store {
-        Store::new(&self.0).unwrap()
-    }
+use support::{
+    aja, control, group, link, task, turn_at, turn_with, Done, Script, State as Fixture,
+};
+
+/// The one decision this file's brain makes: it says "finished" and does the actions.
+fn script(actions: Vec<Action>) -> Vec<Decision> {
+    vec![Decision {
+        reply: "finished".into(),
+        actions,
+        ..Decision::default()
+    }]
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-struct Script(Mutex<VecDeque<Decision>>);
-impl Brain for Script {
-    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.0.lock().unwrap().pop_front().unwrap_or_default()
-    }
-}
-fn script(actions: Vec<Action>) -> Script {
-    Script(Mutex::new(
-        vec![Decision {
-            reply: "finished".into(),
-            actions,
-            ..Decision::default()
-        }]
-        .into(),
-    ))
-}
+
+/// A worker that records every assignment, so a test can state what it ran.
 #[derive(Default)]
 struct WorkerLog(Mutex<Vec<Assignment>>);
 impl Worker for WorkerLog {
@@ -58,18 +35,7 @@ impl Worker for WorkerLog {
         "ended: message\nwork recorded".into()
     }
 }
-fn aja(title: &str, run: bool) -> Action {
-    Action::OpenTask {
-        title: title.into(),
-        request: title.into(),
-        acceptance: "done".into(),
-        evidence: None,
-        run,
-    }
-}
-const fn edge(from: u64, to: u64, kind: RelationKind) -> Action {
-    Action::LinkTasks { from, to, kind }
-}
+
 fn close(id: u64, accepted: bool) -> Action {
     Action::CloseTask {
         task_id: id,
@@ -77,22 +43,12 @@ fn close(id: u64, accepted: bool) -> Action {
         note: "judged".into(),
     }
 }
-fn run(store: &Store, actions: Vec<Action>, worker: &WorkerLog) -> TurnOutcome<'static> {
-    turn(
-        store,
-        "request",
-        &script(actions),
-        worker,
-        &Ports::default(),
-    )
-    .unwrap()
-}
 
 #[test]
 fn torn_tail_recovery_is_closed_under_future_appends_and_committed_corruption_is_an_error() {
     use std::io::Write;
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     store.append_simple(Kind::User, "one", 1, 1).unwrap();
     std::fs::OpenOptions::new()
         .append(true)
@@ -100,11 +56,12 @@ fn torn_tail_recovery_is_closed_under_future_appends_and_committed_corruption_is
         .unwrap()
         .write_all(b"{\"id\":")
         .unwrap();
-    let restarted = f.store();
+    let restarted = fixture.store();
     restarted.append_simple(Kind::User, "two", 2, 2).unwrap();
     restarted.append_simple(Kind::User, "three", 3, 3).unwrap();
     assert_eq!(
-        f.store()
+        fixture
+            .store()
             .events()
             .unwrap()
             .iter()
@@ -118,25 +75,28 @@ fn torn_tail_recovery_is_closed_under_future_appends_and_committed_corruption_is
         .unwrap()
         .write_all(b"not json\n")
         .unwrap();
-    assert!(Store::new(&f.0).is_err());
+    assert!(Store::new(fixture.path()).is_err());
 }
 
 #[test]
 fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal() {
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
-    let proposed = run(
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
+    let proposed = turn_at(
         &store,
-        vec![Action::Propose {
+        "request",
+        script(vec![Action::Propose {
             kind: ProposalKind::Goal,
             target_id: None,
             text: "goal".into(),
-        }],
-        &worker,
+        }]),
     );
     let id = proposed.context().proposals[0].id;
-    let refused = run(&store, vec![Action::Confirm { proposal_id: id }], &worker);
+    let refused = turn_at(
+        &store,
+        "request",
+        script(vec![Action::Confirm { proposal_id: id }]),
+    );
     assert!(refused.context().goal.is_none());
     let options = TurnOptions {
         approvals: vec![id],
@@ -145,8 +105,8 @@ fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal()
     let confirmed = turn_at_with_options(
         &store,
         "explicit approval",
-        &script(vec![Action::Confirm { proposal_id: id }]),
-        &worker,
+        &Script::new(script(vec![Action::Confirm { proposal_id: id }])),
+        &Done::default(),
         &Ports::default(),
         now_utc(),
         &options,
@@ -174,21 +134,20 @@ fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal()
     assert!(!events
         .iter()
         .any(|event| event.kind == Kind::User && event.data.is_some()));
-    let state = State::load(&f.store()).expect("state");
+    let state = State::load(&fixture.store()).expect("state");
     assert!(state.project("", None, now_utc()).proposals.is_empty());
 }
 
 #[test]
 fn an_approval_cannot_confirm_a_proposal_in_its_creation_turn() {
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     // Event 1 is the user event, so the proposal a scripted decision creates is
     // event 2: the decision may name it, and the same turn may not confirm it.
-    let out = turn_at_with_options(
+    let out = turn_at(
         &store,
         "request",
-        &script(vec![
+        script(vec![
             Action::Propose {
                 kind: ProposalKind::Commitment,
                 target_id: None,
@@ -196,12 +155,7 @@ fn an_approval_cannot_confirm_a_proposal_in_its_creation_turn() {
             },
             Action::Confirm { proposal_id: 2 },
         ]),
-        &worker,
-        &Ports::default(),
-        now_utc(),
-        &TurnOptions::default(),
-    )
-    .unwrap();
+    );
     assert!(out.context().commitments.is_empty());
     assert!(out
         .context()
@@ -212,24 +166,27 @@ fn an_approval_cannot_confirm_a_proposal_in_its_creation_turn() {
 
 #[test]
 fn groups_close_from_their_members_without_a_fake_execution() {
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let worker = WorkerLog::default();
-    run(
+    turn_with(
         &store,
-        vec![
-            Action::OpenGroup {
-                title: "job".into(),
-                acceptance: "children done".into(),
-            },
-            aja("child", true),
-            edge(2, 1, RelationKind::PartOf),
-        ],
+        "request",
+        script(vec![
+            group("job"),
+            aja("child"),
+            link(2, 1, RelationKind::PartOf),
+        ]),
         &worker,
     );
-    let premature = run(&store, vec![close(1, true)], &worker);
+    let premature = turn_with(&store, "request", script(vec![close(1, true)]), &worker);
     assert_eq!(premature.context().tasks[0].status, TaskStatus::Open);
-    let out = run(&store, vec![close(2, true), close(1, true)], &worker);
+    let out = turn_with(
+        &store,
+        "request",
+        script(vec![close(2, true), close(1, true)]),
+        &worker,
+    );
     assert!(out.context().refused.is_empty());
     assert!(out
         .context()
@@ -237,32 +194,33 @@ fn groups_close_from_their_members_without_a_fake_execution() {
         .iter()
         .all(|task| task.status == TaskStatus::Done));
     assert_eq!(worker.0.lock().unwrap().len(), 1);
-    let refused = run(&store, vec![Action::Dispatch { task_id: 1 }], &worker);
+    let refused = turn_with(
+        &store,
+        "request",
+        script(vec![Action::Dispatch { task_id: 1 }]),
+        &worker,
+    );
     assert!(!refused.context().refused.is_empty());
 }
 
 #[test]
 fn graph_constraints_include_cross_kind_cycles_and_real_dependency_readiness() {
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
-    let out = run(
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
+    let out = turn_at(
         &store,
-        vec![
-            Action::OpenGroup {
-                title: "job".into(),
-                acceptance: "children".into(),
-            },
-            aja("a", false),
-            aja("b", false),
-            edge(2, 1, RelationKind::PartOf),
-            edge(2, 1, RelationKind::DependsOn),
-            edge(3, 2, RelationKind::DependsOn),
-            edge(2, 3, RelationKind::DependsOn),
-            edge(2, 999, RelationKind::RelatesTo),
-            edge(2, 2, RelationKind::RelatesTo),
-        ],
-        &worker,
+        "request",
+        script(vec![
+            group("job"),
+            task("a"),
+            task("b"),
+            link(2, 1, RelationKind::PartOf),
+            link(2, 1, RelationKind::DependsOn),
+            link(3, 2, RelationKind::DependsOn),
+            link(2, 3, RelationKind::DependsOn),
+            link(2, 999, RelationKind::RelatesTo),
+            link(2, 2, RelationKind::RelatesTo),
+        ]),
     );
     assert_eq!(out.context().relations.len(), 2);
     // Four actions are refused; two of them are the same cause (a cycle through
@@ -276,32 +234,46 @@ fn graph_constraints_include_cross_kind_cycles_and_real_dependency_readiness() {
             .count(),
         1
     );
-    let blocked = run(&store, vec![Action::Dispatch { task_id: 3 }], &worker);
+    let blocked = turn_at(
+        &store,
+        "request",
+        script(vec![Action::Dispatch { task_id: 3 }]),
+    );
     assert!(blocked.dispatched.is_empty());
-    run(&store, vec![Action::Dispatch { task_id: 2 }], &worker);
-    run(&store, vec![close(2, true)], &worker);
-    let ready = run(&store, vec![Action::Dispatch { task_id: 3 }], &worker);
+    turn_at(
+        &store,
+        "request",
+        script(vec![Action::Dispatch { task_id: 2 }]),
+    );
+    turn_at(&store, "request", script(vec![close(2, true)]));
+    let ready = turn_at(
+        &store,
+        "request",
+        script(vec![Action::Dispatch { task_id: 3 }]),
+    );
     assert_eq!(ready.dispatched, vec![3]);
 }
 
 #[test]
 fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let worker = WorkerLog::default();
-    run(
+    turn_with(
         &store,
-        vec![aja("a", true), aja("b", true), aja("next", false)],
+        "request",
+        script(vec![aja("a"), aja("b"), task("next")]),
         &worker,
     );
-    let out = run(
+    let out = turn_with(
         &store,
-        vec![
-            edge(3, 1, RelationKind::Continues),
-            edge(3, 2, RelationKind::Continues),
+        "request",
+        script(vec![
+            link(3, 1, RelationKind::Continues),
+            link(3, 2, RelationKind::Continues),
             Action::Dispatch { task_id: 3 },
-            edge(3, 2, RelationKind::Continues),
-        ],
+            link(3, 2, RelationKind::Continues),
+        ]),
         &worker,
     );
     assert_eq!(
@@ -331,16 +303,29 @@ fn look() -> Action {
 }
 #[test]
 fn unrelated_tasks_do_not_change_world_capabilities() {
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let ports = Ports {
         capabilities: Some(&World),
         ..Default::default()
     };
-    let first = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
-    run(&store, vec![aja("unrelated", true)], &worker);
-    let second = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
+    let first = turn(
+        &store,
+        "read",
+        &Script::new(script(vec![look()])),
+        &Done::default(),
+        &ports,
+    )
+    .unwrap();
+    turn_at(&store, "request", script(vec![aja("unrelated")]));
+    let second = turn(
+        &store,
+        "read",
+        &Script::new(script(vec![look()])),
+        &Done::default(),
+        &ports,
+    )
+    .unwrap();
     // The same observation is available after an unrelated task: the capability
     // does not depend on the task index.
     assert_eq!(first.context().evidence, second.context().evidence);
@@ -352,16 +337,15 @@ struct Growing;
 impl Brain for Growing {
     fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
         Decision {
-            actions: vec![aja("another", true)],
+            actions: vec![aja("another")],
             ..Decision::default()
         }
     }
 }
 #[test]
 fn endlessly_novel_states_stop_at_the_turn_budget_with_all_records_retained() {
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let options = TurnOptions {
         limits: TurnLimits {
             decisions: 3,
@@ -373,7 +357,7 @@ fn endlessly_novel_states_stop_at_the_turn_budget_with_all_records_retained() {
         &store,
         "keep going",
         &Growing,
-        &worker,
+        &Done::default(),
         &Ports::default(),
         now_utc(),
         &options,
@@ -412,9 +396,8 @@ fn turn_deadline_and_cancellation_cross_the_brain_boundary() {
         parent.check().is_ok(),
         "child revocation does not revoke its parent"
     );
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let options = TurnOptions {
         limits: TurnLimits {
             timeout_ms: 20,
@@ -427,7 +410,7 @@ fn turn_deadline_and_cancellation_cross_the_brain_boundary() {
         &store,
         "wait",
         &Wait,
-        &worker,
+        &Done::default(),
         &Ports::default(),
         now_utc(),
         &options,
@@ -443,7 +426,7 @@ fn turn_deadline_and_cancellation_cross_the_brain_boundary() {
         &store,
         "cancelled",
         &Growing,
-        &worker,
+        &Done::default(),
         &Ports::default(),
         now_utc(),
         &options,
@@ -455,17 +438,9 @@ fn turn_deadline_and_cancellation_cross_the_brain_boundary() {
 
 #[test]
 fn history_is_discoverable_and_all_rendered_views_obey_utf8_byte_budgets() {
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
-    turn(
-        &store,
-        "remember this fact",
-        &script(vec![]),
-        &worker,
-        &Ports::default(),
-    )
-    .unwrap();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
+    turn_at(&store, "remember this fact", script(vec![]));
     let state = State::load(&store).expect("state");
     let context = state.project("next", None, now_utc());
     assert!(context
@@ -493,12 +468,12 @@ fn history_is_discoverable_and_all_rendered_views_obey_utf8_byte_budgets() {
 
 #[test]
 fn a_stale_store_refuses_to_overwrite_another_writers_cursor() {
-    let f = Fixture::new();
-    let first = f.store();
-    let second = f.store();
+    let fixture = Fixture::new("convergence");
+    let first = fixture.store();
+    let second = fixture.store();
     first.append_simple(Kind::User, "first", 1, 1).unwrap();
     assert!(second.append_simple(Kind::User, "stale", 1, 1).is_err());
-    let fresh = f.store();
+    let fresh = fixture.store();
     let next = fresh.append_simple(Kind::User, "second", 2, 2).unwrap();
     assert_eq!(next.id, 2);
     assert_eq!(fresh.events().unwrap().len(), 2);
@@ -506,8 +481,8 @@ fn a_stale_store_refuses_to_overwrite_another_writers_cursor() {
 
 #[test]
 fn cloned_store_appends_keep_a_single_monotone_event_order() {
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     std::thread::scope(|scope| {
         for _ in 0..4 {
             let store = store.clone();
@@ -525,35 +500,28 @@ fn cloned_store_appends_keep_a_single_monotone_event_order() {
 
 #[test]
 fn group_verdict_is_not_a_second_quality_authority_over_eja() {
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let worker = WorkerLog::default();
-    run(
+    turn_with(
         &store,
-        vec![
-            Action::OpenGroup {
-                title: "best effort".into(),
-                acceptance: "report even tolerated failures".into(),
-            },
-            aja("optional check", false),
-            edge(2, 1, RelationKind::PartOf),
+        "request",
+        script(vec![
+            group("best effort"),
+            task("optional check"),
+            link(2, 1, RelationKind::PartOf),
             close(2, false),
-        ],
+        ]),
         &worker,
     );
-    let out = run(&store, vec![close(1, true)], &worker);
+    let out = turn_with(&store, "request", script(vec![close(1, true)]), &worker);
     assert_eq!(out.context().tasks[0].status, TaskStatus::Done);
     assert_eq!(out.context().tasks[1].status, TaskStatus::Failed);
     assert!(out.context().refused.is_empty());
-    let empty = run(
+    let empty = turn_with(
         &store,
-        vec![
-            Action::OpenGroup {
-                title: "empty selection".into(),
-                acceptance: "no work required".into(),
-            },
-            close(3, true),
-        ],
+        "request",
+        script(vec![group("empty selection"), close(3, true)]),
         &worker,
     );
     assert_eq!(empty.context().tasks[2].status, TaskStatus::Done);
@@ -578,9 +546,13 @@ impl Brain for HeldBrain {
 #[test]
 fn the_journal_lease_excludes_both_cloned_and_independent_stores() {
     for cloned in [false, true] {
-        let f = Fixture::new();
-        let first = f.store();
-        let second = if cloned { first.clone() } else { f.store() };
+        let fixture = Fixture::new("convergence");
+        let first = fixture.store();
+        let second = if cloned {
+            first.clone()
+        } else {
+            fixture.store()
+        };
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let running = std::thread::spawn(move || {
@@ -591,7 +563,7 @@ fn the_journal_lease_excludes_both_cloned_and_independent_stores() {
                     entered: entered_tx,
                     release: Mutex::new(release_rx),
                 },
-                &WorkerLog::default(),
+                &Done::default(),
                 &Ports::default(),
             )
             .unwrap()
@@ -600,8 +572,8 @@ fn the_journal_lease_excludes_both_cloned_and_independent_stores() {
         let blocked = turn(
             &second,
             "second",
-            &script(vec![]),
-            &WorkerLog::default(),
+            &Script::new(script(vec![])),
+            &Done::default(),
             &Ports::default(),
         );
         assert!(blocked.unwrap_err().to_string().contains("another turn"));
@@ -615,7 +587,7 @@ impl Brain for ReceiptBrain {
     fn decide(&self, context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         let mut step = self.0.lock().unwrap();
         let actions = match *step {
-            0 => vec![aja("allocated", false)],
+            0 => vec![task("allocated")],
             1 => vec![Action::Dispatch {
                 task_id: context.focus.expect("creation returns focus"),
             }],
@@ -632,13 +604,13 @@ impl Brain for ReceiptBrain {
 }
 #[test]
 fn allocation_returns_an_id_before_the_model_has_to_address_the_new_entity() {
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let out = turn(
         &store,
         "execute",
         &ReceiptBrain(Mutex::new(0)),
-        &WorkerLog::default(),
+        &Done::default(),
         &Ports::default(),
     )
     .unwrap();
@@ -649,8 +621,8 @@ fn allocation_returns_an_id_before_the_model_has_to_address_the_new_entity() {
 
 #[test]
 fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offset() {
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let first = store
         .append_simple(Kind::User, &"前\n\"后".repeat(80000), 1, 1)
         .unwrap();
@@ -670,7 +642,7 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
     assert_eq!(page["partial_events"][0]["id"], first.id);
     assert_eq!(page["events"][0]["text"], "later fact");
     // The frame cap bounds the serialized page, so measure it as sent.
-    assert!(page.to_string().len() <= aja::FRAME_LIMIT);
+    assert!(page.to_string().len() <= eja::aja::FRAME_LIMIT);
     let target = format!("log:event:{}", first.id);
     let text = serde_json::to_string(&first).unwrap();
     let at = text.find('前').unwrap();
@@ -688,12 +660,12 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
     let out = turn(
         &store,
         "read",
-        &script(vec![Action::Look {
+        &Script::new(script(vec![Action::Look {
             target: "log:all".into(),
             arguments: Value::Null,
             selector: Selector::Range { from: 0, lines: 2 },
-        }]),
-        &WorkerLog::default(),
+        }])),
+        &Done::default(),
         &ports,
     )
     .unwrap();
@@ -711,18 +683,18 @@ impl eja::Host for CancelLookup {
 }
 #[test]
 fn cancellation_keeps_prior_refusals_and_reconciles_reserved_dispatches() {
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let cancelled = Arc::new(AtomicBool::new(false));
     let out = turn_at_with_options(
         &store,
         "run",
-        &script(vec![
+        &Script::new(script(vec![
             Action::Dispatch { task_id: 999 },
-            aja("reserved", true),
+            aja("reserved"),
             look(),
-        ]),
-        &WorkerLog::default(),
+        ])),
+        &Done::default(),
         &CancelLookup(cancelled.clone()),
         now_utc(),
         &TurnOptions {
@@ -754,8 +726,8 @@ fn cancellation_between_queued_ajas_preserves_completed_evidence_and_skips_the_n
             "first execution completed".into()
         }
     }
-    let f = Fixture::new();
-    let store = f.store();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker = CancelAfterFirst {
         cancelled: cancelled.clone(),
@@ -764,7 +736,7 @@ fn cancellation_between_queued_ajas_preserves_completed_evidence_and_skips_the_n
     let out = turn_at_with_options(
         &store,
         "two ajas",
-        &script(vec![aja("first", true), aja("second", true)]),
+        &Script::new(script(vec![aja("first"), aja("second")])),
         &worker,
         &Ports::default(),
         now_utc(),
@@ -793,26 +765,25 @@ fn cancellation_between_queued_ajas_preserves_completed_evidence_and_skips_the_n
 }
 #[test]
 fn a_rejection_is_recorded_and_the_proposal_leaves_the_view() {
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
-    let proposed = run(
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
+    let proposed = turn_at(
         &store,
-        vec![Action::Propose {
+        "request",
+        script(vec![Action::Propose {
             kind: ProposalKind::Commitment,
             target_id: None,
             text: "later".into(),
-        }],
-        &worker,
+        }]),
     );
     let id = proposed.context().proposals[0].id;
-    let rejected = run(
+    let rejected = turn_at(
         &store,
-        vec![Action::Reject {
+        "request",
+        script(vec![Action::Reject {
             proposal_id: id,
             note: "not now".into(),
-        }],
-        &worker,
+        }]),
     );
     assert!(
         rejected.context().proposals.is_empty(),
@@ -827,13 +798,13 @@ fn a_rejection_is_recorded_and_the_proposal_leaves_the_view() {
     assert_eq!(data["proposal_id"], json!(id));
     assert_eq!(data["note"], json!("not now"));
     // Rejecting twice is refused: the fact is already resolved.
-    let again = run(
+    let again = turn_at(
         &store,
-        vec![Action::Reject {
+        "request",
+        script(vec![Action::Reject {
             proposal_id: id,
             note: "again".into(),
-        }],
-        &worker,
+        }]),
     );
     assert!(
         again
@@ -848,14 +819,13 @@ fn a_rejection_is_recorded_and_the_proposal_leaves_the_view() {
 
 #[test]
 fn a_recorded_relationship_is_identity_content() {
-    let f = Fixture::new();
-    let store = f.store();
-    let worker = WorkerLog::default();
+    let fixture = Fixture::new("convergence");
+    let store = fixture.store();
     let text = "the bench answers to the scheduler";
-    run(
+    turn_at(
         &store,
-        vec![Action::RecordRelationship { text: text.into() }],
-        &worker,
+        "request",
+        script(vec![Action::RecordRelationship { text: text.into() }]),
     );
     let events = store.events().unwrap();
     assert!(events

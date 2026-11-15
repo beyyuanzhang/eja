@@ -1,136 +1,43 @@
+mod support;
 use eja::adapters::{render_context, Ports};
 use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, State, Store,
+    now_utc, turn_at_with_options, Action, Assignment, Decision, Kind, ProposalKind, State, Store,
     TaskStatus, Worker,
 };
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use support::{decision, turn_with, Done, Script, State as Fixture};
 
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-
-struct QueueBrain {
-    queue: Mutex<VecDeque<Decision>>,
-}
-
-impl QueueBrain {
-    fn new(decisions: Vec<Decision>) -> Self {
-        Self {
-            queue: Mutex::new(decisions.into()),
-        }
+/// A worker whose report is the exact account a test states.
+struct Report(&'static str);
+impl Worker for Report {
+    fn execute(&self, _: &Assignment, _: &eja::Control) -> String {
+        self.0.to_string()
     }
 }
 
-impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct QueueWorker {
-    queue: Mutex<VecDeque<String>>,
-}
-
-impl QueueWorker {
-    fn new(reports: Vec<String>) -> Self {
-        Self {
-            queue: Mutex::new(reports.into()),
-        }
-    }
-}
-
-impl Worker for QueueWorker {
-    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
-        self.queue
-            .lock()
-            .expect("worker")
-            .pop_front()
-            .unwrap_or_else(|| {
-                format!(
-                    "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
-                    "no scripted record"
-                )
-            })
-    }
-}
-
-fn decision(reply: &str, actions: Vec<Action>) -> Decision {
-    Decision {
-        reply: reply.to_string(),
-        actions,
-        refused: Vec::new(),
-    }
-}
-
-fn record(summary: &str) -> String {
-    format!("1 steps, 1 tool calls, project: unchanged, ended: message\n{summary}")
-}
-
-fn temp_store() -> std::path::PathBuf {
-    let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("eja-core-{}-{}", std::process::id(), serial));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
-}
-
-fn now() -> chrono::DateTime<chrono::Utc> {
-    use chrono::TimeZone;
-    chrono::Utc
-        .with_ymd_and_hms(2026, 11, 9, 12, 0, 0)
-        .single()
-        .expect("time")
-}
-
-fn propose_and_confirm(
-    store: &Store,
-    kind: ProposalKind,
-    text: &str,
-    target_id: Option<u64>,
-    at: chrono::DateTime<chrono::Utc>,
-) {
-    let propose = QueueBrain::new(vec![decision(
-        "proposed",
-        vec![Action::Propose {
+fn propose_and_confirm(store: &Store, kind: ProposalKind, text: &str, target_id: Option<u64>) {
+    let proposed = turn_with(
+        store,
+        "propose",
+        vec![decision(vec![Action::Propose {
             kind,
             target_id,
             text: text.to_string(),
-        }],
-    )]);
-    let outcome = turn_at(
-        store,
-        "propose",
-        &propose,
-        &QueueWorker::new(vec![]),
-        &Ports::default(),
-        at,
-    )
-    .expect("propose");
-    let proposal_id = outcome
+        }])],
+        &Done::default(),
+    );
+    let proposal_id = proposed
         .context()
         .proposals
         .last()
         .expect("pending proposal")
         .id;
-    let confirm = QueueBrain::new(vec![decision(
-        "confirmed",
-        vec![Action::Confirm { proposal_id }],
-    )]);
-    eja::turn_at_with_options(
+    turn_at_with_options(
         store,
         "confirm",
-        &confirm,
-        &QueueWorker::new(vec![]),
+        &Script::new(vec![decision(vec![Action::Confirm { proposal_id }])]),
+        &Done::default(),
         &Ports::default(),
-        at,
+        now_utc(),
         &eja::TurnOptions {
             approvals: vec![proposal_id],
             ..Default::default()
@@ -141,39 +48,32 @@ fn propose_and_confirm(
 
 #[test]
 fn closed_loop_dispatches_reports_and_accepts() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let brain = QueueBrain::new(vec![
-        decision(
-            "working",
-            vec![Action::OpenTask {
-                title: "release checklist".to_string(),
-                request: "write a release checklist".to_string(),
-                acceptance: "contains build, smoke test, upload".to_string(),
-                evidence: None,
-                run: true,
-            }],
-        ),
-        decision(
-            "done",
-            vec![Action::CloseTask {
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    let decisions = vec![
+        decision(vec![Action::OpenTask {
+            title: "release checklist".to_string(),
+            request: "write a release checklist".to_string(),
+            acceptance: "contains build, smoke test, upload".to_string(),
+            evidence: None,
+            run: true,
+        }]),
+        Decision {
+            reply: "done".to_string(),
+            actions: vec![Action::CloseTask {
                 task_id: 1,
                 accepted: true,
                 note: "checked".to_string(),
             }],
-        ),
-    ]);
-    let worker = QueueWorker::new(vec![record("checklist written")]);
-
-    let outcome = turn_at(
+            refused: Vec::new(),
+        },
+    ];
+    let outcome = turn_with(
         &store,
         "write a release checklist",
-        &brain,
-        &worker,
-        &Ports::default(),
-        now(),
-    )
-    .expect("turn");
+        decisions,
+        &Done("checklist written"),
+    );
 
     assert_eq!(outcome.reply, "done");
     assert_eq!(outcome.context().tasks.len(), 1);
@@ -199,7 +99,7 @@ fn closed_loop_dispatches_reports_and_accepts() {
         ]
     );
 
-    let mut names: Vec<String> = std::fs::read_dir(&dir)
+    let mut names: Vec<String> = std::fs::read_dir(fixture.path())
         .expect("read")
         .map(|entry| {
             entry
@@ -215,7 +115,9 @@ fn closed_loop_dispatches_reports_and_accepts() {
         vec!["log.jsonl".to_string(), "log.turn.lock".to_string()]
     );
     assert_eq!(
-        std::fs::metadata(dir.join("log.turn.lock")).unwrap().len(),
+        std::fs::metadata(fixture.path().join("log.turn.lock"))
+            .unwrap()
+            .len(),
         0,
         "the lease stores no second state"
     );
@@ -223,42 +125,31 @@ fn closed_loop_dispatches_reports_and_accepts() {
 
 #[test]
 fn rejection_fails_the_task_and_keeps_the_report() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let brain = QueueBrain::new(vec![
-        decision(
-            "start",
-            vec![Action::OpenTask {
-                title: "migration".to_string(),
-                request: "write the migration".to_string(),
-                acceptance: "contains backup, dual-write, cutover".to_string(),
-                evidence: None,
-                run: true,
-            }],
-        ),
-        decision(
-            "reject",
-            vec![Action::CloseTask {
-                task_id: 1,
-                accepted: false,
-                note: "missing cutover".to_string(),
-            }],
-        ),
-    ]);
-    let digest = format!(
-        "0 steps, 0 tool calls, project: unchanged, ended: budget\n{}",
-        "only backup and dual-write"
-    );
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    let decisions = vec![
+        decision(vec![Action::OpenTask {
+            title: "migration".to_string(),
+            request: "write the migration".to_string(),
+            acceptance: "contains backup, dual-write, cutover".to_string(),
+            evidence: None,
+            run: true,
+        }]),
+        decision(vec![Action::CloseTask {
+            task_id: 1,
+            accepted: false,
+            note: "missing cutover".to_string(),
+        }]),
+    ];
 
-    let outcome = turn_at(
+    let outcome = turn_with(
         &store,
         "do the migration",
-        &brain,
-        &QueueWorker::new(vec![digest]),
-        &Ports::default(),
-        now(),
-    )
-    .expect("turn");
+        decisions,
+        &Report(
+            "0 steps, 0 tool calls, project: unchanged, ended: budget\nonly backup and dual-write",
+        ),
+    );
 
     assert_eq!(outcome.context().tasks[0].status, TaskStatus::Failed);
     assert!(
@@ -276,32 +167,25 @@ fn rejection_fails_the_task_and_keeps_the_report() {
 
 #[test]
 fn impossible_actions_are_refused_visibly_and_change_nothing() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let first = QueueBrain::new(vec![
-        decision(
-            "start",
-            vec![Action::OpenTask {
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    let worker = Done("first run");
+    let outcome = turn_with(
+        &store,
+        "one task",
+        vec![
+            decision(vec![Action::OpenTask {
                 title: "one run".to_string(),
                 request: "do the work".to_string(),
                 acceptance: "a record exists".to_string(),
                 evidence: None,
                 run: true,
-            }],
-        ),
-        // The task now has a aja record: dispatching it again is refused.
-        decision("again", vec![Action::Dispatch { task_id: 1 }]),
-    ]);
-    let worker = QueueWorker::new(vec![record("first run")]);
-    let outcome = turn_at(
-        &store,
-        "one task",
-        &first,
+            }]),
+            // The task now has a aja record: dispatching it again is refused.
+            decision(vec![Action::Dispatch { task_id: 1 }]),
+        ],
         &worker,
-        &Ports::default(),
-        now(),
-    )
-    .expect("first turn");
+    );
     assert_eq!(
         outcome.context().refused.len(),
         1,
@@ -316,26 +200,19 @@ fn impossible_actions_are_refused_visibly_and_change_nothing() {
     assert_eq!(outcome.dispatched.len(), 1);
 
     // Unknown ids are refused too, and nothing is appended for them.
-    let second = QueueBrain::new(vec![decision(
+    let outcome = turn_with(
+        &store,
         "close early",
-        vec![
+        vec![decision(vec![
             Action::CloseTask {
                 task_id: 9,
                 accepted: true,
                 note: "nothing".to_string(),
             },
             Action::Dispatch { task_id: 9 },
-        ],
-    )]);
-    let outcome = turn_at(
-        &store,
-        "close early",
-        &second,
+        ])],
         &worker,
-        &Ports::default(),
-        now(),
-    )
-    .expect("second turn");
+    );
     assert_eq!(
         outcome.context().refused.len(),
         2,
@@ -371,14 +248,13 @@ fn impossible_actions_are_refused_visibly_and_change_nothing() {
 
 #[test]
 fn identity_is_reconstructed_and_worker_reports_are_not_identity() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
     propose_and_confirm(
         &store,
         ProposalKind::Commitment,
         "answer with the conclusion first",
         None,
-        now(),
     );
 
     let events = store.events().expect("events");
@@ -391,48 +267,45 @@ fn identity_is_reconstructed_and_worker_reports_are_not_identity() {
 
 #[test]
 fn task_index_and_read_task_are_structured() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let open = QueueBrain::new(vec![
-        decision(
-            "open A",
-            vec![Action::OpenTask {
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    turn_with(
+        &store,
+        "open A",
+        vec![
+            decision(vec![Action::OpenTask {
                 title: "release".to_string(),
                 request: "write release steps".to_string(),
                 acceptance: "contains build".to_string(),
                 evidence: None,
                 run: false,
-            }],
-        ),
-        decision("opened A", vec![]),
-        decision(
-            "open B",
-            vec![Action::OpenTask {
-                title: "migration".to_string(),
-                request: "write migration steps".to_string(),
-                acceptance: "contains backup".to_string(),
-                evidence: None,
-                run: false,
-            }],
-        ),
-    ]);
-    let worker = QueueWorker::new(vec![]);
-    turn_at(&store, "open A", &open, &worker, &Ports::default(), now()).expect("A");
-    turn_at(&store, "open B", &open, &worker, &Ports::default(), now()).expect("B");
+            }]),
+            decision(vec![]),
+        ],
+        &Done::default(),
+    );
+    turn_with(
+        &store,
+        "open B",
+        vec![decision(vec![Action::OpenTask {
+            title: "migration".to_string(),
+            request: "write migration steps".to_string(),
+            acceptance: "contains backup".to_string(),
+            evidence: None,
+            run: false,
+        }])],
+        &Done::default(),
+    );
 
-    let read = QueueBrain::new(vec![
-        decision("reading", vec![Action::Focus { task_id: 1 }]),
-        decision("found", vec![]),
-    ]);
-    let outcome = turn_at(
+    let outcome = turn_with(
         &store,
         "look at the first task",
-        &read,
-        &worker,
-        &Ports::default(),
-        now(),
-    )
-    .expect("read");
+        vec![
+            decision(vec![Action::Focus { task_id: 1 }]),
+            decision(vec![]),
+        ],
+        &Done::default(),
+    );
 
     assert_eq!(outcome.context().focus.expect("focus"), 1);
     assert_eq!(outcome.context().tasks.len(), 2);
@@ -440,53 +313,49 @@ fn task_index_and_read_task_are_structured() {
 
 #[test]
 fn explicit_dispatch_runs_an_open_task() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let brain = QueueBrain::new(vec![
-        decision(
-            "open",
-            vec![Action::OpenTask {
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    let worker = Done("organized");
+    turn_with(
+        &store,
+        "open a task",
+        vec![
+            decision(vec![Action::OpenTask {
                 title: "organize".to_string(),
                 request: "organize the files".to_string(),
                 acceptance: "both summaries exist".to_string(),
                 evidence: None,
                 run: false,
-            }],
-        ),
-        decision("opened", vec![]),
-        decision("start", vec![Action::Dispatch { task_id: 1 }]),
-        decision(
-            "done",
-            vec![Action::CloseTask {
+            }]),
+            decision(vec![]),
+        ],
+        &worker,
+    );
+    let outcome = turn_with(
+        &store,
+        "run it",
+        vec![
+            decision(vec![Action::Dispatch { task_id: 1 }]),
+            decision(vec![Action::CloseTask {
                 task_id: 1,
                 accepted: true,
                 note: "ok".to_string(),
-            }],
-        ),
-    ]);
-    let worker = QueueWorker::new(vec![record("organized")]);
-    turn_at(
-        &store,
-        "open a task",
-        &brain,
+            }]),
+        ],
         &worker,
-        &Ports::default(),
-        now(),
-    )
-    .expect("open");
-    let outcome =
-        turn_at(&store, "run it", &brain, &worker, &Ports::default(), now()).expect("dispatch");
+    );
     assert_eq!(outcome.dispatched, vec![1]);
     assert_eq!(outcome.context().tasks[0].status, TaskStatus::Done);
 }
 
 #[test]
 fn cannot_close_without_a_worker_report() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let brain = QueueBrain::new(vec![decision(
-        "close",
-        vec![
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    let outcome = turn_with(
+        &store,
+        "open and close",
+        vec![decision(vec![
             Action::OpenTask {
                 title: "no record".to_string(),
                 request: "do something".to_string(),
@@ -499,17 +368,9 @@ fn cannot_close_without_a_worker_report() {
                 accepted: true,
                 note: "empty".to_string(),
             },
-        ],
-    )]);
-    let outcome = turn_at(
-        &store,
-        "open and close",
-        &brain,
-        &QueueWorker::new(vec![]),
-        &Ports::default(),
-        now(),
-    )
-    .expect("turn");
+        ])],
+        &Done::default(),
+    );
     assert_eq!(outcome.context().tasks[0].status, TaskStatus::Open);
     assert!(outcome.context().tasks[0].close.is_none());
     assert!(!store
@@ -521,34 +382,23 @@ fn cannot_close_without_a_worker_report() {
 
 #[test]
 fn worker_failure_stays_waiting_for_eja() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let brain = QueueBrain::new(vec![
-        decision(
-            "start",
-            vec![Action::OpenTask {
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    let outcome = turn_with(
+        &store,
+        "run",
+        vec![
+            decision(vec![Action::OpenTask {
                 title: "failing".to_string(),
                 request: "execute".to_string(),
                 acceptance: "complete".to_string(),
                 evidence: None,
                 run: true,
-            }],
-        ),
-        decision("worker failed", vec![]),
-    ]);
-    let digest = format!(
-        "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
-        "failed"
+            }]),
+            decision(vec![]),
+        ],
+        &Report("0 steps, 0 tool calls, project: unchanged, ended: error\nfailed"),
     );
-    let outcome = turn_at(
-        &store,
-        "run",
-        &brain,
-        &QueueWorker::new(vec![digest]),
-        &Ports::default(),
-        now(),
-    )
-    .expect("turn");
     assert_eq!(outcome.context().tasks[0].status, TaskStatus::Waiting);
     assert!(outcome.context().tasks[0]
         .digest()
@@ -558,34 +408,21 @@ fn worker_failure_stays_waiting_for_eja() {
 
 #[test]
 fn correction_targets_an_event_id_not_a_phrase() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    propose_and_confirm(
-        &store,
-        ProposalKind::Commitment,
-        "arbitrary text",
-        None,
-        now(),
-    );
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    propose_and_confirm(&store, ProposalKind::Commitment, "arbitrary text", None);
     let commitment = State::load(&store).expect("state").commitments()[0].clone();
 
-    let wrong = QueueBrain::new(vec![decision(
-        "wrong target",
-        vec![Action::Propose {
+    turn_with(
+        &store,
+        "correct",
+        vec![decision(vec![Action::Propose {
             kind: ProposalKind::Correction,
             target_id: Some(999),
             text: "whatever".to_string(),
-        }],
-    )]);
-    turn_at(
-        &store,
-        "correct",
-        &wrong,
-        &QueueWorker::new(vec![]),
-        &Ports::default(),
-        now(),
-    )
-    .expect("wrong");
+        }])],
+        &Done::default(),
+    );
     assert_eq!(State::load(&store).expect("state").commitments().len(), 1);
 
     propose_and_confirm(
@@ -593,7 +430,6 @@ fn correction_targets_an_event_id_not_a_phrase() {
         ProposalKind::Correction,
         "whatever",
         Some(commitment.id),
-        now(),
     );
     let events = store.events().expect("events");
     assert!(State::fold(events.clone()).commitments().is_empty());
@@ -625,61 +461,43 @@ fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
         }
     }
 
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let opener = QueueBrain::new(vec![decision(
-        "two tasks",
-        vec![
-            Action::OpenTask {
-                title: "a".to_string(),
-                request: "do a".to_string(),
-                acceptance: "a holds".to_string(),
-                evidence: None,
-                run: false,
-            },
-            Action::OpenTask {
-                title: "b".to_string(),
-                request: "do b".to_string(),
-                acceptance: "b holds".to_string(),
-                evidence: None,
-                run: false,
-            },
-        ],
-    )]);
+    let fixture = Fixture::new("loop");
+    let store = fixture.store();
+    let opener = vec![decision(vec![
+        Action::OpenTask {
+            title: "a".to_string(),
+            request: "do a".to_string(),
+            acceptance: "a holds".to_string(),
+            evidence: None,
+            run: false,
+        },
+        Action::OpenTask {
+            title: "b".to_string(),
+            request: "do b".to_string(),
+            acceptance: "b holds".to_string(),
+            evidence: None,
+            run: false,
+        },
+    ])];
     let running = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let worker = OverlapWorker {
         running,
         peak: peak.clone(),
     };
-    turn_at(
-        &store,
-        "two tasks",
-        &opener,
-        &worker,
-        &Ports::default(),
-        now(),
-    )
-    .expect("open");
-    let brain = QueueBrain::new(vec![
-        decision(
-            "dispatch both",
-            vec![
-                Action::Dispatch { task_id: 1 },
-                Action::Dispatch { task_id: 2 },
-            ],
-        ),
-        decision("done", vec![]),
-    ]);
-    let outcome = turn_at(
+    turn_with(&store, "two tasks", opener, &worker);
+    let outcome = turn_with(
         &store,
         "dispatch",
-        &brain,
+        vec![
+            decision(vec![
+                Action::Dispatch { task_id: 1 },
+                Action::Dispatch { task_id: 2 },
+            ]),
+            decision(vec![]),
+        ],
         &worker,
-        &Ports::default(),
-        now(),
-    )
-    .expect("turn");
+    );
     assert_eq!(outcome.dispatched, vec![1, 2]);
     assert_eq!(peak.load(Ordering::SeqCst), 1, "one execution owner");
     assert_eq!(
@@ -695,10 +513,9 @@ fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
 
 #[test]
 fn one_journal_takes_one_writer() {
-    let dir = std::env::temp_dir().join(format!("eja-writer-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let first = Store::new(&dir).expect("first store");
-    let second = Store::new(&dir).expect("second store reads the same journal");
+    let fixture = Fixture::new("writer");
+    let first = fixture.store();
+    let second = fixture.store();
     first
         .append_simple(Kind::User, "one", 1, 1)
         .expect("first writer appends");

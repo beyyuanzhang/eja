@@ -1,13 +1,14 @@
 //! The command line is a thin shell over the library; these tests run it, so a
 //! broken flag or an unreadable target fails here rather than in a user's hands.
-use eja::adapters::Ports;
-use eja::{turn_at, Action, Assignment, Brain, Decision, EjaContext, Store, TaskStatus, Worker};
+mod support;
+
+use eja::{Action, TaskStatus};
 use std::{
-    collections::VecDeque,
-    path::PathBuf,
+    path::Path,
     process::Command,
     sync::{Mutex, MutexGuard, OnceLock},
 };
+use support::{decision, group, task, turn_with, Done, State};
 
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -20,13 +21,7 @@ const fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_eja")
 }
 
-fn root(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("eja-cli-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
-fn run(dir: &PathBuf, args: &[&str]) -> (bool, String) {
+fn run(dir: &Path, args: &[&str]) -> (bool, String) {
     let output = Command::new(binary())
         .arg("--dir")
         .arg(dir)
@@ -38,71 +33,29 @@ fn run(dir: &PathBuf, args: &[&str]) -> (bool, String) {
     (output.status.success(), text)
 }
 
-struct Script(Mutex<VecDeque<Decision>>);
-
-impl Brain for Script {
-    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.0
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("scripted decision")
-    }
-}
-
-struct Done;
-
-impl Worker for Done {
-    fn execute(&self, _: &Assignment, _: &eja::Control) -> String {
-        "1 steps, 0 tool calls, project: unchanged, ended: message\nwork".to_string()
-    }
-}
-
-fn seeded(dir: &PathBuf) {
-    let store = Store::new(dir).expect("store");
-    let brain = Script(Mutex::new(VecDeque::from(vec![
-        Decision {
-            reply: "planned".to_string(),
-            actions: vec![
-                Action::OpenGroup {
-                    title: "a group".to_string(),
-                    acceptance: "members done".to_string(),
-                },
-                Action::OpenTask {
-                    title: "a member".to_string(),
-                    request: "do the work".to_string(),
-                    acceptance: "output".to_string(),
-                    evidence: None,
-                    run: false,
-                },
-                Action::Dispatch { task_id: 2 },
-            ],
-            refused: Vec::new(),
-        },
-        // A turn that only commits continues; a decision that commits nothing is
-        // its final reply.
-        Decision {
-            reply: "done".to_string(),
-            actions: Vec::new(),
-            refused: Vec::new(),
-        },
-    ])));
-    turn_at(
+/// The journal every test here starts from, written through one library turn:
+/// a group with one member, and a dispatch that runs it.
+fn seeded(fixture: &State) {
+    let store = fixture.store();
+    // A turn that only commits continues; a decision that commits nothing is its
+    // final reply, which is why one decision is enough here.
+    turn_with(
         &store,
         "plan the work",
-        &brain,
-        &Done,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("turn");
+        vec![decision(vec![
+            group("a group"),
+            task("a member"),
+            Action::Dispatch { task_id: 2 },
+        ])],
+        &Done("work"),
+    );
 }
 
 #[test]
 fn every_show_target_the_usage_line_offers_answers() {
     let _lock = serial();
-    let dir = root("show");
-    seeded(&dir);
+    let fixture = State::new("cli-show");
+    seeded(&fixture);
     for (target, expected) in [
         ("context", "CURRENT INPUT"),
         ("log", "\"kind\":\"user\""),
@@ -111,21 +64,21 @@ fn every_show_target_the_usage_line_offers_answers() {
         ("task:2", "a member"),
         ("audit:2", "audit component"),
     ] {
-        let (ok, text) = run(&dir, &["show", target]);
+        let (ok, text) = run(fixture.path(), &["show", target]);
         assert!(ok, "show {target} failed: {text}");
         assert!(text.contains(expected), "show {target}: {text}");
     }
-    let state = Store::new(&dir).expect("store");
-    let tasks = eja::State::load(&state).expect("state");
+    let store = fixture.reopen();
+    let tasks = eja::State::load(&store).expect("state");
     assert_eq!(tasks.tasks()[1].status, TaskStatus::Waiting);
 }
 
 #[test]
 fn an_unknown_show_target_is_refused_with_the_usage_line() {
     let _lock = serial();
-    let dir = root("usage");
-    seeded(&dir);
-    let (ok, text) = run(&dir, &["show", "everything"]);
+    let fixture = State::new("cli-usage");
+    seeded(&fixture);
+    let (ok, text) = run(fixture.path(), &["show", "everything"]);
     assert!(!ok);
     assert!(text.contains("unknown show target"), "{text}");
 }
@@ -133,9 +86,9 @@ fn an_unknown_show_target_is_refused_with_the_usage_line() {
 #[test]
 fn a_directory_written_before_the_rename_is_refused_not_read() {
     let _lock = serial();
-    let dir = root("legacy");
-    std::fs::create_dir_all(dir.join("nodes")).expect("legacy dir");
-    let (ok, text) = run(&dir, &["show", "log"]);
+    let fixture = State::new("cli-legacy");
+    std::fs::create_dir_all(fixture.path().join("nodes")).expect("legacy dir");
+    let (ok, text) = run(fixture.path(), &["show", "log"]);
     assert!(!ok, "a legacy directory must not be read: {text}");
     assert!(text.contains("nodes/"), "{text}");
     assert!(text.contains("no migration"), "{text}");
@@ -144,15 +97,15 @@ fn a_directory_written_before_the_rename_is_refused_not_read() {
 #[test]
 fn a_confirm_flag_reaches_the_turn_instead_of_being_ignored() {
     let _lock = serial();
-    let dir = root("confirm");
-    seeded(&dir);
+    let fixture = State::new("cli-confirm");
+    seeded(&fixture);
     // There is no model configured here, so the turn stops before deciding — and
     // says so. The point is that the approval was parsed and carried into the
     // turn's options, not that a model was reachable.
-    let (ok, text) = run(&dir, &["--confirm", "7", "turn", "approve it"]);
+    let (ok, text) = run(fixture.path(), &["--confirm", "7", "turn", "approve it"]);
     assert!(!ok, "{text}");
     assert!(text.to_lowercase().contains("model"), "{text}");
-    let (ok, text) = run(&dir, &["--confirm", "not-a-number", "turn", "x"]);
+    let (ok, text) = run(fixture.path(), &["--confirm", "not-a-number", "turn", "x"]);
     assert!(!ok);
     assert!(text.contains("invalid id for --confirm"), "{text}");
 }

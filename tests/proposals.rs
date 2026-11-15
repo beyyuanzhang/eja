@@ -1,186 +1,115 @@
+mod support;
+
 use eja::adapters::Ports;
-use eja::{
-    turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, State, Store,
-    Worker,
-};
-use std::collections::VecDeque;
-use std::sync::Mutex;
+use eja::{Action, Decision, Kind, ProposalKind, State, Store, TurnOptions, TurnOutcome};
+use support::{decision, turn_at, Done, Script, State as Fixture};
 
-struct QueueBrain {
-    queue: Mutex<VecDeque<Decision>>,
-}
-
-impl QueueBrain {
-    fn new(decisions: Vec<Decision>) -> Self {
-        Self {
-            queue: Mutex::new(decisions.into()),
-        }
-    }
-}
-
-impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct NoWorker;
-
-impl Worker for NoWorker {
-    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
-        format!(
-            "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
-            "no worker"
-        )
-    }
-}
-
-fn decision(reply: &str, actions: Vec<Action>) -> Decision {
-    Decision {
-        reply: reply.to_string(),
-        actions,
-        refused: Vec::new(),
-    }
-}
-
-static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn store() -> Store {
-    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("eja-proposals-{}-{}", std::process::id(), serial));
-    let _ = std::fs::remove_dir_all(&dir);
-    Store::new(&dir).expect("store")
+/// The one thing the kit does not cover: a turn the host authorizes in advance.
+fn approved(
+    store: &Store,
+    input: &'static str,
+    decisions: Vec<Decision>,
+    approvals: Vec<u64>,
+) -> TurnOutcome<'static> {
+    let brain = Script::new(decisions);
+    eja::turn_at_with_options(
+        store,
+        input,
+        &brain,
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            approvals,
+            ..Default::default()
+        },
+    )
+    .expect("turn")
 }
 
 #[test]
 fn proposal_does_not_change_identity_until_confirmed() {
-    let store = store();
-    let propose = QueueBrain::new(vec![decision(
-        "proposed",
-        vec![Action::Propose {
-            kind: ProposalKind::Commitment,
-            target_id: None,
-            text: "answer first".to_string(),
-        }],
-    )]);
+    let fixture = Fixture::new("proposals");
+    let store = fixture.store();
     let proposed = turn_at(
         &store,
         "propose",
-        &propose,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("propose");
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "answer first".to_string(),
+        }])],
+    );
     assert_eq!(proposed.context().proposals.len(), 1);
     assert!(State::load(&store).expect("state").commitments().is_empty());
 
     let proposal_id = proposed.context().proposals[0].id;
-    let confirm = QueueBrain::new(vec![decision(
-        "confirmed",
-        vec![Action::Confirm { proposal_id }],
-    )]);
-    let confirmed = eja::turn_at_with_options(
+    let confirmed = approved(
         &store,
         "confirm",
-        &confirm,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-        &eja::TurnOptions {
-            approvals: vec![proposal_id],
-            ..Default::default()
-        },
-    )
-    .expect("confirm");
+        vec![decision(vec![Action::Confirm { proposal_id }])],
+        vec![proposal_id],
+    );
     assert!(confirmed.context().proposals.is_empty());
     assert_eq!(State::load(&store).expect("state").commitments().len(), 1);
 }
 
 #[test]
 fn a_proposal_cannot_be_confirmed_in_the_same_turn() {
-    let store = store();
-    let brain = QueueBrain::new(vec![decision(
-        "propose and confirm",
-        vec![
+    let fixture = Fixture::new("proposals-same-turn");
+    let store = fixture.store();
+    turn_at(
+        &store,
+        "do both",
+        vec![decision(vec![
             Action::Propose {
                 kind: ProposalKind::Commitment,
                 target_id: None,
                 text: "answer first".to_string(),
             },
             Action::Confirm { proposal_id: 2 },
-        ],
-    )]);
-    turn_at(
-        &store,
-        "do both",
-        &brain,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("turn");
+        ])],
+    );
     assert!(State::load(&store).expect("state").commitments().is_empty());
 }
 
 #[test]
 fn rejection_leaves_identity_unchanged() {
-    let store = store();
-    let propose = QueueBrain::new(vec![decision(
-        "proposed",
-        vec![Action::Propose {
-            kind: ProposalKind::Commitment,
-            target_id: None,
-            text: "answer first".to_string(),
-        }],
-    )]);
+    let fixture = Fixture::new("proposals-reject");
+    let store = fixture.store();
     let proposed = turn_at(
         &store,
         "propose",
-        &propose,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("propose");
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "answer first".to_string(),
+        }])],
+    );
     let proposal_id = proposed.context().proposals[0].id;
-    let reject = QueueBrain::new(vec![decision(
-        "rejected",
-        vec![Action::Reject {
-            proposal_id,
-            note: "no".to_string(),
-        }],
-    )]);
     let rejected = turn_at(
         &store,
         "reject",
-        &reject,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("reject");
+        vec![decision(vec![Action::Reject {
+            proposal_id,
+            note: "no".to_string(),
+        }])],
+    );
     assert!(rejected.context().proposals.is_empty());
     assert!(State::load(&store).expect("state").commitments().is_empty());
 }
 
 #[test]
 fn replacements_wait_for_confirmation_and_revalidate_the_target() {
-    let store = store();
+    let fixture = Fixture::new("proposals-replace");
+    let store = fixture.store();
     let old = store
         .append_simple(Kind::Commitment, "original", 1, 1)
         .unwrap();
-    let propose = QueueBrain::new(vec![decision(
-        "proposed",
-        vec![
+    let out = turn_at(
+        &store,
+        "propose",
+        vec![decision(vec![
             Action::Propose {
                 kind: ProposalKind::Commitment,
                 target_id: Some(old.id),
@@ -191,17 +120,8 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
                 target_id: Some(old.id),
                 text: "stale replacement".into(),
             },
-        ],
-    )]);
-    let out = turn_at(
-        &store,
-        "propose",
-        &propose,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .unwrap();
+        ])],
+    );
     assert_eq!(out.context().proposals.len(), 2);
     assert_eq!(
         State::load(&store).expect("state").commitments()[0].id,
@@ -209,26 +129,15 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
     );
     let first = out.context().proposals[0].id;
     let stale = out.context().proposals[1].id;
-    let confirm = QueueBrain::new(vec![decision(
-        "confirm",
-        vec![
-            Action::Confirm { proposal_id: first },
-            Action::Confirm { proposal_id: stale },
-        ],
-    )]);
-    let out = eja::turn_at_with_options(
+    let out = approved(
         &store,
         "confirm",
-        &confirm,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-        &eja::TurnOptions {
-            approvals: vec![first, stale],
-            ..Default::default()
-        },
-    )
-    .unwrap();
+        vec![decision(vec![
+            Action::Confirm { proposal_id: first },
+            Action::Confirm { proposal_id: stale },
+        ])],
+        vec![first, stale],
+    );
     assert_eq!(out.context().commitments.len(), 1);
     assert_eq!(out.context().commitments[0].text, "replacement");
     assert_eq!(out.context().commitments[0].closes, Some(old.id));
@@ -249,13 +158,15 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
 
 #[test]
 fn invalid_revision_targets_do_not_create_proposals() {
-    let store = store();
+    let fixture = Fixture::new("proposals-invalid");
+    let store = fixture.store();
     let old = store
         .append_simple(Kind::Commitment, "original", 1, 1)
         .unwrap();
-    let brain = QueueBrain::new(vec![decision(
-        "invalid",
-        vec![
+    let out = turn_at(
+        &store,
+        "propose",
+        vec![decision(vec![
             Action::Propose {
                 kind: ProposalKind::Goal,
                 target_id: Some(old.id),
@@ -271,17 +182,8 @@ fn invalid_revision_targets_do_not_create_proposals() {
                 target_id: None,
                 text: "missing target".into(),
             },
-        ],
-    )]);
-    let out = turn_at(
-        &store,
-        "propose",
-        &brain,
-        &NoWorker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .unwrap();
+        ])],
+    );
     assert!(out.context().proposals.is_empty());
     assert!(out.context().goal.is_none());
     assert_eq!(out.context().commitments[0].id, old.id);

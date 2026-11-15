@@ -1,25 +1,8 @@
-use eja::adapters::Ports;
-use eja::{turn_at, Action, Assignment, Brain, Decision, EjaContext, Store, TaskStatus, Worker};
-use std::collections::VecDeque;
+mod support;
+
+use eja::{Action, Assignment, TaskStatus, Worker};
 use std::sync::{Arc, Mutex};
-
-struct QueueBrain {
-    queue: Mutex<VecDeque<Decision>>,
-}
-
-impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: String::new(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
+use support::{decision, turn_with, State};
 
 struct CaptureWorker {
     seen: Arc<Mutex<Vec<Assignment>>>,
@@ -37,44 +20,29 @@ impl Worker for CaptureWorker {
 
 #[test]
 fn worker_receives_the_task_contract_and_original_input() {
-    let dir = std::env::temp_dir().join(format!("eja-contract-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::new(&dir).expect("store");
+    let fixture = State::new("contract");
+    let store = fixture.store();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let worker = CaptureWorker { seen: seen.clone() };
-    let brain = QueueBrain {
-        queue: Mutex::new(VecDeque::from(vec![
-            Decision {
-                reply: "open".to_string(),
-                actions: vec![Action::OpenTask {
-                    title: "expanded title".to_string(),
-                    request: "EJA expanded request".to_string(),
-                    acceptance: "EJA acceptance only".to_string(),
-                    evidence: None,
-                    run: true,
-                }],
-                refused: Vec::new(),
-            },
-            Decision {
-                reply: "done".to_string(),
-                actions: vec![Action::CloseTask {
-                    task_id: 1,
-                    accepted: true,
-                    note: "ok".to_string(),
-                }],
-                refused: Vec::new(),
-            },
-        ])),
-    };
-    let outcome = turn_at(
+    let outcome = turn_with(
         &store,
         "raw user task",
-        &brain,
+        vec![
+            decision(vec![Action::OpenTask {
+                title: "expanded title".to_string(),
+                request: "EJA expanded request".to_string(),
+                acceptance: "EJA acceptance only".to_string(),
+                evidence: None,
+                run: true,
+            }]),
+            decision(vec![Action::CloseTask {
+                task_id: 1,
+                accepted: true,
+                note: "ok".to_string(),
+            }]),
+        ],
         &worker,
-        &Ports::default(),
-        eja::now_utc(),
-    )
-    .expect("turn");
+    );
 
     let assignments = seen.lock().expect("seen");
     assert_eq!(assignments.len(), 1);

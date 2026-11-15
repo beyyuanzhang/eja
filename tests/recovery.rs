@@ -1,64 +1,14 @@
-use eja::adapters::Ports;
-use eja::{
-    recover, turn_at, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, State, Store,
-    TaskStatus, Worker,
-};
-use std::collections::VecDeque;
+mod support;
+
+use eja::{recover, EventMeta, Kind, State, TaskStatus};
 use std::io::Write;
-use std::sync::Mutex;
-
-struct QueueBrain {
-    queue: Mutex<VecDeque<Decision>>,
-}
-
-impl QueueBrain {
-    fn new(decisions: Vec<Decision>) -> Self {
-        Self {
-            queue: Mutex::new(decisions.into()),
-        }
-    }
-}
-
-impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        self.queue
-            .lock()
-            .expect("brain")
-            .pop_front()
-            .unwrap_or_else(|| Decision {
-                reply: "continued".to_string(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            })
-    }
-}
-
-struct NoWorker;
-
-impl Worker for NoWorker {
-    fn execute(&self, _assignment: &Assignment, _: &eja::Control) -> String {
-        format!(
-            "0 steps, 0 tool calls, project: unchanged, ended: error\n{}",
-            "no worker"
-        )
-    }
-}
-
-static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn temp_store() -> std::path::PathBuf {
-    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("eja-recovery-{}-{}", std::process::id(), serial));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    dir
-}
+use support::{turn_at, State as Fixture};
 
 #[test]
 fn interrupted_assignment_is_reconciled_without_duplicate_dispatch() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
-    let assignment = Assignment {
+    let fixture = Fixture::new("recovery");
+    let store = fixture.store();
+    let assignment = eja::Assignment {
         task_id: 1,
         objective: "do it".to_string(),
         issued_at: 100,
@@ -115,22 +65,13 @@ fn interrupted_assignment_is_reconciled_without_duplicate_dispatch() {
     );
     assert!(recover(&store, 3, 300).expect("idempotent").is_empty());
 
-    let brain = QueueBrain::new(vec![]);
-    turn_at(
-        &store,
-        "continue",
-        &brain,
-        &NoWorker,
-        &Ports::default(),
-        chrono::Utc::now(),
-    )
-    .expect("turn");
+    turn_at(&store, "continue", vec![]);
 }
 
 #[test]
 fn torn_tail_is_ignored_by_the_reader() {
-    let dir = temp_store();
-    let store = Store::new(&dir).expect("store");
+    let fixture = Fixture::new("recovery-torn");
+    let store = fixture.store();
     store
         .append(Kind::User, "eja", "one", 1, EventMeta::new(1))
         .expect("append");
