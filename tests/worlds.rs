@@ -381,3 +381,41 @@ fn reconciling_a_run_is_one_recorded_observation() {
         refused.refused
     );
 }
+#[test]
+fn two_state_directories_on_one_project_keep_separate_branches() {
+    let project = project_with_one_commit("two-instances");
+    let control = control();
+    let first = Worktrees::new(
+        &project,
+        project.join(".eja/worlds"),
+        project.join(".eja"),
+        &control,
+    )
+    .expect("first instance");
+    let second = Worktrees::new(
+        &project,
+        project.join(".other/worlds"),
+        project.join(".other"),
+        &control,
+    )
+    .expect("second instance");
+    let a = first.reserve(1, &control).expect("first reserve");
+    let b = second.reserve(1, &control).expect("second reserve");
+    // Both instances reserved task 1. Each owns a branch of its own, so the
+    // second reservation cannot resign the first instance's refs.
+    let listed = std::process::Command::new("git")
+        .current_dir(&project)
+        .args(["branch", "--list", "eja/aja-1-*"])
+        .output()
+        .expect("git branch");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(
+        listed.lines().count(),
+        2,
+        "one branch per state directory: {listed}"
+    );
+    assert!(a.root.join("base.txt").exists());
+    assert!(b.root.join("base.txt").exists());
+    first.release(&a);
+    second.release(&b);
+}

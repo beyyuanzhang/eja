@@ -329,8 +329,17 @@ impl Worktrees {
         })
     }
 
-    fn branch(task: u64) -> String {
-        format!("eja/aja-{task}")
+    /// One branch per (state directory, task). Two instances that share a
+    /// project would otherwise both own `eja/aja-1`, and resigning the branch
+    /// would delete the other instance's refs. The suffix is derived from the
+    /// state directory itself so the name never depends on the Rust version.
+    fn branch(&self, task: u64) -> String {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in self.root.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("eja/aja-{task}-{:08x}", hash as u32)
     }
 }
 
@@ -346,7 +355,7 @@ impl Worlds for Worktrees {
             );
             std::fs::remove_dir_all(&root).ok();
         }
-        let branch = Self::branch(task);
+        let branch = self.branch(task);
         let head = git(&self.project, &["rev-parse", "--verify", "HEAD"], control)?;
         // A restart must not reuse a branch: the new execution gets a new id.
         let _ = git(&self.project, &["branch", "-D", &branch], control);
@@ -396,7 +405,7 @@ impl Worlds for Worktrees {
     }
 
     fn reconcile(&self, task: u64, control: &Control) -> Result<Value> {
-        let branch = Self::branch(task);
+        let branch = self.branch(task);
         match git(
             &self.project,
             &["merge", "--no-ff", "--no-edit", &branch],

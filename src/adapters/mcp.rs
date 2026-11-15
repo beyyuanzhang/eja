@@ -172,7 +172,7 @@ impl McpTools {
     }
 
     /// A tool may answer a witness only when the host declared it.
-    pub fn is_witness(&self, public: &str) -> bool {
+    pub(crate) fn is_witness(&self, public: &str) -> bool {
         self.tools.get(public).is_some_and(|remote| remote.witness)
     }
 
