@@ -25,12 +25,10 @@ pub use worlds::{Shared, Worktrees, World, Worlds};
 
 use crate::Kind;
 
+/// The name a rendered line shows for a fact: the kind's wire name, from the
+/// one place that writes it down.
 fn label(kind: Kind) -> String {
-    serde_json::to_value(kind)
-        .expect("unit event kinds serialize")
-        .as_str()
-        .expect("event kind is a string")
-        .to_owned()
+    kind.as_str().to_owned()
 }
 
 fn llm_env() -> Option<(String, String, String)> {

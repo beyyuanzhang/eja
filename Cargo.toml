@@ -6,6 +6,8 @@ description = "EJA/AJA minimal closed loop"
 repository = "https://github.com/beyyuanzhang/eja"
 license = "MIT"
 readme = "README.md"
+keywords = ["agent", "kernel", "journal", "llm", "workflow"]
+categories = ["development-tools", "api-bindings"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

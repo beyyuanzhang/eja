@@ -39,6 +39,34 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// The name this kind has on the wire.
+    ///
+    /// Serde derives it, so it is written once: the test below holds this list to
+    /// the serialized form, and a variant added without a name here fails it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Eja => "eja",
+            Self::Goal => "goal",
+            Self::Commitment => "commitment",
+            Self::Correction => "correction",
+            Self::Proposal => "proposal",
+            Self::ProposalConfirmed => "proposal_confirmed",
+            Self::ProposalRejected => "proposal_rejected",
+            Self::RecordDecision => "decision",
+            Self::Relationship => "relationship",
+            Self::TaskOpened => "task_opened",
+            Self::TaskRelation => "task_relation",
+            Self::TaskAssigned => "task_assigned",
+            Self::WorkerReport => "worker_report",
+            Self::TaskClosed => "task_closed",
+            Self::Observed => "observed",
+            Self::Approval => "approval",
+            Self::Refused => "refused",
+        }
+    }
+
     #[must_use]
     pub const fn is_closable(self) -> bool {
         matches!(self, Self::Goal | Self::Commitment)
@@ -638,5 +666,39 @@ impl std::fmt::Display for Address {
             Authority::World => "world",
         };
         write!(formatter, "{scheme}:{}", self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_kind_states_its_wire_name() {
+        // serde owns the wire form; as_str is the same table written once for the
+        // renderer. Reading one through the other is what keeps them one name.
+        for kind in [
+            Kind::User,
+            Kind::Eja,
+            Kind::Goal,
+            Kind::Commitment,
+            Kind::Correction,
+            Kind::Proposal,
+            Kind::ProposalConfirmed,
+            Kind::ProposalRejected,
+            Kind::RecordDecision,
+            Kind::Relationship,
+            Kind::TaskOpened,
+            Kind::TaskRelation,
+            Kind::TaskAssigned,
+            Kind::WorkerReport,
+            Kind::TaskClosed,
+            Kind::Observed,
+            Kind::Approval,
+            Kind::Refused,
+        ] {
+            let wire = serde_json::to_value(kind).expect("a unit variant serializes");
+            assert_eq!(wire.as_str(), Some(kind.as_str()), "{kind:?}");
+        }
     }
 }

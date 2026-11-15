@@ -310,6 +310,18 @@ pub fn git_at(
     args: &[&str],
     control: &Control,
 ) -> Result<String> {
+    let mut command = hermetic(git_dir, tree);
+    command.args(args);
+    let bytes = process::output(&mut command, control, crate::aja::FRAME_LIMIT)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+/// One git invocation a project cannot influence.
+///
+/// Every path that runs git — freezing a run, settling a worktree, reading a
+/// frozen file — starts here, so a project's hooks, signing settings, identity
+/// and global configuration reach none of them.
+pub fn hermetic(git_dir: Option<&Path>, tree: &Path) -> Command {
     let mut command = Command::new("git");
     match git_dir {
         Some(dir) => command
@@ -326,15 +338,13 @@ pub fn git_at(
             "-c",
             "commit.gpgsign=false",
         ])
-        .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_AUTHOR_NAME", "eja")
         .env("GIT_AUTHOR_EMAIL", "eja@local")
         .env("GIT_COMMITTER_NAME", "eja")
         .env("GIT_COMMITTER_EMAIL", "eja@local");
-    let bytes = process::output(&mut command, control, crate::aja::FRAME_LIMIT)?;
-    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+    command
 }
 
 fn git(cwd: &Path, args: &[&str], control: &Control) -> Result<String> {

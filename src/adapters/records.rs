@@ -14,7 +14,7 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdout, Stdio},
 };
 
 /// The tool a aja uses to read a passage of its own or an inherited record.
@@ -190,12 +190,10 @@ impl RecordFiles {
             if let Some(checkpoints) = &self.checkpoints {
                 let manifest = Manifest::read(&self.root, aja)?;
                 let commit = checkpoint(&manifest)?;
-                let mut child = Command::new("git")
-                    .arg("--git-dir")
-                    .arg(checkpoints)
-                    .arg("show")
-                    .arg(format!("{commit}:{rest}"))
-                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                // The same hermetic git every other path uses: a frozen file is
+                // read under the environment that wrote it.
+                let mut child = super::worlds::hermetic(Some(checkpoints), &self.root)
+                    .args(["show", &format!("{commit}:{rest}")])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn()?;
