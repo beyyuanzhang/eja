@@ -10,7 +10,7 @@ struct QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -74,7 +74,7 @@ fn parent_and_typed_relation_are_folded_into_the_graph() {
     .expect("turn");
 
     assert_eq!(
-        outcome.context.relations,
+        outcome.context().relations,
         vec![Edge {
             from: 2,
             to: 1,

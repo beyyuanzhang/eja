@@ -271,7 +271,7 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
             now() + chrono::Duration::seconds(index as i64 * 2),
         )
         .expect("propose");
-        let proposal_id = outcome.context.proposals[0].id;
+        let proposal_id = outcome.context().proposals[0].id;
         let confirm = QueueBrain::new(vec![Decision {
             reply: "confirm".to_string(),
             actions: vec![Action::Confirm { proposal_id }],

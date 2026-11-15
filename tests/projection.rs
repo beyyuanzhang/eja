@@ -17,9 +17,8 @@ fn projection_keeps_every_recorded_commitment_and_says_so() {
             )
             .expect("append");
     }
-    let context = State::load(&store)
-        .expect("state")
-        .project("check", None, chrono::Utc::now());
+    let state = State::load(&store).expect("state");
+    let context = state.project("check", None, chrono::Utc::now());
     assert_eq!(context.commitments.len(), 210);
     assert_eq!(store.events().expect("events").len(), 210);
 
@@ -49,12 +48,13 @@ fn evidence_is_folded_from_the_journal_never_from_the_caller() {
     let store = Store::new(&dir).expect("store");
     // The only way an observation exists is as a committed fact. A projection
     // reads it back from the journal like every other fact.
+    let result = serde_json::json!({"text": "a".repeat(5000)});
     let observation = Observation {
         kind: ObservationKind::Look,
-        target: "record:1/big.json".to_string(),
-        arguments: serde_json::Value::Null,
+        target: "record:1/big.json",
+        arguments: &serde_json::Value::Null,
         selector: Selector::Whole,
-        result: serde_json::json!({"text": "a".repeat(5000)}),
+        result: &result,
         error: None,
     };
     store
@@ -66,11 +66,10 @@ fn evidence_is_folded_from_the_journal_never_from_the_caller() {
             EventMeta::data(1, serde_json::to_value(&observation).expect("observation")),
         )
         .expect("append");
-    let context = State::load(&store)
-        .expect("state")
-        .project("go", None, chrono::Utc::now());
+    let state = State::load(&store).expect("state");
+    let context = state.project("go", None, chrono::Utc::now());
     assert_eq!(context.evidence.len(), 1);
-    assert_eq!(context.evidence[0], observation);
+    assert!(context.evidence[0].same_content(&observation));
     assert!(
         render_context(&context).contains("record:1/big.json"),
         "the projection shows what the log recorded"

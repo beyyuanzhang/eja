@@ -212,8 +212,10 @@ fn run() -> Result<()> {
             if eja::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("interrupted; the aja was stopped and its run is recorded".into());
             }
+            // The outcome owns the fold; the projection is read from it here.
+            let context = outcome.context();
             println!("eja: {}", outcome.reply);
-            for note in &outcome.context.refused {
+            for note in &context.refused {
                 println!("[refused: {note}]");
             }
             if outcome.end != TurnEnd::Complete {
@@ -225,20 +227,18 @@ fn run() -> Result<()> {
             }
             println!(
                 "[{} | focus #{} | dispatched {} | looks {} | decisions {} | worker {}ms | log {}]",
-                counts(&outcome.context.tasks),
-                outcome
-                    .context
-                    .focus
-                    .map_or("-".into(), |id| id.to_string()),
+                counts(context.tasks),
+                context.focus.map_or("-".into(), |id| id.to_string()),
                 outcome.dispatched.len(),
-                outcome.context.evidence.len(),
+                context.evidence.len(),
                 outcome.decisions,
                 outcome.worker_ms,
                 store.events()?.len()
             );
         }
         Command::Context => {
-            let context = State::load(&store)?.project("", options.focus, eja::now_utc());
+            let state = State::load(&store)?;
+            let context = state.project("", options.focus, eja::now_utc());
             println!("{}", adapters::render_context(&context));
             println!(
                 "[{} tasks | focus #{}]",

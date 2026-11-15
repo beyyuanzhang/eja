@@ -130,53 +130,66 @@ impl State {
 
     /// The newest unclosed goal. Adding one without replacing leaves the others
     /// active, so withdrawing the newest reveals the next one.
-    pub fn goal(&self) -> Option<Event> {
+    pub fn goal(&self) -> Option<&Event> {
         self.goals
             .iter()
             .rev()
             .filter_map(|index| self.events.get(*index))
             .find(|event| !self.closed.contains(&event.id))
-            .cloned()
     }
 
-    pub fn commitments(&self) -> Vec<Event> {
+    pub fn commitments(&self) -> Vec<&Event> {
         self.open(&self.commitments)
     }
 
-    pub fn identity(&self) -> Vec<Event> {
+    pub fn identity(&self) -> Vec<&Event> {
         self.identity
             .iter()
-            .filter_map(|index| self.events.get(*index).cloned())
+            .filter_map(|index| self.events.get(*index))
             .collect()
     }
 
     /// Actions this turn that the host could not carry out, from EJA's own words.
-    pub fn refusals(&self, turn: u64) -> Vec<String> {
+    ///
+    /// A turn's facts are the journal's tail, so the scan stops at its first
+    /// event: reading this turn costs this turn, not the whole log.
+    pub fn refusals(&self, turn: u64) -> Vec<&str> {
+        debug_assert_eq!(turn, self.turn(), "a turn reads only its own events");
         self.events
             .iter()
-            .filter(|event| event.kind == Kind::Refused && event.turn == turn)
-            .map(|event| event.text.clone())
+            .rev()
+            .take_while(|event| event.turn == turn)
+            .filter(|event| event.kind == Kind::Refused)
+            .map(|event| event.text.as_str())
             .collect()
     }
 
     /// What this turn observed, one entry per distinct observation: a repeated
     /// read keeps the newest answer, so the view states what is currently true.
-    pub fn evidence(&self, turn: u64) -> Vec<Observation> {
-        let mut out: Vec<Observation> = Vec::new();
-        for event in self.events.iter() {
-            if event.kind != Kind::Observed || event.turn != turn {
-                continue;
-            }
-            let Some(observation) = decode::<Observation>(event) else {
+    pub fn evidence(&self, turn: u64) -> Vec<Observation<'_>> {
+        debug_assert_eq!(turn, self.turn(), "a turn reads only its own events");
+        let mut out: Vec<Observation<'_>> = Vec::new();
+        // Walk the tail backwards, then restore the order the turn happened in.
+        for event in self
+            .events
+            .iter()
+            .rev()
+            .take_while(|event| event.turn == turn)
+            .filter(|event| event.kind == Kind::Observed)
+        {
+            let Some(data) = event.data.as_ref() else {
                 continue;
             };
-            out.retain(|other| {
-                !(other.target == observation.target
-                    && other.arguments == observation.arguments
-                    && other.selector == observation.selector)
-            });
+            let Some(observation) = Observation::read(data) else {
+                continue;
+            };
+            // A repeated read is one entry: the newest answer is what holds.
+            if out.iter().any(|other| other.same_subject(&observation)) {
+                continue;
+            }
             out.push(observation);
         }
+        out.reverse();
         out
     }
 
@@ -193,7 +206,7 @@ impl State {
         out
     }
 
-    pub fn pending_proposals(&self, turn: u64) -> Vec<ProposalView> {
+    pub fn pending_proposals(&self, turn: u64) -> Vec<ProposalView<'_>> {
         let approved = self.approved(turn);
         self.proposals
             .iter()
@@ -201,7 +214,7 @@ impl State {
                 id: proposal.id,
                 kind: proposal.data.kind,
                 target_id: proposal.data.target_id,
-                text: proposal.text.clone(),
+                text: &proposal.text,
                 created_at: proposal.at,
                 turn: proposal.turn,
                 approved: approved.contains(&proposal.id),
@@ -223,8 +236,14 @@ impl State {
             })
     }
 
-    /// The model's bounded working view: the projection of this state.
-    pub fn project(&self, input: &str, focus: Option<TaskId>, now: DateTime<Utc>) -> EjaContext {
+    /// The model's bounded working view: the projection of this state. It
+    /// borrows every fact it shows, so a decision costs no copy of the log.
+    pub fn project<'a>(
+        &'a self,
+        input: &'a str,
+        focus: Option<TaskId>,
+        now: DateTime<Utc>,
+    ) -> EjaContext<'a> {
         let turn = self.turn();
         // The current input is separate from the conversation it belongs to.
         let history_before = self.events.last().map_or(0, |last| {
@@ -232,20 +251,19 @@ impl State {
         });
         EjaContext {
             now: now.timestamp(),
-            input: input.to_string(),
+            input,
             history: self
                 .events
                 .iter()
                 .filter(|event| matches!(event.kind, Kind::User | Kind::Eja))
                 .filter(|event| event.turn < history_before)
                 .rev()
-                .cloned()
                 .collect(),
             goal: self.goal(),
             identity: self.identity(),
             commitments: self.commitments(),
-            relations: self.edges.clone(),
-            tasks: self.tasks.clone(),
+            relations: &self.edges,
+            tasks: &self.tasks,
             focus: focus.filter(|id| self.knows(*id)),
             evidence: self.evidence(turn),
             proposals: self.pending_proposals(turn),
@@ -253,12 +271,11 @@ impl State {
         }
     }
 
-    fn open(&self, indices: &[usize]) -> Vec<Event> {
+    fn open(&self, indices: &[usize]) -> Vec<&Event> {
         indices
             .iter()
             .filter_map(|index| self.events.get(*index))
             .filter(|event| !self.closed.contains(&event.id))
-            .cloned()
             .collect()
     }
 
@@ -329,7 +346,10 @@ impl State {
                 let Some(id) = task_id_in_scope(&event.scope) else {
                     return;
                 };
-                let Some(observation) = decode::<Observation>(event) else {
+                let Some(data) = event.data.as_ref() else {
+                    return;
+                };
+                let Some(observation) = Observation::read(data) else {
                     return;
                 };
                 // Acceptance evidence is one observation the host made. An
@@ -339,7 +359,7 @@ impl State {
                 }
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
                     task.evidence_id = Some(event.id);
-                    task.evidence_result = Some(observation.result);
+                    task.evidence_result = Some(observation.result.clone());
                 }
             }
             Kind::TaskClosed => {
@@ -380,10 +400,10 @@ impl State {
         let task = Task {
             kind: open.kind,
             id,
-            title: open.title,
-            request: open.request,
-            origin: open.origin,
-            acceptance: open.acceptance,
+            title: open.title.to_string(),
+            request: open.request.to_string(),
+            origin: open.origin.to_string(),
+            acceptance: open.acceptance.to_string(),
             status: TaskStatus::Open,
             created_at: event.at,
             digest_at: None,

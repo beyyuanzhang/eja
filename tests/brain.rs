@@ -29,12 +29,14 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         )
         .unwrap();
     // Evidence is a committed fact before any projection can read it.
+    let target = format!("log:event:{}", old.id);
+    let result = serde_json::json!({"matches": 1, "events": [old]});
     let observation = Observation {
         kind: ObservationKind::Look,
-        target: format!("log:event:{}", old.id),
-        arguments: serde_json::Value::Null,
+        target: &target,
+        arguments: &serde_json::Value::Null,
         selector: Selector::Whole,
-        result: serde_json::json!({"matches": 1, "events": [old]}),
+        result: &result,
         error: None,
     };
     store
@@ -46,9 +48,8 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
             EventMeta::data(1, serde_json::to_value(&observation).unwrap()),
         )
         .unwrap();
-    let context = State::load(&store)
-        .unwrap()
-        .project("revise the goal", None, eja::now_utc());
+    let state = State::load(&store).unwrap();
+    let context = state.project("revise the goal", None, eja::now_utc());
     assert!(render_context(&context).contains("CURRENT INPUT"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let port = listener.local_addr().expect("addr").port();

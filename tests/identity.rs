@@ -42,9 +42,8 @@ fn the_self_survives_budget_pressure_before_the_indexes_do() {
             )
             .unwrap();
     }
-    let context = State::load(&store)
-        .expect("state")
-        .project("go", None, eja::now_utc());
+    let state = State::load(&store).expect("state");
+    let context = state.project("go", None, eja::now_utc());
 
     // Reading order is a claim about what the subject is.
     let whole = render_context(&context);

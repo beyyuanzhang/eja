@@ -8,7 +8,7 @@ use support::control;
 struct Script(Mutex<VecDeque<Decision>>);
 
 impl Brain for Script {
-    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.0
             .lock()
             .unwrap()
@@ -73,8 +73,8 @@ fn a_world_look_does_not_depend_on_waiting_tasks() {
         },
     )
     .expect("turn");
-    assert_eq!(out.context.evidence.len(), 1);
-    assert!(out.context.refused.is_empty());
+    assert_eq!(out.context().evidence.len(), 1);
+    assert!(out.context().refused.is_empty());
     assert!(!store
         .events()
         .unwrap()
@@ -127,15 +127,15 @@ fn observing_a_read_only_tool_records_a_view() {
     )
     .expect("turn");
     assert_eq!(out.reply, "it is clear");
-    assert_eq!(out.context.evidence.len(), 1);
-    assert_eq!(out.context.evidence[0].target, "mcp__weather__get");
-    assert_eq!(out.context.evidence[0].result["sky"], "clear");
+    assert_eq!(out.context().evidence.len(), 1);
+    assert_eq!(out.context().evidence[0].target, "mcp__weather__get");
+    assert_eq!(out.context().evidence[0].result["sky"], "clear");
     assert!(store
         .events()
         .expect("events")
         .iter()
         .any(|event| event.kind == Kind::Observed));
-    let rendered = eja::adapters::render_context(&out.context);
+    let rendered = eja::adapters::render_context(&out.context());
     assert!(
         rendered.contains("EVIDENCE (1):"),
         "{}",

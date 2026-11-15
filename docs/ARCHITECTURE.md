@@ -29,11 +29,20 @@ read once per turn, and the projection is a read of that value. Every derived
 thing (task table, graph, pending proposals, the turn's evidence) is a field or a
 trivial read of it, never a second pass that could disagree.
 
+`C` is a view, not a copy. It borrows the facts it selects, the derived tables it
+shows and the input it is projected with — `EjaContext<'_>` holds references, so
+a decision allocates a selection of pointers, never a second copy of the log. A
+turn's outcome owns `S` and derives `C` on demand, so one turn holds one copy of
+its facts and no projection outlives the facts it describes. A view that must
+outlive its fold would be a second authority, so there is none.
+
 ## Five invariants
 
 1. **Facts and projections.** Events and raw records are immutable facts. Task
    tables, relations, pending proposals, digests and model contexts are derived.
    An assignment freezes a aja's activation contract; it is not a second task.
+   A projection borrows the fold; the fold is the only copy of a fact. An outcome
+   owns the fold it produced, and `context()` derives the view from it.
 2. **Explicit authority.** Typed ids and host grants authorize transitions.
    Model text does not grant approval: an approval is its own event, recorded by
    the host for one turn, and confirmation needs it plus a pending proposal from
@@ -234,9 +243,16 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | One world, one owner: a second run is refused before it costs an aja id | worlds |
 | A worktree world settles and reconciles explicitly; conflicts are reported | worlds |
 
-Repeated projections detect stalls. They are not a convergence proof. The strict
-execution bound comes from the host budgets; solving a natural-language objective
-remains model-dependent.
+A decision reports whether it added information: a fact the projection states, or
+a refusal told for the first time. A look that repeats the observation it would
+replace added none, and the turn ends at its fixpoint. The kernel decides that
+from what each action produced, not by keeping a second projection to compare
+against — a comparison of borrowed views is impossible by construction, and it
+was never the right question: what matters is whether the decision told the
+subject anything it did not already know.
+
+Stall detection is not a convergence proof. The strict execution bound comes from
+the host budgets; solving a natural-language objective remains model-dependent.
 
 ## Ownership and compatibility
 

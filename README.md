@@ -22,6 +22,10 @@ transport, connectors and record reading.
 turn reads the journal once and pushes every event it commits into the same
 value. Nothing validates an action against a second derivation of the log.
 
+`C = view(S, input)` is a borrowed view: what a decision reads holds references
+into `S` and the input, so a projection copies no fact. A turn's outcome owns
+`S` and derives the view on demand; no projection outlives the facts it shows.
+
 ## Facts and views
 
 - `log.jsonl` is the authority for identity, task lifecycles, graph edges,

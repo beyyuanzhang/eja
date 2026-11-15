@@ -23,7 +23,7 @@ impl Queue {
     }
 }
 impl Brain for Queue {
-    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.0
             .lock()
             .expect("brain")
@@ -92,7 +92,7 @@ fn declared_evidence_is_a_host_observation_and_the_judgment_can_use_it() {
         eja::now_utc(),
     )
     .expect("turn");
-    let task = &out.context.tasks[0];
+    let task = &out.context().tasks[0];
     assert_eq!(task.status, TaskStatus::Waiting);
     assert_eq!(
         task.evidence.as_ref().expect("request")["tool"],
@@ -136,7 +136,7 @@ fn declared_evidence_is_a_host_observation_and_the_judgment_can_use_it() {
         eja::now_utc(),
     )
     .expect("close");
-    assert_eq!(closed.context.tasks[0].status, TaskStatus::Done);
+    assert_eq!(closed.context().tasks[0].status, TaskStatus::Done);
 }
 
 #[test]
@@ -152,10 +152,10 @@ fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
     )
     .expect("turn");
     assert!(
-        out.context.tasks[0].evidence.is_some(),
+        out.context().tasks[0].evidence.is_some(),
         "the request is a fact"
     );
-    assert!(out.context.tasks[0].evidence_result.is_none());
+    assert!(out.context().tasks[0].evidence_result.is_none());
 
     let closed = turn_at(
         &store,
@@ -170,15 +170,15 @@ fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
         eja::now_utc(),
     )
     .expect("close");
-    assert_eq!(closed.context.tasks[0].status, TaskStatus::Waiting);
+    assert_eq!(closed.context().tasks[0].status, TaskStatus::Waiting);
     assert!(
         closed
-            .context
+            .context()
             .refused
             .iter()
             .any(|note| note.contains("needs the evidence")),
         "{:?}",
-        closed.context.refused
+        closed.context().refused
     );
 
     // Rejecting needs no evidence: a witness that never answers cannot strand
@@ -196,8 +196,8 @@ fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
         eja::now_utc(),
     )
     .expect("reject");
-    assert_eq!(rejected.context.tasks[0].status, TaskStatus::Failed);
-    assert!(rejected.context.tasks[0]
+    assert_eq!(rejected.context().tasks[0].status, TaskStatus::Failed);
+    assert!(rejected.context().tasks[0]
         .close
         .as_ref()
         .is_some_and(|close| !close.accepted));
@@ -253,10 +253,10 @@ fn an_approval_authorizes_only_the_turn_it_was_recorded_in() {
         eja::now_utc(),
     )
     .expect("propose");
-    let id = first.context.proposals[0].id;
+    let id = first.context().proposals[0].id;
     assert!(
         first
-            .context
+            .context()
             .proposals
             .iter()
             .all(|proposal| !proposal.approved),
@@ -284,14 +284,14 @@ fn an_approval_authorizes_only_the_turn_it_was_recorded_in() {
         eja::now_utc(),
     )
     .expect("confirm");
-    assert!(stale.context.commitments.is_empty());
+    assert!(stale.context().commitments.is_empty());
     assert!(
         stale
-            .context
+            .context()
             .refused
             .iter()
             .any(|note| note.contains("no approval")),
         "{:?}",
-        stale.context.refused
+        stale.context().refused
     );
 }

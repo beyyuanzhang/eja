@@ -35,7 +35,7 @@ impl Drop for Fixture {
 }
 struct Script(Mutex<VecDeque<Decision>>);
 impl Brain for Script {
-    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.0.lock().unwrap().pop_front().unwrap_or_default()
     }
 }
@@ -76,7 +76,7 @@ fn close(id: u64, accepted: bool) -> Action {
         note: "judged".into(),
     }
 }
-fn run(store: &Store, actions: Vec<Action>, worker: &WorkerLog) -> TurnOutcome {
+fn run(store: &Store, actions: Vec<Action>, worker: &WorkerLog) -> TurnOutcome<'static> {
     turn(
         store,
         "request",
@@ -134,9 +134,9 @@ fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal()
         }],
         &worker,
     );
-    let id = proposed.context.proposals[0].id;
+    let id = proposed.context().proposals[0].id;
     let refused = run(&store, vec![Action::Confirm { proposal_id: id }], &worker);
-    assert!(refused.context.goal.is_none());
+    assert!(refused.context().goal.is_none());
     let options = TurnOptions {
         approvals: vec![id],
         ..Default::default()
@@ -151,8 +151,8 @@ fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal()
         &options,
     )
     .unwrap();
-    assert!(confirmed.context.proposals.is_empty());
-    assert_eq!(confirmed.context.goal.unwrap().text, "goal");
+    assert!(confirmed.context().proposals.is_empty());
+    assert_eq!(confirmed.context().goal.unwrap().text, "goal");
     let events = store.events().unwrap();
     assert_eq!(
         events
@@ -173,11 +173,8 @@ fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal()
     assert!(!events
         .iter()
         .any(|event| event.kind == Kind::User && event.data.is_some()));
-    assert!(State::load(&f.store())
-        .expect("state")
-        .project("", None, now_utc())
-        .proposals
-        .is_empty());
+    let state = State::load(&f.store()).expect("state");
+    assert!(state.project("", None, now_utc()).proposals.is_empty());
 }
 
 #[test]
@@ -204,9 +201,9 @@ fn an_approval_cannot_confirm_a_proposal_in_its_creation_turn() {
         &TurnOptions::default(),
     )
     .unwrap();
-    assert!(out.context.commitments.is_empty());
+    assert!(out.context().commitments.is_empty());
     assert!(out
-        .context
+        .context()
         .refused
         .iter()
         .any(|note| note.contains("created this turn")));
@@ -230,17 +227,17 @@ fn groups_close_from_their_members_without_a_fake_execution() {
         &worker,
     );
     let premature = run(&store, vec![close(1, true)], &worker);
-    assert_eq!(premature.context.tasks[0].status, TaskStatus::Open);
+    assert_eq!(premature.context().tasks[0].status, TaskStatus::Open);
     let out = run(&store, vec![close(2, true), close(1, true)], &worker);
-    assert!(out.context.refused.is_empty());
+    assert!(out.context().refused.is_empty());
     assert!(out
-        .context
+        .context()
         .tasks
         .iter()
         .all(|task| task.status == TaskStatus::Done));
     assert_eq!(worker.0.lock().unwrap().len(), 1);
     let refused = run(&store, vec![Action::Dispatch { task_id: 1 }], &worker);
-    assert!(!refused.context.refused.is_empty());
+    assert!(!refused.context().refused.is_empty());
 }
 
 #[test]
@@ -266,12 +263,12 @@ fn graph_constraints_include_cross_kind_cycles_and_real_dependency_readiness() {
         ],
         &worker,
     );
-    assert_eq!(out.context.relations.len(), 2);
+    assert_eq!(out.context().relations.len(), 2);
     // Four actions are refused; two of them are the same cause (a cycle through
     // the group), and a refusal is told once per distinct note.
-    assert_eq!(out.context.refused.len(), 3);
+    assert_eq!(out.context().refused.len(), 3);
     assert_eq!(
-        out.context
+        out.context()
             .refused
             .iter()
             .filter(|note| note.contains("dependency cycle"))
@@ -307,7 +304,7 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
         &worker,
     );
     assert_eq!(
-        out.context
+        out.context()
             .relations
             .iter()
             .filter(|edge| edge.from == 3)
@@ -315,7 +312,7 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
         1
     );
     assert_eq!(worker.0.lock().unwrap().last().unwrap().resume, Some(1));
-    assert_eq!(out.context.refused.len(), 2);
+    assert_eq!(out.context().refused.len(), 2);
 }
 
 struct World;
@@ -345,14 +342,14 @@ fn unrelated_tasks_do_not_change_world_capabilities() {
     let second = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
     // The same observation is available after an unrelated task: the capability
     // does not depend on the task index.
-    assert_eq!(first.context.evidence, second.context.evidence);
-    assert_eq!(first.context.evidence.len(), 1);
-    assert!(first.context.refused.is_empty() && second.context.refused.is_empty());
+    assert_eq!(first.context().evidence, second.context().evidence);
+    assert_eq!(first.context().evidence.len(), 1);
+    assert!(first.context().refused.is_empty() && second.context().refused.is_empty());
 }
 
 struct Growing;
 impl Brain for Growing {
-    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
         Decision {
             actions: vec![aja("another", true)],
             ..Decision::default()
@@ -385,7 +382,7 @@ fn endlessly_novel_states_stop_at_the_turn_budget_with_all_records_retained() {
     assert_eq!(out.decisions, 3);
     assert_eq!(out.dispatched.len(), 3);
     assert!(out
-        .context
+        .context()
         .tasks
         .iter()
         .all(|task| task.status == TaskStatus::Waiting));
@@ -393,7 +390,7 @@ fn endlessly_novel_states_stop_at_the_turn_budget_with_all_records_retained() {
 }
 struct Wait;
 impl Brain for Wait {
-    fn decide(&self, _: &EjaContext, control: &Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, control: &Control) -> Decision {
         while control.check().is_ok() {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -468,9 +465,8 @@ fn history_is_discoverable_and_all_rendered_views_obey_utf8_byte_budgets() {
         &Ports::default(),
     )
     .unwrap();
-    let context = State::load(&store)
-        .expect("state")
-        .project("next", None, now_utc());
+    let state = State::load(&store).expect("state");
+    let context = state.project("next", None, now_utc());
     assert!(context
         .history
         .iter()
@@ -486,8 +482,8 @@ fn history_is_discoverable_and_all_rendered_views_obey_utf8_byte_budgets() {
         )
         .unwrap();
     assert_eq!(history["events"].as_array().unwrap().len(), 2);
-    let mut context = context;
-    context.input = "汉字\"\n".repeat(2000);
+    let tall = "汉字\"\n".repeat(2000);
+    let context = state.project(&tall, None, now_utc());
     for budget in [0, 1, 2, 3, 64, 400, 2000] {
         let view = render_context_within(&context, budget);
         assert!(view.len() <= budget);
@@ -545,9 +541,9 @@ fn group_verdict_is_not_a_second_quality_authority_over_eja() {
         &worker,
     );
     let out = run(&store, vec![close(1, true)], &worker);
-    assert_eq!(out.context.tasks[0].status, TaskStatus::Done);
-    assert_eq!(out.context.tasks[1].status, TaskStatus::Failed);
-    assert!(out.context.refused.is_empty());
+    assert_eq!(out.context().tasks[0].status, TaskStatus::Done);
+    assert_eq!(out.context().tasks[1].status, TaskStatus::Failed);
+    assert!(out.context().refused.is_empty());
     let empty = run(
         &store,
         vec![
@@ -559,7 +555,7 @@ fn group_verdict_is_not_a_second_quality_authority_over_eja() {
         ],
         &worker,
     );
-    assert_eq!(empty.context.tasks[2].status, TaskStatus::Done);
+    assert_eq!(empty.context().tasks[2].status, TaskStatus::Done);
     assert!(worker.0.lock().unwrap().is_empty());
 }
 
@@ -568,7 +564,7 @@ struct HeldBrain {
     release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 impl Brain for HeldBrain {
-    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.entered.send(()).unwrap();
         self.release
             .lock()
@@ -615,7 +611,7 @@ fn the_journal_lease_excludes_both_cloned_and_independent_stores() {
 
 struct ReceiptBrain(Mutex<usize>);
 impl Brain for ReceiptBrain {
-    fn decide(&self, context: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         let mut step = self.0.lock().unwrap();
         let actions = match *step {
             0 => vec![aja("allocated", false)],
@@ -646,8 +642,8 @@ fn allocation_returns_an_id_before_the_model_has_to_address_the_new_entity() {
     )
     .unwrap();
     assert_eq!(out.decisions, 3);
-    assert_eq!(out.context.tasks[0].status, TaskStatus::Done);
-    assert!(out.context.refused.is_empty());
+    assert_eq!(out.context().tasks[0].status, TaskStatus::Done);
+    assert!(out.context().refused.is_empty());
 }
 
 #[test]
@@ -699,7 +695,7 @@ fn oversized_log_events_do_not_block_discovery_and_remain_readable_by_utf8_offse
         &ports,
     )
     .unwrap();
-    let rendered = eja::adapters::render_context(&out.context);
+    let rendered = eja::adapters::render_context(&out.context());
     assert!(rendered.contains("next=2"));
     assert!(rendered.contains("oversized events"));
 }
@@ -739,7 +735,7 @@ fn cancellation_keeps_prior_refusals_and_reconciles_reserved_dispatches() {
         .unwrap()
         .iter()
         .any(|e| e.kind == Kind::Refused && e.text.contains("999")));
-    assert_eq!(out.context.tasks[0].status, TaskStatus::Waiting);
+    assert_eq!(out.context().tasks[0].status, TaskStatus::Waiting);
     assert!(out.dispatched.is_empty());
 }
 
@@ -780,16 +776,16 @@ fn cancellation_between_queued_ajas_preserves_completed_evidence_and_skips_the_n
     assert_eq!(*worker.seen.lock().unwrap(), vec![1]);
     assert_eq!(out.dispatched, vec![1]);
     assert_eq!(
-        out.context.tasks[0].digest.as_deref(),
+        out.context().tasks[0].digest.as_deref(),
         Some("first execution completed")
     );
-    assert!(out.context.tasks[1]
+    assert!(out.context().tasks[1]
         .digest
         .as_deref()
         .unwrap()
         .contains("interrupted"));
     assert!(out
-        .context
+        .context()
         .tasks
         .iter()
         .all(|task| task.status == TaskStatus::Waiting));
@@ -808,7 +804,7 @@ fn a_rejection_is_recorded_and_the_proposal_leaves_the_view() {
         }],
         &worker,
     );
-    let id = proposed.context.proposals[0].id;
+    let id = proposed.context().proposals[0].id;
     let rejected = run(
         &store,
         vec![Action::Reject {
@@ -818,7 +814,7 @@ fn a_rejection_is_recorded_and_the_proposal_leaves_the_view() {
         &worker,
     );
     assert!(
-        rejected.context.proposals.is_empty(),
+        rejected.context().proposals.is_empty(),
         "a rejected proposal is no longer pending"
     );
     let events = store.events().unwrap();
@@ -840,12 +836,12 @@ fn a_rejection_is_recorded_and_the_proposal_leaves_the_view() {
     );
     assert!(
         again
-            .context
+            .context()
             .refused
             .iter()
             .any(|note| note.contains("not pending")),
         "{:?}",
-        again.context.refused
+        again.context().refused
     );
 }
 
@@ -864,9 +860,8 @@ fn a_recorded_relationship_is_identity_content() {
     assert!(events
         .iter()
         .any(|event| event.kind == Kind::Relationship && event.text == text));
-    let context = State::load(&store)
-        .expect("state")
-        .project("", None, now_utc());
+    let state = State::load(&store).expect("state");
+    let context = state.project("", None, now_utc());
     assert!(
         context.identity.iter().any(|event| event.text == text),
         "a relationship is identity content, not a task edge"

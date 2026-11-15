@@ -23,7 +23,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -118,7 +118,7 @@ fn propose_and_confirm(
     )
     .expect("propose");
     let proposal_id = outcome
-        .context
+        .context()
         .proposals
         .last()
         .expect("pending proposal")
@@ -155,11 +155,11 @@ fn user_input_does_not_become_a_goal() {
         day(2026, 11, 9, 9),
     )
     .expect("turn");
-    assert_eq!(outcome.context.input, "what is the weather?");
-    assert!(outcome.context.goal.is_none());
+    assert_eq!(outcome.context().input, "what is the weather?");
+    assert!(outcome.context().goal.is_none());
     let restarted = Store::new(&dir).expect("restart");
     assert!(State::load(&restarted).expect("state").goal().is_none());
-    assert!(eja::adapters::render_context(&outcome.context).contains("CURRENT GOAL:\n  (none)"));
+    assert!(eja::adapters::render_context(&outcome.context()).contains("CURRENT GOAL:\n  (none)"));
 }
 
 #[test]
@@ -182,11 +182,12 @@ fn unrelated_input_preserves_a_confirmed_goal() {
         day(2026, 11, 9, 10),
     )
     .expect("turn");
-    let goal = outcome.context.goal.as_ref().expect("goal");
+    let context = outcome.context();
+    let goal = context.goal.as_ref().expect("goal");
     assert_eq!(goal.text, "ship the release");
-    assert!(eja::adapters::render_context(&outcome.context)
+    assert!(eja::adapters::render_context(&outcome.context())
         .contains(&format!("#{} ship the release", goal.id)));
-    assert_eq!(outcome.context.input, "what is the weather?");
+    assert_eq!(outcome.context().input, "what is the weather?");
 }
 
 #[test]
@@ -213,11 +214,8 @@ fn restart_and_model_switch_preserve_identity() {
     )
     .expect("continue");
 
-    let context = State::load(&store).expect("state").project(
-        "what did I commit to?",
-        None,
-        day(2026, 11, 10, 10),
-    );
+    let state = State::load(&store).expect("state");
+    let context = state.project("what did I commit to?", None, day(2026, 11, 10, 10));
     assert_eq!(context.commitments.len(), 1);
     assert_eq!(
         context.commitments[0].text,
@@ -307,11 +305,8 @@ fn replacements_preserve_their_kind_and_revision_chain_across_restart() {
             previous = Some(entry.id);
         }
         let restarted = Store::new(&dir).expect("restart");
-        let context = State::load(&restarted).expect("state").project(
-            "unrelated input",
-            None,
-            day(2026, 11, 10, 9),
-        );
+        let state = State::load(&restarted).expect("state");
+        let context = state.project("unrelated input", None, day(2026, 11, 10, 9));
         if kind == ProposalKind::Goal {
             assert_eq!(context.goal.as_ref().expect("goal").text, "latest");
         } else {
@@ -367,8 +362,8 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
     )
     .expect("turn");
 
-    assert_eq!(outcome.context.now, at.timestamp());
-    let task = &outcome.context.tasks[0];
+    assert_eq!(outcome.context().now, at.timestamp());
+    let task = &outcome.context().tasks[0];
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.created_at, at.timestamp());
     assert_eq!(task.digest_at, Some(at.timestamp()));
@@ -397,9 +392,8 @@ fn temporal_gap_is_numeric_and_language_free() {
     );
 
     let later = day(2026, 11, 12, 18);
-    let context = State::load(&store)
-        .expect("state")
-        .project("what is due?", None, later);
+    let state = State::load(&store).expect("state");
+    let context = state.project("what is due?", None, later);
     assert_eq!(context.now, later.timestamp());
     assert_eq!(context.commitments[0].at, day(2026, 11, 9, 9).timestamp());
 }

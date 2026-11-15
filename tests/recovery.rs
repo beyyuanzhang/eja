@@ -19,7 +19,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")

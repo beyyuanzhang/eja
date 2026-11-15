@@ -63,13 +63,13 @@ impl ProposalKind {
 }
 
 /// A pending proposal as a projection sees it. It is a view: the fact is the
-/// `Proposal` event, and the section of the journal it lives in.
+/// `Proposal` event, and the text is borrowed from it rather than copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProposalView {
+pub struct ProposalView<'a> {
     pub id: u64,
     pub kind: ProposalKind,
     pub target_id: Option<u64>,
-    pub text: String,
+    pub text: &'a str,
     pub created_at: i64,
     pub turn: u64,
     /// True when the host recorded an approval for this turn.
@@ -194,13 +194,13 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TaskOpen {
+pub(crate) struct TaskOpen<'a> {
     #[serde(default)]
     pub(crate) kind: TaskKind,
-    pub(crate) title: String,
-    pub(crate) request: String,
-    pub(crate) origin: String,
-    pub(crate) acceptance: String,
+    pub(crate) title: &'a str,
+    pub(crate) request: &'a str,
+    pub(crate) origin: &'a str,
+    pub(crate) acceptance: &'a str,
     /// A host-interpreted request for acceptance evidence. A judgment counts only
     /// when the host observed that evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,27 +236,30 @@ pub struct Task {
     pub evidence_result: Option<Value>,
 }
 
-/// The model's bounded working view. A projection is derived from the journal
-/// every time it is read, so it is not a fact and is not serializable.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EjaContext {
+/// The model's bounded working view. It borrows the fold it projects: a view is
+/// what `S` looks like within a budget, never a second copy of `S`. Every field
+/// is either a selection of borrowed facts or a borrowed derived table.
+#[derive(Debug, Clone)]
+pub struct EjaContext<'a> {
     pub now: i64,
-    pub input: String,
-    pub history: Vec<Event>,
-    pub goal: Option<Event>,
-    pub identity: Vec<Event>,
-    pub commitments: Vec<Event>,
-    pub tasks: Vec<Task>,
-    pub relations: Vec<Edge>,
+    pub input: &'a str,
+    pub history: Vec<&'a Event>,
+    pub goal: Option<&'a Event>,
+    pub identity: Vec<&'a Event>,
+    pub commitments: Vec<&'a Event>,
+    /// The task table and the graph are derived fields of the fold, so the view
+    /// borrows them whole instead of copying them per decision.
+    pub tasks: &'a [Task],
+    pub relations: &'a [Edge],
     /// The task the projection is about; it is one of `tasks`.
     pub focus: Option<TaskId>,
     /// What this turn observed, folded from the events that recorded it. An
     /// observation names its own subject, so a repeat of the same read is the
     /// same entry and the view states the same information.
-    pub evidence: Vec<Observation>,
-    pub proposals: Vec<ProposalView>,
+    pub evidence: Vec<Observation<'a>>,
+    pub proposals: Vec<ProposalView<'a>>,
     /// Actions this turn that the host could not carry out.
-    pub refused: Vec<String>,
+    pub refused: Vec<&'a str>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -383,20 +386,56 @@ pub enum ObservationKind {
 }
 
 /// One observation, recorded once. This is the only shape an EJA observation has.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Observation {
+///
+/// The recorded form owns its data; the read form borrows it. `read` decodes one
+/// committed event's payload in place, so a projection of a hundred observations
+/// copies none of them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Observation<'a> {
     /// What this is; `target` names its subject.
-    #[serde(default)]
     pub kind: ObservationKind,
-    pub target: String,
-    #[serde(default)]
-    pub arguments: Value,
-    #[serde(default)]
+    pub target: &'a str,
+    pub arguments: &'a Value,
     pub selector: Selector,
-    #[serde(default)]
-    pub result: Value,
-    #[serde(default)]
-    pub error: Option<String>,
+    pub result: &'a Value,
+    pub error: Option<&'a str>,
+}
+
+impl<'a> Observation<'a> {
+    /// Whether two observations answer the same read: the entry one replaces.
+    pub fn same_subject(&self, other: &Observation<'_>) -> bool {
+        self.target == other.target
+            && self.arguments == other.arguments
+            && self.selector == other.selector
+    }
+
+    /// Whether two observations state the same thing, content included. The
+    /// kernel compares content, never the event that recorded it.
+    pub fn same_content(&self, other: &Observation<'_>) -> bool {
+        self.kind == other.kind
+            && self.same_subject(other)
+            && self.result == other.result
+            && self.error == other.error
+    }
+
+    /// Read one recorded observation. A payload this version cannot read is not
+    /// evidence, so it yields `None` and the projection skips it.
+    pub fn read(data: &'a Value) -> Option<Self> {
+        Some(Self {
+            kind: match data.get("kind") {
+                Some(kind) => ObservationKind::deserialize(kind).ok()?,
+                None => ObservationKind::Look,
+            },
+            target: data.get("target")?.as_str()?,
+            arguments: data.get("arguments")?,
+            selector: match data.get("selector") {
+                Some(selector) => Selector::deserialize(selector).ok()?,
+                None => Selector::Whole,
+            },
+            result: data.get("result")?,
+            error: data.get("error").and_then(Value::as_str),
+        })
+    }
 }
 
 /// The host: one read primitive, and the two host acts a turn may request.
@@ -488,18 +527,8 @@ pub struct TurnOptions {
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[derive(Debug, Clone)]
-pub struct TurnOutcome {
-    pub reply: String,
-    /// Everything the turn produced, folded once: tasks, evidence and refusals
-    /// are read from here, not kept in a second copy.
-    pub context: EjaContext,
-    pub dispatched: Vec<TaskId>,
-    pub decisions: usize,
-    pub worker_ms: u128,
-    pub end: TurnEnd,
-    pub reason: Option<String>,
-}
+// `TurnOutcome` lives in `turn`: it owns the fold that produced it.
+
 /// Where a payload lives. One address space over every authority a view can read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

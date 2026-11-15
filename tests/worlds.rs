@@ -23,7 +23,7 @@ impl Queue {
     }
 }
 impl Brain for Queue {
-    fn decide(&self, _: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.0
             .lock()
             .expect("brain")
@@ -339,8 +339,8 @@ fn reconciling_a_run_is_one_recorded_observation() {
         &options,
     )
     .expect("reconcile");
-    let account = out
-        .context
+    let context = out.context();
+    let account = context
         .evidence
         .iter()
         .find(|view| view.kind == eja::ObservationKind::Reconcile)
@@ -375,12 +375,12 @@ fn reconciling_a_run_is_one_recorded_observation() {
     .expect("refusal");
     assert!(
         refused
-            .context
+            .context()
             .refused
             .iter()
             .any(|note| note.contains("reconcile refused")),
         "{:?}",
-        refused.context.refused
+        refused.context().refused
     );
 }
 #[test]

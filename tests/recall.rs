@@ -19,7 +19,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -79,7 +79,7 @@ fn recall_is_an_id_result_not_text_matching() {
         eja::now_utc(),
     )
     .expect("propose");
-    let proposal_id = proposed.context.proposals.last().expect("proposal").id;
+    let proposal_id = proposed.context().proposals.last().expect("proposal").id;
     let confirm = QueueBrain::new(vec![decision(
         "confirmed",
         vec![Action::Confirm { proposal_id }],
@@ -120,14 +120,14 @@ fn recall_is_an_id_result_not_text_matching() {
     )
     .expect("recall");
 
-    assert_eq!(outcome.context.evidence.len(), 1);
-    let events = outcome.context.evidence[0].result["events"]
+    assert_eq!(outcome.context().evidence.len(), 1);
+    let events = outcome.context().evidence[0].result["events"]
         .as_array()
         .expect("events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["id"], commitment.id);
     assert_eq!(events[0]["kind"], "commitment");
-    assert_eq!(outcome.context.evidence.len(), 1);
+    assert_eq!(outcome.context().evidence.len(), 1);
     assert!(store
         .events()
         .expect("events")

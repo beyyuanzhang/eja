@@ -22,7 +22,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -118,7 +118,7 @@ fn propose_and_confirm(
     )
     .expect("propose");
     let proposal_id = outcome
-        .context
+        .context()
         .proposals
         .last()
         .expect("pending proposal")
@@ -179,9 +179,12 @@ fn closed_loop_dispatches_reports_and_accepts() {
     .expect("turn");
 
     assert_eq!(outcome.reply, "done");
-    assert_eq!(outcome.context.tasks.len(), 1);
-    assert_eq!(outcome.context.tasks[0].status, TaskStatus::Done);
-    assert_eq!(outcome.context.tasks[0].origin, "write a release checklist");
+    assert_eq!(outcome.context().tasks.len(), 1);
+    assert_eq!(outcome.context().tasks[0].status, TaskStatus::Done);
+    assert_eq!(
+        outcome.context().tasks[0].origin,
+        "write a release checklist"
+    );
     assert_eq!(outcome.dispatched, vec![1]);
     assert_eq!(outcome.dispatched.len(), 1);
 
@@ -260,15 +263,15 @@ fn rejection_fails_the_task_and_keeps_the_report() {
     )
     .expect("turn");
 
-    assert_eq!(outcome.context.tasks[0].status, TaskStatus::Failed);
+    assert_eq!(outcome.context().tasks[0].status, TaskStatus::Failed);
     assert!(
-        !outcome.context.tasks[0]
+        !outcome.context().tasks[0]
             .close
             .as_ref()
             .expect("close")
             .accepted
     );
-    assert!(outcome.context.tasks[0]
+    assert!(outcome.context().tasks[0]
         .digest
         .as_deref()
         .unwrap_or("")
@@ -304,15 +307,15 @@ fn impossible_actions_are_refused_visibly_and_change_nothing() {
     )
     .expect("first turn");
     assert_eq!(
-        outcome.context.refused.len(),
+        outcome.context().refused.len(),
         1,
         "{:?}",
-        outcome.context.refused
+        outcome.context().refused
     );
     assert!(
-        outcome.context.refused[0].contains("waiting"),
+        outcome.context().refused[0].contains("waiting"),
         "{:?}",
-        outcome.context.refused
+        outcome.context().refused
     );
     assert!(outcome.dispatched.len() == 1);
 
@@ -338,18 +341,18 @@ fn impossible_actions_are_refused_visibly_and_change_nothing() {
     )
     .expect("second turn");
     assert_eq!(
-        outcome.context.refused.len(),
+        outcome.context().refused.len(),
         2,
         "{:?}",
-        outcome.context.refused
+        outcome.context().refused
     );
     assert!(outcome
-        .context
+        .context()
         .refused
         .iter()
         .any(|note| note.contains("close refused")));
     assert!(outcome
-        .context
+        .context()
         .refused
         .iter()
         .any(|note| note.contains("no task 9")));
@@ -365,7 +368,7 @@ fn impossible_actions_are_refused_visibly_and_change_nothing() {
     // A refused action becomes a host note in the log and in the next projection:
     // EJA can read its own dead ends instead of repeating them.
     assert!(events.iter().any(|event| event.kind == Kind::Refused));
-    let rendered = render_context(&outcome.context);
+    let rendered = render_context(&outcome.context());
     assert!(rendered.contains("REFUSED"), "{rendered}");
     assert!(rendered.contains("no task 9"), "{rendered}");
 }
@@ -435,8 +438,8 @@ fn task_index_and_read_task_are_structured() {
     )
     .expect("read");
 
-    assert_eq!(outcome.context.focus.expect("focus"), 1);
-    assert_eq!(outcome.context.tasks.len(), 2);
+    assert_eq!(outcome.context().focus.expect("focus"), 1);
+    assert_eq!(outcome.context().tasks.len(), 2);
 }
 
 #[test]
@@ -478,7 +481,7 @@ fn explicit_dispatch_runs_an_open_task() {
     let outcome =
         turn_at(&store, "run it", &brain, &worker, &Ports::default(), now()).expect("dispatch");
     assert_eq!(outcome.dispatched, vec![1]);
-    assert_eq!(outcome.context.tasks[0].status, TaskStatus::Done);
+    assert_eq!(outcome.context().tasks[0].status, TaskStatus::Done);
 }
 
 #[test]
@@ -511,8 +514,8 @@ fn cannot_close_without_a_worker_report() {
         now(),
     )
     .expect("turn");
-    assert_eq!(outcome.context.tasks[0].status, TaskStatus::Open);
-    assert!(outcome.context.tasks[0].close.is_none());
+    assert_eq!(outcome.context().tasks[0].status, TaskStatus::Open);
+    assert!(outcome.context().tasks[0].close.is_none());
     assert!(!store
         .events()
         .expect("events")
@@ -550,8 +553,8 @@ fn worker_failure_stays_waiting_for_eja() {
         now(),
     )
     .expect("turn");
-    assert_eq!(outcome.context.tasks[0].status, TaskStatus::Waiting);
-    assert!(outcome.context.tasks[0]
+    assert_eq!(outcome.context().tasks[0].status, TaskStatus::Waiting);
+    assert!(outcome.context().tasks[0]
         .digest
         .as_deref()
         .unwrap_or("")
@@ -686,7 +689,7 @@ fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
     assert_eq!(peak.load(Ordering::SeqCst), 1, "one execution owner");
     assert_eq!(
         outcome
-            .context
+            .context()
             .tasks
             .iter()
             .filter(|t| t.digest.is_some())

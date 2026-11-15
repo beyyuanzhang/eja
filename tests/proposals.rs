@@ -19,7 +19,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -80,10 +80,10 @@ fn proposal_does_not_change_identity_until_confirmed() {
         eja::now_utc(),
     )
     .expect("propose");
-    assert_eq!(proposed.context.proposals.len(), 1);
+    assert_eq!(proposed.context().proposals.len(), 1);
     assert!(State::load(&store).expect("state").commitments().is_empty());
 
-    let proposal_id = proposed.context.proposals[0].id;
+    let proposal_id = proposed.context().proposals[0].id;
     let confirm = QueueBrain::new(vec![decision(
         "confirmed",
         vec![Action::Confirm { proposal_id }],
@@ -101,7 +101,7 @@ fn proposal_does_not_change_identity_until_confirmed() {
         },
     )
     .expect("confirm");
-    assert!(confirmed.context.proposals.is_empty());
+    assert!(confirmed.context().proposals.is_empty());
     assert_eq!(State::load(&store).expect("state").commitments().len(), 1);
 }
 
@@ -151,7 +151,7 @@ fn rejection_leaves_identity_unchanged() {
         eja::now_utc(),
     )
     .expect("propose");
-    let proposal_id = proposed.context.proposals[0].id;
+    let proposal_id = proposed.context().proposals[0].id;
     let reject = QueueBrain::new(vec![decision(
         "rejected",
         vec![Action::Reject {
@@ -168,7 +168,7 @@ fn rejection_leaves_identity_unchanged() {
         eja::now_utc(),
     )
     .expect("reject");
-    assert!(rejected.context.proposals.is_empty());
+    assert!(rejected.context().proposals.is_empty());
     assert!(State::load(&store).expect("state").commitments().is_empty());
 }
 
@@ -202,13 +202,13 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
         eja::now_utc(),
     )
     .unwrap();
-    assert_eq!(out.context.proposals.len(), 2);
+    assert_eq!(out.context().proposals.len(), 2);
     assert_eq!(
         State::load(&store).expect("state").commitments()[0].id,
         old.id
     );
-    let first = out.context.proposals[0].id;
-    let stale = out.context.proposals[1].id;
+    let first = out.context().proposals[0].id;
+    let stale = out.context().proposals[1].id;
     let confirm = QueueBrain::new(vec![decision(
         "confirm",
         vec![
@@ -229,11 +229,11 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
         },
     )
     .unwrap();
-    assert_eq!(out.context.commitments.len(), 1);
-    assert_eq!(out.context.commitments[0].text, "replacement");
-    assert_eq!(out.context.commitments[0].closes, Some(old.id));
-    assert_eq!(out.context.proposals.len(), 1);
-    assert_eq!(out.context.proposals[0].id, stale);
+    assert_eq!(out.context().commitments.len(), 1);
+    assert_eq!(out.context().commitments[0].text, "replacement");
+    assert_eq!(out.context().commitments[0].closes, Some(old.id));
+    assert_eq!(out.context().proposals.len(), 1);
+    assert_eq!(out.context().proposals[0].id, stale);
     let events = store.events().unwrap();
     assert_eq!(
         events
@@ -282,7 +282,7 @@ fn invalid_revision_targets_do_not_create_proposals() {
         eja::now_utc(),
     )
     .unwrap();
-    assert!(out.context.proposals.is_empty());
-    assert!(out.context.goal.is_none());
-    assert_eq!(out.context.commitments[0].id, old.id);
+    assert!(out.context().proposals.is_empty());
+    assert!(out.context().goal.is_none());
+    assert_eq!(out.context().commitments[0].id, old.id);
 }

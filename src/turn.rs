@@ -6,9 +6,9 @@
 use crate::domain::{ProposalData, TaskOpen};
 use crate::state::task_scope;
 use crate::{
-    now_utc, Action, Assignment, Brain, CloseOutcome, Control, ControlError, Edge, EventMeta, Host,
-    Kind, Observation, ObservationKind, ProposalKind, RelationKind, Result, Selector, State, Store,
-    Task, TaskId, TaskKind, TaskStatus, TurnEnd, TurnOptions, TurnOutcome, Worker,
+    now_utc, Action, Assignment, Brain, CloseOutcome, Control, ControlError, Edge, EjaContext,
+    EventMeta, Host, Kind, Observation, ObservationKind, ProposalKind, RelationKind, Result,
+    Selector, State, Store, Task, TaskId, TaskKind, TaskStatus, TurnEnd, TurnOptions, Worker,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -16,6 +16,75 @@ use std::{
     collections::HashSet,
     time::{Duration, Instant},
 };
+
+/// What one turn did, and the fold it ended with.
+///
+/// The outcome owns the fold, not a rendered projection: `context` derives the
+/// view on demand, so two readers cannot hold two shapes of one fact and no
+/// projection outlives the facts it describes.
+#[derive(Debug, Clone)]
+pub struct TurnOutcome<'a> {
+    pub reply: String,
+    pub dispatched: Vec<TaskId>,
+    pub decisions: usize,
+    pub worker_ms: u128,
+    pub end: TurnEnd,
+    pub reason: Option<String>,
+    /// `S`: the logical state the turn ended with.
+    state: State,
+    /// The input this turn was about, borrowed from the caller like every other
+    /// text a view shows.
+    input: &'a str,
+    focus: Option<TaskId>,
+    now: chrono::DateTime<chrono::Utc>,
+}
+
+impl TurnOutcome<'_> {
+    /// `C = view(S, input)`: the projection of the state this turn ended with.
+    pub fn context(&self) -> EjaContext<'_> {
+        self.state.project(self.input, self.focus, self.now)
+    }
+}
+
+/// What a turn has produced so far. The fold stays separate until the end, so
+/// the outcome can own it.
+#[derive(Default)]
+struct Progress {
+    dispatched: Vec<TaskId>,
+    decisions: usize,
+    worker_ms: u128,
+}
+
+/// What one decision produced.
+///
+/// `committed` follows the state machine's own rule about which actions continue
+/// a turn; `informed` is the finer question the fixpoint needs: did they change
+/// anything the projection states? A look that repeats the observation it would
+/// replace committed a fact and added no information.
+#[derive(Debug, Default, Clone, Copy)]
+struct Effect {
+    committed: bool,
+    told: bool,
+    informed: bool,
+}
+
+impl Effect {
+    /// An action whose fact the projection states.
+    fn fact(&mut self) {
+        self.committed = true;
+        self.informed = true;
+    }
+
+    /// A refusal told for the first time this turn.
+    fn noted(&mut self, told: bool) {
+        self.told |= told;
+        self.informed |= told;
+    }
+
+    fn acted(self) -> bool {
+        self.committed || self.told
+    }
+}
 
 /// Commit one fact: the journal is the authority, and the fold is updated by the
 /// same event, so no reader has to scan again.
@@ -35,7 +104,7 @@ fn commit(
 /// A refusal is information: it tells EJA what the state did not allow. A note is
 /// told once per turn, so repeating an impossible action changes nothing.
 fn refuse(store: &Store, state: &mut State, ctx: &ActionCtx<'_>, note: String) -> Result<bool> {
-    if state.refusals(ctx.turn).contains(&note) {
+    if state.refusals(ctx.turn).iter().any(|other| *other == note) {
         return Ok(false);
     }
     commit(
@@ -139,13 +208,16 @@ fn confirm_proposal(
         )));
     }
     // One event both establishes the replacement and closes its predecessor.
-    // A Correction has no replacement: it only withdraws its target.
+    // A Correction has no replacement: it only withdraws its target. The text is
+    // borrowed from the fold, which the commit below needs mutably, so it is
+    // taken before the commit — the event owns its text anyway.
+    let text = proposal.text.to_string();
     commit(
         store,
         state,
         proposal.kind.event_kind(),
         "eja",
-        &proposal.text,
+        &text,
         turn,
         EventMeta {
             at,
@@ -203,14 +275,14 @@ fn append_identity(
     commit(store, state, kind, "eja", text, turn, EventMeta::new(at))
 }
 
-fn open_task(ctx: &ActionCtx<'_>, state: &mut State, input: TaskOpen) -> Result<TaskId> {
+fn open_task(ctx: &ActionCtx<'_>, state: &mut State, input: TaskOpen<'_>) -> Result<TaskId> {
     let id = state.next_task_id()?;
     commit(
         ctx.store,
         state,
         Kind::TaskOpened,
         &task_scope(id),
-        &input.title,
+        input.title,
         ctx.turn,
         EventMeta::data(ctx.at, serde_json::to_value(&input)?),
     )?;
@@ -235,9 +307,9 @@ fn link_tasks(
     if from == to {
         return Ok(Some("relate refused: self relation".into()));
     }
-    let mut edges = state.relations().to_vec();
+    let graph = state.relations();
     let edge = Edge { from, to, kind };
-    if edges.contains(&edge) {
+    if graph.contains(&edge) {
         return Ok(None);
     }
     match kind {
@@ -247,7 +319,7 @@ fn link_tasks(
                     "relate refused: containment needs an open group".into(),
                 ));
             }
-            if edges
+            if graph
                 .iter()
                 .any(|edge| edge.from == from && edge.kind == kind)
             {
@@ -270,7 +342,7 @@ fn link_tasks(
                 ));
             }
             if kind == RelationKind::Continues
-                && edges
+                && graph
                     .iter()
                     .any(|edge| edge.from == from && edge.kind == kind)
             {
@@ -281,9 +353,9 @@ fn link_tasks(
         }
         _ => {}
     }
-    edges.push(edge);
     // A group completes after its members; a aja executes after its explicit
-    // dependencies. One combined dependency graph catches cross-kind cycles.
+    // dependencies. One combined dependency graph catches cross-kind cycles; the
+    // candidate edge is chained in rather than copied into the graph.
     let dependency = |edge: &Edge| match edge.kind {
         RelationKind::PartOf => Some((edge.to, edge.from)),
         RelationKind::DependsOn | RelationKind::Continues => Some((edge.from, edge.to)),
@@ -306,8 +378,9 @@ fn link_tasks(
             }
             if seen.insert(id) {
                 pending.extend(
-                    edges
+                    graph
                         .iter()
+                        .chain(std::iter::once(&edge))
                         .filter_map(dependency)
                         .filter(|(source, _)| *source == id)
                         .map(|(_, target)| target),
@@ -404,7 +477,7 @@ fn reserve_dispatch(
 fn record_dispatch(
     ctx: &ActionCtx<'_>,
     state: &mut State,
-    out: &mut TurnOutcome,
+    progress: &mut Progress,
     assignment: Assignment,
     digest: String,
 ) -> Result<()> {
@@ -417,7 +490,7 @@ fn record_dispatch(
         ctx.turn,
         EventMeta::new(ctx.at),
     )?;
-    out.dispatched.push(assignment.task_id);
+    progress.dispatched.push(assignment.task_id);
     Ok(())
 }
 
@@ -427,7 +500,7 @@ fn record_dispatch(
 fn run_dispatches(
     ctx: &ActionCtx<'_>,
     state: &mut State,
-    out: &mut TurnOutcome,
+    progress: &mut Progress,
     pending: Vec<Assignment>,
 ) -> Result<()> {
     let slots = ctx.options.limits.slots.max(1);
@@ -437,8 +510,8 @@ fn run_dispatches(
             let task_id = assignment.task_id;
             let started = Instant::now();
             let digest = run_one(ctx.worker, &assignment, ctx.control);
-            out.worker_ms += started.elapsed().as_millis();
-            record_dispatch(ctx, state, out, assignment, digest)?;
+            progress.worker_ms += started.elapsed().as_millis();
+            record_dispatch(ctx, state, progress, assignment, digest)?;
             observe_evidence(ctx, state, task_id)?;
         }
         return Ok(());
@@ -470,7 +543,7 @@ fn run_dispatches(
             });
         }
     });
-    out.worker_ms += started.elapsed().as_millis();
+    progress.worker_ms += started.elapsed().as_millis();
     let mut collected = results
         .into_inner()
         .map_err(|_| "dispatch results are unavailable")?;
@@ -478,7 +551,7 @@ fn run_dispatches(
     for (_, assignment, digest) in collected {
         ctx.control.check()?;
         let task_id = assignment.task_id;
-        record_dispatch(ctx, state, out, assignment, digest)?;
+        record_dispatch(ctx, state, progress, assignment, digest)?;
         observe_evidence(ctx, state, task_id)?;
     }
     Ok(())
@@ -494,33 +567,32 @@ fn run_one(worker: &dyn Worker, assignment: &Assignment, control: &Control) -> S
 /// The host's own observation of what a run achieved. Failure is recorded too: a
 /// witness that could not answer leaves the judgment undecidable, and says why.
 fn observe_evidence(ctx: &ActionCtx<'_>, state: &mut State, task_id: TaskId) -> Result<()> {
-    let Some(task) = state.task(task_id) else {
-        return Ok(());
-    };
-    let Some(request) = task.evidence.clone() else {
-        return Ok(());
-    };
-    if task.evidence_id.is_some() {
-        return Ok(());
-    }
-    let target = request["tool"].as_str().unwrap_or("witness").to_string();
-    let observation = match ctx.host.witness(&request, ctx.control) {
-        Ok(result) => Observation {
+    // The observation borrows the task's request, so it is serialized before the
+    // fold is touched again: one copy of the fact, written once.
+    let data = {
+        let Some(task) = state.task(task_id) else {
+            return Ok(());
+        };
+        let Some(request) = task.evidence.as_ref() else {
+            return Ok(());
+        };
+        if task.evidence_id.is_some() {
+            return Ok(());
+        }
+        let target = request["tool"].as_str().unwrap_or("witness");
+        let (result, error) = match ctx.host.witness(request, ctx.control) {
+            Ok(result) => (result, None),
+            Err(error) => (serde_json::Value::Null, Some(error.to_string())),
+        };
+        let observation = Observation {
             kind: ObservationKind::Witness,
             target,
             arguments: request,
             selector: Selector::Whole,
-            result,
-            error: None,
-        },
-        Err(error) => Observation {
-            kind: ObservationKind::Witness,
-            target,
-            arguments: request,
-            selector: Selector::Whole,
-            result: serde_json::Value::Null,
-            error: Some(error.to_string()),
-        },
+            result: &result,
+            error: error.as_deref(),
+        };
+        serde_json::to_value(&observation)?
     };
     commit(
         ctx.store,
@@ -529,7 +601,7 @@ fn observe_evidence(ctx: &ActionCtx<'_>, state: &mut State, task_id: TaskId) -> 
         &task_scope(task_id),
         "",
         ctx.turn,
-        EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
+        EventMeta::data(ctx.at, data),
     )
 }
 
@@ -548,16 +620,19 @@ fn reconcile(
             "reconcile refused: task {task_id} has no run to reconcile"
         )));
     }
-    let observation = match ctx.host.reconcile(task_id, ctx.control) {
-        Ok(result) => Observation {
-            kind: ObservationKind::Reconcile,
-            target: task_scope(task_id),
-            arguments: serde_json::json!({"task": task_id}),
-            selector: Selector::Whole,
-            result,
-            error: None,
-        },
+    let result = match ctx.host.reconcile(task_id, ctx.control) {
+        Ok(result) => result,
         Err(error) => return Ok(Err(format!("reconcile refused: {error}"))),
+    };
+    let target = task_scope(task_id);
+    let arguments = serde_json::json!({"task": task_id});
+    let observation = Observation {
+        kind: ObservationKind::Reconcile,
+        target: &target,
+        arguments: &arguments,
+        selector: Selector::Whole,
+        result: &result,
+        error: None,
     };
     commit(
         ctx.store,
@@ -645,11 +720,10 @@ fn apply_actions(
     actions: &[Action],
     ctx: &ActionCtx<'_>,
     state: &mut State,
-    out: &mut TurnOutcome,
+    progress: &mut Progress,
     focus: &mut Option<TaskId>,
-) -> Result<bool> {
-    let mut acted = false;
-    let mut told = false;
+) -> Result<Effect> {
+    let mut effect = Effect::default();
     let mut pending: Vec<Assignment> = Vec::new();
     for action in actions {
         ctx.control.check()?;
@@ -665,23 +739,26 @@ fn apply_actions(
                 if let Some(note) =
                     propose(ctx.store, state, *kind, *target_id, text, ctx.turn, ctx.at)?
                 {
-                    told |= refuse(ctx.store, state, ctx, note)?;
+                    let told = refuse(ctx.store, state, ctx, note)?;
+                    effect.noted(told);
                 } else {
-                    acted = true;
+                    effect.fact();
                 }
             }
             Action::Confirm { proposal_id } => {
                 if let Some(note) =
                     confirm_proposal(ctx.store, state, *proposal_id, ctx.turn, ctx.at)?
                 {
-                    told |= refuse(ctx.store, state, ctx, note)?;
+                    let told = refuse(ctx.store, state, ctx, note)?;
+                    effect.noted(told);
                 }
             }
             Action::Reject { proposal_id, note } => {
                 if let Some(note) =
                     reject_proposal(ctx.store, state, *proposal_id, note, ctx.turn, ctx.at)?
                 {
-                    told |= refuse(ctx.store, state, ctx, note)?;
+                    let told = refuse(ctx.store, state, ctx, note)?;
+                    effect.noted(told);
                 }
             }
             Action::OpenGroup { title, acceptance } => {
@@ -690,15 +767,15 @@ fn apply_actions(
                     state,
                     TaskOpen {
                         kind: TaskKind::Group,
-                        title: title.clone(),
-                        request: String::new(),
-                        origin: ctx.input.into(),
-                        acceptance: acceptance.clone(),
+                        title,
+                        request: "",
+                        origin: ctx.input,
+                        acceptance,
                         evidence: None,
                     },
                 )?;
                 *focus = Some(id);
-                acted = true;
+                effect.fact();
             }
             Action::OpenTask {
                 title,
@@ -712,19 +789,22 @@ fn apply_actions(
                     state,
                     TaskOpen {
                         kind: TaskKind::Aja,
-                        title: title.clone(),
-                        request: request.clone(),
-                        origin: ctx.input.into(),
-                        acceptance: acceptance.clone(),
+                        title,
+                        request,
+                        origin: ctx.input,
+                        acceptance,
                         evidence: evidence.clone(),
                     },
                 )?;
                 *focus = Some(id);
-                acted = true;
+                effect.fact();
                 if *run {
                     match reserve_dispatch(ctx, state, id)? {
                         Ok(assignment) => pending.push(assignment),
-                        Err(note) => told |= refuse(ctx.store, state, ctx, note)?,
+                        Err(note) => {
+                            let told = refuse(ctx.store, state, ctx, note)?;
+                            effect.noted(told);
+                        }
                     }
                 }
             }
@@ -732,15 +812,19 @@ fn apply_actions(
                 Ok(assignment) => {
                     *focus = Some(*task_id);
                     pending.push(assignment);
-                    acted = true;
+                    effect.fact();
                 }
-                Err(note) => told |= refuse(ctx.store, state, ctx, note)?,
+                Err(note) => {
+                    let told = refuse(ctx.store, state, ctx, note)?;
+                    effect.noted(told);
+                }
             },
             Action::LinkTasks { from, to, kind } => {
                 if let Some(note) =
                     link_tasks(ctx.store, state, *from, *to, *kind, ctx.turn, ctx.at)?
                 {
-                    told |= refuse(ctx.store, state, ctx, note)?;
+                    let told = refuse(ctx.store, state, ctx, note)?;
+                    effect.noted(told);
                 }
             }
             Action::CloseTask {
@@ -751,25 +835,33 @@ fn apply_actions(
                 if let Some(reason) = close_task(
                     ctx.store, state, *task_id, *accepted, note, ctx.turn, ctx.at,
                 )? {
-                    told |= refuse(ctx.store, state, ctx, reason)?;
+                    let told = refuse(ctx.store, state, ctx, reason)?;
+                    effect.noted(told);
                 }
             }
             Action::Reconcile { task_id } => match reconcile(ctx, state, *task_id)? {
-                Ok(()) => acted = true,
-                Err(note) => told |= refuse(ctx.store, state, ctx, note)?,
+                Ok(()) => effect.fact(),
+                Err(note) => {
+                    let told = refuse(ctx.store, state, ctx, note)?;
+                    effect.noted(told);
+                }
             },
             Action::Focus { task_id } => {
                 if !state.knows(*task_id) {
-                    told |= refuse(
+                    let told = refuse(
                         ctx.store,
                         state,
                         ctx,
                         format!("focus refused: no task {task_id}"),
                     )?;
+                    effect.noted(told);
                     continue;
                 }
+                // Navigating to the task this turn is already about states
+                // nothing new, so it is committed but not informative.
+                effect.informed |= *focus != Some(*task_id);
+                effect.committed = true;
                 *focus = Some(*task_id);
-                acted = true;
             }
             Action::Look {
                 target,
@@ -793,14 +885,29 @@ fn apply_actions(
                         ),
                         Err(error) => (Value::Null, Some(error.to_string())),
                     };
+                let error = error.as_deref();
                 let observation = Observation {
                     kind: ObservationKind::Look,
-                    target: target.clone(),
-                    arguments: arguments.clone(),
+                    target,
+                    arguments,
                     selector: selector.clone(),
-                    result,
+                    result: &result,
                     error,
                 };
+                // A read that repeats the observation it would replace states
+                // nothing new. The comparison happens before the commit, while
+                // both the fold and the new observation can be read.
+                effect.informed |= {
+                    let evidence = state.evidence(ctx.turn);
+                    match evidence
+                        .iter()
+                        .find(|previous| previous.same_subject(&observation))
+                    {
+                        Some(previous) => !previous.same_content(&observation),
+                        None => true,
+                    }
+                };
+                effect.committed = true;
                 commit(
                     ctx.store,
                     state,
@@ -810,32 +917,31 @@ fn apply_actions(
                     ctx.turn,
                     EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
                 )?;
-                acted = true;
             }
         }
     }
-    run_dispatches(ctx, state, out, pending)?;
-    Ok(acted || told)
+    run_dispatches(ctx, state, progress, pending)?;
+    Ok(effect)
 }
 
-pub fn turn(
+pub fn turn<'i>(
     store: &Store,
-    input: &str,
+    input: &'i str,
     brain: &dyn Brain,
     worker: &dyn Worker,
     host: &dyn Host,
-) -> Result<TurnOutcome> {
+) -> Result<TurnOutcome<'i>> {
     turn_at(store, input, brain, worker, host, now_utc())
 }
 
-pub fn turn_at(
+pub fn turn_at<'i>(
     store: &Store,
-    input: &str,
+    input: &'i str,
     brain: &dyn Brain,
     worker: &dyn Worker,
     host: &dyn Host,
     now: DateTime<Utc>,
-) -> Result<TurnOutcome> {
+) -> Result<TurnOutcome<'i>> {
     turn_at_with_options(
         store,
         input,
@@ -847,23 +953,23 @@ pub fn turn_at(
     )
 }
 
-fn stop(out: &mut TurnOutcome, error: ControlError) {
-    out.end = match error {
+fn stop(end: &mut TurnEnd, reason: &mut Option<String>, error: ControlError) {
+    *end = match error {
         ControlError::Cancelled => TurnEnd::Cancelled,
         ControlError::Deadline => TurnEnd::Budget,
     };
-    out.reason = Some(error.to_string());
+    *reason = Some(error.to_string());
 }
 
-pub fn turn_at_with_options(
+pub fn turn_at_with_options<'i>(
     store: &Store,
-    input: &str,
+    input: &'i str,
     brain: &dyn Brain,
     worker: &dyn Worker,
     host: &dyn Host,
     now: DateTime<Utc>,
     options: &TurnOptions,
-) -> Result<TurnOutcome> {
+) -> Result<TurnOutcome<'i>> {
     let _journal_lease = store.lock_turn()?;
     options.limits.validate()?;
     let control = Control::new(
@@ -917,15 +1023,6 @@ pub fn turn_at_with_options(
             None
         }
     });
-    let mut out = TurnOutcome {
-        reply: String::new(),
-        context: state.project(input, focus, now),
-        dispatched: Vec::new(),
-        decisions: 0,
-        worker_ms: 0,
-        end: TurnEnd::Complete,
-        reason: None,
-    };
     let ctx = ActionCtx {
         store,
         input,
@@ -936,26 +1033,36 @@ pub fn turn_at_with_options(
         control: &control,
         options,
     };
+    let mut progress = Progress::default();
+    let mut reply = String::new();
+    let mut end = TurnEnd::Complete;
+    let mut reason: Option<String> = None;
     let mut actions_used = 0usize;
     loop {
         if let Err(error) = control.check() {
-            stop(&mut out, error);
+            stop(&mut end, &mut reason, error);
             break;
         }
-        if out.decisions >= options.limits.decisions {
-            out.end = TurnEnd::Budget;
-            out.reason = Some("turn decision budget exhausted".into());
+        if progress.decisions >= options.limits.decisions {
+            end = TurnEnd::Budget;
+            reason = Some("turn decision budget exhausted".into());
             break;
         }
-        out.decisions += 1;
-        let decision = brain.decide(&out.context, &control);
+        progress.decisions += 1;
+        // The projection is a borrow of the fold, so it lives exactly as long as
+        // this decision: the actions that follow commit facts, which needs the
+        // fold mutably.
+        let decision = {
+            let context = state.project(input, focus, now);
+            brain.decide(&context, &control)
+        };
         if let Err(error) = control.check() {
-            stop(&mut out, error);
+            stop(&mut end, &mut reason, error);
             break;
         }
         if decision.actions.len() > options.limits.actions.saturating_sub(actions_used) {
-            out.end = TurnEnd::Budget;
-            out.reason = Some("turn action budget exhausted".into());
+            end = TurnEnd::Budget;
+            reason = Some("turn action budget exhausted".into());
             break;
         }
         let dispatches = decision
@@ -972,60 +1079,66 @@ pub fn turn_at_with_options(
             > options
                 .limits
                 .dispatches
-                .saturating_sub(out.dispatched.len())
+                .saturating_sub(progress.dispatched.len())
         {
-            out.end = TurnEnd::Budget;
-            out.reason = Some("turn dispatch budget exhausted".into());
+            end = TurnEnd::Budget;
+            reason = Some("turn dispatch budget exhausted".into());
             break;
         }
         actions_used += decision.actions.len();
         for note in &decision.refused {
             refuse(store, &mut state, &ctx, note.clone())?;
         }
-        let acted = match apply_actions(&decision.actions, &ctx, &mut state, &mut out, &mut focus) {
-            Ok(acted) => acted,
+        let effect = match apply_actions(
+            &decision.actions,
+            &ctx,
+            &mut state,
+            &mut progress,
+            &mut focus,
+        ) {
+            Ok(effect) => effect,
             Err(error) => {
                 if let Err(stopped) = control.check() {
-                    stop(&mut out, stopped);
+                    stop(&mut end, &mut reason, stopped);
                     break;
                 }
                 return Err(error);
             }
         };
-        // The projection is what the model just read. If the facts this decision
-        // committed leave it identical, they added no information and the turn is
-        // at its fixpoint; a decision that committed nothing is a final reply.
-        let next = state.project(input, focus, now);
-        let repeated = next == out.context;
-        out.context = next;
-        if !acted {
-            out.reply = decision.reply.trim().to_string();
+        // A decision that committed nothing is a final reply. One that committed
+        // facts but states nothing new is the turn's fixpoint: the kernel knows
+        // that from what each action produced, without keeping a second copy of
+        // the projection to compare against.
+        if !effect.acted() {
+            reply = decision.reply.trim().to_string();
             break;
         }
-        if repeated {
-            out.end = TurnEnd::Stalled;
+        if !effect.informed {
+            end = TurnEnd::Stalled;
             break;
         }
     }
     let mut meta = EventMeta::new(at);
-    if out.end != TurnEnd::Complete {
-        out.reply = format!(
+    if end != TurnEnd::Complete {
+        reply = format!(
             "[turn {:?}] {}",
-            out.end,
-            out.reason.as_deref().unwrap_or("projection repeated")
+            end,
+            reason.as_deref().unwrap_or("projection repeated")
         );
-        meta.data = Some(serde_json::json!({"end": out.end, "reason": out.reason}));
+        meta.data = Some(serde_json::json!({"end": end, "reason": reason}));
     }
     recover_state(store, &mut state, turn_no, at)?;
-    commit(
-        store,
-        &mut state,
-        Kind::Eja,
-        "eja",
-        &out.reply,
-        turn_no,
-        meta,
-    )?;
-    out.context = state.project(input, focus, now);
-    Ok(out)
+    commit(store, &mut state, Kind::Eja, "eja", &reply, turn_no, meta)?;
+    Ok(TurnOutcome {
+        reply,
+        dispatched: progress.dispatched,
+        decisions: progress.decisions,
+        worker_ms: progress.worker_ms,
+        end,
+        reason,
+        state,
+        input,
+        focus,
+        now,
+    })
 }

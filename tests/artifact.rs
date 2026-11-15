@@ -20,7 +20,7 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
+    fn decide(&self, _context: &EjaContext<'_>, _: &eja::Control) -> Decision {
         self.queue
             .lock()
             .expect("brain")
@@ -124,15 +124,15 @@ fn eja_reads_artifact_content_then_decides() {
     )
     .expect("turn");
 
-    assert_eq!(outcome.context.evidence.len(), 1);
-    assert_eq!(outcome.context.evidence[0].result["path"], "1/out.md");
-    assert!(outcome.context.evidence[0].result["text"]
+    assert_eq!(outcome.context().evidence.len(), 1);
+    assert_eq!(outcome.context().evidence[0].result["path"], "1/out.md");
+    assert!(outcome.context().evidence[0].result["text"]
         .as_str()
         .expect("text")
         .contains("upload"));
-    assert_eq!(outcome.context.tasks[0].status, TaskStatus::Done);
+    assert_eq!(outcome.context().tasks[0].status, TaskStatus::Done);
     assert!(
-        outcome.context.tasks[0]
+        outcome.context().tasks[0]
             .close
             .as_ref()
             .expect("close")

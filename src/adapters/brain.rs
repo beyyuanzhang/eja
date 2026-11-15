@@ -117,32 +117,34 @@ const ORDER: [&str; 12] = [
 
 /// One line of a section. A line whose fact has an address says where it lives, so
 /// a section that the budget folds can still be unfolded.
-struct Item {
-    address: Option<String>,
+struct Item<'a> {
+    /// The address a folded section names: sometimes a pattern built for this
+    /// render (an event or task id), sometimes the observation's own target.
+    address: Option<std::borrow::Cow<'a, str>>,
     lines: Vec<String>,
 }
 
-struct Section {
+struct Section<'a> {
     title: &'static str,
     counted: bool,
-    items: Vec<Item>,
+    items: Vec<Item<'a>>,
 }
 
-fn plain(lines: Vec<String>) -> Item {
+fn plain(lines: Vec<String>) -> Item<'static> {
     Item {
         address: None,
         lines,
     }
 }
 
-fn addressed(address: String, lines: Vec<String>) -> Item {
+fn addressed<'a>(address: impl Into<std::borrow::Cow<'a, str>>, lines: Vec<String>) -> Item<'a> {
     Item {
-        address: Some(address),
+        address: Some(address.into()),
         lines,
     }
 }
 
-fn section(title: &'static str, counted: bool, items: Vec<Item>) -> Section {
+fn section<'a>(title: &'static str, counted: bool, items: Vec<Item<'a>>) -> Section<'a> {
     Section {
         title,
         counted,
@@ -152,7 +154,7 @@ fn section(title: &'static str, counted: bool, items: Vec<Item>) -> Section {
 
 /// One section rendered at record scale, written straight into its sink so the
 /// same code both counts it and renders it.
-fn section_into(out: &mut impl std::fmt::Write, section: &Section) -> std::fmt::Result {
+fn section_into(out: &mut impl std::fmt::Write, section: &Section<'_>) -> std::fmt::Result {
     if section.counted {
         writeln!(out, "{} ({}):", section.title, section.items.len())?;
     } else {
@@ -170,21 +172,21 @@ fn section_into(out: &mut impl std::fmt::Write, section: &Section) -> std::fmt::
 }
 
 /// One section rendered at record scale.
-fn section_text(section: &Section) -> String {
+fn section_text(section: &Section<'_>) -> String {
     let mut out = String::new();
     let _ = section_into(&mut out, section);
     out
 }
 
 /// The bytes one section would render to, without rendering it.
-fn section_len(section: &Section) -> usize {
+fn section_len(section: &Section<'_>) -> usize {
     let mut count = crate::measure::Count::default();
     let _ = section_into(&mut count, section);
     count.0
 }
 
 /// The addresses a section's items live at, as one range.
-fn span(section: &Section) -> Option<String> {
+fn span(section: &Section<'_>) -> Option<String> {
     let mut first = None;
     let mut last = None;
     for address in section
@@ -206,7 +208,7 @@ fn span(section: &Section) -> Option<String> {
 
 /// One section at index scale: its title, its size and the address that unfolds
 /// it. Unfolding is one address lookup, so the footer states the rule once.
-fn section_line(section: &Section) -> String {
+fn section_line(section: &Section<'_>) -> String {
     let count = section.items.len();
     let noun = if count == 1 { "item" } else { "items" };
     match span(section) {
@@ -383,12 +385,13 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .map(|observation| {
                 // An observation that names an address is unfolded by that
                 // address; one that names a host tool has none to give.
-                let address = crate::Address::parse(&observation.target)
-                    .is_some()
-                    .then(|| observation.target.clone());
+                let lines = evidence_lines(observation);
+                if crate::Address::parse(observation.target).is_none() {
+                    return plain(lines);
+                }
                 Item {
-                    address,
-                    lines: evidence_lines(observation),
+                    address: Some(std::borrow::Cow::Borrowed(observation.target)),
+                    lines,
                 }
             })
             .collect(),
@@ -550,7 +553,7 @@ fn evidence_lines(observation: &Observation) -> Vec<String> {
 
 /// The projection is one space: sections in priority order, each whole while the
 /// declared budget allows, listed when it does not, and never cut mid-line.
-fn folded(sections: &[Section], budget: usize) -> String {
+fn folded(sections: &[Section<'_>], budget: usize) -> String {
     // Measure without rendering: a section the budget folds into one line is
     // never built in full.
     let regions: Vec<fold::Region> = sections
