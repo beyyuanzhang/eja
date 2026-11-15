@@ -669,3 +669,29 @@ fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
         2
     );
 }
+
+#[test]
+fn one_journal_takes_one_writer() {
+    let dir = std::env::temp_dir().join(format!("eja-writer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let first = Store::new(&dir).expect("first store");
+    let second = Store::new(&dir).expect("second store reads the same journal");
+    first
+        .append_simple(Kind::User, "one", 1, 1)
+        .expect("first writer appends");
+
+    // The second store's cursor is now stale: it refuses instead of interleaving
+    // an event whose id would collide with the first writer's.
+    let refused = second.append_simple(Kind::User, "two", 1, 2);
+    assert!(
+        refused
+            .as_ref()
+            .err()
+            .map(|error| error.to_string().contains("outside this Store"))
+            .unwrap_or(false),
+        "{refused:?}"
+    );
+    // Nothing was written by the refused append, and the first writer's fact
+    // is still the whole journal.
+    assert_eq!(first.events().expect("events").len(), 1);
+}

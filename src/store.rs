@@ -21,15 +21,41 @@ struct Cursor {
     bytes: u64,
 }
 
-fn lock_log(file: &fs::File) -> Result<()> {
+/// How long a write may wait for the log lock before calling it a second writer.
+const LOCK_WAIT_MS: u32 = 100;
+
+/// The log lock guards one append, not the journal: ownership for a turn is the
+/// separate `turn.lock`. A concurrent thread that spawns a child can briefly
+/// duplicate the descriptor to the child, and a duplicated descriptor keeps the
+/// lock alive until the child execs; that is not a second writer, so a short wait
+/// tells the two apart instead of failing a turn.
+fn lock_log(path: &Path, file: &fs::File) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("log already has an active writer".into());
+        let mut waited = 0;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            let transient = error.raw_os_error() == Some(libc::EWOULDBLOCK);
+            if !transient || waited >= LOCK_WAIT_MS {
+                return Err(format!(
+                    "log {} already has an active writer ({error})",
+                    path.display()
+                )
+                .into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            waited += 1;
         }
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = (path, file);
+        Ok(())
+    }
 }
 
 /// A complete newline commits a record. Only an uncommitted final fragment is
@@ -81,7 +107,7 @@ impl Store {
             .append(true)
             .read(true)
             .open(&log_path)?;
-        lock_log(&locked)?;
+        lock_log(&log_path, &locked)?;
         let (existing, committed) = scan_events(&log_path)?;
         if locked.metadata()?.len() != committed {
             locked.set_len(committed)?;
@@ -116,7 +142,7 @@ impl Store {
             .create(true)
             .append(true)
             .open(self.log_path.with_extension("turn.lock"))?;
-        lock_log(&file).map_err(|_| "another turn already owns this journal")?;
+        lock_log(&self.log_path, &file).map_err(|_| "another turn already owns this journal")?;
         Ok(file)
     }
 
@@ -153,7 +179,7 @@ impl Store {
             .create(true)
             .append(true)
             .open(&self.log_path)?;
-        lock_log(&file)?;
+        lock_log(&self.log_path, &file)?;
         if file.metadata()?.len() != cursor.bytes {
             return Err("log changed outside this Store; reopen it before appending".into());
         }
