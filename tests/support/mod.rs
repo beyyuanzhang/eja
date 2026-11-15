@@ -6,7 +6,7 @@
 #![allow(dead_code)] // each test crate compiles the whole kit and uses part of it.
 
 use eja::{
-    Action, Assignment, Brain, Control, Decision, EjaContext, Kind, RelationKind, Store, TaskKind,
+    Action, Assignment, Brain, Control, Decision, EjaContext, Kind, RelationKind, Store,
     TurnOutcome, Worker,
 };
 use std::path::{Path, PathBuf};
@@ -91,19 +91,6 @@ impl Script {
     /// One decision, one turn.
     pub fn once(actions: Vec<Action>) -> Self {
         Self::new(vec![decision(actions)])
-    }
-
-    /// A turn that reads the current view and then answers, so the test can state
-    /// what a decision was looking at.
-    pub fn inspect_then(answer: &str) -> Self {
-        Self::new(vec![
-            decision(vec![]),
-            Decision {
-                reply: answer.to_string(),
-                actions: Vec::new(),
-                refused: Vec::new(),
-            },
-        ])
     }
 
     pub fn seen(&self) -> std::sync::MutexGuard<'_, Vec<Seen>> {
@@ -239,11 +226,6 @@ pub const fn link(from: u64, to: u64, kind: RelationKind) -> Action {
     Action::LinkTasks { from, to, kind }
 }
 
-/// A task as the fold holds it, for a test that states one field.
-pub fn opened(store: &Store) -> Vec<eja::Task> {
-    eja::State::load(store).expect("state").tasks().to_vec()
-}
-
 pub fn kinds(store: &Store, kind: Kind) -> usize {
     store
         .events()
@@ -251,8 +233,4 @@ pub fn kinds(store: &Store, kind: Kind) -> usize {
         .iter()
         .filter(|event| event.kind == kind)
         .count()
-}
-
-pub fn is_aja(task: &eja::Task) -> bool {
-    task.kind == TaskKind::Aja
 }
