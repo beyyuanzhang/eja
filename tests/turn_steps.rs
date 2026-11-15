@@ -1,3 +1,4 @@
+#![allow(clippy::significant_drop_tightening)] // a guard held for one test block is contention-free
 use eja::adapters::{Ports, RecordReader};
 use eja::{
     turn, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, Selector, Store,
@@ -193,7 +194,7 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     .unwrap();
     assert_eq!(out.decisions, 5);
     assert_eq!(out.reply, "final answer");
-    assert!(out.end != eja::TurnEnd::Stalled);
+    assert_ne!(out.end, eja::TurnEnd::Stalled);
     assert_eq!(out.context().focus.unwrap(), 1);
     let context = out.context();
     let log_look = context
@@ -462,7 +463,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         },
     )
     .unwrap();
-    assert!(resumed.end != eja::TurnEnd::Stalled);
+    assert_ne!(resumed.end, eja::TurnEnd::Stalled);
     assert_eq!(resumed.context().tasks[0].status, TaskStatus::Done);
     assert_eq!(brain.seen.lock().unwrap()[0].focus.unwrap(), 1);
     assert_eq!(worker.0.lock().unwrap().len(), 1);

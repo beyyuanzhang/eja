@@ -94,12 +94,12 @@ fn declared_evidence_is_a_host_observation_and_the_judgment_can_use_it() {
     .expect("turn");
     let task = &out.context().tasks[0];
     assert_eq!(task.status, TaskStatus::Waiting);
+    assert_eq!(task.evidence().expect("request")["tool"], json!("checks"));
     assert_eq!(
-        task.evidence.as_ref().expect("request")["tool"],
-        json!("checks")
-    );
-    assert_eq!(
-        task.evidence_result.as_ref().expect("evidence")["passed"],
+        task.run
+            .as_ref()
+            .and_then(|run| run.evidence_result.as_ref())
+            .expect("evidence")["passed"],
         json!(true)
     );
 
@@ -118,7 +118,7 @@ fn declared_evidence_is_a_host_observation_and_the_judgment_can_use_it() {
         })
         .expect("witness observation");
     assert_eq!(
-        task.evidence_id,
+        task.evidence_id(),
         Some(observed.id),
         "the task points at the observation"
     );
@@ -152,10 +152,14 @@ fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
     )
     .expect("turn");
     assert!(
-        out.context().tasks[0].evidence.is_some(),
+        out.context().tasks[0].evidence().is_some(),
         "the request is a fact"
     );
-    assert!(out.context().tasks[0].evidence_result.is_none());
+    assert!(out.context().tasks[0]
+        .run
+        .as_ref()
+        .and_then(|run| run.evidence_result.as_ref())
+        .is_none());
 
     let closed = turn_at(
         &store,

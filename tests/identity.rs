@@ -72,7 +72,7 @@ fn a_folded_region_is_still_read_by_its_address() {
                 Kind::RecordDecision,
                 &format!("decision {index}"),
                 1,
-                index as i64,
+                i64::from(index),
             )
             .unwrap();
         ids.push(event.id);

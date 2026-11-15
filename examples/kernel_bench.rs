@@ -1,13 +1,19 @@
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)] // a benchmark converts measured counts for printing
 //! Deterministic kernel benchmark. No network, no model calls.
 //!
-//! Run: cargo run --release --example kernel_bench
+//! Run: cargo run --release --example `kernel_bench`
 
 use chrono::{TimeZone, Utc};
 use eja::adapters::RecordFiles;
 use eja::adapters::{Ports, RecordReader};
 use eja::{
-    recover, turn_at, Action, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, Result,
-    State, Store, Worker,
+    recover, turn_at, Action, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, State,
+    Store, Worker,
 };
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -86,7 +92,7 @@ fn pct(samples: &[Duration], percentile: f64) -> f64 {
         .iter()
         .map(|sample| sample.as_secs_f64() * 1000.0)
         .collect();
-    values.sort_by(|a, b| a.total_cmp(b));
+    values.sort_by(f64::total_cmp);
     let index = ((values.len() - 1) as f64 * percentile).ceil() as usize;
     values[index.min(values.len() - 1)]
 }
@@ -103,7 +109,7 @@ fn write_commitments(path: &Path, count: usize) {
             "text": format!("commitment {id}"),
             "closes": null,
         });
-        writeln!(file, "{}", event).expect("write event");
+        writeln!(file, "{event}").expect("write event");
     }
     file.sync_all().expect("sync");
 }
@@ -358,7 +364,7 @@ fn bench_artifact(root: &Path, count: usize) -> (f64, f64) {
             .slice(
                 "artifact.txt",
                 &eja::Selector::Whole,
-                &eja::Control::new(Duration::from_secs(5), Default::default()),
+                &eja::Control::new(Duration::from_secs(5), std::sync::Arc::default()),
             )
             .unwrap();
         samples.push(start.elapsed());
@@ -368,7 +374,7 @@ fn bench_artifact(root: &Path, count: usize) -> (f64, f64) {
     (pct(&samples, 0.5), pct(&samples, 0.95))
 }
 
-fn main() -> Result<()> {
+fn main() {
     let root = temp_dir("all");
     println!("# EJA kernel benchmark");
     println!(
@@ -426,5 +432,4 @@ fn main() -> Result<()> {
     println!("16 KiB artifact: p50={artifact_p50:.3} ms, p95={artifact_p95:.3} ms");
 
     let _ = fs::remove_dir_all(&root);
-    Ok(())
 }

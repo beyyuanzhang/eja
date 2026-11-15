@@ -18,14 +18,16 @@ impl Drop for Owned {
         // command and anything it started. Killing an already-reaped group is a
         // no-op error that this path ignores on purpose.
         unsafe {
-            libc::killpg(self.0.id() as i32, libc::SIGKILL);
+            if let Ok(group) = libc::pid_t::try_from(self.0.id()) {
+                libc::killpg(group, libc::SIGKILL);
+            }
         }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
-pub(crate) fn output(command: &mut Command, control: &Control, limit: usize) -> Result<Vec<u8>> {
+pub fn output(command: &mut Command, control: &Control, limit: usize) -> Result<Vec<u8>> {
     control.check()?;
     {
         use std::os::unix::process::CommandExt;
@@ -60,7 +62,9 @@ pub(crate) fn output(command: &mut Command, control: &Control, limit: usize) -> 
     let err = std::thread::spawn(move || read(Box::new(stderr)));
     // The caller blocks on the child; one watcher enforces its control. Nothing on
     // this path polls the child to discover that it finished.
-    let id = child.0.id() as i32;
+    let Ok(group) = libc::pid_t::try_from(child.0.id()) else {
+        return Err("command has no signalable process group".into());
+    };
     let (stop, stopped) = mpsc::channel::<()>();
     let watcher = {
         let control = control.clone();
@@ -72,7 +76,7 @@ pub(crate) fn output(command: &mut Command, control: &Control, limit: usize) -> 
             if control.check().is_err() {
                 // SAFETY: same group id as above; the child is alive until reaped.
                 unsafe {
-                    libc::killpg(id, libc::SIGKILL);
+                    libc::killpg(group, libc::SIGKILL);
                 }
                 return;
             }

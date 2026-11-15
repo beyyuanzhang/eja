@@ -162,8 +162,8 @@ fn stopped(reason: &str) -> (String, String) {
     (format!("{reason}; continue in a new aja"), "budget".into())
 }
 
-fn ask(reader: &mut impl BufRead, writer: &mut impl Write, ask: Ask<'_>) -> Result<Value> {
-    send(writer, &ask)?;
+fn ask(reader: &mut impl BufRead, writer: &mut impl Write, ask: &Ask<'_>) -> Result<Value> {
+    send(writer, ask)?;
     receive(reader)
 }
 
@@ -185,7 +185,7 @@ fn run(
         let message = ask(
             reader,
             writer,
-            Ask::Model {
+            &Ask::Model {
                 messages: &messages,
             },
         )?;
@@ -218,7 +218,7 @@ fn run(
             let result = ask(
                 reader,
                 writer,
-                Ask::Tool {
+                &Ask::Tool {
                     id: call["id"].as_str().unwrap_or_default(),
                     name,
                     arguments: &arguments,
@@ -238,6 +238,8 @@ pub fn worker_main() -> Result<()> {
     let start: Start = receive(&mut reader)?;
     let (text, reason) =
         run(start, &mut reader, &mut writer).unwrap_or_else(|e| (e.to_string(), "error".into()));
+    // The run is over: the input stream is released before the last frame.
+    drop(reader);
     send(
         &mut writer,
         &Ask::Finish {

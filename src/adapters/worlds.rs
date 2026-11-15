@@ -154,8 +154,7 @@ fn snapshot(root: &Path, skip: &Path, control: &Control) -> (Inventory, bool) {
                 .modified()
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|time| time.as_nanos() as i64)
-                .unwrap_or(0);
+                .map_or(0, |time| i64::try_from(time.as_nanos()).unwrap_or(i64::MAX));
             state.insert(
                 relative.to_string_lossy().replace('\\', "/"),
                 (metadata.len(), stamp),
@@ -215,20 +214,20 @@ type Open = Mutex<HashMap<u64, Reservation>>;
 
 fn keep(open: &Open, task: u64, reservation: Reservation) {
     open.lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(task, reservation);
 }
 
 fn take(open: &Open, task: u64) -> Result<Reservation> {
     open.lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&task)
         .ok_or_else(|| "this world has no open reservation".into())
 }
 
 fn forget(open: &Open, task: u64) {
     open.lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&task);
 }
 
@@ -251,7 +250,10 @@ impl Shared {
 
 impl Worlds for Shared {
     fn reserve(&self, task: u64, control: &Control) -> Result<World> {
-        let mut open = self.open.lock().unwrap_or_else(|error| error.into_inner());
+        let mut open = self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // One mutable world has one owner. A host that wants two runs at once
         // must give them isolated worlds, so this refuses instead of letting two
         // runs write the same directory.
@@ -264,6 +266,9 @@ impl Worlds for Shared {
             task,
             Reservation::start(&self.project, &self.private, control),
         );
+        // The reservation is recorded; the map must not stay locked while the
+        // world is handed back.
+        drop(open);
         Ok(World {
             task,
             label: "shared".to_string(),
@@ -296,11 +301,25 @@ pub struct Worktrees {
     open: Open,
 }
 
-fn git(cwd: &Path, args: &[&str], control: &Control) -> Result<String> {
+/// One hermetic git invocation. Both durability paths — a run's fossil and a
+/// worktree's settle — commit a tree through this, so a project's hooks, signing
+/// settings and identity can never reach a run.
+pub fn git_at(
+    git_dir: Option<&Path>,
+    tree: &Path,
+    args: &[&str],
+    control: &Control,
+) -> Result<String> {
     let mut command = Command::new("git");
+    match git_dir {
+        Some(dir) => command
+            .arg("--git-dir")
+            .arg(dir)
+            .arg("--work-tree")
+            .arg(tree),
+        None => command.arg("-C").arg(tree),
+    };
     command
-        .arg("-C")
-        .arg(cwd)
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -316,6 +335,10 @@ fn git(cwd: &Path, args: &[&str], control: &Control) -> Result<String> {
         .env("GIT_COMMITTER_EMAIL", "eja@local");
     let bytes = process::output(&mut command, control, crate::aja::FRAME_LIMIT)?;
     Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+fn git(cwd: &Path, args: &[&str], control: &Control) -> Result<String> {
+    git_at(None, cwd, args, control)
 }
 
 impl Worktrees {
@@ -351,7 +374,12 @@ impl Worktrees {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        format!("eja/aja-{task}-{:08x}", hash as u32)
+        // The branch name carries the low 32 bits: enough to separate two state
+        // directories over one project, and short enough for a ref.
+        format!(
+            "eja/aja-{task}-{:08x}",
+            u32::try_from(hash & 0xffff_ffff).unwrap_or(0)
+        )
     }
 }
 
@@ -449,7 +477,7 @@ impl Worlds for Worktrees {
     fn release(&self, world: &World) {
         // The branch keeps the work; the directory is only a workspace.
         forget(&self.open, world.task);
-        let control = crate::Control::new(RELEASE, Default::default());
+        let control = crate::Control::new(RELEASE, std::sync::Arc::default());
         let text = world.root.to_string_lossy().to_string();
         let _ = git(
             &self.project,

@@ -28,7 +28,9 @@ impl std::error::Error for ControlError {}
 #[derive(Clone, Debug)]
 pub struct Control {
     deadline: Instant,
-    cancellations: Vec<Arc<AtomicBool>>,
+    /// Shared, not copied: a child inherits the same flags, and a derived control
+    /// is created once per decision and action.
+    cancellations: Arc<[Arc<AtomicBool>]>,
 }
 impl Control {
     pub fn new(timeout: Duration, cancelled: Arc<AtomicBool>) -> Self {
@@ -36,9 +38,10 @@ impl Control {
             deadline: Instant::now()
                 .checked_add(timeout)
                 .unwrap_or_else(Instant::now),
-            cancellations: vec![cancelled],
+            cancellations: Arc::from([cancelled]),
         }
     }
+    #[must_use]
     pub fn child(&self, timeout: Duration) -> Self {
         Self {
             deadline: self.deadline.min(
@@ -49,8 +52,12 @@ impl Control {
             cancellations: self.cancellations.clone(),
         }
     }
+    #[must_use]
     pub fn cancelled_by(mut self, flag: Arc<AtomicBool>) -> Self {
-        self.cancellations.push(flag);
+        let mut flags = Vec::with_capacity(self.cancellations.len() + 1);
+        flags.extend(self.cancellations.iter().cloned());
+        flags.push(flag);
+        self.cancellations = Arc::from(flags);
         self
     }
     pub fn check(&self) -> std::result::Result<(), ControlError> {

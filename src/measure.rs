@@ -39,6 +39,50 @@ pub fn value(value: &serde_json::Value) -> usize {
     len.0
 }
 
+/// One bounded view's byte budget. The three address spaces select different
+/// units — events, lines, one passage — but they admit and stop the same way, so
+/// that arithmetic lives here once.
+pub struct Budget {
+    used: usize,
+    limit: usize,
+    truncated: bool,
+}
+
+impl Budget {
+    pub const fn new(limit: usize) -> Self {
+        Self {
+            used: 0,
+            limit,
+            truncated: false,
+        }
+    }
+
+    /// Admit one measured unit; a unit that does not fit stops the view.
+    pub const fn admit(&mut self, size: usize) -> bool {
+        if self.used.saturating_add(size) < self.limit {
+            self.used += size;
+            true
+        } else {
+            self.truncated = true;
+            false
+        }
+    }
+
+    /// Stop the view for a reason of its own, such as a unit larger than a frame.
+    pub const fn stop(&mut self) {
+        self.truncated = true;
+    }
+
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+/// The serialized size of a list of provider messages.
+pub fn messages(messages: &[serde_json::Value]) -> usize {
+    messages.iter().map(value).sum()
+}
+
 /// The same idea for formatted text: count what a writer would receive.
 #[derive(Debug, Default)]
 pub struct Count(pub usize);

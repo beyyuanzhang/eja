@@ -13,7 +13,7 @@ fn projection_keeps_every_recorded_commitment_and_says_so() {
                 "eja",
                 &format!("commitment {index}"),
                 1,
-                EventMeta::new(index as i64),
+                EventMeta::new(i64::from(index)),
             )
             .expect("append");
     }

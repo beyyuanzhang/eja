@@ -278,7 +278,7 @@ fn correction_can_close_a_goal_without_language_matching() {
         day(2026, 11, 9, 10),
     );
     let events = store.events().expect("events");
-    assert!(State::fold(events.clone()).goal().is_none());
+    assert!(State::fold(events).goal().is_none());
 }
 
 #[test]
@@ -366,7 +366,10 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
     let task = &outcome.context().tasks[0];
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.created_at, at.timestamp());
-    assert_eq!(task.digest_at, Some(at.timestamp()));
+    assert_eq!(
+        task.run.as_ref().and_then(|run| run.digest_at),
+        Some(at.timestamp())
+    );
     assert_eq!(task.closed_at, Some(at.timestamp()));
 
     let events = store.events().expect("events");

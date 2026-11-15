@@ -16,7 +16,13 @@ L' = L ++ events(A, O)
 The [architecture contract](docs/ARCHITECTURE.md) defines the invariants and the
 composition laws. The implementation has six core modules: domain, store, state,
 turn, the shared control, and the one renderer `fold`. Adapters own model
-transport, connectors and record reading.
+transport, connectors and record reading: one record module owns the manifest, the
+path resolver, the reader and the shadow repository that freezes a run.
+
+A task that executes carries its run facts together (`Run`): its account and the
+observation that answers its acceptance contract. A group aggregates and never
+runs, so it has none of them and no reader has to ask whether a field means
+anything for the kind it is looking at.
 
 `S = fold(L)` is one value: `State` applies the journal event by event, and a
 turn reads the journal once and pushes every event it commits into the same
@@ -33,14 +39,17 @@ into `S` and the input, so a projection copies no fact. A turn's outcome owns
 - `<dir>/ajas/<id>/context.jsonl` records that aja's own start messages,
   assistant messages and full tool results. A continuation stores its parent
   address, rather than copying the parent's payload into its record.
-- `aja.json` freezes the assignment, digest and optional checkpoint address.
-  The digest is an index into evidence, not a verdict.
+- `aja.json` is one typed manifest: the assignment, the digest, and the optional
+  checkpoint address a `record:` file is read from. The digest is an index into
+  evidence, not a verdict.
 - Working contexts are bounded views. Live tool results and replayed tool results
   use the same view function. Every tool result has a `{aja, entry}` address;
   `eja_read_record` reads a bounded passage from this aja or its ancestry.
 - A checkpoint captures Git-visible workspace files. It is evidence about the
   world at that time; a continuation inherits observations, not a restored world.
-  Missing checkpoints are reported in both manifest and digest.
+  Missing checkpoints are reported in both manifest and digest. The record store
+  owns that repository and its one hermetic git invocation, so a project's hooks,
+  signing settings and global configuration never reach a run.
 - An approval is its own event, recorded by the host for one turn. Confirmation
   reads that event, so a caller's flag never becomes a second authority.
 - A task may declare **evidence** at open: what the host must observe before the
@@ -247,9 +256,15 @@ and continuation edges; matching input text never invents a job relationship.
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets
 cargo test
 ```
+
+The crate holds itself to clippy's pedantic and nursery groups, declared in
+`Cargo.toml`. Two lints are named there instead of ignored at each site:
+`missing_errors_doc` (every fallible function states its refusals in the prose of
+the contract, not in a generated list) and `too_many_lines` (the turn loop and
+the projection are each one sequence a reader follows top to bottom).
 
 Composition regressions cover unrelated-task invariance, large-result replay,
 record addressability, aggregate completion, relation uniqueness and cross-kind
@@ -259,7 +274,9 @@ protocol-only contract, self-before-index rendering and addressable folding.
 Acceptance regressions add one-turn approvals and witness-or-undecidable
 judgments; world regressions add parallel slots with ordered reports, explicit
 reconciliation and conflict reporting. Native/MCP tests also cover
-real local HTTP, cancellation, process cleanup and frozen checkpoints.
+real local HTTP, cancellation, process cleanup and frozen checkpoints, including
+a record repository that asks git for a hostile hook and a signature the run
+does not have.
 
 Trusted adapters must honor Control, own their resources and bound their output.
 An ordinary child process is not an OS security sandbox. Cancellation cannot

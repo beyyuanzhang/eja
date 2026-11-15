@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 /// The scale a region is shown at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Level {
+pub enum Level {
     /// The region's whole body.
     Record,
     /// One line with the region's address.
@@ -26,18 +26,18 @@ pub(crate) enum Level {
 }
 
 impl Level {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
-            Level::Record => "record",
-            Level::Index => "index",
-            Level::Map => "map",
+            Self::Record => "record",
+            Self::Index => "index",
+            Self::Map => "map",
         }
     }
 }
 
 /// One addressable region of a space. The caller keeps the bodies; a region is
 /// only what the renderer needs to choose a scale and to name an address.
-pub(crate) struct Region {
+pub struct Region {
     /// Where the region lives: `log:event:12`, `log:task:3`, `record 3/7`.
     pub address: String,
     /// One line that stands for the region at index scale.
@@ -58,7 +58,7 @@ impl Region {
 
 /// A space rendered within a budget: the head whole, the rest listed, the
 /// oldest folded into one address line. The texts stay in the regions.
-pub(crate) struct View {
+pub struct View {
     /// Indices of the regions kept whole, in order.
     pub record: Vec<usize>,
     /// Indices of the regions listed as one line.
@@ -115,7 +115,7 @@ pub fn tool_result(value: &serde_json::Value, aja: u64, entry: usize) -> serde_j
 /// the newest steps stay whole; older steps become one address line each; the
 /// oldest fold into a single address. Returns false when even that does not fit,
 /// which is the aja's stopping point, not a licence to keep re-sending at the cap.
-pub(crate) fn transcript(messages: &mut Vec<Value>, budget: usize) -> bool {
+pub fn transcript(messages: &mut Vec<Value>, budget: usize) -> bool {
     let size = |messages: &[Value]| messages.iter().map(crate::measure::value).sum::<usize>();
     // The common case: the space already fits, so nothing is measured twice.
     if size(messages) <= budget {
@@ -222,7 +222,7 @@ fn step_region(number: usize, messages: &[Value]) -> Region {
     )
 }
 
-pub(crate) fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Value> {
+pub fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Value> {
     let budget = limits.steps.map_or_else(
         || format!("You have {} seconds.", limits.timeout_ms / 1000),
         |steps| {
@@ -252,7 +252,7 @@ pub(crate) fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Va
 }
 
 #[derive(Debug)]
-pub(crate) struct ContextBudget;
+pub struct ContextBudget;
 impl std::fmt::Display for ContextBudget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AJA context budget exhausted: assignment does not fit")
@@ -260,7 +260,7 @@ impl std::fmt::Display for ContextBudget {
 }
 impl std::error::Error for ContextBudget {}
 
-pub(crate) fn prepare_messages(
+pub fn prepare_messages(
     assignment: &Assignment,
     limits: &Limits,
     inherited: Vec<Value>,
@@ -279,7 +279,7 @@ pub(crate) fn prepare_messages(
     Ok(messages)
 }
 
-fn line_bytes(line: &str) -> usize {
+const fn line_bytes(line: &str) -> usize {
     line.len() + 8
 }
 
@@ -301,16 +301,16 @@ const FOOTER: usize = 80;
 /// one line each for the rest, and — when even the lines do not fit — one address
 /// range for the tail. The result is deterministic and fits the budget, except
 /// for a budget smaller than the fold line itself.
-pub(crate) fn assemble(regions: &[Region], budget: usize) -> View {
+pub fn assemble(regions: &[Region], budget: usize) -> View {
     let count = regions.len();
     if count == 0 {
-        return build(regions, Vec::new(), None, 0, budget);
+        return build(regions, &[], None, 0, budget);
     }
     let room = |extra: usize| budget.saturating_sub(FOOTER + extra);
 
     let whole: usize = regions.iter().map(|region| region.bytes + 8).sum();
     if whole <= room(0) {
-        return build(regions, vec![Level::Record; count], None, count, budget);
+        return build(regions, &vec![Level::Record; count], None, count, budget);
     }
     let listed: usize = regions.iter().map(|region| line_bytes(&region.line)).sum();
     if listed <= room(0) {
@@ -323,7 +323,7 @@ pub(crate) fn assemble(regions: &[Region], budget: usize) -> View {
             left -= region.bytes + 8;
             widths[index] = Level::Record;
         }
-        return build(regions, widths, None, count, budget);
+        return build(regions, &widths, None, count, budget);
     }
     // Not even one line each: keep the head's lines and fold the tail into one
     // address range, so a space of any size still states where it went.
@@ -340,7 +340,7 @@ pub(crate) fn assemble(regions: &[Region], budget: usize) -> View {
         kept += 1;
     }
     let map = (kept < count).then(|| fold_line(regions, kept, count));
-    build(regions, widths, map, kept, budget)
+    build(regions, &widths, map, kept, budget)
 }
 
 /// The one line that stands for the folded tail: the addresses that read it, or
@@ -368,7 +368,7 @@ fn fold_line(regions: &[Region], kept: usize, count: usize) -> String {
 
 fn build(
     regions: &[Region],
-    widths: Vec<Level>,
+    widths: &[Level],
     map: Option<String>,
     shown: usize,
     budget: usize,
@@ -405,7 +405,7 @@ fn build(
 }
 
 /// Render a view as text within its declared budget.
-pub(crate) fn text_within(
+pub fn text_within(
     view: &View,
     regions: &[Region],
     title: &str,
@@ -427,7 +427,7 @@ pub(crate) fn text_within(
 /// Render a view as text: whole bodies first, then lines, then the fold line.
 /// A body is produced on demand, so a region that the budget folded is never
 /// rendered in full.
-pub(crate) fn text(
+pub fn text(
     view: &View,
     regions: &[Region],
     title: &str,
@@ -469,7 +469,7 @@ pub(crate) fn text(
 
 /// The folded part of a space: one address line per region that did not stay
 /// whole, plus the fold line for the rest.
-pub(crate) fn tail(view: &View, regions: &[Region], title: &str) -> Option<String> {
+pub fn tail(view: &View, regions: &[Region], title: &str) -> Option<String> {
     if view.index.is_empty() && view.map.is_none() {
         return None;
     }

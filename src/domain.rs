@@ -39,8 +39,9 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn is_closable(self) -> bool {
-        matches!(self, Kind::Goal | Kind::Commitment)
+    #[must_use]
+    pub const fn is_closable(self) -> bool {
+        matches!(self, Self::Goal | Self::Commitment)
     }
 }
 
@@ -53,7 +54,7 @@ pub enum ProposalKind {
 }
 
 impl ProposalKind {
-    pub(crate) fn event_kind(self) -> Kind {
+    pub(crate) const fn event_kind(self) -> Kind {
         match self {
             Self::Goal => Kind::Goal,
             Self::Commitment => Kind::Commitment,
@@ -77,13 +78,13 @@ pub struct ProposalView<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ProposalData {
+pub struct ProposalData {
     pub(crate) kind: ProposalKind,
     #[serde(default)]
     pub(crate) target_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub id: u64,
     pub at: i64,
@@ -105,7 +106,8 @@ pub struct EventMeta {
 }
 
 impl EventMeta {
-    pub fn new(at: i64) -> Self {
+    #[must_use]
+    pub const fn new(at: i64) -> Self {
         Self {
             at,
             closes: None,
@@ -113,7 +115,8 @@ impl EventMeta {
         }
     }
 
-    pub fn data(at: i64, value: Value) -> Self {
+    #[must_use]
+    pub const fn data(at: i64, value: Value) -> Self {
         Self {
             at,
             closes: None,
@@ -141,7 +144,8 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
             Self::Running => "running",
@@ -150,11 +154,9 @@ impl TaskStatus {
             Self::Failed => "failed",
         }
     }
-    pub fn is_active(self) -> bool {
-        matches!(
-            self,
-            TaskStatus::Open | TaskStatus::Running | TaskStatus::Waiting
-        )
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Open | Self::Running | Self::Waiting)
     }
 }
 
@@ -194,7 +196,7 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TaskOpen<'a> {
+pub struct TaskOpen<'a> {
     #[serde(default)]
     pub(crate) kind: TaskKind,
     pub(crate) title: &'a str,
@@ -225,20 +227,65 @@ pub struct Task {
     pub acceptance: String,
     pub status: TaskStatus,
     pub created_at: i64,
-    pub digest_at: Option<i64>,
     pub closed_at: Option<i64>,
-    pub digest: Option<String>,
     pub close: Option<CloseOutcome>,
-    /// The acceptance evidence this task asked the host for, fixed at open.
+    /// The facts of a task that executes. A group aggregates and never runs, so
+    /// it has none of them and no reader has to ask whether a field means
+    /// anything for the kind it is looking at.
+    pub run: Option<Run>,
+}
+
+/// What a run leaves behind: its account, and the observation that answers its
+/// acceptance contract. Every field is a fold of one recorded event.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Run {
+    /// The host's account of the run, from its report.
+    pub digest: Option<String>,
+    pub digest_at: Option<i64>,
+    /// The acceptance observation this run asked for, fixed at open.
     pub evidence: Option<Value>,
     /// The observation that answered it, when the host produced one.
     pub evidence_id: Option<u64>,
     pub evidence_result: Option<Value>,
 }
 
-/// The model's bounded working view. It borrows the fold it projects: a view is
-/// what `S` looks like within a budget, never a second copy of `S`. Every field
-/// is either a selection of borrowed facts or a borrowed derived table.
+impl Run {
+    /// A run that has not reported yet still carries the contract it was opened
+    /// with, so the judgment can be made when the report arrives.
+    #[must_use]
+    pub fn opened(evidence: Option<Value>) -> Self {
+        Self {
+            evidence,
+            ..Self::default()
+        }
+    }
+}
+
+impl Task {
+    /// The acceptance observation this task asked the host for.
+    #[must_use]
+    pub fn evidence(&self) -> Option<&Value> {
+        self.run.as_ref().and_then(|run| run.evidence.as_ref())
+    }
+
+    /// The observation that answered it, when the host produced one.
+    #[must_use]
+    pub fn evidence_id(&self) -> Option<u64> {
+        self.run.as_ref().and_then(|run| run.evidence_id)
+    }
+
+    /// The host's account of the run, once it reported.
+    #[must_use]
+    pub fn digest(&self) -> Option<&str> {
+        self.run.as_ref().and_then(|run| run.digest.as_deref())
+    }
+}
+
+/// The model's bounded working view of the fold.
+///
+/// It borrows what it projects: a view is what `S` looks like within a budget,
+/// never a second copy of `S`. Every field is a selection of borrowed facts or a
+/// borrowed derived table.
 #[derive(Debug, Clone)]
 pub struct EjaContext<'a> {
     pub now: i64,
@@ -257,9 +304,20 @@ pub struct EjaContext<'a> {
     /// observation names its own subject, so a repeat of the same read is the
     /// same entry and the view states the same information.
     pub evidence: Vec<Observation<'a>>,
+    /// Committed observations this version could not decode. Counted, never
+    /// dropped silently: the evidence section states how many are missing.
+    pub unreadable_evidence: usize,
     pub proposals: Vec<ProposalView<'a>>,
     /// Actions this turn that the host could not carry out.
     pub refused: Vec<&'a str>,
+}
+
+impl EjaContext<'_> {
+    /// The task the projection is about, from the one table that holds it.
+    #[must_use]
+    pub fn task(&self, id: TaskId) -> Option<&Task> {
+        self.tasks.iter().find(|task| task.id == id)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -390,7 +448,7 @@ pub enum ObservationKind {
 /// The recorded form owns its data; the read form borrows it. `read` decodes one
 /// committed event's payload in place, so a projection of a hundred observations
 /// copies none of them.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Observation<'a> {
     /// What this is; `target` names its subject.
     pub kind: ObservationKind,
@@ -403,6 +461,7 @@ pub struct Observation<'a> {
 
 impl<'a> Observation<'a> {
     /// Whether two observations answer the same read: the entry one replaces.
+    #[must_use]
     pub fn same_subject(&self, other: &Observation<'_>) -> bool {
         self.target == other.target
             && self.arguments == other.arguments
@@ -411,6 +470,7 @@ impl<'a> Observation<'a> {
 
     /// Whether two observations state the same thing, content included. The
     /// kernel compares content, never the event that recorded it.
+    #[must_use]
     pub fn same_content(&self, other: &Observation<'_>) -> bool {
         self.kind == other.kind
             && self.same_subject(other)
@@ -551,6 +611,7 @@ pub struct Address {
 }
 
 impl Address {
+    #[must_use]
     pub fn parse(raw: &str) -> Option<Self> {
         let (scheme, id) = raw.split_once(':')?;
         if id.is_empty() {

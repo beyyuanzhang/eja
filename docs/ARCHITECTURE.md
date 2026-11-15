@@ -140,6 +140,9 @@ retroactively change the assignment. Identical relation insertion is idempotent.
 
 ## Records and views
 
+An observation that this version cannot decode is counted, not dropped: the
+evidence section states how many committed observations it could not show.
+
 An observation says what it is — `look`, `witness` or `reconcile` — and its
 target then names the subject. The kind is a typed field, never a reserved target
 string: a host read tool may be named `witness`, and a fact may not depend on
@@ -172,12 +175,16 @@ restored during continuation: historical observations must be distinguished from
 current world observations.
 
 Checkpoint file reads and native record reads share one source resolver for
-whole/range/match. Readers bound retained bytes and return truncation metadata.
+whole/range/match, and one record module owns the manifest type, the resolver,
+the reader and the shadow repository that freezes a run. Readers bound retained
+bytes through the same budget helper and return truncation metadata.
 Log pages include their next cursor in model evidence. An oversized event is
 represented by an explicit locator, never a modified fact; bounded UTF-8 byte
 views of `event:<id>` preserve access without blocking later page entries.
 The shadow Git repository captures Git-visible files, excludes EJA state and
 `.git`, disables hooks/signing/global configuration and runs under host Control.
+The record store owns that repository; a worker hands it a run and receives a
+commit, so no adapter keeps a second copy of the record layout.
 Checkpoint failure is recorded explicitly; it cannot erase an already frozen
 transcript or manufacture an acceptance.
 

@@ -71,10 +71,7 @@ fn decision(reply: &str, actions: Vec<Action>) -> Decision {
 }
 
 fn record(summary: &str) -> String {
-    format!(
-        "1 steps, 1 tool calls, project: unchanged, ended: message\n{}",
-        summary
-    )
+    format!("1 steps, 1 tool calls, project: unchanged, ended: message\n{summary}")
 }
 
 fn temp_store() -> std::path::PathBuf {
@@ -272,8 +269,7 @@ fn rejection_fails_the_task_and_keeps_the_report() {
             .accepted
     );
     assert!(outcome.context().tasks[0]
-        .digest
-        .as_deref()
+        .digest()
         .unwrap_or("")
         .contains("ended: budget"));
 }
@@ -317,7 +313,7 @@ fn impossible_actions_are_refused_visibly_and_change_nothing() {
         "{:?}",
         outcome.context().refused
     );
-    assert!(outcome.dispatched.len() == 1);
+    assert_eq!(outcome.dispatched.len(), 1);
 
     // Unknown ids are refused too, and nothing is appended for them.
     let second = QueueBrain::new(vec![decision(
@@ -387,7 +383,7 @@ fn identity_is_reconstructed_and_worker_reports_are_not_identity() {
 
     let events = store.events().expect("events");
     assert_eq!(State::fold(events.clone()).commitments().len(), 1);
-    assert!(!State::fold(events.clone())
+    assert!(!State::fold(events)
         .identity()
         .iter()
         .any(|event| event.kind == Kind::WorkerReport));
@@ -555,8 +551,7 @@ fn worker_failure_stays_waiting_for_eja() {
     .expect("turn");
     assert_eq!(outcome.context().tasks[0].status, TaskStatus::Waiting);
     assert!(outcome.context().tasks[0]
-        .digest
-        .as_deref()
+        .digest()
         .unwrap_or("")
         .contains("ended: error"));
 }
@@ -602,7 +597,7 @@ fn correction_targets_an_event_id_not_a_phrase() {
     );
     let events = store.events().expect("events");
     assert!(State::fold(events.clone()).commitments().is_empty());
-    assert!(!State::fold(events.clone())
+    assert!(!State::fold(events)
         .tasks()
         .iter()
         .any(|task| task.status == TaskStatus::Running));
@@ -654,7 +649,7 @@ fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
     let running = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let worker = OverlapWorker {
-        running: running.clone(),
+        running,
         peak: peak.clone(),
     };
     turn_at(
@@ -692,7 +687,7 @@ fn multiple_dispatches_use_one_execution_owner_and_preserve_order() {
             .context()
             .tasks
             .iter()
-            .filter(|t| t.digest.is_some())
+            .filter(|t| t.digest().is_some())
             .count(),
         2
     );
@@ -715,8 +710,7 @@ fn one_journal_takes_one_writer() {
         refused
             .as_ref()
             .err()
-            .map(|error| error.to_string().contains("outside this Store"))
-            .unwrap_or(false),
+            .is_some_and(|error| error.to_string().contains("outside this Store")),
         "{refused:?}"
     );
     // Nothing was written by the refused append, and the first writer's fact

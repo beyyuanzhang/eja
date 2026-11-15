@@ -8,10 +8,28 @@
 use crate::domain::{ProposalData, TaskOpen};
 use crate::{
     CloseOutcome, Edge, EjaContext, Event, Kind, Observation, ObservationKind, ProposalKind,
-    ProposalView, Result, Store, Task, TaskId, TaskStatus,
+    ProposalView, Result, Run, Store, Task, TaskId, TaskKind, TaskStatus,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
+
+/// What one turn observed: the readable observations, and how many committed
+/// ones this version could not decode. A count, so nothing is dropped silently.
+#[derive(Debug, Default, Clone)]
+pub struct Evidence<'a> {
+    pub observations: Vec<Observation<'a>>,
+    pub unreadable: usize,
+}
+
+impl Evidence<'_> {
+    pub const fn len(&self) -> usize {
+        self.observations.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.observations.is_empty()
+    }
+}
 
 /// A proposal that no event has resolved yet. Its own event id is its identity.
 #[derive(Debug, Clone)]
@@ -63,7 +81,7 @@ fn proposal_of(event: &Event) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
-pub(crate) fn task_scope(task_id: TaskId) -> String {
+pub fn task_scope(task_id: TaskId) -> String {
     format!("task:{task_id}")
 }
 
@@ -77,6 +95,7 @@ impl State {
         Ok(Self::fold(store.events()?))
     }
 
+    #[must_use]
     pub fn fold(events: Vec<Event>) -> Self {
         let mut state = Self::default();
         for event in events {
@@ -92,32 +111,39 @@ impl State {
         self.events.push(event);
     }
 
+    #[must_use]
     pub fn events(&self) -> &[Event] {
         &self.events
     }
 
     /// The newest committed fact identifies everything committed so far.
+    #[must_use]
     pub fn last_id(&self) -> u64 {
         self.events.last().map_or(0, |event| event.id)
     }
 
     /// The turn the newest fact belongs to.
+    #[must_use]
     pub fn turn(&self) -> u64 {
         self.events.last().map_or(0, |event| event.turn)
     }
 
+    #[must_use]
     pub fn tasks(&self) -> &[Task] {
         &self.tasks
     }
 
+    #[must_use]
     pub fn task(&self, id: TaskId) -> Option<&Task> {
         self.tasks.iter().find(|task| task.id == id)
     }
 
+    #[must_use]
     pub fn knows(&self, id: TaskId) -> bool {
         self.task(id).is_some()
     }
 
+    #[must_use]
     pub fn relations(&self) -> &[Edge] {
         &self.edges
     }
@@ -130,6 +156,7 @@ impl State {
 
     /// The newest unclosed goal. Adding one without replacing leaves the others
     /// active, so withdrawing the newest reveals the next one.
+    #[must_use]
     pub fn goal(&self) -> Option<&Event> {
         self.goals
             .iter()
@@ -138,10 +165,12 @@ impl State {
             .find(|event| !self.closed.contains(&event.id))
     }
 
+    #[must_use]
     pub fn commitments(&self) -> Vec<&Event> {
         self.open(&self.commitments)
     }
 
+    #[must_use]
     pub fn identity(&self) -> Vec<&Event> {
         self.identity
             .iter()
@@ -152,9 +181,11 @@ impl State {
     /// Actions this turn that the host could not carry out, from EJA's own words.
     ///
     /// A turn's facts are the journal's tail, so the scan stops at its first
-    /// event: reading this turn costs this turn, not the whole log.
-    pub fn refusals(&self, turn: u64) -> Vec<&str> {
-        debug_assert_eq!(turn, self.turn(), "a turn reads only its own events");
+    /// event and reading this turn costs this turn, not the whole log. There is
+    /// no argument to get wrong: the turn is the newest one by definition.
+    #[must_use]
+    pub fn refusals(&self) -> Vec<&str> {
+        let turn = self.turn();
         self.events
             .iter()
             .rev()
@@ -166,9 +197,13 @@ impl State {
 
     /// What this turn observed, one entry per distinct observation: a repeated
     /// read keeps the newest answer, so the view states what is currently true.
-    pub fn evidence(&self, turn: u64) -> Vec<Observation<'_>> {
-        debug_assert_eq!(turn, self.turn(), "a turn reads only its own events");
-        let mut out: Vec<Observation<'_>> = Vec::new();
+    /// What this turn observed, and what of it this version could not read.
+    ///
+    /// A committed observation this version cannot decode is counted rather than
+    /// dropped: the projection states how many it could not show.
+    pub fn evidence(&self) -> Evidence<'_> {
+        let turn = self.turn();
+        let mut evidence = Evidence::default();
         // Walk the tail backwards, then restore the order the turn happened in.
         for event in self
             .events
@@ -177,23 +212,27 @@ impl State {
             .take_while(|event| event.turn == turn)
             .filter(|event| event.kind == Kind::Observed)
         {
-            let Some(data) = event.data.as_ref() else {
-                continue;
-            };
-            let Some(observation) = Observation::read(data) else {
+            let read = event.data.as_ref().and_then(Observation::read);
+            let Some(observation) = read else {
+                evidence.unreadable += 1;
                 continue;
             };
             // A repeated read is one entry: the newest answer is what holds.
-            if out.iter().any(|other| other.same_subject(&observation)) {
+            if evidence
+                .observations
+                .iter()
+                .any(|other: &Observation<'_>| other.same_subject(&observation))
+            {
                 continue;
             }
-            out.push(observation);
+            evidence.observations.push(observation);
         }
-        out.reverse();
-        out
+        evidence.observations.reverse();
+        evidence
     }
 
     /// Approvals the host recorded for one turn.
+    #[must_use]
     pub fn approved(&self, turn: u64) -> Vec<u64> {
         let mut out: Vec<u64> = self
             .approvals
@@ -206,6 +245,7 @@ impl State {
         out
     }
 
+    #[must_use]
     pub fn pending_proposals(&self, turn: u64) -> Vec<ProposalView<'_>> {
         let approved = self.approved(turn);
         self.proposals
@@ -224,6 +264,7 @@ impl State {
 
     /// A proposal may only name an active identity fact of its own kind: a
     /// correction withdraws its target, a goal or commitment replaces it.
+    #[must_use]
     pub fn valid_proposal_target(&self, kind: ProposalKind, target_id: Option<u64>) -> bool {
         let Some(target_id) = target_id else {
             return kind != ProposalKind::Correction;
@@ -238,6 +279,7 @@ impl State {
 
     /// The model's bounded working view: the projection of this state. It
     /// borrows every fact it shows, so a decision costs no copy of the log.
+    #[must_use]
     pub fn project<'a>(
         &'a self,
         input: &'a str,
@@ -249,6 +291,7 @@ impl State {
         let history_before = self.events.last().map_or(0, |last| {
             last.turn.saturating_add(u64::from(last.kind == Kind::Eja))
         });
+        let evidence = self.evidence();
         EjaContext {
             now: now.timestamp(),
             input,
@@ -265,9 +308,10 @@ impl State {
             relations: &self.edges,
             tasks: &self.tasks,
             focus: focus.filter(|id| self.knows(*id)),
-            evidence: self.evidence(turn),
+            evidence: evidence.observations,
+            unreadable_evidence: evidence.unreadable,
             proposals: self.pending_proposals(turn),
-            refused: self.refusals(turn),
+            refused: self.refusals(),
         }
     }
 
@@ -337,8 +381,9 @@ impl State {
                     return;
                 };
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
-                    task.digest = Some(event.text.clone());
-                    task.digest_at = Some(event.at);
+                    let run = task.run.get_or_insert_with(Run::default);
+                    run.digest = Some(event.text.clone());
+                    run.digest_at = Some(event.at);
                     task.status = TaskStatus::Waiting;
                 }
             }
@@ -358,8 +403,9 @@ impl State {
                     return;
                 }
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
-                    task.evidence_id = Some(event.id);
-                    task.evidence_result = Some(observation.result.clone());
+                    let run = task.run.get_or_insert_with(Run::default);
+                    run.evidence_id = Some(event.id);
+                    run.evidence_result = Some(observation.result.clone());
                 }
             }
             Kind::TaskClosed => {
@@ -406,13 +452,10 @@ impl State {
             acceptance: open.acceptance.to_string(),
             status: TaskStatus::Open,
             created_at: event.at,
-            digest_at: None,
             closed_at: None,
-            digest: None,
             close: None,
-            evidence: open.evidence,
-            evidence_id: None,
-            evidence_result: None,
+            // Only a task that executes carries a run; a group never does.
+            run: (open.kind == TaskKind::Aja).then(|| Run::opened(open.evidence)),
         };
         let at = self
             .tasks

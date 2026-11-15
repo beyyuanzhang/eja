@@ -47,11 +47,11 @@ impl ContextLog {
         })
     }
 
-    fn record(&mut self, entry: Value) -> Result<()> {
+    fn record(&mut self, entry: &Value) -> Result<()> {
         if entry.get("kind").and_then(Value::as_str) == Some("assistant") {
             self.assistants += 1;
         }
-        let mut line = serde_json::to_vec(&entry)?;
+        let mut line = serde_json::to_vec(entry)?;
         line.push(b'\n');
         self.file.write_all(&line)?;
         self.file.flush()?;
@@ -71,8 +71,8 @@ struct Process {
 }
 
 impl Process {
-    fn start(binary: &Path, work: &Path, start: Start) -> Result<Self> {
-        if crate::measure::bytes(&start)? > aja::FRAME_LIMIT {
+    fn start(binary: &Path, work: &Path, start: &Start) -> Result<Self> {
+        if crate::measure::bytes(start)? > aja::FRAME_LIMIT {
             return Err("AJA start frame exceeds limit".into());
         }
         let child = Command::new(binary)
@@ -142,7 +142,10 @@ struct Lease<'a> {
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(index) = active.iter().position(|run| run.id == self.id) {
             active.remove(index).cancelled.store(true, Ordering::SeqCst);
         }
@@ -184,10 +187,9 @@ pub struct NativeWorker {
     model: Arc<dyn Model>,
     tools: Arc<dyn ToolGateway>,
     limits: Limits,
-    /// The shadow repository that keeps one commit per aja: the fossils.
-    checkpoints: PathBuf,
-    /// The host's own state, never part of what a aja did to the project.
-    state: PathBuf,
+    /// The shadow repository that keeps one commit per aja: the fossils. It owns
+    /// the private state path too, so the worker holds no layout of its own.
+    records: super::records::Checkpoints,
     /// Where each run may change things. Isolation is the host's decision, and
     /// the backend refuses a world that already has an owner.
     worlds: Arc<dyn Worlds>,
@@ -222,13 +224,13 @@ impl NativeWorker {
             model,
             tools,
             limits: Limits::default(),
-            checkpoints,
-            worlds: Arc::new(Shared::new(project.clone(), state.clone())),
-            state,
+            records: super::records::Checkpoints::new(checkpoints, state.clone()),
+            worlds: Arc::new(Shared::new(project, state)),
             active: Mutex::new(Vec::new()),
         })
     }
     /// The worlds this host provides. Without one, every run shares the project.
+    #[must_use]
     pub fn with_worlds(mut self, worlds: Arc<dyn Worlds>) -> Self {
         self.worlds = worlds;
         self
@@ -239,17 +241,23 @@ impl NativeWorker {
         Ok(self)
     }
     pub fn cancel(&self, aja_id: u64) -> bool {
-        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        match active.iter().find(|run| run.id == aja_id) {
-            Some(run) => {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active
+            .iter()
+            .find(|run| run.id == aja_id)
+            .is_some_and(|run| {
                 run.cancelled.store(true, Ordering::SeqCst);
                 true
-            }
-            None => false,
-        }
+            })
     }
     pub fn active_count(&self) -> usize {
-        self.active.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     fn run(
@@ -261,7 +269,7 @@ impl NativeWorker {
         world: &World,
     ) -> Result<(String, String)> {
         let mut definitions = self.tools.definitions(assignment);
-        definitions.push(super::record::definition());
+        definitions.push(super::records::definition());
         let allowed: HashSet<String> = definitions
             .iter()
             .filter_map(|d| d["function"]["name"].as_str().map(String::from))
@@ -269,16 +277,16 @@ impl NativeWorker {
         if allowed.len() != definitions.len() {
             return Err("invalid or duplicate host tool definitions".into());
         }
-        log.record(json!({"kind":"start", "view_version":1, "messages":fold::fresh_messages(assignment,&self.limits)}))?;
-        let ancestors = super::record::lineage(&self.root, assignment.resume, control)?;
+        log.record(&json!({"kind":"start", "view_version":1, "messages":fold::fresh_messages(assignment,&self.limits)}))?;
+        let ancestors = super::records::lineage(&self.root, assignment.resume, control)?;
         let inherited =
-            super::record::replay(&self.root, &ancestors, self.limits.context_bytes, control)?;
+            super::records::replay(&self.root, &ancestors, self.limits.context_bytes, control)?;
         let messages = fold::prepare_messages(assignment, &self.limits, inherited)?;
         let start = Start {
             context_bytes: self.limits.context_bytes,
             messages,
         };
-        let mut process = Process::start(&self.binary, &world.root, start)?;
+        let mut process = Process::start(&self.binary, &world.root, &start)?;
         let context = ToolContext {
             aja_id: assignment.task_id,
             project: &world.root,
@@ -315,12 +323,10 @@ impl NativeWorker {
                         return Err("AJA model output limit reached".into());
                     }
                     if let Err(error) = aja::validate_assistant(&value) {
-                        log.record(
-                            json!({"kind":"model_error","message":value,"error":error.to_string()}),
-                        )?;
+                        log.record(&json!({"kind":"model_error","message":value,"error":error.to_string()}))?;
                         return Err(error);
                     }
-                    log.record(json!({
+                    log.record(&json!({
                         "kind": "assistant",
                         "message": value,
                     }))?;
@@ -335,8 +341,8 @@ impl NativeWorker {
                     *counts.entry(name.clone()).or_insert(0) += 1;
                     let value = if !allowed.contains(&name) {
                         json!({"error":"tool not allowed"})
-                    } else if name == super::record::READ_TOOL {
-                        super::record::read(
+                    } else if name == super::records::READ_TOOL {
+                        super::records::read(
                             &self.root,
                             assignment.task_id,
                             &ancestors,
@@ -356,7 +362,7 @@ impl NativeWorker {
                         return Err("AJA tool output limit reached".into());
                     }
                     let entry = log.entries;
-                    log.record(json!({
+                    log.record(&json!({
                         "kind": "tool",
                         "id": id,
                         "name": name,
@@ -384,71 +390,21 @@ impl NativeWorker {
         }
     }
 
-    /// Freeze the world this aja left: one commit in the state's shadow
-    /// repository. The commit is the fossil EJA reads a aja's files from.
-    fn checkpoint(
-        &self,
-        assignment: &Assignment,
-        root: &Path,
-        control: &Control,
-    ) -> Result<String> {
-        let git = |args: &[&str]| -> Result<String> {
-            let mut command = std::process::Command::new("git");
-            command
-                .arg("--git-dir")
-                .arg(&self.checkpoints)
-                .arg("--work-tree")
-                .arg(root)
-                .args([
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "commit.gpgsign=false",
-                ])
-                .args(args)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_AUTHOR_NAME", "eja")
-                .env("GIT_AUTHOR_EMAIL", "eja@local")
-                .env("GIT_COMMITTER_NAME", "eja")
-                .env("GIT_COMMITTER_EMAIL", "eja@local");
-            let bytes = super::process::output(&mut command, control, aja::FRAME_LIMIT)?;
-            Ok(String::from_utf8_lossy(&bytes).trim().to_string())
-        };
-        if !self.checkpoints.join("HEAD").exists() {
-            fs::create_dir_all(&self.checkpoints)?;
-            git(&["init", "--quiet"])?;
-        }
-        let mut spec = vec![
-            "add".to_string(),
-            "-A".into(),
-            "--".into(),
-            ".".into(),
-            ":!.git".into(),
-        ];
-        if let Ok(relative) = self.state.strip_prefix(root) {
-            let relative = relative.to_string_lossy().to_string();
-            if !relative.is_empty() {
-                let exclude = format!(":!{relative}");
-                spec.push(exclude);
-            }
-        }
-        git(&spec.iter().map(String::as_str).collect::<Vec<_>>())?;
-        let message = format!("aja {} at {}", assignment.task_id, assignment.issued_at);
-        git(&["commit", "--quiet", "--allow-empty", "-m", &message])?;
-        git(&["rev-parse", "HEAD"])
-    }
-
-    fn seal(&self, run: Run<'_>, control: &Control) -> Result<String> {
-        let Run {
+    fn seal(&self, run: Seal<'_>, control: &Control) -> Result<String> {
+        let Seal {
             aja,
             assignment,
             outcome,
             world,
             world_line,
         } = run;
-        let (checkpoint, checkpoint_error) = match self.checkpoint(assignment, &world.root, control)
-        {
+        // The record store freezes the world; the worker only hands it the run.
+        let (checkpoint, checkpoint_error) = match self.records.freeze(
+            assignment.task_id,
+            assignment.issued_at,
+            &world.root,
+            control,
+        ) {
             Ok(commit) => (Some(commit), None),
             Err(error) => (None, Some(error.to_string())),
         };
@@ -459,7 +415,7 @@ impl NativeWorker {
             permissions.set_readonly(true);
             fs::set_permissions(&context, permissions)?;
         }
-        let context_bytes = fs::metadata(&context).map(|m| m.len()).unwrap_or(0);
+        let context_bytes = fs::metadata(&context).map_or(0, |m| m.len());
         let calls: usize = outcome.counts.values().sum();
         let histogram: Vec<String> = {
             let mut pairs: Vec<_> = outcome.counts.iter().collect();
@@ -482,16 +438,16 @@ impl NativeWorker {
         if let Some(error) = &checkpoint_error {
             let _ = write!(digest, "\ncheckpoint unavailable: {error}");
         }
-        let manifest = json!({
-            "assignment": assignment,
-            "digest": digest,
-            "world": world.label,
-            "checkpoint": checkpoint,
-            "checkpoint_error": checkpoint_error,
-            "context": "context.jsonl",
-            "context_bytes": context_bytes,
-            "frozen": true,
-        });
+        let manifest = super::records::Manifest {
+            assignment: assignment.clone(),
+            digest: digest.clone(),
+            world: world.label.clone(),
+            checkpoint,
+            checkpoint_error,
+            context: "context.jsonl".to_string(),
+            context_bytes: usize::try_from(context_bytes).unwrap_or(usize::MAX),
+            frozen: true,
+        };
         let temp = aja.join("aja.json.tmp");
         fs::write(&temp, serde_json::to_vec_pretty(&manifest)?)?;
         fs::File::open(&temp)?.sync_all()?;
@@ -508,7 +464,7 @@ impl NativeWorker {
 }
 
 /// Everything one run produced, in one place: the record is sealed from this.
-struct Run<'a> {
+struct Seal<'a> {
     aja: &'a Path,
     assignment: &'a Assignment,
     outcome: Outcome<'a>,
@@ -541,7 +497,10 @@ impl Worker for NativeWorker {
             Err(error) => return format!("0 steps, 0 tool calls, ended: error\nno world: {error}"),
         };
         {
-            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Err(e) = fs::create_dir(&aja) {
                 return format!(
                     "0 steps, 0 tool calls, ended: error\naja already reserved or unavailable: {e}"
@@ -584,7 +543,7 @@ impl Worker for NativeWorker {
                 (error.to_string(), reason.to_string())
             }
         };
-        let _ = log.record(json!({"kind": "finish", "text": &text, "reason": &reason}));
+        let _ = log.record(&json!({"kind": "finish", "text": &text, "reason": &reason}));
         drop(log);
         // The account is the host's: measured against the reservation, and made
         // durable before the aja is sealed.
@@ -606,7 +565,7 @@ impl Worker for NativeWorker {
             Err(error) => format!("world: {}: account unavailable ({error})", world.label),
         };
         self.seal(
-            Run {
+            Seal {
                 aja: &aja,
                 assignment,
                 outcome: Outcome {

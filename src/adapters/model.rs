@@ -62,6 +62,7 @@ impl OpenAiModel {
         let client = reqwest::Client::builder().build()?;
         Ok(self.http.get_or_init(|| (runtime, client)))
     }
+    #[must_use]
     pub fn from_env() -> Option<Self> {
         let (base, key, model) = super::llm_env()?;
         Some(Self::new(

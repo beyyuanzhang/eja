@@ -24,7 +24,7 @@ pub trait ToolGateway: Send + Sync {
 }
 
 /// No absolute paths, parent traversal, or symlinks in a aja's file capabilities.
-pub(crate) fn relative_file(root: &Path, name: &str) -> Result<PathBuf> {
+pub fn relative_file(root: &Path, name: &str) -> Result<PathBuf> {
     if name.is_empty() || name.len() > 4096 {
         return Err("invalid path".into());
     }
@@ -48,7 +48,7 @@ pub(crate) fn relative_file(root: &Path, name: &str) -> Result<PathBuf> {
 /// Resolve a workspace path: relative to the project, or absolute inside it.
 /// Anything else is refused, so the canonical path forms a caller sees in a task
 /// still address the workspace.
-pub(crate) fn workspace_path(root: &Path, name: &str) -> Result<PathBuf> {
+pub fn workspace_path(root: &Path, name: &str) -> Result<PathBuf> {
     if name.is_empty() || name == "." {
         return Ok(root.to_path_buf());
     }

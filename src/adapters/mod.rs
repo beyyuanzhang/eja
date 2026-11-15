@@ -8,7 +8,6 @@ mod model;
 mod native;
 mod ports;
 mod process;
-mod record;
 mod records;
 mod tools;
 mod worlds;
@@ -137,8 +136,8 @@ pub(crate) async fn controlled<T>(
             control.check()?;
             result
         }
-        _ = tokio::time::sleep_until(deadline) => Err(stop_reason(control)),
-        _ = cancelled(control) => Err(stop_reason(control)),
+        () = tokio::time::sleep_until(deadline) => Err(stop_reason(control)),
+        () = cancelled(control) => Err(stop_reason(control)),
     }
 }
 

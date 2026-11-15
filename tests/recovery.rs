@@ -4,6 +4,7 @@ use eja::{
     TaskStatus, Worker,
 };
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::Mutex;
 
 struct QueueBrain {
@@ -108,9 +109,9 @@ fn interrupted_assignment_is_reconciled_without_duplicate_dispatch() {
     let task = State::fold(events).tasks()[0].clone();
     assert_eq!(task.status, TaskStatus::Waiting);
     assert!(
-        task.digest.as_deref().unwrap_or("").contains("interrupted"),
+        task.digest().unwrap_or("").contains("interrupted"),
         "{:?}",
-        task.digest
+        task.run
     );
     assert!(recover(&store, 3, 300).expect("idempotent").is_empty());
 
@@ -137,7 +138,6 @@ fn torn_tail_is_ignored_by_the_reader() {
         .append(true)
         .open(&store.log_path)
         .expect("open");
-    use std::io::Write;
     file.write_all(b"{\"id\":").expect("torn");
     let events = store.events().expect("events");
     assert_eq!(events.len(), 1);

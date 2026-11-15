@@ -4,6 +4,7 @@ use eja::{
     turn_at, Action, Assignment, Brain, Decision, EjaContext, Selector, Store, TaskStatus, Worker,
 };
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use support::control;
 
@@ -146,7 +147,10 @@ fn aja_files_answer_a_range_and_a_match() {
     let dir = std::env::temp_dir().join(format!("eja-slice-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
-    let body: String = (0..20).map(|n| format!("line {n}\n")).collect();
+    let mut body = String::new();
+    for n in 0..20 {
+        writeln!(body, "line {n}").expect("string writer");
+    }
     std::fs::write(dir.join("note.txt"), body).expect("write");
     let reader = RecordFiles::new(&dir);
     let range = reader
@@ -193,7 +197,10 @@ fn a_match_returns_every_hit_and_the_view_budget_is_the_only_limit() {
     let dir = std::env::temp_dir().join(format!("eja-match-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
-    let body: String = (0..30).map(|n| format!("hit {n}\n")).collect();
+    let mut body = String::new();
+    for n in 0..30 {
+        writeln!(body, "hit {n}").expect("string writer");
+    }
     std::fs::write(dir.join("note.txt"), body).expect("write");
     let reader = RecordFiles::new(&dir);
     let hit = reader

@@ -175,6 +175,9 @@ impl Store {
         let event = Event { id, ..event };
         lock_log(&self.log_path, &self.file)?;
         let written = self.write(&mut cursor, &event);
+        // The in-process cursor is released before the log lock: the next writer
+        // may be another process and must not wait on this one's bookkeeping.
+        drop(cursor);
         // The lock covers this append only: the next writer may be another process.
         self.file.unlock()?;
         written?;
@@ -217,12 +220,15 @@ impl Store {
     }
 }
 
+#[must_use]
 pub fn now_utc() -> DateTime<Utc> {
     Utc::now()
 }
 
+#[must_use]
 pub fn format_utc(at: i64) -> String {
-    DateTime::<Utc>::from_timestamp(at, 0)
-        .map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
-        .unwrap_or_else(|| at.to_string())
+    DateTime::<Utc>::from_timestamp(at, 0).map_or_else(
+        || at.to_string(),
+        |time| time.to_rfc3339_opts(SecondsFormat::Secs, true),
+    )
 }

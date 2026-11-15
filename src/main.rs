@@ -98,8 +98,8 @@ fn on_interrupt() {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_sigint as *const () as libc::sighandler_t;
         action.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigemptyset(&raw mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &raw const action, std::ptr::null_mut());
     }
 }
 
@@ -145,7 +145,10 @@ fn run() -> Result<()> {
     if !ignore.exists() {
         std::fs::write(&ignore, "*\n")?;
     }
-    let startup = eja::Control::new(std::time::Duration::from_secs(300), Default::default());
+    let startup = eja::Control::new(
+        std::time::Duration::from_secs(300),
+        std::sync::Arc::default(),
+    );
     match command {
         Command::Turn(input) => {
             let limits = &mut options.limits;
@@ -191,14 +194,15 @@ fn run() -> Result<()> {
             .with_limits(aja_limits)?
             .with_worlds(worlds);
             let records = RecordFiles::with_checkpoints(ajas, dir.join("checkpoints"));
-            let worlds: Option<&dyn Worlds> = match &isolated {
-                Some(worlds) => Some(worlds.as_ref()),
-                None => Some(shared.as_ref()),
+            // A run always has a world: isolated when asked for, shared otherwise.
+            let worlds: &dyn Worlds = match &isolated {
+                Some(worlds) => worlds.as_ref(),
+                None => shared.as_ref(),
             };
             let ports = Ports {
                 aja: Some(&records),
                 capabilities: Some(&*tools),
-                worlds,
+                worlds: Some(worlds),
             };
             let outcome = turn_at_with_options(
                 &store,
@@ -228,7 +232,9 @@ fn run() -> Result<()> {
             println!(
                 "[{} | focus #{} | dispatched {} | looks {} | decisions {} | worker {}ms | log {}]",
                 counts(context.tasks),
-                context.focus.map_or("-".into(), |id| id.to_string()),
+                context
+                    .focus
+                    .map_or_else(|| "-".to_string(), |id| id.to_string()),
                 outcome.dispatched.len(),
                 context.evidence.len(),
                 outcome.decisions,
@@ -243,7 +249,9 @@ fn run() -> Result<()> {
             println!(
                 "[{} tasks | focus #{}]",
                 context.tasks.len(),
-                context.focus.map_or("-".into(), |id| id.to_string())
+                context
+                    .focus
+                    .map_or_else(|| "-".to_string(), |id| id.to_string())
             );
         }
         Command::Log => {
@@ -335,7 +343,7 @@ fn run() -> Result<()> {
                     task.status.as_str(),
                     task.title
                 );
-                if let Some(digest) = &task.digest {
+                if let Some(digest) = task.digest() {
                     println!("  record: {}", digest.lines().next().unwrap_or(""));
                 }
                 match std::fs::metadata(dir.join(format!("ajas/{}/context.jsonl", task.id))) {
@@ -382,26 +390,30 @@ fn print_task(task: &Task) {
         "  origin: {}\n  request: {}\n  acceptance: {}",
         task.origin, task.request, task.acceptance
     );
-    if let Some(evidence) = &task.evidence {
-        println!("  evidence: {evidence}");
-        match (&task.evidence_result, task.evidence_id) {
-            (Some(result), Some(id)) => println!("  evidence observed #{id}: {result}"),
-            _ => println!("  evidence observed: no"),
+    if let Some(run) = &task.run {
+        if let Some(evidence) = &run.evidence {
+            println!("  evidence: {evidence}");
+            match (&run.evidence_result, run.evidence_id) {
+                (Some(result), Some(id)) => println!("  evidence observed #{id}: {result}"),
+                _ => println!("  evidence observed: no"),
+            }
         }
-    }
-    if let Some(digest) = &task.digest {
-        println!(
-            "  record at: {}",
-            task.digest_at.map_or("-".into(), eja::format_utc)
-        );
-        for line in digest.lines() {
-            println!("  record: {line}");
+        if let Some(digest) = &run.digest {
+            println!(
+                "  record at: {}",
+                run.digest_at
+                    .map_or_else(|| "-".to_string(), eja::format_utc)
+            );
+            for line in digest.lines() {
+                println!("  record: {line}");
+            }
         }
     }
     if let Some(close) = &task.close {
         println!(
             "  closed at: {}",
-            task.closed_at.map_or("-".into(), eja::format_utc)
+            task.closed_at
+                .map_or_else(|| "-".to_string(), eja::format_utc)
         );
         println!(
             "  closed: {} — {}",

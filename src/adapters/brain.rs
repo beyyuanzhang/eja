@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::{label, llm_env, Control, Model, OpenAiModel};
 
-fn relation(kind: crate::RelationKind) -> &'static str {
+const fn relation(kind: crate::RelationKind) -> &'static str {
     match kind {
         crate::RelationKind::PartOf => "part_of",
         crate::RelationKind::DependsOn => "depends_on",
@@ -20,7 +20,7 @@ fn relation(kind: crate::RelationKind) -> &'static str {
     }
 }
 
-fn kind_label(kind: ObservationKind) -> &'static str {
+const fn kind_label(kind: ObservationKind) -> &'static str {
     match kind {
         ObservationKind::Look => "look",
         ObservationKind::Witness => "witness",
@@ -97,23 +97,44 @@ expose from/next/total; continue at next. Oversized events are listed in \
 partial_events: read event:<id> with selector {\"select\":\"bytes\",\"from\":0,\
 \"bytes\":4096}, then continue at next_offset. Byte views contain serialized event text.";
 
-/// The fold keeps the head whole, so this order is the priority: what this turn is
-/// about and what EJA just looked at come before any index. The self is not an
-/// index: goal and identity survive budget pressure and the indexes fold first.
-const ORDER: [&str; 12] = [
-    "NOW (UTC)",
-    "CURRENT INPUT",
-    "CURRENT GOAL",
-    "ACTIVE IDENTITY",
-    "CURRENT TASK",
-    "EVIDENCE",
-    "REFUSED",
-    "OPEN COMMITMENTS",
-    "PENDING PROPOSALS",
-    "RECENT CONVERSATION",
-    "TASK INDEX",
-    "RELATIONS",
-];
+/// The projection's regions. The declaration order is the priority the fold
+/// protects: what this turn is about and what EJA just looked at come before any
+/// index, so the self survives budget pressure and the indexes fold first. One
+/// place states both the order and the title, so they cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    Now,
+    Input,
+    Goal,
+    Identity,
+    Task,
+    Evidence,
+    Refused,
+    Commitments,
+    Proposals,
+    Conversation,
+    Index,
+    Relations,
+}
+
+impl Slot {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Now => "NOW (UTC)",
+            Self::Input => "CURRENT INPUT",
+            Self::Goal => "CURRENT GOAL",
+            Self::Identity => "ACTIVE IDENTITY",
+            Self::Task => "CURRENT TASK",
+            Self::Evidence => "EVIDENCE",
+            Self::Refused => "REFUSED",
+            Self::Commitments => "OPEN COMMITMENTS",
+            Self::Proposals => "PENDING PROPOSALS",
+            Self::Conversation => "RECENT CONVERSATION",
+            Self::Index => "TASK INDEX",
+            Self::Relations => "RELATIONS",
+        }
+    }
+}
 
 /// One line of a section. A line whose fact has an address says where it lives, so
 /// a section that the budget folds can still be unfolded.
@@ -125,12 +146,12 @@ struct Item<'a> {
 }
 
 struct Section<'a> {
-    title: &'static str,
+    slot: Slot,
     counted: bool,
     items: Vec<Item<'a>>,
 }
 
-fn plain(lines: Vec<String>) -> Item<'static> {
+const fn plain(lines: Vec<String>) -> Item<'static> {
     Item {
         address: None,
         lines,
@@ -144,9 +165,9 @@ fn addressed<'a>(address: impl Into<std::borrow::Cow<'a, str>>, lines: Vec<Strin
     }
 }
 
-fn section<'a>(title: &'static str, counted: bool, items: Vec<Item<'a>>) -> Section<'a> {
+const fn section(slot: Slot, counted: bool, items: Vec<Item<'_>>) -> Section<'_> {
     Section {
-        title,
+        slot,
         counted,
         items,
     }
@@ -156,9 +177,9 @@ fn section<'a>(title: &'static str, counted: bool, items: Vec<Item<'a>>) -> Sect
 /// same code both counts it and renders it.
 fn section_into(out: &mut impl std::fmt::Write, section: &Section<'_>) -> std::fmt::Result {
     if section.counted {
-        writeln!(out, "{} ({}):", section.title, section.items.len())?;
+        writeln!(out, "{} ({}):", section.slot.title(), section.items.len())?;
     } else {
-        writeln!(out, "{}:", section.title)?;
+        writeln!(out, "{}:", section.slot.title())?;
     }
     if section.items.is_empty() {
         writeln!(out, "  (none)")?;
@@ -208,47 +229,52 @@ fn span(section: &Section<'_>) -> Option<String> {
 
 /// One section at index scale: its title, its size and the address that unfolds
 /// it. Unfolding is one address lookup, so the footer states the rule once.
+#[must_use]
 fn section_line(section: &Section<'_>) -> String {
     let count = section.items.len();
     let noun = if count == 1 { "item" } else { "items" };
-    match span(section) {
-        Some(span) => format!("  {} ({count} {noun}, {span})", section.title),
-        None => format!("  {} ({count} {noun})", section.title),
-    }
+    span(section).map_or_else(
+        || format!("  {} ({count} {noun})", section.slot.title()),
+        |span| format!("  {} ({count} {noun}, {span})", section.slot.title()),
+    )
 }
 
+#[must_use]
 pub fn render_context(context: &EjaContext) -> String {
     render_context_within(context, usize::MAX)
 }
 
 /// Render a bounded projection with total section counts and an explicit landing
 /// scale. Omitted regions stay addressable and discoverable through their ids.
+#[must_use]
 pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     let mut sections = Vec::new();
     sections.push(section(
-        "NOW (UTC)",
+        Slot::Now,
         false,
         vec![plain(vec![format!("  {}", format_utc(context.now))])],
     ));
     sections.push(section(
-        "CURRENT INPUT",
+        Slot::Input,
         false,
         vec![plain(vec![format!("  {}", context.input)])],
     ));
     sections.push(section(
-        "CURRENT GOAL",
+        Slot::Goal,
         false,
-        vec![match &context.goal {
-            Some(goal) => addressed(
-                event_address(goal.id),
-                vec![format!("  #{} {}", goal.id, goal.text)],
-            ),
-            None => plain(vec!["  (none)".to_string()]),
-        }],
+        vec![context.goal.map_or_else(
+            || plain(vec!["  (none)".to_string()]),
+            |goal| {
+                addressed(
+                    event_address(goal.id),
+                    vec![format!("  #{} {}", goal.id, goal.text)],
+                )
+            },
+        )],
     ));
 
     sections.push(section(
-        "OPEN COMMITMENTS",
+        Slot::Commitments,
         true,
         context
             .commitments
@@ -267,7 +293,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
     sections.push(section(
-        "PENDING PROPOSALS",
+        Slot::Proposals,
         true,
         context
             .proposals
@@ -281,8 +307,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                         format!("{:?}", proposal.kind).to_lowercase(),
                         proposal
                             .target_id
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
+                            .map_or_else(|| "-".to_string(), |id| id.to_string()),
                         proposal.turn,
                         if proposal.approved {
                             " approved"
@@ -296,39 +321,37 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
     // The focus is one of the tasks, not a second copy of it.
-    let focused = context
-        .focus
-        .and_then(|id| context.tasks.iter().find(|task| task.id == id));
-    let task_items = match focused {
-        Some(task) => {
-            let mut lines = vec![
-                format!(
-                    "  #{} [{:?}/{}] {}",
-                    task.id,
-                    task.kind,
-                    task.status.as_str(),
-                    task.title
-                ),
-                format!("  created: {}", format_utc(task.created_at)),
-                format!("  request: {}", task.request),
-                format!("  acceptance: {}", task.acceptance),
-            ];
-            if let Some(digest) = &task.digest {
+    let focused = context.focus.and_then(|id| context.task(id));
+    let task_items = focused.map_or_else(
+        || vec![plain(vec!["  (none)".to_string()])],
+        |task| {
+        let mut lines = vec![
+            format!(
+                "  #{} [{:?}/{}] {}",
+                task.id,
+                task.kind,
+                task.status.as_str(),
+                task.title
+            ),
+            format!("  created: {}", format_utc(task.created_at)),
+            format!("  request: {}", task.request),
+            format!("  acceptance: {}", task.acceptance),
+        ];
+        if let Some(run) = &task.run {
+            if let Some(digest) = &run.digest {
                 lines.push(format!(
                     "  aja record at: {}",
-                    task.digest_at
-                        .map(format_utc)
-                        .unwrap_or_else(|| "-".to_string())
+                    run.digest_at.map_or_else(|| "-".to_string(), format_utc)
                 ));
                 for line in digest.lines() {
                     lines.push(format!("  record: {line}"));
                 }
             }
-            if let Some(evidence) = &task.evidence {
+            if let Some(evidence) = &run.evidence {
                 lines.push(format!("  evidence: {evidence}"));
-                match (&task.evidence_result, task.evidence_id) {
+                match (&run.evidence_result, run.evidence_id) {
                     (Some(result), Some(id)) => {
-                        lines.push(format!("  evidence observed #{id}: {result}"))
+                        lines.push(format!("  evidence observed #{id}: {result}"));
                     }
                     _ => lines.push(
                         "  evidence observed: no — an acceptance is undecidable until the host answers, a rejection needs none"
@@ -336,35 +359,33 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                     ),
                 }
             }
-            if let Some(close) = &task.close {
-                lines.push(format!(
-                    "  closed at: {}",
-                    task.closed_at
-                        .map(format_utc)
-                        .unwrap_or_else(|| "-".to_string())
-                ));
-                lines.push(format!(
-                    "  closed: {} — {}",
-                    if close.accepted {
-                        "accepted"
-                    } else {
-                        "rejected"
-                    },
-                    close.note
-                ));
-            }
-            vec![addressed(task_address(task.id), lines)]
         }
-        None => vec![plain(vec!["  (none)".to_string()])],
-    };
-    sections.push(section("CURRENT TASK", false, task_items));
+        if let Some(close) = &task.close {
+            lines.push(format!(
+                "  closed at: {}",
+                task.closed_at.map_or_else(|| "-".to_string(), format_utc)
+            ));
+            lines.push(format!(
+                "  closed: {} — {}",
+                if close.accepted {
+                    "accepted"
+                } else {
+                    "rejected"
+                },
+                close.note
+            ));
+        }
+            vec![addressed(task_address(task.id), lines)]
+        },
+    );
+    sections.push(section(Slot::Task, false, task_items));
 
     // What the host could not do, in EJA's own words from the last decision: the
     // state refused it, or it could not be read as an action. EJA sees this before
     // deciding again, so an impossible action is not a dead end.
     if !context.refused.is_empty() {
         sections.push(section(
-            "REFUSED",
+            Slot::Refused,
             false,
             context
                 .refused
@@ -376,29 +397,33 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
 
     // Evidence sits before the index: when a budget forces a trim, what EJA
     // actually looked at survives and old index entries are dropped first.
-    sections.push(section(
-        "EVIDENCE",
-        true,
-        context
-            .evidence
-            .iter()
-            .map(|observation| {
-                // An observation that names an address is unfolded by that
-                // address; one that names a host tool has none to give.
-                let lines = evidence_lines(observation);
-                if crate::Address::parse(observation.target).is_none() {
-                    return plain(lines);
-                }
-                Item {
-                    address: Some(std::borrow::Cow::Borrowed(observation.target)),
-                    lines,
-                }
-            })
-            .collect(),
-    ));
+    let mut evidence: Vec<Item<'_>> = context
+        .evidence
+        .iter()
+        .map(|observation| {
+            // An observation that names an address is unfolded by that address;
+            // one that names a host tool has none to give.
+            let lines = evidence_lines(observation);
+            if crate::Address::parse(observation.target).is_none() {
+                return plain(lines);
+            }
+            Item {
+                address: Some(std::borrow::Cow::Borrowed(observation.target)),
+                lines,
+            }
+        })
+        .collect();
+    // An observation this version cannot read is stated, never dropped.
+    if context.unreadable_evidence > 0 {
+        evidence.push(plain(vec![format!(
+            "  {} committed observation(s) this version could not read",
+            context.unreadable_evidence
+        )]));
+    }
+    sections.push(section(Slot::Evidence, true, evidence));
 
     sections.push(section(
-        "ACTIVE IDENTITY",
+        Slot::Identity,
         true,
         context
             .identity
@@ -419,7 +444,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
     sections.push(section(
-        "RECENT CONVERSATION",
+        Slot::Conversation,
         true,
         context
             .history
@@ -446,7 +471,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .then_with(|| b.id.cmp(&a.id))
     });
     sections.push(section(
-        "TASK INDEX",
+        Slot::Index,
         true,
         index
             .iter()
@@ -465,7 +490,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
     sections.push(section(
-        "RELATIONS",
+        Slot::Relations,
         true,
         context
             .relations
@@ -484,12 +509,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
 
-    sections.sort_by_key(|section| {
-        ORDER
-            .iter()
-            .position(|title| *title == section.title)
-            .unwrap_or(ORDER.len())
-    });
+    sections.sort_by_key(|section| section.slot);
     folded(&sections, budget)
 }
 
@@ -577,8 +597,7 @@ pub fn parse_decision(raw: &str) -> Decision {
     let stripped = trimmed
         .strip_prefix("\u{60}\u{60}\u{60}json")
         .or_else(|| trimmed.strip_prefix("\u{60}\u{60}\u{60}"))
-        .map(|text| text.trim())
-        .unwrap_or(trimmed);
+        .map_or(trimmed, str::trim);
     let stripped = stripped
         .strip_suffix("\u{60}\u{60}\u{60}")
         .unwrap_or(stripped)

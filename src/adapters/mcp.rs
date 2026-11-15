@@ -61,10 +61,10 @@ struct ServerConfig {
     #[serde(default = "timeout")]
     timeout_ms: u64,
 }
-fn enabled() -> bool {
+const fn enabled() -> bool {
     true
 }
-fn timeout() -> u64 {
+const fn timeout() -> u64 {
     30_000
 }
 
@@ -109,8 +109,8 @@ fn alias(server: &str, tool: &str) -> String {
         return name;
     }
     // Stable short suffix for long tool names. Collisions are rejected below.
-    let hash = tool.bytes().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    let hash = tool.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     });
     format!("{}_{hash:016x}", &name[..47])
 }
@@ -126,11 +126,16 @@ impl LocalServer {
         }
         self.stopped = true;
         if let Some(id) = self.child.id() {
-            // SAFETY: the server was spawned into its own process group, so its id
-            // is a live group id owned by this process; killing that group ends the
-            // server and anything it started. A reaped group is a no-op error.
-            unsafe {
-                libc::killpg(id as i32, libc::SIGKILL);
+            // A child id is a process id; one that cannot be a group id is not a
+            // group to signal, and the guard still closes the child's pipes.
+            if let Ok(group) = libc::pid_t::try_from(id) {
+                // SAFETY: the server was spawned into its own process group, so its
+                // id is a live group id owned by this process; killing that group
+                // ends the server and anything it started. A reaped group is a
+                // no-op error.
+                unsafe {
+                    libc::killpg(group, libc::SIGKILL);
+                }
             }
         }
         let _ = self.child.start_kill();
@@ -235,13 +240,16 @@ impl McpTools {
                     if !config.headers.is_empty() {
                         return Err("stdio MCP cannot have HTTP headers".into());
                     }
-                    let cwd = match &config.cwd {
-                        Some(p) if p.is_relative() => {
-                            path.parent().unwrap_or(Path::new(".")).join(p)
-                        }
-                        Some(p) => p.clone(),
-                        None => project.to_path_buf(),
-                    };
+                    let cwd = config.cwd.as_ref().map_or_else(
+                        || project.to_path_buf(),
+                        |p| {
+                            if p.is_relative() {
+                                path.parent().unwrap_or_else(|| Path::new(".")).join(p)
+                            } else {
+                                p.clone()
+                            }
+                        },
+                    );
                     let mut command = Command::new(program);
                     command
                         .args(&config.args)
@@ -502,8 +510,8 @@ impl ToolGateway for McpTools {
                 let response = tokio::select! {
                     biased;
                     response = &mut handle.rx => Some(response??),
-                    _ = tokio::time::sleep_until(cancel_deadline) => None,
-                    _ = super::cancelled(&call_control) => None,
+                    () = tokio::time::sleep_until(cancel_deadline) => None,
+                    () = super::cancelled(&call_control) => None,
                 };
                 // A stop asks the server to stop rather than dropping the call.
                 let Some(response) = response else {
@@ -573,10 +581,9 @@ impl ToolGateway for HostTools {
     /// built-in file tools: the workspace is reached the way the host provides
     /// it, so writing a deliverable costs the same as working on it.
     fn definitions(&self, assignment: &Assignment) -> Vec<Value> {
-        match &self.mcp {
-            Some(mcp) => mcp.definitions(assignment),
-            None => Vec::new(),
-        }
+        self.mcp
+            .as_ref()
+            .map_or_else(Vec::new, |mcp| mcp.definitions(assignment))
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         if !name.starts_with("mcp__") {

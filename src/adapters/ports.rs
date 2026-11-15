@@ -8,9 +8,10 @@ pub trait RecordReader {
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value>;
 }
 
-/// The host's declared capabilities: what EJA may observe, and what may answer
-/// an acceptance witness. An observation is always safe; a witness is an
-/// effect-capable host act and must be declared, so both refuse by default.
+/// What the host declares EJA may do.
+///
+/// An observation is always safe; a witness is an effect-capable host act and
+/// must be declared, so both refuse by default.
 pub trait Capabilities: Send + Sync {
     fn observe(&self, _tool: &str, _arguments: &Value, _control: &Control) -> Result<Value> {
         Err("this host observes no tools".into())
@@ -135,32 +136,35 @@ fn page(log: &[Event], target: &str, selector: &Selector) -> Result<Value> {
     let end = from.saturating_add(count).min(events.len());
     let mut selected = Vec::new();
     let mut partial = Vec::new();
-    let mut bytes = 512;
+    // One budget helper for every address space: a log page, a record window and
+    // a single passage all admit units and stop the same way.
+    let mut budget = crate::measure::Budget::new(crate::aja::FRAME_LIMIT);
+    budget.admit(512);
     let mut next = from;
     for event in &events[from..end] {
-        let size = serde_json::to_vec(event)?.len() + 1;
+        let size = crate::measure::bytes(event)? + 1;
+        // An event that cannot fit a frame on its own is stated by its address;
+        // the reader continues with a byte selector instead of losing it.
         if size > crate::aja::FRAME_LIMIT - 512 {
             let locator = serde_json::json!({
                 "id": event.id,
                 "bytes": size - 1,
                 "address": format!("log:event:{}", event.id),
             });
-            let size = crate::measure::value(&locator) + 1;
-            if size > crate::aja::FRAME_LIMIT.saturating_sub(bytes) {
+            if !budget.admit(crate::measure::value(&locator) + 1) {
                 break;
             }
-            bytes += size;
             partial.push(locator);
         } else {
-            if size > crate::aja::FRAME_LIMIT.saturating_sub(bytes) {
+            if !budget.admit(size) {
                 break;
             }
-            bytes += size;
             selected.push(*event);
         }
         next += 1;
     }
+    let truncated = budget.truncated() || next < events.len();
     Ok(
-        serde_json::json!({"events":selected,"partial_events":partial,"from":from,"next":next,"total":events.len(),"truncated":next<events.len()}),
+        serde_json::json!({"events":selected,"partial_events":partial,"from":from,"next":next,"total":events.len(),"truncated":truncated}),
     )
 }

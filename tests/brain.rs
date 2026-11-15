@@ -89,13 +89,13 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         assert!(input.contains("EVIDENCE"));
         assert!(input.contains("recalled digest"));
         assert!(input.contains("recalled structured evidence"));
-        let content = serde_json::json!({
+        let echoed = serde_json::json!({
             "reply": "recorded",
             "actions": [{"op": "propose", "kind": "goal", "target_id": goal.id, "text": "replacement goal"}]
         })
         .to_string();
         let body = serde_json::json!({
-            "choices": [{"message": {"content": content}, "finish_reason":"stop"}]
+            "choices": [{"message": {"content": echoed}, "finish_reason":"stop"}]
         })
         .to_string();
         let response = format!(

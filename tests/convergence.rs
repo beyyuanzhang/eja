@@ -1,3 +1,4 @@
+#![allow(clippy::significant_drop_tightening)] // a guard held for one test block is contention-free
 //! Composition laws: these cross the boundaries that isolated feature tests miss.
 mod support;
 use eja::{
@@ -66,7 +67,7 @@ fn aja(title: &str, run: bool) -> Action {
         run,
     }
 }
-fn edge(from: u64, to: u64, kind: RelationKind) -> Action {
+const fn edge(from: u64, to: u64, kind: RelationKind) -> Action {
     Action::LinkTasks { from, to, kind }
 }
 fn close(id: u64, accepted: bool) -> Action {
@@ -399,7 +400,7 @@ impl Brain for Wait {
 }
 #[test]
 fn turn_deadline_and_cancellation_cross_the_brain_boundary() {
-    let parent = Control::new(Duration::from_secs(5), Default::default());
+    let parent = Control::new(Duration::from_secs(5), std::sync::Arc::default());
     let local = Arc::new(AtomicBool::new(false));
     let child = parent
         .child(Duration::from_secs(50))
@@ -776,12 +777,11 @@ fn cancellation_between_queued_ajas_preserves_completed_evidence_and_skips_the_n
     assert_eq!(*worker.seen.lock().unwrap(), vec![1]);
     assert_eq!(out.dispatched, vec![1]);
     assert_eq!(
-        out.context().tasks[0].digest.as_deref(),
+        out.context().tasks[0].digest(),
         Some("first execution completed")
     );
     assert!(out.context().tasks[1]
-        .digest
-        .as_deref()
+        .digest()
         .unwrap()
         .contains("interrupted"));
     assert!(out

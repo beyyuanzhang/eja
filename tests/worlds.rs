@@ -307,7 +307,7 @@ fn reconciling_a_run_is_one_recorded_observation() {
     let project = dir.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let store = Store::new(&dir).expect("store");
-    let worlds = Shared::new(project.clone(), dir.join(".eja"));
+    let worlds = Shared::new(project, dir.join(".eja"));
     let ports = eja::adapters::Ports {
         worlds: Some(&worlds),
         ..Default::default()
@@ -426,7 +426,7 @@ fn the_shared_world_has_one_owner() {
     let dir = temp_dir("owner");
     let project = dir.join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let shared = Shared::new(project.clone(), dir.join(".eja"));
+    let shared = Shared::new(project, dir.join(".eja"));
     let control = control();
     let first = shared.reserve(1, &control).expect("first reservation");
     // A second run may not write the same directory while the first holds it.
