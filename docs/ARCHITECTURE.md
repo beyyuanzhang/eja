@@ -198,6 +198,9 @@ transcript or manufacture an acceptance.
 - `Host::witness`: the host's own observation of declared acceptance evidence.
   A host that declares none is still complete: the default refuses, so an
   acceptance is unavailable and only a rejection is left open.
+  Failed read-only witnesses may be retried after reconciliation or on a later
+  acceptance attempt, at most once per task per turn; effectful witnesses are
+  not retried automatically.
   `Host::reconcile`: land one run's world, or report its conflicts as the
   recorded outcome.
 - `Worlds`: reserve, settle, reconcile and release the world one execution may
@@ -208,6 +211,8 @@ transcript or manufacture an acceptance.
   cannot isolate refuses, so no second mechanism counts owners and a refused
   world costs no aja id. Release is cleanup, so it runs under a bound the backend
   declares rather than under the spent control of the run it cleans up after.
+  Worktree cleanup removes a directory only after settlement committed it;
+  otherwise the reported absolute path remains available for recovery.
 - `Model` and `ToolGateway`: host effects under inherited grants/control.
 - `RecordReader` / `Capabilities`: what the host lets EJA read or witness,
   composed by Ports, without another state store or task authority.

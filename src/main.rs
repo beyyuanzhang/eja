@@ -158,6 +158,9 @@ fn run() -> Result<()> {
             limits.timeout_ms = env("EJA_TURN_TIMEOUT_MS", limits.timeout_ms)?;
             limits.slots = env("EJA_AJA_SLOTS", limits.slots)?;
             limits.validate()?;
+            if limits.slots > 1 && config.is_some() {
+                return Err("parallel slots cannot use MCP: shared servers are not bound to isolated worlds; set EJA_AJA_SLOTS=1".into());
+            }
             let brain = OpenAiBrain::from_env()?
                 .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?;
             let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;

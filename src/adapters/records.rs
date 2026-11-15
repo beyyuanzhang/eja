@@ -50,6 +50,26 @@ impl Checkpoints {
         world: &Path,
         control: &Control,
     ) -> Result<String> {
+        // Git locks individual commands, but the index and HEAD together form
+        // one transaction. Share this lock across workers and processes.
+        let lock_path = self.git_dir.with_extension("freeze-lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)?;
+        loop {
+            control.check()?;
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let git = |args: &[&str]| super::worlds::git_at(Some(&self.git_dir), world, args, control);
         if !self.git_dir.join("HEAD").exists() {
             fs::create_dir_all(&self.git_dir)?;

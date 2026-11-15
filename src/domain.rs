@@ -531,6 +531,10 @@ impl<'a> Observation<'a> {
 /// Every method inherits host control. A host that declares no worlds and no
 /// acceptance evidence is still a complete host; the defaults say so.
 pub trait Host {
+    /// Whether a failed witness can be called again without repeating an effect.
+    fn witness_retry_safe(&self, _request: &Value) -> bool {
+        false
+    }
     /// One read. A target that parses as an address resolves through that
     /// authority; any other target is a host read tool name.
     fn look(

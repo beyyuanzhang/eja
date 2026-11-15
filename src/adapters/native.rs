@@ -503,7 +503,7 @@ impl Worker for NativeWorker {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Err(e) = fs::create_dir(&aja) {
                 return format!(
-                    "0 steps, 0 tool calls, ended: error\naja already reserved or unavailable: {e}"
+                    "0 steps, 0 tool calls, ended: error\naja already reserved or unavailable: {e}; world retained at {}", world.world.root.display()
                 );
             }
             active.push(ActiveRun {
@@ -521,7 +521,7 @@ impl Worker for NativeWorker {
             Ok(log) => log,
             Err(error) => {
                 return format!(
-                    "0 steps, 0 tool calls, ended: error\naja context is unavailable: {error}"
+                    "0 steps, 0 tool calls, ended: error\naja context is unavailable: {error}; world retained at {}", world.root.display()
                 )
             }
         };
@@ -562,7 +562,11 @@ impl Worker for NativeWorker {
                 }
                 line
             }
-            Err(error) => format!("world: {}: account unavailable ({error})", world.label),
+            Err(error) => format!(
+                "world: {}: account unavailable ({error}); recover at {}",
+                world.label,
+                world.root.display()
+            ),
         };
         self.seal(
             Seal {
@@ -580,7 +584,7 @@ impl Worker for NativeWorker {
             parent,
         )
         .unwrap_or_else(|e| {
-            format!("{steps} steps, 0 tool calls, ended: error\naja could not be frozen: {e}")
+            format!("{steps} steps, 0 tool calls, ended: error\naja could not be frozen: {e}; world: {}", world.root.display())
         })
     }
 }

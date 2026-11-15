@@ -13,6 +13,9 @@ pub trait RecordReader {
 /// An observation is always safe; a witness is an effect-capable host act and
 /// must be declared, so both refuse by default.
 pub trait Capabilities: Send + Sync {
+    fn witness_retry_safe(&self, _request: &Value) -> bool {
+        false
+    }
     fn observe(&self, _tool: &str, _arguments: &Value, _control: &Control) -> Result<Value> {
         Err("this host observes no tools".into())
     }
@@ -31,6 +34,10 @@ pub struct Ports<'a> {
 }
 
 impl Host for Ports<'_> {
+    fn witness_retry_safe(&self, request: &Value) -> bool {
+        self.capabilities
+            .is_some_and(|capabilities| capabilities.witness_retry_safe(request))
+    }
     fn look(
         &self,
         target: &str,

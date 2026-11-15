@@ -167,6 +167,7 @@ struct Connection {
 
 /// One registry/runtime for the application, shared across disposable ajas.
 pub struct McpTools {
+    project: PathBuf,
     runtime: Runtime,
     connections: Vec<Connection>,
     children: Vec<LocalServer>,
@@ -201,6 +202,7 @@ impl McpTools {
             return Err("MCP config exceeds 32 servers".into());
         }
         let mut host = Self {
+            project: project.canonicalize()?,
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
@@ -481,6 +483,9 @@ impl ToolGateway for McpTools {
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         ctx.control.check()?;
+        if ctx.project.canonicalize()? != self.project {
+            return Err("MCP server is not bound to this world".into());
+        }
         let tool = self.tools.get(name).ok_or("MCP tool not granted")?;
         let connection = &self.connections[tool.server];
         let args = args
@@ -597,6 +602,17 @@ impl ToolGateway for HostTools {
 }
 
 impl Capabilities for HostTools {
+    fn witness_retry_safe(&self, request: &Value) -> bool {
+        let Some(tool) = request["tool"].as_str() else {
+            return false;
+        };
+        tool == "read_file"
+            || tool == "list_dir"
+            || self
+                .mcp
+                .as_ref()
+                .is_some_and(|mcp| mcp.is_witness(tool) && mcp.is_read_only(tool))
+    }
     /// EJA may look at the world; it may never act. Files are readable only from
     /// the project, connector tools only when declared read-only.
     fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {

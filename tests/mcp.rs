@@ -615,3 +615,55 @@ fn initialization_deadline_does_not_shorten_future_call_timeouts() {
         .unwrap();
     assert_eq!(value["content"][0]["text"], "later call");
 }
+
+#[test]
+fn shared_mcp_rejects_a_different_world_before_calling_server() {
+    let _lock = serial();
+    let f = Fixture::new();
+    let path = f.config(&json!({"mcpServers":{"fixture":f.stdio("fixture", "files")}}));
+    let host = McpTools::load(&path, f.root(), &control()).unwrap();
+    let world = f.dir("other-world");
+    let c = control();
+    let ctx = ToolContext {
+        aja_id: 1,
+        project: &world,
+        private: f.root(),
+        control: &c,
+    };
+    let error = host
+        .call(
+            &ctx,
+            "mcp__fixture__write_file",
+            &json!({"path":"out.txt","text":"bad"}),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("not bound"), "{error}");
+    assert!(!f.root().join("out.txt").exists());
+    assert!(!f
+        .events("fixture")
+        .iter()
+        .any(|e| e["method"] == "tools/call"));
+}
+
+#[test]
+fn cli_rejects_parallel_slots_with_mcp_before_starting_a_server() {
+    let _lock = serial();
+    let f = Fixture::new();
+    let config = f.config(&json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
+    let out = Command::new(env!("CARGO_BIN_EXE_eja"))
+        .current_dir(f.root())
+        .args([
+            "--dir",
+            f.root().to_str().unwrap(),
+            "--mcp-config",
+            config.to_str().unwrap(),
+            "turn",
+            "hello",
+        ])
+        .env("EJA_AJA_SLOTS", "2")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("parallel slots cannot use MCP"));
+    assert!(!f.root().join("fixture/pid").exists());
+}

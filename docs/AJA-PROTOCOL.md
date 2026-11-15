@@ -77,6 +77,11 @@ Waiting for EJA judgment retains no AJA process. All cleanup and checkpoint
 resources belong to the host. Ordinary filesystem permissions and child processes
 are application boundaries, not an OS security sandbox.
 
+If worktree settlement fails, including cancellation or timeout, its directory
+is retained and the run's account reports its absolute recovery path. A settled
+branch remains available for reconciliation and cannot be replaced by reusing an
+aja id. Checkpoint writes sharing a store serialize the complete Git transaction.
+
 MCP connections belong to the command/application, and are shared across the
 ajas of one host. Cancelling a request asks the server to stop; it cannot undo remote effects.
 Legacy host/admin adapters must satisfy the same bounded-output and Control

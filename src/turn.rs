@@ -54,6 +54,7 @@ struct Progress {
     dispatched: Vec<TaskId>,
     decisions: usize,
     worker_ms: u128,
+    witness_retries: std::collections::HashSet<TaskId>,
 }
 
 /// What one decision produced.
@@ -607,6 +608,25 @@ fn observe_evidence(ctx: &ActionCtx<'_>, state: &mut State, task_id: TaskId) -> 
     )
 }
 
+fn retry_evidence(
+    ctx: &ActionCtx<'_>,
+    state: &mut State,
+    progress: &mut Progress,
+    task_id: TaskId,
+) -> Result<()> {
+    let eligible = state.task(task_id).is_some_and(|task| {
+        task.digest().is_some()
+            && task.evidence_id().is_none()
+            && task
+                .evidence()
+                .is_some_and(|request| ctx.host.witness_retry_safe(request))
+    });
+    if eligible && progress.witness_retries.insert(task_id) {
+        observe_evidence(ctx, state, task_id)?;
+    }
+    Ok(())
+}
+
 /// Reconciling a world is the host's act and its account is evidence. Conflicts
 /// are recorded, never merged away.
 fn reconcile(
@@ -833,6 +853,9 @@ fn apply_actions(
                 accepted,
                 note,
             } => {
+                if *accepted {
+                    retry_evidence(ctx, state, progress, *task_id)?;
+                }
                 if let Some(reason) = close_task(
                     ctx.store, state, *task_id, *accepted, note, ctx.turn, ctx.at,
                 )? {
@@ -841,7 +864,10 @@ fn apply_actions(
                 }
             }
             Action::Reconcile { task_id } => match reconcile(ctx, state, *task_id)? {
-                Ok(()) => effect.fact(),
+                Ok(()) => {
+                    retry_evidence(ctx, state, progress, *task_id)?;
+                    effect.fact();
+                }
                 Err(note) => {
                     let told = refuse(ctx.store, state, ctx, &note)?;
                     effect.noted(told);

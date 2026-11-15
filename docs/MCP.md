@@ -100,6 +100,15 @@ The declaration is checked against the server catalog at load time, like
 declaration, never the model's request, that decides which tools may answer; the
 file read tools are always allowed because they cannot have effects. A witness
 call runs under its own 120-second child deadline.
+After reconciliation or a later acceptance attempt, a failed witness is retried
+at most once per task per turn only when it is read-only (including host file
+reads). Successful evidence is retained; effect-capable witnesses are never
+automatically repeated. An unavailable witness still permits rejection.
+
+MCP servers are shared and bound to the project used when they start, not to
+per-run worktrees. Calls from a different world are refused. The CLI therefore
+rejects `EJA_AJA_SLOTS` greater than one when any MCP configuration is present,
+including an empty or read-only configuration; single-slot MCP remains available.
 
 ## Trust boundary
 

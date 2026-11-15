@@ -1474,3 +1474,259 @@ fn a_record_ancestry_cycle_is_refused() {
         "{digest}"
     );
 }
+
+struct ParallelModel;
+impl Model for ParallelModel {
+    fn complete(
+        &self,
+        messages: &[Value],
+        _: &[Value],
+        _: &Limits,
+        _: &Control,
+        _: bool,
+    ) -> Result<Value> {
+        if messages.last().unwrap()["role"] == "tool" {
+            Ok(final_message(&[]))
+        } else {
+            Ok(calls(vec![call("deliver", json!({}))]))
+        }
+    }
+}
+struct ParallelDelivery(std::sync::atomic::AtomicUsize);
+impl ToolGateway for ParallelDelivery {
+    fn definitions(&self, _: &Assignment) -> Vec<Value> {
+        vec![
+            json!({"type":"function","function":{"name":"deliver","parameters":{"type":"object","properties":{}}}}),
+        ]
+    }
+    fn call(&self, ctx: &ToolContext<'_>, _: &str, _: &Value) -> Result<Value> {
+        std::fs::write(ctx.project.join("delivered.txt"), ctx.aja_id.to_string())?;
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.0.load(Ordering::SeqCst) < 2 {
+            ctx.control.check()?;
+            if Instant::now() >= deadline {
+                return Err("parallel delivery peer did not arrive".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(json!({"ok":true}))
+    }
+}
+fn git_project(state: &State) {
+    for args in [
+        &["init", "--quiet"][..],
+        &["add", "-A"][..],
+        &[
+            "-c",
+            "user.name=eja",
+            "-c",
+            "user.email=eja@local",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ][..],
+    ] {
+        if args[0] == "add" {
+            std::fs::write(state.path().join("base"), "base").unwrap();
+            std::fs::create_dir_all(state.path().join(".eja")).unwrap();
+            std::fs::write(state.path().join(".eja/.gitignore"), "*\n").unwrap();
+        }
+        assert!(Command::new("git")
+            .current_dir(state.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+#[test]
+fn parallel_native_worktrees_freeze_each_runs_own_content() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = workspace("parallel-native-worlds");
+    git_project(&f);
+    let worlds = Arc::new(
+        eja::adapters::Worktrees::new(
+            f.path(),
+            f.path().join(".eja/worlds"),
+            f.path().join(".eja"),
+            &control(),
+        )
+        .unwrap(),
+    );
+    let worker = NativeWorker::new(
+        env!("CARGO_BIN_EXE_eja"),
+        f.path().join(".eja/ajas"),
+        f.path(),
+        Arc::new(ParallelModel),
+        Arc::new(ParallelDelivery(std::sync::atomic::AtomicUsize::new(0))),
+    )
+    .unwrap()
+    .with_worlds(worlds);
+    std::thread::scope(|s| {
+        for id in 1..=2 {
+            let worker = &worker;
+            s.spawn(move || {
+                let digest = worker.execute(&assignment(id), &control());
+                assert!(!digest.contains("unavailable"), "{digest}");
+            });
+        }
+    });
+    for id in 1..=2 {
+        let manifest = manifest_of(&f, id);
+        let commit = manifest["checkpoint"].as_str().unwrap();
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(f.path().join(".eja/checkpoints"))
+            .args(["show", &format!("{commit}:delivered.txt")])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), id.to_string());
+    }
+}
+struct InterruptDelivery {
+    flag: Arc<AtomicBool>,
+    wait: bool,
+}
+impl ToolGateway for InterruptDelivery {
+    fn definitions(&self, _: &Assignment) -> Vec<Value> {
+        vec![
+            json!({"type":"function","function":{"name":"deliver","parameters":{"type":"object","properties":{}}}}),
+        ]
+    }
+    fn call(&self, ctx: &ToolContext<'_>, _: &str, _: &Value) -> Result<Value> {
+        std::fs::write(ctx.project.join("delivered.txt"), "recover me")?;
+        if self.wait {
+            while ctx.control.check().is_ok() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            self.flag.store(true, Ordering::SeqCst);
+        }
+        Ok(json!({}))
+    }
+}
+#[test]
+fn cancelled_or_expired_parent_keeps_unsaved_worktree() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for wait in [false, true] {
+        let f = workspace("recover-native");
+        git_project(&f);
+        let worlds = Arc::new(
+            eja::adapters::Worktrees::new(
+                f.path(),
+                f.path().join(".eja/worlds"),
+                f.path().join(".eja"),
+                &control(),
+            )
+            .unwrap(),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let worker = NativeWorker::new(
+            env!("CARGO_BIN_EXE_eja"),
+            f.path().join(".eja/ajas"),
+            f.path(),
+            Arc::new(ParallelModel),
+            Arc::new(InterruptDelivery {
+                flag: flag.clone(),
+                wait,
+            }),
+        )
+        .unwrap()
+        .with_worlds(worlds.clone());
+        let parent = Control::new(Duration::from_secs(if wait { 5 } else { 30 }), flag);
+        let digest = worker.execute(&assignment(1), &parent);
+        let path = f.path().join(".eja/worlds/1");
+        assert_eq!(
+            std::fs::read_to_string(path.join("delivered.txt")).unwrap(),
+            "recover me"
+        );
+        assert!(
+            digest.contains(path.canonicalize().unwrap().to_str().unwrap()),
+            "{digest}"
+        );
+        assert!(eja::adapters::Worlds::reserve(&*worlds, 1, &control()).is_err());
+    }
+}
+
+struct OneDelivery;
+impl ToolGateway for OneDelivery {
+    fn definitions(&self, _: &Assignment) -> Vec<Value> {
+        vec![
+            json!({"type":"function","function":{"name":"deliver","parameters":{"type":"object","properties":{}}}}),
+        ]
+    }
+    fn call(&self, ctx: &ToolContext<'_>, _: &str, _: &Value) -> Result<Value> {
+        std::fs::write(ctx.project.join("delivered.txt"), "landed")?;
+        Ok(json!({}))
+    }
+}
+#[test]
+fn reconciliation_retries_file_witness_and_enables_acceptance() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = workspace("native-witness");
+    git_project(&f);
+    let private = f.path().join(".eja");
+    let worlds = Arc::new(
+        eja::adapters::Worktrees::new(f.path(), private.join("worlds"), &private, &control())
+            .unwrap(),
+    );
+    let worker = NativeWorker::new(
+        env!("CARGO_BIN_EXE_eja"),
+        private.join("ajas"),
+        f.path(),
+        Arc::new(ParallelModel),
+        Arc::new(OneDelivery),
+    )
+    .unwrap()
+    .with_worlds(worlds.clone());
+    let tools = eja::adapters::HostTools::new(None, f.path(), &private, &control()).unwrap();
+    let ports = eja::adapters::Ports {
+        worlds: Some(&*worlds),
+        capabilities: Some(&tools),
+        aja: None,
+    };
+    let brain = support::Script::new(vec![
+        support::decision(vec![eja::Action::OpenTask {
+            title: "deliver".into(),
+            request: "deliver".into(),
+            acceptance: "file exists".into(),
+            evidence: Some(json!({"tool":"read_file","arguments":{"path":"delivered.txt"}})),
+            run: true,
+        }]),
+        support::decision(vec![
+            eja::Action::Reconcile { task_id: 1 },
+            eja::Action::CloseTask {
+                task_id: 1,
+                accepted: true,
+                note: "seen".into(),
+            },
+        ]),
+    ]);
+    let store = eja::Store::new(private.join("journal")).unwrap();
+    let out = eja::turn(&store, "run", &brain, &worker, &ports).unwrap();
+    let task = &out.context().tasks[0];
+    assert_eq!(task.status, eja::TaskStatus::Done);
+    assert!(task.evidence_id().is_some());
+    let observations: Vec<_> = store
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.scope == "task:1" && e.kind == eja::Kind::Observed)
+        .collect();
+    assert_eq!(observations.len(), 2);
+    assert!(observations[0].data.as_ref().unwrap()["error"].is_string());
+    assert!(observations[1].data.as_ref().unwrap()["error"].is_null());
+    assert_eq!(
+        std::fs::read_to_string(f.path().join("delivered.txt")).unwrap(),
+        "landed"
+    );
+}

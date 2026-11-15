@@ -7,7 +7,7 @@ use super::process;
 use crate::{Control, Result};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -299,6 +299,7 @@ pub struct Worktrees {
     root: PathBuf,
     private: PathBuf,
     open: Open,
+    saved: Mutex<HashSet<u64>>,
 }
 
 /// One hermetic git invocation. Both durability paths — a run's fossil and a
@@ -359,18 +360,25 @@ impl Worktrees {
         private: impl Into<PathBuf>,
         control: &Control,
     ) -> Result<Self> {
+        control.check()?;
         let project = project.into();
         let root = root.into();
+        let private = private.into();
+        std::fs::create_dir_all(&root)?;
+        let root = root.canonicalize()?;
+        let private = private
+            .canonicalize()
+            .or_else(|_| std::path::absolute(&private))?;
         let top = git(&project, &["rev-parse", "--show-toplevel"], control)
             .map_err(|_| "isolated worlds need a git project")?;
         git(&project, &["rev-parse", "--verify", "HEAD"], control)
             .map_err(|_| "isolated worlds need one commit to branch from")?;
-        std::fs::create_dir_all(&root)?;
         Ok(Self {
             project: PathBuf::from(top),
             root,
-            private: private.into(),
+            private,
             open: Mutex::new(HashMap::new()),
+            saved: Mutex::new(HashSet::new()),
         })
     }
 
@@ -397,18 +405,26 @@ impl Worlds for Worktrees {
     fn reserve(&self, task: u64, control: &Control) -> Result<World> {
         let root = self.root.join(task.to_string());
         if root.exists() {
-            let text = root.to_string_lossy().to_string();
-            let _ = git(
-                &self.project,
-                &["worktree", "remove", "--force", &text],
-                control,
-            );
-            std::fs::remove_dir_all(&root).ok();
+            return Err(format!("world already exists; recover it at {}", root.display()).into());
         }
         let branch = self.branch(task);
         let head = git(&self.project, &["rev-parse", "--verify", "HEAD"], control)?;
-        // A restart must not reuse a branch: the new execution gets a new id.
-        let _ = git(&self.project, &["branch", "-D", &branch], control);
+        // Never replace a previous run's durable branch, even after its worktree
+        // was released. A new execution must use a new task id.
+        if git(
+            &self.project,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+            control,
+        )
+        .is_ok()
+        {
+            return Err(format!("world branch already exists: {branch}").into());
+        }
         let root_text = root.to_string_lossy().to_string();
         git(
             &self.project,
@@ -447,6 +463,10 @@ impl Worlds for Worktrees {
             control,
         )?;
         let commit = git(&world.root, &["rev-parse", "HEAD"], control)?;
+        self.saved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(world.task);
         Ok(json!({
             "world": world.label,
             "change": delta.line(),
@@ -487,6 +507,14 @@ impl Worlds for Worktrees {
     fn release(&self, world: &World) {
         // The branch keeps the work; the directory is only a workspace.
         forget(&self.open, world.task);
+        if !self
+            .saved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&world.task)
+        {
+            return;
+        }
         let control = crate::Control::new(RELEASE, std::sync::Arc::default());
         let text = world.root.to_string_lossy().to_string();
         let _ = git(

@@ -257,6 +257,11 @@ host runs one shared world. Above one it needs a git project with at least one
 commit, because each run gets its own worktree and branch (`<dir>/worlds/<id>`)
 and is reconciled only when asked. A worktree world starts at `HEAD`: uncommitted
 project changes stay in the project and are reported by the run's own account.
+The CLI rejects multiple slots whenever an MCP configuration is present: shared
+MCP servers are not bound to individual worktrees. The MCP adapter also rejects
+calls from a different world. A worktree that could not be settled is retained;
+the run's account gives its absolute path for recovery. Settled branches are not
+replaced when a task id is reused.
 `--task ID` selects initial focus. `show audit:ID` follows explicit containment
 and continuation edges; matching input text never invents a job relationship.
 

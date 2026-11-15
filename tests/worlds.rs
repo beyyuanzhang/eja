@@ -441,3 +441,102 @@ fn a_world_per_run_needs_a_git_project() {
     let error = refused.err().expect("a plain directory cannot be forked");
     assert!(error.to_string().contains("git"), "{error}");
 }
+
+#[test]
+fn failed_settlement_preserves_the_world_and_a_saved_branch_cannot_be_replaced() {
+    let state = State::new("preserved-world");
+    let project = project_with_one_commit(&state);
+    let worlds = Worktrees::new(
+        &project,
+        project.join(".eja/worlds"),
+        project.join(".eja"),
+        &control(),
+    )
+    .unwrap();
+    let world = worlds.reserve(1, &control()).unwrap();
+    std::fs::write(world.root.join("out"), "recover").unwrap();
+    let cancelled = Control::new(
+        Duration::from_secs(10),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
+    assert!(worlds.settle(&world, &cancelled).is_err());
+    worlds.release(&world);
+    assert_eq!(
+        std::fs::read_to_string(world.root.join("out")).unwrap(),
+        "recover"
+    );
+    assert!(worlds.reserve(1, &control()).is_err());
+    let broken = worlds.reserve(3, &control()).unwrap();
+    std::fs::write(broken.root.join("out"), "git failure").unwrap();
+    std::fs::remove_file(broken.root.join(".git")).unwrap();
+    assert!(worlds.settle(&broken, &control()).is_err());
+    worlds.release(&broken);
+    assert_eq!(
+        std::fs::read_to_string(broken.root.join("out")).unwrap(),
+        "git failure"
+    );
+    let saved = worlds.reserve(2, &control()).unwrap();
+    std::fs::write(saved.root.join("out"), "saved").unwrap();
+    let commit = worlds.settle(&saved, &control()).unwrap()["commit"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    worlds.release(&saved);
+    assert!(!saved.root.exists());
+    assert!(worlds.reserve(2, &control()).is_err());
+    assert_eq!(worlds.reconcile(2, &control()).unwrap()["merged"], true);
+    assert_eq!(
+        std::fs::read_to_string(project.join("out")).unwrap(),
+        "saved"
+    );
+    assert!(!commit.is_empty());
+}
+
+#[test]
+fn relative_roots_resolve_before_project_is_rebased_to_git_top() {
+    if std::env::var_os("EJA_RELATIVE_WORLD_CHILD").is_some() {
+        std::fs::create_dir_all(".eja").unwrap();
+        let worlds = Worktrees::new(".", ".eja/worlds", ".eja", &control()).unwrap();
+        let world = worlds.reserve(41, &control()).unwrap();
+        let expected = std::env::current_dir().unwrap().join(".eja/worlds/41");
+        assert_eq!(world.root, expected.canonicalize().unwrap());
+        worlds.settle(&world, &control()).unwrap();
+        worlds.release(&world);
+        let alias = Worktrees::new(".", ".eja/worlds/../worlds", ".eja", &control()).unwrap();
+        assert!(alias.reserve(41, &control()).is_err());
+        return;
+    }
+    let state = State::new("relative-world");
+    let project = project_with_one_commit(&state);
+    let sub = project.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .current_dir(&sub)
+        .env("EJA_RELATIVE_WORLD_CHILD", "1")
+        .args([
+            "--exact",
+            "relative_roots_resolve_before_project_is_rebased_to_git_top",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn cancelled_world_setup_does_not_create_the_state_root() {
+    let state = State::new("cancel-world-setup");
+    let project = project_with_one_commit(&state);
+    let root = project.join(".eja/new-worlds");
+    let cancelled = Control::new(
+        Duration::from_secs(10),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
+    assert!(Worktrees::new(&project, &root, project.join(".eja"), &cancelled).is_err());
+    assert!(!root.exists());
+}

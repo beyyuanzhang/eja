@@ -245,3 +245,59 @@ fn an_approval_authorizes_only_the_turn_it_was_recorded_in() {
         stale.context().refused
     );
 }
+
+#[test]
+fn failed_read_only_witness_retries_later_but_effectful_witness_does_not() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Flaky {
+        calls: AtomicUsize,
+        safe: bool,
+    }
+    impl Capabilities for Flaky {
+        fn witness_retry_safe(&self, _: &Value) -> bool {
+            self.safe
+        }
+        fn witness(&self, _: &Value, _: &eja::Control) -> eja::Result<Value> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err("temporarily unavailable".into())
+            } else {
+                Ok(json!({"ok":true}))
+            }
+        }
+    }
+    for safe in [true, false] {
+        let fixture = State::new("retry-witness");
+        let store = fixture.store();
+        let cap = Flaky {
+            calls: AtomicUsize::new(0),
+            safe,
+        };
+        let ports = Ports {
+            capabilities: Some(&cap),
+            ..Default::default()
+        };
+        turn(&store, "run", run_steps(), &ports);
+        for _ in 0..2 {
+            turn(
+                &store,
+                "accept",
+                vec![decision(vec![Action::CloseTask {
+                    task_id: 1,
+                    accepted: true,
+                    note: "verified".into(),
+                }])],
+                &ports,
+            );
+        }
+        let task = &support::opened(&store)[0];
+        assert_eq!(
+            task.status,
+            if safe {
+                TaskStatus::Done
+            } else {
+                TaskStatus::Waiting
+            }
+        );
+        assert_eq!(cap.calls.load(Ordering::SeqCst), if safe { 3 } else { 1 });
+    }
+}
