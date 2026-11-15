@@ -37,8 +37,10 @@ at most 1 KiB from a full result in this aja or its explicit ancestry.
 Context fitting folds the transcript: the system prompt, the assignment, and the
 newest steps stay whole while the budget allows, older steps become one address
 line each, and the oldest fold into one address range. Nothing is deleted from
-the record, and every folded step is read back with its `record:<aja>/<path>`
-address — the same address space as `log:` and `world:`.
+the record. Every step line names the record entry it came from, and the fold line
+names the range of those entries, so a folded step is read back with
+`eja_read_record {aja, entry}` — the record half of the same address space that
+`log:` and `world:` name from the host side.
 A contract that cannot fit even at that scale ends with budget. Incomplete
 provider responses and invalid tool messages end with error.
 
@@ -48,6 +50,10 @@ provider responses and invalid tool messages end with error.
 finish. Start stores only fresh messages. The frozen assignment.resume is its parent address. A
 continuation does not copy ancestor payloads. Replaying legacy records that
 already contain inherited start messages treats them as ancestry roots.
+
+Replaying a predecessor folds its transcript against the same budget, but only
+when the working set outgrows it: measuring the whole transcript once per record
+entry would cost the square of a long record for no new information.
 
 `aja.json` is published by atomic rename after process cleanup and transcript
 sync. It contains assignment, digest, optional checkpoint, checkpoint_error,

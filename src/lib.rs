@@ -12,15 +12,13 @@ pub mod adapters;
 pub mod aja;
 mod control;
 mod domain;
-pub mod fold;
+mod fold;
+mod measure;
 mod state;
 mod store;
 mod turn;
 pub use control::{Control, ControlError, INTERRUPTED};
 pub use domain::*;
-pub use state::{
-    active_identity, current_goal, open_commitments, project, project_with_evidence, relations,
-    tasks,
-};
+pub use state::State;
 pub use store::{format_utc, now_utc, Store};
 pub use turn::{recover, turn, turn_at, turn_at_with_options};

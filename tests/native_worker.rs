@@ -368,8 +368,8 @@ fn a_continuation_starts_from_the_predecessor_record() {
     assert!(
         first_call_of_second_aja[0]["content"]
             .as_str()
-            .is_some_and(|text| text.starts_with("You are AJA")),
-        "the predecessor transcript is inherited"
+            .is_some_and(|text| text.starts_with("You are one AJA")),
+        "the inherited turn opens with the current system contract"
     );
     assert!(
         first_call_of_second_aja
@@ -576,9 +576,11 @@ fn timeout_cancellation_and_busy_slot_release_all_aja_resources() {
         }
         let pids = worker_pids();
         assert!(!pids.is_empty());
-        assert!(w
-            .execute(&assignment(2), &control())
-            .contains("ended: budget"));
+        // One shared world has one owner: the second run is refused by the world,
+        // not by a slot counter in the worker, and it costs no aja id.
+        let refused = w.execute(&assignment(2), &control());
+        assert!(refused.contains("ended: error"), "{refused}");
+        assert!(refused.contains("one owner"), "{refused}");
         assert!(!f.0.join(".eja/ajas/2").exists());
         if cancel {
             assert!(w.cancel(1));

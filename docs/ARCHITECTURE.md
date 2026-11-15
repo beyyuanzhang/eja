@@ -8,7 +8,7 @@ protocol and MCP documents specify their boundaries, not additional authorities.
 ```
 P = (L, R, K)                         persistent facts and evidence
 S = fold(L)                          logical state
-C = view_B(S, input, evidence(P))     model's bounded working view
+C = view_B(S, input)                  model's bounded working view
 A = model(C)                         proposed typed actions
 (O, W') = execute(A, W, grants, ctrl) actual observations and external effects
 L' = L ++ events(A, O)               recorded transition
@@ -21,6 +21,13 @@ Every view points at one **address** in one authority — `log:<target>`,
 address is a host read tool. Folding and reading use that one namespace.
 One fact has one authority; keeping a derived index or snapshot does not create
 another authority. Folding never re-executes world effects.
+
+`fold` is one value, not a library of scans. `State` applies the journal event by
+event — the initial `fold` and every append inside a turn run the same transition
+— so a decision is validated against the state it will produce, the journal is
+read once per turn, and the projection is a read of that value. Every derived
+thing (task table, graph, pending proposals, the turn's evidence) is a field or a
+trivial read of it, never a second pass that could disagree.
 
 ## Five invariants
 
@@ -39,22 +46,32 @@ another authority. Folding never re-executes world effects.
    cannot be obtained cannot strand a task.
 3. **Bounded, addressable views.** One renderer produces every model-facing
    view: EJA's projection and a aja transcript are the same call over different
-   spaces (the log; the aja's own record). Regions are shown whole while the
-   declared budget allows, one line plus handle after that, and the oldest fold
-   into one address range; a folded region stays addressable, so unfolding is a
-   read, never a re-derivation. Full payloads remain addressable. Continuation
-   stores parent references, reconstructs a valid prefix, applies the budget
-   before transport, and uses the new assignment and new system budget. Views
-   never change facts.
+   spaces (the log; the aja's own record). Every region carries the address that
+   reads it back — `log:event:12`, `log:task:3`, or the record entry an aja
+   reads with `eja_read_record`. Regions are shown whole while the declared
+   budget allows, one line with that address after that, and the oldest fold into
+   one address range; unfolding is a read, never a re-derivation. A region that
+   names no address says so instead of promising a handle. Full payloads remain
+   addressable. One selector vocabulary — whole, range, match, bytes — is applied
+   to the space each authority is: a log page takes whole or range (and an
+   oversized event also takes bytes), a frozen record file takes whole, range or
+   match, and a world address names one path and takes none. Continuation stores
+   parent references, reconstructs a valid prefix, applies the budget before
+   transport, and uses the new assignment and new system budget. Views never
+   change facts.
 4. **One execution meaning.** An aja executes once; groups aggregate and never
    execute. Continuation has one predecessor. Dependency and containment rules
    are checked against one combined completion-order graph before logging.
 5. **Owned finite execution.** Every turn has decision/action/dispatch/time
    budgets and a slot budget. Every aja has its own time/context/response budget.
    One Control hierarchy can only shorten authority's deadline. Each execution
-   reserves one world and owns one process; parallel slots require isolated
-   worlds, and one shared world has one execution owner. Stop reasons and
-   evidence survive cleanup; recovery never reruns a aja.
+   reserves one world and owns one process. The turn owns how many runs a decision
+   may start; the world backend owns how many may exist at once, because it is
+   the only thing that knows whether a world is isolated: one shared world has one
+   owner, and refusing a world refuses the run before it costs an aja id. Releasing
+   a world is cleanup, so it runs under a bound the backend declares, never under
+   the spent control of the run it cleans up after. Stop reasons and evidence
+   survive cleanup; recovery never reruns a aja.
 
 Protocol-independent work tactics remain model decisions. A global waiting-task
 flag is not an observation capability. Text equality is not a task relationship.
@@ -87,7 +104,7 @@ Three properties are testable, and `tests/identity.rs` holds them:
 
 | Entity | Operation | Preconditions / result |
 |---|---|---|
-| Aja | open_task | Open, no execution yet; `evidence` fixes the acceptance witness |
+| Aja | open_task | Open, no execution yet; `evidence` fixes the observation its judgment needs |
 | Aja | dispatch | Open; depends_on targets Done; continues target has a frozen-run report; then Running |
 | Aja | worker report / recovery | Running -> Waiting |
 | Aja | close_task | Waiting -> Done or Failed, EJA's judgment; needs the witness evidence when `evidence` was declared |
@@ -114,6 +131,12 @@ retroactively change the assignment. Identical relation insertion is idempotent.
 
 ## Records and views
 
+An observation says what it is — `look`, `witness` or `reconcile` — and its
+target then names the subject. The kind is a typed field, never a reserved target
+string: a host read tool may be named `witness`, and a fact may not depend on
+that collision staying unambiguous. A look that repeats keeps the newest answer
+in the projection, so the same read twice states the same information.
+
 A v1 start record contains `{kind:"start", view_version:1, messages}`;
 messages contain only this aja's system and assignment. The frozen
 `assignment.resume` is the sole parent address. Tool entries include
@@ -130,10 +153,14 @@ host state. Live model messages use the current system contract even when old
 messages are inherited.
 
 The fold states its landing scale in the rendered view only when the budget
-forced something out; a view that fits whole carries no notice. A aja whose
-transcript cannot fit even as one address line stops with `budget` and continues
-in a new aja, so a transcript is never re-sent pinned at the cap. No checkpoint is restored during continuation: historical
-observations must be distinguished from current world observations.
+forced something out; a view that fits whole carries no notice. A region shown at
+index scale names the address range that unfolds it, so the notice and the lines
+agree about how to reach the rest: a projection leaves its facts readable by id,
+and a transcript leaves them readable as record entries. A aja whose transcript
+cannot fit even as one address line stops with `budget` and continues in a new
+aja, so a transcript is never re-sent pinned at the cap. No checkpoint is
+restored during continuation: historical observations must be distinguished from
+current world observations.
 
 Checkpoint file reads and native record reads share one source resolver for
 whole/range/match. Readers bound retained bytes and return truncation metadata.
@@ -161,7 +188,10 @@ transcript or manufacture an acceptance.
   change. A world is a lease — where a run may write — and the backend keeps the
   reservation that turns it into an account: one line, measured, complete or
   explicitly unobserved. Isolation is the host's decision; the kernel never
-  assumes a repository.
+  assumes a repository. Reserve is also the concurrency guard: a backend that
+  cannot isolate refuses, so no second mechanism counts owners and a refused
+  world costs no aja id. Release is cleanup, so it runs under a bound the backend
+  declares rather than under the spent control of the run it cleans up after.
 - `Model` and `ToolGateway`: host effects under inherited grants/control.
 - `RecordReader` / `Capabilities`: what the host lets EJA read or witness,
   composed by Ports, without another state store or task authority.
@@ -197,7 +227,11 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | A folded region reads back through its address | identity |
 | A host approval authorizes only the turn it was recorded in | acceptance |
 | Acceptance needs observed evidence; a rejection needs none | acceptance |
+| A repeated read states the same information, so a turn ends at its fixpoint | turn_steps |
+| The turn's evidence is folded from the journal, never supplied by a caller | projection |
+| A folded region names an address that reads it | fold + identity |
 | Parallel slots run at once and the log keeps action order | worlds |
+| One world, one owner: a second run is refused before it costs an aja id | worlds |
 | A worktree world settles and reconciles explicitly; conflicts are reported | worlds |
 
 Repeated projections detect stalls. They are not a convergence proof. The strict
@@ -206,7 +240,10 @@ remains model-dependent.
 
 ## Ownership and compatibility
 
-Core modules are `domain`, `store`, `state`, `turn`, and shared `control`.
+Core modules are `domain`, `store`, `state`, `turn`, the shared `control`
+and the one renderer `fold`. `state` is the fold itself: `S = fold(L)` is a
+value the turn maintains by pushing each event it commits, so the journal is read
+once per turn and every derived table is a field of that value.
 Adapters never obtain a mutable identity handle. Store's low-level append API is
 for trusted host/admin code, including fixture construction. The journal-wide
 Unix turn lease is the sole turn exclusion guard. Append locking and stale-cursor

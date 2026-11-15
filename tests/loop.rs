@@ -1,7 +1,7 @@
 use eja::adapters::{render_context, Ports};
 use eja::{
-    active_identity, open_commitments, tasks, turn_at, Action, Assignment, Brain, Decision,
-    EjaContext, Kind, ProposalKind, Store, TaskStatus, Worker,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, State, Store,
+    TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -383,8 +383,9 @@ fn identity_is_reconstructed_and_worker_reports_are_not_identity() {
     );
 
     let events = store.events().expect("events");
-    assert_eq!(open_commitments(&events).len(), 1);
-    assert!(!active_identity(&events)
+    assert_eq!(State::fold(events.clone()).commitments().len(), 1);
+    assert!(!State::fold(events.clone())
+        .identity()
         .iter()
         .any(|event| event.kind == Kind::WorkerReport));
 }
@@ -568,7 +569,7 @@ fn correction_targets_an_event_id_not_a_phrase() {
         None,
         now(),
     );
-    let commitment = open_commitments(&store.events().expect("events"))[0].clone();
+    let commitment = State::load(&store).expect("state").commitments()[0].clone();
 
     let wrong = QueueBrain::new(vec![decision(
         "wrong target",
@@ -587,7 +588,7 @@ fn correction_targets_an_event_id_not_a_phrase() {
         now(),
     )
     .expect("wrong");
-    assert_eq!(open_commitments(&store.events().expect("events")).len(), 1);
+    assert_eq!(State::load(&store).expect("state").commitments().len(), 1);
 
     propose_and_confirm(
         &store,
@@ -597,8 +598,9 @@ fn correction_targets_an_event_id_not_a_phrase() {
         now(),
     );
     let events = store.events().expect("events");
-    assert!(open_commitments(&events).is_empty());
-    assert!(!tasks(&events)
+    assert!(State::fold(events.clone()).commitments().is_empty());
+    assert!(!State::fold(events.clone())
+        .tasks()
         .iter()
         .any(|task| task.status == TaskStatus::Running));
 }

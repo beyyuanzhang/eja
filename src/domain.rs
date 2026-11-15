@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+/// The one error type of a port. `Send + Sync` because a worker runs on its own
+/// thread and its failure must be reportable from there.
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Result<T> = std::result::Result<T, Error>;
 pub type TaskId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +62,9 @@ impl ProposalKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A pending proposal as a projection sees it. It is a view: the fact is the
+/// `Proposal` event, and the section of the journal it lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposalView {
     pub id: u64,
     pub kind: ProposalKind,
@@ -68,7 +73,6 @@ pub struct ProposalView {
     pub created_at: i64,
     pub turn: u64,
     /// True when the host recorded an approval for this turn.
-    #[serde(default)]
     pub approved: bool,
 }
 
@@ -79,7 +83,7 @@ pub(crate) struct ProposalData {
     pub(crate) target_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: u64,
     pub at: i64,
@@ -209,7 +213,9 @@ pub struct CloseOutcome {
     pub note: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One task, folded from its own events. A group shares this shape and never
+/// executes, so a run's fields stay empty for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
     pub kind: TaskKind,
     pub id: TaskId,
@@ -224,16 +230,15 @@ pub struct Task {
     pub digest: Option<String>,
     pub close: Option<CloseOutcome>,
     /// The acceptance evidence this task asked the host for, fixed at open.
-    #[serde(default)]
-    pub witness: Option<Value>,
+    pub evidence: Option<Value>,
     /// The observation that answered it, when the host produced one.
-    #[serde(default)]
-    pub witness_id: Option<u64>,
-    #[serde(default)]
-    pub witness_result: Option<Value>,
+    pub evidence_id: Option<u64>,
+    pub evidence_result: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// The model's bounded working view. A projection is derived from the journal
+/// every time it is read, so it is not a fact and is not serializable.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EjaContext {
     pub now: i64,
     pub input: String,
@@ -245,6 +250,9 @@ pub struct EjaContext {
     pub relations: Vec<Edge>,
     /// The task the projection is about; it is one of `tasks`.
     pub focus: Option<TaskId>,
+    /// What this turn observed, folded from the events that recorded it. An
+    /// observation names its own subject, so a repeat of the same read is the
+    /// same entry and the view states the same information.
     pub evidence: Vec<Observation>,
     pub proposals: Vec<ProposalView>,
     /// Actions this turn that the host could not carry out.
@@ -360,9 +368,26 @@ pub enum Selector {
     },
 }
 
-/// One look, recorded once. This is the only shape an EJA observation has.
+/// What one observation is. A fact says what kind it is; a target string never
+/// does, or a host tool named after an authority would be read as that authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationKind {
+    /// What EJA read: an address, or a host read tool.
+    #[default]
+    Look,
+    /// The host's answer to the acceptance evidence one task asked for.
+    Witness,
+    /// The host's account of one run's world.
+    Reconcile,
+}
+
+/// One observation, recorded once. This is the only shape an EJA observation has.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Observation {
+    /// What this is; `target` names its subject.
+    #[serde(default)]
+    pub kind: ObservationKind,
     pub target: String,
     #[serde(default)]
     pub arguments: Value,

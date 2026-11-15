@@ -3,13 +3,20 @@ use crate::{Control, Result};
 use std::{
     io::Read,
     process::{Child, Command, Stdio},
+    sync::mpsc::{self, RecvTimeoutError},
     time::Duration,
 };
+
+/// How often the watcher looks at the run's control while the child runs.
+const WATCH: Duration = Duration::from_millis(5);
 
 struct Owned(Child);
 impl Drop for Owned {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        // SAFETY: the child was spawned into its own process group above, so its
+        // id is a live group id owned by this process; killing that group ends the
+        // command and anything it started. Killing an already-reaped group is a
+        // no-op error that this path ignores on purpose.
         unsafe {
             libc::killpg(self.0.id() as i32, libc::SIGKILL);
         }
@@ -17,9 +24,9 @@ impl Drop for Owned {
         let _ = self.0.wait();
     }
 }
+
 pub(crate) fn output(command: &mut Command, control: &Control, limit: usize) -> Result<Vec<u8>> {
     control.check()?;
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
@@ -51,30 +58,44 @@ pub(crate) fn output(command: &mut Command, control: &Control, limit: usize) -> 
     };
     let out = std::thread::spawn(move || read(Box::new(stdout)));
     let err = std::thread::spawn(move || read(Box::new(stderr)));
-    let status = (|| -> Result<_> {
-        loop {
-            if let Some(status) = child.0.try_wait()? {
-                return Ok(status);
+    // The caller blocks on the child; one watcher enforces its control. Nothing on
+    // this path polls the child to discover that it finished.
+    let id = child.0.id() as i32;
+    let (stop, stopped) = mpsc::channel::<()>();
+    let watcher = {
+        let control = control.clone();
+        std::thread::spawn(move || loop {
+            match stopped.recv_timeout(WATCH) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => {}
             }
-            control.check()?;
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    })();
-    drop(child);
-    let out = out.join();
-    let err = err.join();
-    let (out, overflow) = out.map_err(|_| "command stdout reader panicked")??;
-    let (err, err_overflow) = err.map_err(|_| "command stderr reader panicked")??;
+            if control.check().is_err() {
+                // SAFETY: same group id as above; the child is alive until reaped.
+                unsafe {
+                    libc::killpg(id, libc::SIGKILL);
+                }
+                return;
+            }
+        })
+    };
+    let status = child.0.wait();
+    drop(stop);
+    let _ = watcher.join();
+    let (out, err) = (out.join(), err.join());
     let status = status?;
-    if overflow || err_overflow {
-        return Err("command output limit reached".into());
-    }
+    let (err, err_overflow) = err.map_err(|_| "command stderr reader panicked")??;
     if !status.success() {
+        // A control that expired while the child ran is the reason it died.
+        control.check()?;
         return Err(format!(
             "checkpoint command failed: {}",
             String::from_utf8_lossy(&err).trim()
         )
         .into());
+    }
+    let (out, overflow) = out.map_err(|_| "command stdout reader panicked")??;
+    if overflow || err_overflow {
+        return Err("command output limit reached".into());
     }
     Ok(out)
 }

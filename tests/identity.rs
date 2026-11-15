@@ -1,6 +1,6 @@
 mod support;
 use eja::adapters::{render_context, render_context_within, Ports, SYSTEM_PROMPT};
-use eja::{project, EventMeta, Host, Kind, Selector, Store};
+use eja::{EventMeta, Host, Kind, Selector, State, Store};
 use support::control;
 
 /// The contract states the protocol; the projection states the history. Neither
@@ -42,7 +42,9 @@ fn the_self_survives_budget_pressure_before_the_indexes_do() {
             )
             .unwrap();
     }
-    let context = project(&store, "go", None, eja::now_utc()).expect("project");
+    let context = State::load(&store)
+        .expect("state")
+        .project("go", None, eja::now_utc());
 
     // Reading order is a claim about what the subject is.
     let whole = render_context(&context);

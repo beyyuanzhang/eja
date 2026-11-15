@@ -119,24 +119,15 @@ impl RecordReader for RecordFiles {
             );
         }
         let mut reader = BufReader::new(self.source(path)?);
-        let mut all = VecDeque::new();
+        // The before-window keeps each line's serialized size beside it, so the
+        // window's byte budget is maintained instead of re-measured per line.
+        let mut window: VecDeque<(usize, Value)> = VecDeque::new();
+        let mut window_bytes = 0usize;
         let mut selected = Vec::new();
         let mut hits: Vec<(usize, Vec<Value>)> = Vec::new();
         let mut total = 0usize;
         let mut bytes = 256usize;
         let mut truncated = false;
-        let (from, count) = match selector {
-            Selector::Range { from, lines } => (*from, *lines),
-            _ => (0, 0),
-        };
-        let (needle, before, after) = match selector {
-            Selector::Match {
-                text,
-                before,
-                after,
-            } => (text.as_str(), *before, *after),
-            _ => ("", 0, 0),
-        };
         loop {
             control.check()?;
             let mut raw = Vec::new();
@@ -171,55 +162,67 @@ impl RecordReader for RecordFiles {
             }
             let text = String::from_utf8_lossy(&raw).into_owned();
             let line = json!({"line":total,"text":text});
-            if matches!(selector, Selector::Range { .. })
-                && total >= from
-                && total < from.saturating_add(count)
-            {
-                let size = line.to_string().len() + 1;
-                if bytes.saturating_add(size) < crate::aja::FRAME_LIMIT {
-                    bytes += size;
-                    selected.push(line.clone());
-                } else {
-                    truncated = true;
+            let size = crate::measure::value(&line) + 1;
+            match selector {
+                Selector::Range { from, lines } => {
+                    if total >= *from && total < from.saturating_add(*lines) {
+                        if bytes.saturating_add(size) < crate::aja::FRAME_LIMIT {
+                            bytes += size;
+                            selected.push(line);
+                        } else {
+                            truncated = true;
+                        }
+                    }
                 }
-            }
-            if matches!(selector, Selector::Match { .. }) {
-                for (_, context) in hits
-                    .iter_mut()
-                    .rev()
-                    .take_while(|(at, _)| total <= at.saturating_add(after))
-                {
-                    let size = line.to_string().len() + 1;
-                    if bytes.saturating_add(size) < crate::aja::FRAME_LIMIT {
+                Selector::Match {
+                    text: needle,
+                    before,
+                    after,
+                } => {
+                    // The after-window of a hit that still covers this line.
+                    for (_, context) in hits
+                        .iter_mut()
+                        .rev()
+                        .take_while(|(at, _)| total <= at.saturating_add(*after))
+                    {
+                        if bytes.saturating_add(size) < crate::aja::FRAME_LIMIT {
+                            bytes += size;
+                            context.push(line.clone());
+                        } else {
+                            truncated = true;
+                        }
+                    }
+                    if text.contains(needle.as_str()) {
+                        let mut context: Vec<Value> =
+                            window.iter().map(|(_, line)| line.clone()).collect();
                         context.push(line.clone());
-                        bytes += size;
-                    } else {
-                        truncated = true;
+                        let hit = crate::measure::bytes(&context)? + 64;
+                        if bytes.saturating_add(hit) < crate::aja::FRAME_LIMIT {
+                            bytes += hit;
+                            hits.push((total, context));
+                        } else {
+                            truncated = true;
+                        }
+                    }
+                    // The before-window is bounded by lines and by bytes.
+                    window.push_back((size, line));
+                    window_bytes += size;
+                    while window.len() > *before || window_bytes > crate::aja::FRAME_LIMIT {
+                        let Some((dropped, _)) = window.pop_front() else {
+                            break;
+                        };
+                        window_bytes = window_bytes.saturating_sub(dropped);
                     }
                 }
-                if text.contains(needle) {
-                    let mut context: Vec<_> = all.iter().cloned().collect();
-                    context.push(line.clone());
-                    let size = serde_json::to_vec(&context)?.len() + 64;
-                    if bytes.saturating_add(size) < crate::aja::FRAME_LIMIT {
-                        bytes += size;
-                        hits.push((total, context));
-                    } else {
-                        truncated = true;
-                    }
-                }
-                // The before-window is bounded by output bytes as well as lines.
-                all.push_back(line);
-                while all.len() > before
-                    || all.iter().map(|line| line.to_string().len()).sum::<usize>()
-                        > crate::aja::FRAME_LIMIT
-                {
-                    all.pop_front();
-                }
+                _ => {}
             }
             total += 1;
         }
         let value = if matches!(selector, Selector::Range { .. }) {
+            let from = match selector {
+                Selector::Range { from, .. } => *from,
+                _ => 0,
+            };
             json!({"path":path,"total_lines":total,"from":from.min(total),"lines":selected,"truncated":truncated})
         } else {
             let hits: Vec<_> = hits
@@ -228,7 +231,7 @@ impl RecordReader for RecordFiles {
                 .collect();
             json!({"path":path,"total_lines":total,"matches":hits,"truncated":truncated})
         };
-        if value.to_string().len() > crate::aja::FRAME_LIMIT {
+        if crate::measure::value(&value) > crate::aja::FRAME_LIMIT {
             return Err("selected record view exceeds output budget; narrow the selector".into());
         }
         Ok(value)

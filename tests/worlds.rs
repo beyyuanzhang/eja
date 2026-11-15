@@ -343,7 +343,7 @@ fn reconciling_a_run_is_one_recorded_observation() {
         .context
         .evidence
         .iter()
-        .find(|view| view.target == "world")
+        .find(|view| view.kind == eja::ObservationKind::Reconcile)
         .expect("the account is evidence EJA sees");
     assert_eq!(
         account.result["merged"],
@@ -356,7 +356,7 @@ fn reconciling_a_run_is_one_recorded_observation() {
                 && event
                     .data
                     .as_ref()
-                    .is_some_and(|data| data["target"] == serde_json::json!("world"))
+                    .is_some_and(|data| data["kind"] == serde_json::json!("reconcile"))
         }),
         "the account is one immutable fact"
     );

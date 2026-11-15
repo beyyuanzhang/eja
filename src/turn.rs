@@ -1,10 +1,15 @@
 //! The single transition path: validate, record, execute, observe, project.
+//!
+//! A turn folds the journal once and pushes every event it commits into that
+//! same fold, so a decision is validated against one derivation and no action
+//! re-reads the log. Nothing here holds a second copy of a fact.
 use crate::domain::{ProposalData, TaskOpen};
-use crate::state::{
-    approvals, next_task_id, pending_proposals, relations_with_tasks, task_scope,
-    valid_proposal_target,
+use crate::state::task_scope;
+use crate::{
+    now_utc, Action, Assignment, Brain, CloseOutcome, Control, ControlError, Edge, EventMeta, Host,
+    Kind, Observation, ObservationKind, ProposalKind, RelationKind, Result, Selector, State, Store,
+    Task, TaskId, TaskKind, TaskStatus, TurnEnd, TurnOptions, TurnOutcome, Worker,
 };
-use crate::*;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::{
@@ -12,42 +17,87 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Commit one fact: the journal is the authority, and the fold is updated by the
+/// same event, so no reader has to scan again.
+fn commit(
+    store: &Store,
+    state: &mut State,
+    kind: Kind,
+    scope: &str,
+    text: &str,
+    turn: u64,
+    meta: EventMeta,
+) -> Result<()> {
+    state.push(store.append(kind, scope, text, turn, meta)?);
+    Ok(())
+}
+
+/// A refusal is information: it tells EJA what the state did not allow. A note is
+/// told once per turn, so repeating an impossible action changes nothing.
+fn refuse(store: &Store, state: &mut State, ctx: &ActionCtx<'_>, note: String) -> Result<bool> {
+    if state.refusals(ctx.turn).contains(&note) {
+        return Ok(false);
+    }
+    commit(
+        store,
+        state,
+        Kind::Refused,
+        "eja",
+        &note,
+        ctx.turn,
+        EventMeta::new(ctx.at),
+    )?;
+    Ok(true)
+}
+
 /// Report tasks left Running by a previous process as unknown rather than
 /// re-running them. Callers must already own the journal turn (a turn calls it
 /// under its lease): this writes facts without taking one itself.
 pub fn recover(store: &Store, turn: u64, at: i64) -> Result<Vec<TaskId>> {
+    let mut state = State::load(store)?;
+    recover_state(store, &mut state, turn, at)
+}
+
+fn recover_state(store: &Store, state: &mut State, turn: u64, at: i64) -> Result<Vec<TaskId>> {
+    let running: Vec<TaskId> = state
+        .tasks()
+        .iter()
+        .filter(|task| task.status == TaskStatus::Running)
+        .map(|task| task.id)
+        .collect();
     let mut recovered = Vec::new();
-    for task in tasks(&store.events()?) {
-        if task.status != TaskStatus::Running {
-            continue;
-        }
-        store.append(
+    for id in running {
+        commit(
+            store,
+            state,
             Kind::WorkerReport,
-            &task_scope(task.id),
+            &task_scope(id),
             "worker session interrupted; state unknown",
             turn,
             EventMeta::new(at),
         )?;
-        recovered.push(task.id);
+        recovered.push(id);
     }
     Ok(recovered)
 }
 
 fn propose(
     store: &Store,
+    state: &mut State,
     kind: ProposalKind,
     target_id: Option<u64>,
     text: &str,
     turn: u64,
     at: i64,
 ) -> Result<Option<String>> {
-    let events = store.events()?;
-    if !valid_proposal_target(&events, kind, target_id) {
+    if !state.valid_proposal_target(kind, target_id) {
         return Ok(Some(format!(
             "proposal refused: no active {kind:?} target to replace"
         )));
     }
-    store.append(
+    commit(
+        store,
+        state,
         Kind::Proposal,
         "eja",
         text,
@@ -57,9 +107,15 @@ fn propose(
     Ok(None)
 }
 
-fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Result<Option<String>> {
-    let events = store.events()?;
-    let Some(proposal) = pending_proposals(&events, turn)
+fn confirm_proposal(
+    store: &Store,
+    state: &mut State,
+    proposal_id: u64,
+    turn: u64,
+    at: i64,
+) -> Result<Option<String>> {
+    let Some(proposal) = state
+        .pending_proposals(turn)
         .into_iter()
         .find(|proposal| proposal.id == proposal_id)
     else {
@@ -72,19 +128,21 @@ fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Resu
             "confirm refused: proposal {proposal_id} was created this turn; confirm it in a later turn"
         )));
     }
-    if !approvals(&events, turn).contains(&proposal_id) {
+    if !state.approved(turn).contains(&proposal_id) {
         return Ok(Some(format!(
             "confirm refused: the host recorded no approval for proposal {proposal_id} in this turn"
         )));
     }
-    if !valid_proposal_target(&events, proposal.kind, proposal.target_id) {
+    if !state.valid_proposal_target(proposal.kind, proposal.target_id) {
         return Ok(Some(format!(
             "confirm refused: the target of proposal {proposal_id} is no longer active"
         )));
     }
     // One event both establishes the replacement and closes its predecessor.
     // A Correction has no replacement: it only withdraws its target.
-    store.append(
+    commit(
+        store,
+        state,
         proposal.kind.event_kind(),
         "eja",
         &proposal.text,
@@ -100,13 +158,14 @@ fn confirm_proposal(store: &Store, proposal_id: u64, turn: u64, at: i64) -> Resu
 
 fn reject_proposal(
     store: &Store,
+    state: &mut State,
     proposal_id: u64,
     note: &str,
     turn: u64,
     at: i64,
 ) -> Result<Option<String>> {
-    let events = store.events()?;
-    if !pending_proposals(&events, turn)
+    if !state
+        .pending_proposals(turn)
         .iter()
         .any(|proposal| proposal.id == proposal_id)
     {
@@ -114,7 +173,9 @@ fn reject_proposal(
             "reject refused: proposal {proposal_id} is not pending"
         )));
     }
-    store.append(
+    commit(
+        store,
+        state,
         Kind::ProposalRejected,
         "eja",
         "",
@@ -127,19 +188,26 @@ fn reject_proposal(
     Ok(None)
 }
 
-fn append_identity(store: &Store, action: &Action, turn: u64, at: i64) -> Result<()> {
+fn append_identity(
+    store: &Store,
+    state: &mut State,
+    action: &Action,
+    turn: u64,
+    at: i64,
+) -> Result<()> {
     let (kind, text) = match action {
         Action::RecordDecision { text } => (Kind::RecordDecision, text),
         Action::RecordRelationship { text } => (Kind::Relationship, text),
         _ => return Ok(()),
     };
-    store.append_simple(kind, text, turn, at)?;
-    Ok(())
+    commit(store, state, kind, "eja", text, turn, EventMeta::new(at))
 }
 
-fn open_task(ctx: &ActionCtx<'_>, input: TaskOpen) -> Result<TaskId> {
-    let id = next_task_id(&ctx.store.events()?)?;
-    ctx.store.append(
+fn open_task(ctx: &ActionCtx<'_>, state: &mut State, input: TaskOpen) -> Result<TaskId> {
+    let id = state.next_task_id()?;
+    commit(
+        ctx.store,
+        state,
         Kind::TaskOpened,
         &task_scope(id),
         &input.title,
@@ -151,24 +219,23 @@ fn open_task(ctx: &ActionCtx<'_>, input: TaskOpen) -> Result<TaskId> {
 
 fn link_tasks(
     store: &Store,
+    state: &mut State,
     from: TaskId,
     to: TaskId,
     kind: RelationKind,
     turn: u64,
     at: i64,
 ) -> Result<Option<String>> {
-    let events = store.events()?;
-    let all = tasks(&events);
-    let Some(source) = all.iter().find(|task| task.id == from) else {
+    let Some(source) = state.task(from) else {
         return Ok(Some("relate refused: missing source task".into()));
     };
-    let Some(target) = all.iter().find(|task| task.id == to) else {
+    let Some(target) = state.task(to) else {
         return Ok(Some("relate refused: missing target task".into()));
     };
     if from == to {
         return Ok(Some("relate refused: self relation".into()));
     }
-    let mut edges = relations_with_tasks(&events, &all);
+    let mut edges = state.relations().to_vec();
     let edge = Edge { from, to, kind };
     if edges.contains(&edge) {
         return Ok(None);
@@ -248,7 +315,9 @@ fn link_tasks(
             }
         }
     }
-    store.append(
+    commit(
+        store,
+        state,
         Kind::TaskRelation,
         &task_scope(from),
         "",
@@ -260,12 +329,10 @@ fn link_tasks(
 
 fn reserve_dispatch(
     ctx: &ActionCtx<'_>,
+    state: &mut State,
     task_id: TaskId,
 ) -> Result<std::result::Result<Assignment, String>> {
-    let Some(task) = tasks(&ctx.store.events()?)
-        .into_iter()
-        .find(|task| task.id == task_id)
-    else {
+    let Some(task) = state.task(task_id) else {
         return Ok(Err(format!("dispatch refused: no task {task_id}")));
     };
     if task.status != TaskStatus::Open {
@@ -279,16 +346,14 @@ fn reserve_dispatch(
             "dispatch refused: a group is not an execution aja".into()
         ));
     }
-    let events = ctx.store.events()?;
-    let all = tasks(&events);
-    let edges = relations_with_tasks(&events, &all);
-    for edge in edges
+    for edge in state
+        .relations()
         .iter()
         .filter(|edge| edge.from == task_id && edge.kind == RelationKind::DependsOn)
     {
-        if !all
-            .iter()
-            .any(|other| other.id == edge.to && other.status == TaskStatus::Done)
+        if !state
+            .task(edge.to)
+            .is_some_and(|other| other.status == TaskStatus::Done)
         {
             return Ok(Err(format!(
                 "dispatch refused: dependency {} is not done",
@@ -296,7 +361,8 @@ fn reserve_dispatch(
             )));
         }
     }
-    let predecessors: Vec<_> = edges
+    let predecessors: Vec<_> = state
+        .relations()
         .iter()
         .filter(|edge| edge.from == task_id && edge.kind == RelationKind::Continues)
         .collect();
@@ -307,8 +373,9 @@ fn reserve_dispatch(
     }
     let resume = predecessors.first().map(|edge| edge.to);
     if resume.is_some_and(|id| {
-        !all.iter()
-            .any(|other| other.id == id && other.kind == TaskKind::Aja && other.digest.is_some())
+        !state
+            .task(id)
+            .is_some_and(|other| other.kind == TaskKind::Aja && other.digest.is_some())
     }) {
         return Ok(Err(
             "dispatch refused: continuation needs a completed aja record".into(),
@@ -322,7 +389,9 @@ fn reserve_dispatch(
         resume,
         issued_at: ctx.at,
     };
-    ctx.store.append(
+    commit(
+        ctx.store,
+        state,
         Kind::TaskAssigned,
         &task_scope(task.id),
         "",
@@ -334,11 +403,14 @@ fn reserve_dispatch(
 
 fn record_dispatch(
     ctx: &ActionCtx<'_>,
+    state: &mut State,
     out: &mut TurnOutcome,
     assignment: Assignment,
     digest: String,
 ) -> Result<()> {
-    ctx.store.append(
+    commit(
+        ctx.store,
+        state,
         Kind::WorkerReport,
         &task_scope(assignment.task_id),
         &digest,
@@ -354,8 +426,8 @@ fn record_dispatch(
 /// at once, and each completed run leaves its evidence before the next report.
 fn run_dispatches(
     ctx: &ActionCtx<'_>,
+    state: &mut State,
     out: &mut TurnOutcome,
-    log: &mut TurnLog,
     pending: Vec<Assignment>,
 ) -> Result<()> {
     let slots = ctx.options.limits.slots.max(1);
@@ -366,8 +438,8 @@ fn run_dispatches(
             let started = Instant::now();
             let digest = run_one(ctx.worker, &assignment, ctx.control);
             out.worker_ms += started.elapsed().as_millis();
-            record_dispatch(ctx, out, assignment, digest)?;
-            observe_evidence(ctx, log, task_id)?;
+            record_dispatch(ctx, state, out, assignment, digest)?;
+            observe_evidence(ctx, state, task_id)?;
         }
         return Ok(());
     }
@@ -406,8 +478,8 @@ fn run_dispatches(
     for (_, assignment, digest) in collected {
         ctx.control.check()?;
         let task_id = assignment.task_id;
-        record_dispatch(ctx, out, assignment, digest)?;
-        observe_evidence(ctx, log, task_id)?;
+        record_dispatch(ctx, state, out, assignment, digest)?;
+        observe_evidence(ctx, state, task_id)?;
     }
     Ok(())
 }
@@ -421,107 +493,105 @@ fn run_one(worker: &dyn Worker, assignment: &Assignment, control: &Control) -> S
 
 /// The host's own observation of what a run achieved. Failure is recorded too: a
 /// witness that could not answer leaves the judgment undecidable, and says why.
-fn observe_evidence(ctx: &ActionCtx<'_>, log: &mut TurnLog, task_id: TaskId) -> Result<()> {
-    let events = ctx.store.events()?;
-    let Some(task) = tasks(&events).into_iter().find(|task| task.id == task_id) else {
+fn observe_evidence(ctx: &ActionCtx<'_>, state: &mut State, task_id: TaskId) -> Result<()> {
+    let Some(task) = state.task(task_id) else {
         return Ok(());
     };
-    let Some(request) = task.witness.clone() else {
+    let Some(request) = task.evidence.clone() else {
         return Ok(());
     };
-    if task.witness_id.is_some() {
+    if task.evidence_id.is_some() {
         return Ok(());
     }
+    let target = request["tool"].as_str().unwrap_or("witness").to_string();
     let observation = match ctx.host.witness(&request, ctx.control) {
         Ok(result) => Observation {
-            target: "witness".to_string(),
+            kind: ObservationKind::Witness,
+            target,
             arguments: request,
             selector: Selector::Whole,
             result,
             error: None,
         },
         Err(error) => Observation {
-            target: "witness".to_string(),
+            kind: ObservationKind::Witness,
+            target,
             arguments: request,
             selector: Selector::Whole,
             result: serde_json::Value::Null,
             error: Some(error.to_string()),
         },
     };
-    ctx.store.append(
+    commit(
+        ctx.store,
+        state,
         Kind::Observed,
         &task_scope(task_id),
         "",
         ctx.turn,
         EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
-    )?;
-    log.evidence.push(observation);
-    Ok(())
+    )
 }
 
 /// Reconciling a world is the host's act and its account is evidence. Conflicts
 /// are recorded, never merged away.
-fn reconcile(ctx: &ActionCtx<'_>, log: &mut TurnLog, task_id: TaskId) -> Result<bool> {
-    let events = ctx.store.events()?;
-    let Some(task) = tasks(&events).into_iter().find(|task| task.id == task_id) else {
-        log.refused
-            .push(format!("reconcile refused: no task {task_id}"));
-        return Ok(false);
+fn reconcile(
+    ctx: &ActionCtx<'_>,
+    state: &mut State,
+    task_id: TaskId,
+) -> Result<std::result::Result<(), String>> {
+    let Some(task) = state.task(task_id) else {
+        return Ok(Err(format!("reconcile refused: no task {task_id}")));
     };
     if task.digest.is_none() {
-        log.refused.push(format!(
+        return Ok(Err(format!(
             "reconcile refused: task {task_id} has no run to reconcile"
-        ));
-        return Ok(false);
+        )));
     }
-    let (result, error) = match ctx.host.reconcile(task_id, ctx.control) {
-        Ok(value) => (value, None),
-        Err(error) => (serde_json::Value::Null, Some(error.to_string())),
+    let observation = match ctx.host.reconcile(task_id, ctx.control) {
+        Ok(result) => Observation {
+            kind: ObservationKind::Reconcile,
+            target: task_scope(task_id),
+            arguments: serde_json::json!({"task": task_id}),
+            selector: Selector::Whole,
+            result,
+            error: None,
+        },
+        Err(error) => return Ok(Err(format!("reconcile refused: {error}"))),
     };
-    if let Some(error) = &error {
-        log.refused.push(format!("reconcile refused: {error}"));
-        return Ok(false);
-    }
-    let observation = Observation {
-        target: "world".to_string(),
-        arguments: serde_json::json!({"task": task_id}),
-        selector: Selector::Whole,
-        result,
-        error: None,
-    };
-    ctx.store.append(
+    commit(
+        ctx.store,
+        state,
         Kind::Observed,
         "eja",
         "",
         ctx.turn,
         EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
     )?;
-    log.evidence.push(observation);
-    Ok(true)
+    Ok(Ok(()))
 }
 
 fn close_task(
     store: &Store,
+    state: &mut State,
     task_id: TaskId,
     accepted: bool,
     note: &str,
     turn: u64,
     at: i64,
 ) -> Result<Option<String>> {
-    let events = store.events()?;
-    let all = tasks(&events);
-    let Some(task) = all.iter().find(|task| task.id == task_id) else {
+    let Some(task) = state.task(task_id) else {
         return Ok(Some(format!("close refused: no task {task_id}")));
     };
     if task.kind == TaskKind::Group {
         if task.status != TaskStatus::Open {
             return Ok(Some("close refused: group is already closed".into()));
         }
-        let edges = relations_with_tasks(&events, &all);
-        let children: Vec<_> = edges
+        let children: Vec<&Task> = state
+            .relations()
             .iter()
             .filter(|edge| edge.to == task_id && edge.kind == RelationKind::PartOf)
-            .filter_map(|edge| all.iter().find(|child| child.id == edge.from))
+            .filter_map(|edge| state.task(edge.from))
             .collect();
         if children.iter().any(|child| child.status.is_active()) {
             return Ok(Some(
@@ -539,7 +609,7 @@ fn close_task(
     // rejection needs none: the point of the gate is that EJA may not accept
     // what it cannot verify, not that it must wait forever for a witness that
     // never answers.
-    if accepted && task.witness.is_some() && task.witness_id.is_none() {
+    if accepted && task.evidence.is_some() && task.evidence_id.is_none() {
         return Ok(Some(format!(
             "close refused: accepting task {task_id} needs the evidence its contract asked for and the host observed none; rejecting needs no evidence"
         )));
@@ -548,7 +618,9 @@ fn close_task(
         accepted,
         note: note.to_string(),
     })?;
-    store.append(
+    commit(
+        store,
+        state,
         Kind::TaskClosed,
         &task_scope(task.id),
         "",
@@ -556,15 +628,6 @@ fn close_task(
         EventMeta::data(at, data),
     )?;
     Ok(None)
-}
-
-/// What one turn has observed and refused so far. The same facts are in the
-/// journal, so the turn does not also return a second copy of them: the folded
-/// context is the single read.
-#[derive(Default)]
-struct TurnLog {
-    evidence: Vec<Observation>,
-    refused: Vec<String>,
 }
 
 struct ActionCtx<'a> {
@@ -581,44 +644,50 @@ struct ActionCtx<'a> {
 fn apply_actions(
     actions: &[Action],
     ctx: &ActionCtx<'_>,
+    state: &mut State,
     out: &mut TurnOutcome,
-    log: &mut TurnLog,
     focus: &mut Option<TaskId>,
 ) -> Result<bool> {
-    let mut observed = false;
+    let mut acted = false;
+    let mut told = false;
     let mut pending: Vec<Assignment> = Vec::new();
     for action in actions {
         ctx.control.check()?;
         match action {
             Action::RecordDecision { .. } | Action::RecordRelationship { .. } => {
-                append_identity(ctx.store, action, ctx.turn, ctx.at)?
+                append_identity(ctx.store, state, action, ctx.turn, ctx.at)?
             }
             Action::Propose {
                 kind,
                 target_id,
                 text,
             } => {
-                if let Some(note) = propose(ctx.store, *kind, *target_id, text, ctx.turn, ctx.at)? {
-                    log.refused.push(note);
+                if let Some(note) =
+                    propose(ctx.store, state, *kind, *target_id, text, ctx.turn, ctx.at)?
+                {
+                    told |= refuse(ctx.store, state, ctx, note)?;
                 } else {
-                    observed = true;
+                    acted = true;
                 }
             }
             Action::Confirm { proposal_id } => {
-                if let Some(note) = confirm_proposal(ctx.store, *proposal_id, ctx.turn, ctx.at)? {
-                    log.refused.push(note);
+                if let Some(note) =
+                    confirm_proposal(ctx.store, state, *proposal_id, ctx.turn, ctx.at)?
+                {
+                    told |= refuse(ctx.store, state, ctx, note)?;
                 }
             }
             Action::Reject { proposal_id, note } => {
                 if let Some(note) =
-                    reject_proposal(ctx.store, *proposal_id, note, ctx.turn, ctx.at)?
+                    reject_proposal(ctx.store, state, *proposal_id, note, ctx.turn, ctx.at)?
                 {
-                    log.refused.push(note);
+                    told |= refuse(ctx.store, state, ctx, note)?;
                 }
             }
             Action::OpenGroup { title, acceptance } => {
                 let id = open_task(
                     ctx,
+                    state,
                     TaskOpen {
                         kind: TaskKind::Group,
                         title: title.clone(),
@@ -629,7 +698,7 @@ fn apply_actions(
                     },
                 )?;
                 *focus = Some(id);
-                observed = true;
+                acted = true;
             }
             Action::OpenTask {
                 title,
@@ -640,6 +709,7 @@ fn apply_actions(
             } => {
                 let id = open_task(
                     ctx,
+                    state,
                     TaskOpen {
                         kind: TaskKind::Aja,
                         title: title.clone(),
@@ -650,27 +720,27 @@ fn apply_actions(
                     },
                 )?;
                 *focus = Some(id);
-                observed = true;
+                acted = true;
                 if *run {
-                    match reserve_dispatch(ctx, id)? {
-                        Ok(assignment) => {
-                            pending.push(assignment);
-                        }
-                        Err(note) => log.refused.push(note),
+                    match reserve_dispatch(ctx, state, id)? {
+                        Ok(assignment) => pending.push(assignment),
+                        Err(note) => told |= refuse(ctx.store, state, ctx, note)?,
                     }
                 }
             }
-            Action::Dispatch { task_id } => match reserve_dispatch(ctx, *task_id)? {
+            Action::Dispatch { task_id } => match reserve_dispatch(ctx, state, *task_id)? {
                 Ok(assignment) => {
                     *focus = Some(*task_id);
                     pending.push(assignment);
-                    observed = true;
+                    acted = true;
                 }
-                Err(note) => log.refused.push(note),
+                Err(note) => told |= refuse(ctx.store, state, ctx, note)?,
             },
             Action::LinkTasks { from, to, kind } => {
-                if let Some(note) = link_tasks(ctx.store, *from, *to, *kind, ctx.turn, ctx.at)? {
-                    log.refused.push(note);
+                if let Some(note) =
+                    link_tasks(ctx.store, state, *from, *to, *kind, ctx.turn, ctx.at)?
+                {
+                    told |= refuse(ctx.store, state, ctx, note)?;
                 }
             }
             Action::CloseTask {
@@ -678,43 +748,40 @@ fn apply_actions(
                 accepted,
                 note,
             } => {
-                if let Some(reason) =
-                    close_task(ctx.store, *task_id, *accepted, note, ctx.turn, ctx.at)?
-                {
-                    log.refused.push(reason);
+                if let Some(reason) = close_task(
+                    ctx.store, state, *task_id, *accepted, note, ctx.turn, ctx.at,
+                )? {
+                    told |= refuse(ctx.store, state, ctx, reason)?;
                 }
             }
-            Action::Reconcile { task_id } => {
-                if reconcile(ctx, log, *task_id)? {
-                    observed = true;
-                }
-            }
+            Action::Reconcile { task_id } => match reconcile(ctx, state, *task_id)? {
+                Ok(()) => acted = true,
+                Err(note) => told |= refuse(ctx.store, state, ctx, note)?,
+            },
             Action::Focus { task_id } => {
-                if !tasks(&ctx.store.events()?)
-                    .iter()
-                    .any(|task| task.id == *task_id)
-                {
-                    log.refused
-                        .push(format!("focus refused: no task {task_id}"));
+                if !state.knows(*task_id) {
+                    told |= refuse(
+                        ctx.store,
+                        state,
+                        ctx,
+                        format!("focus refused: no task {task_id}"),
+                    )?;
                     continue;
                 }
                 *focus = Some(*task_id);
-                observed = true;
+                acted = true;
             }
             Action::Look {
                 target,
                 arguments,
                 selector,
             } => {
-                let events = ctx.store.events()?;
                 let (result, error) =
                     match ctx
                         .host
-                        .look(target, arguments, selector, &events, ctx.control)
+                        .look(target, arguments, selector, state.events(), ctx.control)
                     {
-                        Ok(value)
-                            if serde_json::to_vec(&value)?.len() <= crate::aja::FRAME_LIMIT =>
-                        {
+                        Ok(value) if crate::measure::bytes(&value)? <= crate::aja::FRAME_LIMIT => {
                             (value, None)
                         }
                         Ok(_) => (
@@ -727,41 +794,28 @@ fn apply_actions(
                         Err(error) => (Value::Null, Some(error.to_string())),
                     };
                 let observation = Observation {
+                    kind: ObservationKind::Look,
                     target: target.clone(),
                     arguments: arguments.clone(),
                     selector: selector.clone(),
                     result,
                     error,
                 };
-                ctx.store.append(
+                commit(
+                    ctx.store,
+                    state,
                     Kind::Observed,
                     "eja",
                     "",
                     ctx.turn,
                     EventMeta::data(ctx.at, serde_json::to_value(&observation)?),
                 )?;
-                // The view holds one entry per distinct look, not every repeat.
-                log.evidence.retain(|other| {
-                    !(other.target == observation.target
-                        && other.arguments == observation.arguments
-                        && other.selector == observation.selector)
-                });
-                log.evidence.push(observation);
-                observed = true;
+                acted = true;
             }
         }
     }
-    run_dispatches(ctx, out, log, pending)?;
-    Ok(observed)
-}
-
-/// A turn ends at a fixpoint: a repeated projection carries no new information.
-fn fingerprint(context: &EjaContext) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let bytes = serde_json::to_vec(context).unwrap_or_default();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+    run_dispatches(ctx, state, out, pending)?;
+    Ok(acted || told)
 }
 
 pub fn turn(
@@ -818,19 +872,28 @@ pub fn turn_at_with_options(
     );
     let at = now.timestamp();
     let turn_no = store.next_turn()?;
-    recover(store, turn_no, at)?;
-    let existing_tasks = tasks(&store.events()?);
-    if options
-        .focus
-        .is_some_and(|id| !existing_tasks.iter().any(|task| task.id == id))
-    {
+    // One read of the journal, then every commit updates the same fold: an
+    // action is validated against the state it will produce, never a re-scan.
+    let mut state = State::load(store)?;
+    recover_state(store, &mut state, turn_no, at)?;
+    if options.focus.is_some_and(|id| !state.knows(id)) {
         return Err("focus names an unknown task".into());
     }
-    store.append(Kind::User, "eja", input, turn_no, EventMeta::new(at))?;
+    commit(
+        store,
+        &mut state,
+        Kind::User,
+        "eja",
+        input,
+        turn_no,
+        EventMeta::new(at),
+    )?;
     // An approval is a fact, not a caller's flag: it is recorded once, with the
     // turn it authorizes, and every later read comes from the journal.
     for proposal_id in &options.approvals {
-        store.append(
+        commit(
+            store,
+            &mut state,
             Kind::Approval,
             "eja",
             "",
@@ -842,8 +905,9 @@ pub fn turn_at_with_options(
         )?;
     }
 
-    let active: Vec<Task> = existing_tasks
-        .into_iter()
+    let active: Vec<&Task> = state
+        .tasks()
+        .iter()
         .filter(|task| task.status.is_active())
         .collect();
     let mut focus = options.focus.or_else(|| {
@@ -855,7 +919,7 @@ pub fn turn_at_with_options(
     });
     let mut out = TurnOutcome {
         reply: String::new(),
-        context: project(store, input, focus, now)?,
+        context: state.project(input, focus, now),
         dispatched: Vec::new(),
         decisions: 0,
         worker_ms: 0,
@@ -872,9 +936,6 @@ pub fn turn_at_with_options(
         control: &control,
         options,
     };
-    let mut log = TurnLog::default();
-    let mut seen = HashSet::new();
-    seen.insert(fingerprint(&out.context));
     let mut actions_used = 0usize;
     loop {
         if let Err(error) = control.check() {
@@ -918,22 +979,10 @@ pub fn turn_at_with_options(
             break;
         }
         actions_used += decision.actions.len();
-        let notes = log.refused.len();
-        log.refused.extend(decision.refused.iter().cloned());
-        let actions_result = apply_actions(&decision.actions, &ctx, &mut out, &mut log, &mut focus);
-        // A refusal is information, not a no-op: it tells EJA what the state did
-        // not allow. A new note re-opens the projection so EJA can decide again;
-        // a repeated note changes nothing and the fixpoint ends the turn.
-        let mut told = false;
-        for index in notes..log.refused.len() {
-            let note = &log.refused[index];
-            if log.refused[..index].contains(note) {
-                continue;
-            }
-            store.append(Kind::Refused, "eja", note, ctx.turn, EventMeta::new(at))?;
-            told = true;
+        for note in &decision.refused {
+            refuse(store, &mut state, &ctx, note.clone())?;
         }
-        let acted = match actions_result {
+        let acted = match apply_actions(&decision.actions, &ctx, &mut state, &mut out, &mut focus) {
             Ok(acted) => acted,
             Err(error) => {
                 if let Err(stopped) = control.check() {
@@ -943,16 +992,17 @@ pub fn turn_at_with_options(
                 return Err(error);
             }
         };
-        let observed = acted || told;
-        out.context = project_with_evidence(store, input, focus, now, &log.evidence)?;
-        if !observed {
+        // The projection is what the model just read. If the facts this decision
+        // committed leave it identical, they added no information and the turn is
+        // at its fixpoint; a decision that committed nothing is a final reply.
+        let next = state.project(input, focus, now);
+        let repeated = next == out.context;
+        out.context = next;
+        if !acted {
             out.reply = decision.reply.trim().to_string();
             break;
         }
-        // Every look uses the same continuation path. A look that leaves the
-        // projection unchanged carries no new information: the turn is over,
-        // instead of stopping at an arbitrary count.
-        if !seen.insert(fingerprint(&out.context)) {
+        if repeated {
             out.end = TurnEnd::Stalled;
             break;
         }
@@ -966,8 +1016,16 @@ pub fn turn_at_with_options(
         );
         meta.data = Some(serde_json::json!({"end": out.end, "reason": out.reason}));
     }
-    recover(store, turn_no, at)?;
-    store.append(Kind::Eja, "eja", &out.reply, turn_no, meta)?;
-    out.context = project_with_evidence(store, input, focus, now, &log.evidence)?;
+    recover_state(store, &mut state, turn_no, at)?;
+    commit(
+        store,
+        &mut state,
+        Kind::Eja,
+        "eja",
+        &out.reply,
+        turn_no,
+        meta,
+    )?;
+    out.context = state.project(input, focus, now);
     Ok(out)
 }

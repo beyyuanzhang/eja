@@ -1,7 +1,7 @@
 mod support;
 use eja::adapters::{render_context, OpenAiBrain};
 use eja::{
-    project_with_evidence, Action, Brain, EventMeta, Kind, Observation, ProposalKind, Selector,
+    Action, Brain, EventMeta, Kind, Observation, ObservationKind, ProposalKind, Selector, State,
     Store,
 };
 use std::io::{BufRead, BufReader, Read, Write};
@@ -28,15 +28,27 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
             ),
         )
         .unwrap();
-    let evidence = vec![Observation {
+    // Evidence is a committed fact before any projection can read it.
+    let observation = Observation {
+        kind: ObservationKind::Look,
         target: format!("log:event:{}", old.id),
         arguments: serde_json::Value::Null,
         selector: Selector::Whole,
         result: serde_json::json!({"matches": 1, "events": [old]}),
         error: None,
-    }];
-    let context =
-        project_with_evidence(&store, "revise the goal", None, eja::now_utc(), &evidence).unwrap();
+    };
+    store
+        .append(
+            Kind::Observed,
+            "eja",
+            "",
+            1,
+            EventMeta::data(1, serde_json::to_value(&observation).unwrap()),
+        )
+        .unwrap();
+    let context = State::load(&store)
+        .unwrap()
+        .project("revise the goal", None, eja::now_utc());
     assert!(render_context(&context).contains("CURRENT INPUT"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let port = listener.local_addr().expect("addr").port();

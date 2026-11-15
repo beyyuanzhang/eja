@@ -2,16 +2,20 @@
 use crate::{Event, EventMeta, Kind, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 #[derive(Debug, Clone)]
 pub struct Store {
     pub log_path: PathBuf,
     writer: Arc<Mutex<Cursor>>,
+    /// The append handle, opened once. A file has no user-space buffer, so a
+    /// durable append is `sync_all`; there is no flush that reaches the disk.
+    file: Arc<File>,
 }
 
 #[derive(Debug)]
@@ -23,31 +27,29 @@ struct Cursor {
 
 /// How long a write may wait for the log lock before calling it a second writer.
 const LOCK_WAIT_MS: u32 = 100;
+/// How long one wait for the log lock sleeps before looking again.
+const LOCK_POLL: Duration = Duration::from_millis(1);
 
 /// The log lock guards one append, not the journal: ownership for a turn is the
 /// separate `turn.lock`. A concurrent thread that spawns a child can briefly
 /// duplicate the descriptor to the child, and a duplicated descriptor keeps the
 /// lock alive until the child execs; that is not a second writer, so a short wait
 /// tells the two apart instead of failing a turn.
-fn lock_log(path: &Path, file: &fs::File) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    {
-        let mut waited = 0;
-        loop {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(());
+fn lock_log(path: &Path, file: &File) -> Result<()> {
+    let mut waited = 0;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if waited < LOCK_WAIT_MS => {
+                std::thread::sleep(LOCK_POLL);
+                waited += 1;
             }
-            let error = std::io::Error::last_os_error();
-            let transient = error.raw_os_error() == Some(libc::EWOULDBLOCK);
-            if !transient || waited >= LOCK_WAIT_MS {
-                return Err(format!(
-                    "log {} already has an active writer ({error})",
-                    path.display()
-                )
-                .into());
+            Err(TryLockError::WouldBlock) => {
+                return Err(format!("log {} already has an active writer", path.display()).into())
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            waited += 1;
+            Err(TryLockError::Error(error)) => {
+                return Err(format!("log {} cannot be locked: {error}", path.display()).into())
+            }
         }
     }
 }
@@ -96,17 +98,19 @@ impl Store {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         fs::create_dir_all(root.as_ref())?;
         let log_path = root.as_ref().to_path_buf().join("log.jsonl");
-        let locked = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&log_path)?;
-        lock_log(&log_path, &locked)?;
+        lock_log(&log_path, &file)?;
         let (existing, committed) = scan_events(&log_path)?;
-        if locked.metadata()?.len() != committed {
-            locked.set_len(committed)?;
-            locked.sync_all()?;
+        if file.metadata()?.len() != committed {
+            file.set_len(committed)?;
+            file.sync_all()?;
         }
+        // The handle stays open for appends; the lock covers this scan only.
+        file.unlock()?;
         let next_id = existing
             .iter()
             .map(|event| event.id)
@@ -128,6 +132,7 @@ impl Store {
                 next_turn,
                 bytes: committed,
             })),
+            file: Arc::new(file),
         })
     }
 
@@ -152,15 +157,8 @@ impl Store {
         turn: u64,
         meta: EventMeta,
     ) -> Result<Event> {
-        let mut cursor = self
-            .writer
-            .lock()
-            .map_err(|_| "store writer lock poisoned")?;
-        let id = cursor.next_id;
-        let next_id = id.checked_add(1).ok_or("event id space exhausted")?;
-        let next_turn = turn.checked_add(1).ok_or("turn id space exhausted")?;
         let event = Event {
-            id,
+            id: 0,
             at: meta.at,
             turn,
             scope: scope.to_string(),
@@ -169,29 +167,41 @@ impl Store {
             closes: meta.closes,
             data: meta.data,
         };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)?;
-        lock_log(&self.log_path, &file)?;
-        if file.metadata()?.len() != cursor.bytes {
+        let mut cursor = self
+            .writer
+            .lock()
+            .map_err(|_| "store writer lock poisoned")?;
+        let id = cursor.next_id;
+        let event = Event { id, ..event };
+        lock_log(&self.log_path, &self.file)?;
+        let written = self.write(&mut cursor, &event);
+        // The lock covers this append only: the next writer may be another process.
+        self.file.unlock()?;
+        written?;
+        Ok(event)
+    }
+
+    /// One append under the log lock: the cursor checks that nobody wrote behind
+    /// this Store, the record is written and synced, and a failure rolls back.
+    fn write(&self, cursor: &mut Cursor, event: &Event) -> Result<()> {
+        let next_id = event.id.checked_add(1).ok_or("event id space exhausted")?;
+        let next_turn = event.turn.checked_add(1).ok_or("turn id space exhausted")?;
+        if self.file.metadata()?.len() != cursor.bytes {
             return Err("log changed outside this Store; reopen it before appending".into());
         }
-        let mut bytes = serde_json::to_vec(&event)?;
+        let mut bytes = serde_json::to_vec(event)?;
         bytes.push(b'\n');
-        if let Err(error) = file
-            .write_all(&bytes)
-            .and_then(|_| file.flush())
-            .and_then(|_| file.sync_all())
-        {
-            let _ = file.set_len(cursor.bytes);
-            let _ = file.sync_all();
+        // `&`File implements `Write`, so one handle serves every append.
+        let mut handle: &File = &self.file;
+        if let Err(error) = handle.write_all(&bytes).and_then(|()| self.file.sync_all()) {
+            let _ = self.file.set_len(cursor.bytes);
+            let _ = self.file.sync_all();
             return Err(error.into());
         }
         cursor.bytes += bytes.len() as u64;
         cursor.next_id = next_id;
         cursor.next_turn = cursor.next_turn.max(next_turn);
-        Ok(event)
+        Ok(())
     }
 
     pub fn append_simple(&self, kind: Kind, text: &str, turn: u64, at: i64) -> Result<Event> {

@@ -33,6 +33,10 @@ pub struct OpenAiModel {
     base: String,
     key: String,
     model: String,
+    /// One event loop and one connection pool for every call. A client built per
+    /// request would drop its pool and handshake again each time, and a runtime
+    /// built per request would start and stop an event loop each time.
+    http: std::sync::OnceLock<(tokio::runtime::Runtime, reqwest::Client)>,
 }
 
 impl OpenAiModel {
@@ -41,7 +45,22 @@ impl OpenAiModel {
             base: base.into(),
             key: key.into(),
             model: model.into(),
+            http: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The shared transport, built once. A worker thread drives the pool, and
+    /// `block_on` bridges a synchronous port call onto it.
+    fn http(&self) -> Result<&(tokio::runtime::Runtime, reqwest::Client)> {
+        if let Some(http) = self.http.get() {
+            return Ok(http);
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let client = reqwest::Client::builder().build()?;
+        Ok(self.http.get_or_init(|| (runtime, client)))
     }
     pub fn from_env() -> Option<Self> {
         let (base, key, model) = super::llm_env()?;
@@ -68,11 +87,8 @@ impl OpenAiModel {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        let (runtime, client) = self.http()?;
         runtime.block_on(super::controlled(control, async {
-            let client = reqwest::Client::builder().timeout(timeout).build()?;
             let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
             // A provider hiccup (429, 5xx, a dropped connection) is not EJA's
             // error. Retry a few times with backoff; the run deadline still
@@ -84,6 +100,7 @@ impl OpenAiModel {
                     .post(&url)
                     .bearer_auth(&self.key)
                     .json(&body)
+                    .timeout(timeout)
                     .send()
                     .await;
                 let mut response = match sent {

@@ -1,4 +1,9 @@
-use crate::{format_utc, Action, Brain, Decision, EjaContext, Selector};
+//! EJA's model transport: one bounded projection in, one typed decision out.
+use crate::fold;
+use crate::{
+    format_utc, Action, Brain, Decision, EjaContext, Observation, ObservationKind, Selector,
+};
+use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 
@@ -15,6 +20,22 @@ fn relation(kind: crate::RelationKind) -> &'static str {
     }
 }
 
+fn kind_label(kind: ObservationKind) -> &'static str {
+    match kind {
+        ObservationKind::Look => "look",
+        ObservationKind::Witness => "witness",
+        ObservationKind::Reconcile => "reconcile",
+    }
+}
+
+fn event_address(id: u64) -> String {
+    format!("log:event:{id}")
+}
+
+fn task_address(id: u64) -> String {
+    format!("log:task:{id}")
+}
+
 pub const SYSTEM_PROMPT: &str = "\
 Return ONE JSON object: {\"reply\":\"...\",\"actions\":[...]}. \
 A decision cannot execute anything: the host validates every action, records it, and \
@@ -25,8 +46,11 @@ A dispatch returns the host's account of one run; the run's record is its eviden
 Treat a run's last message as its account, not as a verified outcome. \
 Every read is one action: a look names a target and a selector. A target is an \
 address -- log:event:12, log:task:1, log:history, record:3/report.md (one frozen \
-file of aja 3), world:src/out.txt -- or a host read tool such \
-as read_file, list_dir or a granted connector, which selects through arguments. \
+file of aja 3), world:src/out.txt (one path of the project) -- or a host read tool \
+such as read_file, list_dir or a granted connector, which selects its result through \
+its own arguments. A world address takes no selector; a log page takes whole \
+(newest 40) or range, and event:<id> also takes bytes; a frozen record file takes \
+whole, range or match. \
 Identity changes (goal, commitment, correction) are proposals: propose them, then \
 confirm only when the proposal is marked approved in PENDING PROPOSALS, and never \
 in the turn that created it. An approval is recorded by the host for one turn; \
@@ -40,10 +64,10 @@ Execution edges are fixed before dispatch: dispatch runs only an open aja, \
 depends_on needs its target done, continues has exactly one predecessor with a \
 frozen record, and part_of targets an open group. A group can be closed after its \
 children settle; judge its own acceptance contract, not its children's verdicts. \
-An aja opened with evidence asks the host for acceptance evidence; without the \
-host's observation the judgment is undecidable, not failed. A run that left an \
-isolated world can be reconciled explicitly; the outcome, conflicts included, is \
-recorded evidence. \
+An aja opened with evidence asks the host for the observation its judgment needs; \
+without the host's observation an acceptance is undecidable, not failed, and a \
+rejection needs no evidence. A run that left an isolated world can be reconciled \
+explicitly; the outcome, conflicts included, is recorded evidence. \
 Tasks are execution ajas; open_group creates a non-executable container. \
 Dispatches in one decision run in action order; the host may run them at once when \
 it has isolated worlds. A continuation is a new task related to the previous one \
@@ -61,25 +85,64 @@ Action shapes: \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
 {\"op\":\"focus\",\"task_id\":1}; \
 {\"op\":\"look\",\"target\":\"log:task:1\"}; \
-{\"op\":\"look\",\"target\":\"world:read_file\",\"arguments\":{\"path\":\"a.txt\"}}; \
-{\"op\":\"look\",\"target\":\"world:read_file\",\"arguments\":{\"path\":\"README.md\"}}; \
+{\"op\":\"look\",\"target\":\"world:src/main.rs\"}; \
+{\"op\":\"look\",\"target\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}; \
 {\"op\":\"look\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
 Preconditions: dispatch runs only a task in open state; a task that has a aja \
 record is waiting for judgment, so close it or open a new task for more work. \
 close_task requires a waiting aja, an open aja being cancelled, a group whose \
-children are terminal, and the witness evidence a task asked for. confirm needs a \
+children are terminal, and the evidence a task asked for. confirm needs a \
 proposal from an earlier turn that the host approved for this turn. Log pages \
 expose from/next/total; continue at next. Oversized events are listed in \
 partial_events: read event:<id> with selector {\"select\":\"bytes\",\"from\":0,\
 \"bytes\":4096}, then continue at next_offset. Byte views contain serialized event text.";
 
+/// The fold keeps the head whole, so this order is the priority: what this turn is
+/// about and what EJA just looked at come before any index. The self is not an
+/// index: goal and identity survive budget pressure and the indexes fold first.
+const ORDER: [&str; 12] = [
+    "NOW (UTC)",
+    "CURRENT INPUT",
+    "CURRENT GOAL",
+    "ACTIVE IDENTITY",
+    "CURRENT TASK",
+    "EVIDENCE",
+    "REFUSED",
+    "OPEN COMMITMENTS",
+    "PENDING PROPOSALS",
+    "RECENT CONVERSATION",
+    "TASK INDEX",
+    "RELATIONS",
+];
+
+/// One line of a section. A line whose fact has an address says where it lives, so
+/// a section that the budget folds can still be unfolded.
+struct Item {
+    address: Option<String>,
+    lines: Vec<String>,
+}
+
 struct Section {
     title: &'static str,
     counted: bool,
-    items: Vec<Vec<String>>,
+    items: Vec<Item>,
 }
 
-fn section(title: &'static str, counted: bool, items: Vec<Vec<String>>) -> Section {
+fn plain(lines: Vec<String>) -> Item {
+    Item {
+        address: None,
+        lines,
+    }
+}
+
+fn addressed(address: String, lines: Vec<String>) -> Item {
+    Item {
+        address: Some(address),
+        lines,
+    }
+}
+
+fn section(title: &'static str, counted: bool, items: Vec<Item>) -> Section {
     Section {
         title,
         counted,
@@ -87,60 +150,99 @@ fn section(title: &'static str, counted: bool, items: Vec<Vec<String>>) -> Secti
     }
 }
 
-/// One section rendered at record scale.
-fn section_text(section: &Section) -> String {
-    let mut out = if section.counted {
-        format!("{} ({}):\n", section.title, section.items.len())
+/// One section rendered at record scale, written straight into its sink so the
+/// same code both counts it and renders it.
+fn section_into(out: &mut impl std::fmt::Write, section: &Section) -> std::fmt::Result {
+    if section.counted {
+        writeln!(out, "{} ({}):", section.title, section.items.len())?;
     } else {
-        format!("{}:\n", section.title)
-    };
+        writeln!(out, "{}:", section.title)?;
+    }
     if section.items.is_empty() {
-        out.push_str("  (none)\n");
+        writeln!(out, "  (none)")?;
     }
     for item in &section.items {
-        for line in item {
-            out.push_str(line);
-            out.push('\n');
+        for line in &item.lines {
+            writeln!(out, "{line}")?;
         }
     }
+    Ok(())
+}
+
+/// One section rendered at record scale.
+fn section_text(section: &Section) -> String {
+    let mut out = String::new();
+    let _ = section_into(&mut out, section);
     out
 }
 
-/// One section at index scale: its title and its size. Unfolding is one address
-/// lookup, which the footer states once instead of repeating on every line.
-fn section_line(section: &Section) -> String {
-    format!("{} ({} item)", section.title, section.items.len())
+/// The bytes one section would render to, without rendering it.
+fn section_len(section: &Section) -> usize {
+    let mut count = crate::measure::Count::default();
+    let _ = section_into(&mut count, section);
+    count.0
 }
 
-fn one_line(text: String) -> Vec<Vec<String>> {
-    vec![vec![text]]
+/// The addresses a section's items live at, as one range.
+fn span(section: &Section) -> Option<String> {
+    let mut first = None;
+    let mut last = None;
+    for address in section
+        .items
+        .iter()
+        .filter_map(|item| item.address.as_deref())
+    {
+        first.get_or_insert(address);
+        last = Some(address);
+    }
+    let first = first?;
+    let last = last.unwrap_or(first);
+    Some(if first == last {
+        first.to_string()
+    } else {
+        format!("{first} .. {last}")
+    })
+}
+
+/// One section at index scale: its title, its size and the address that unfolds
+/// it. Unfolding is one address lookup, so the footer states the rule once.
+fn section_line(section: &Section) -> String {
+    let count = section.items.len();
+    let noun = if count == 1 { "item" } else { "items" };
+    match span(section) {
+        Some(span) => format!("  {} ({count} {noun}, {span})", section.title),
+        None => format!("  {} ({count} {noun})", section.title),
+    }
 }
 
 pub fn render_context(context: &EjaContext) -> String {
     render_context_within(context, usize::MAX)
 }
 
-/// Render a bounded projection with total section counts and an explicit cut
-/// notice. Omitted records remain discoverable through typed log lookups.
+/// Render a bounded projection with total section counts and an explicit landing
+/// scale. Omitted regions stay addressable and discoverable through their ids.
 pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     let mut sections = Vec::new();
     sections.push(section(
         "NOW (UTC)",
         false,
-        one_line(format!("  {}", format_utc(context.now))),
+        vec![plain(vec![format!("  {}", format_utc(context.now))])],
     ));
     sections.push(section(
         "CURRENT INPUT",
         false,
-        one_line(format!("  {}", context.input)),
+        vec![plain(vec![format!("  {}", context.input)])],
     ));
     sections.push(section(
         "CURRENT GOAL",
         false,
-        one_line(context.goal.as_ref().map_or_else(
-            || "  (none)".to_string(),
-            |goal| format!("  #{} {}", goal.id, goal.text),
-        )),
+        vec![match &context.goal {
+            Some(goal) => addressed(
+                event_address(goal.id),
+                vec![format!("  #{} {}", goal.id, goal.text)],
+            ),
+            None => plain(vec!["  (none)".to_string()]),
+        }],
     ));
 
     sections.push(section(
@@ -150,12 +252,15 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .commitments
             .iter()
             .map(|event| {
-                vec![format!(
-                    "  #{} {}: {}",
-                    event.id,
-                    format_utc(event.at),
-                    event.text
-                )]
+                addressed(
+                    event_address(event.id),
+                    vec![format!(
+                        "  #{} {}: {}",
+                        event.id,
+                        format_utc(event.at),
+                        event.text
+                    )],
+                )
             })
             .collect(),
     ));
@@ -166,85 +271,91 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .proposals
             .iter()
             .map(|proposal| {
-                vec![format!(
-                    "  proposal #{} [{}] target={} turn={}{}: {}",
-                    proposal.id,
-                    format!("{:?}", proposal.kind).to_lowercase(),
-                    proposal
-                        .target_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    proposal.turn,
-                    if proposal.approved {
-                        " approved"
-                    } else {
-                        " needs host approval"
-                    },
-                    proposal.text
-                )]
+                addressed(
+                    event_address(proposal.id),
+                    vec![format!(
+                        "  proposal #{} [{}] target={} turn={}{}: {}",
+                        proposal.id,
+                        format!("{:?}", proposal.kind).to_lowercase(),
+                        proposal
+                            .target_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        proposal.turn,
+                        if proposal.approved {
+                            " approved"
+                        } else {
+                            " needs host approval"
+                        },
+                        proposal.text
+                    )],
+                )
             })
             .collect(),
     ));
-    let mut task_lines = Vec::new();
     // The focus is one of the tasks, not a second copy of it.
     let focused = context
         .focus
         .and_then(|id| context.tasks.iter().find(|task| task.id == id));
-    if let Some(task) = focused {
-        task_lines.push(format!(
-            "  #{} [{:?}/{}] {}",
-            task.id,
-            task.kind,
-            task.status.as_str(),
-            task.title
-        ));
-        task_lines.push(format!("  created: {}", format_utc(task.created_at)));
-        task_lines.push(format!("  request: {}", task.request));
-        task_lines.push(format!("  acceptance: {}", task.acceptance));
-        if let Some(digest) = &task.digest {
-            task_lines.push(format!(
-                "  aja record at: {}",
-                task.digest_at
-                    .map(format_utc)
-                    .unwrap_or_else(|| "-".to_string())
-            ));
-            for line in digest.lines() {
-                task_lines.push(format!("  record: {line}"));
-            }
-        }
-        if let Some(witness) = &task.witness {
-            task_lines.push(format!("  witness: {witness}"));
-            match (&task.witness_result, task.witness_id) {
-                (Some(result), Some(id)) => {
-                    task_lines.push(format!("  witness evidence #{id}: {result}"))
-                }
-                _ => task_lines.push(
-                    "  witness evidence: not observed — a judgment now would be undecidable"
-                        .to_string(),
+    let task_items = match focused {
+        Some(task) => {
+            let mut lines = vec![
+                format!(
+                    "  #{} [{:?}/{}] {}",
+                    task.id,
+                    task.kind,
+                    task.status.as_str(),
+                    task.title
                 ),
+                format!("  created: {}", format_utc(task.created_at)),
+                format!("  request: {}", task.request),
+                format!("  acceptance: {}", task.acceptance),
+            ];
+            if let Some(digest) = &task.digest {
+                lines.push(format!(
+                    "  aja record at: {}",
+                    task.digest_at
+                        .map(format_utc)
+                        .unwrap_or_else(|| "-".to_string())
+                ));
+                for line in digest.lines() {
+                    lines.push(format!("  record: {line}"));
+                }
             }
+            if let Some(evidence) = &task.evidence {
+                lines.push(format!("  evidence: {evidence}"));
+                match (&task.evidence_result, task.evidence_id) {
+                    (Some(result), Some(id)) => {
+                        lines.push(format!("  evidence observed #{id}: {result}"))
+                    }
+                    _ => lines.push(
+                        "  evidence observed: no — an acceptance is undecidable until the host answers, a rejection needs none"
+                            .to_string(),
+                    ),
+                }
+            }
+            if let Some(close) = &task.close {
+                lines.push(format!(
+                    "  closed at: {}",
+                    task.closed_at
+                        .map(format_utc)
+                        .unwrap_or_else(|| "-".to_string())
+                ));
+                lines.push(format!(
+                    "  closed: {} — {}",
+                    if close.accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    close.note
+                ));
+            }
+            vec![addressed(task_address(task.id), lines)]
         }
-        if let Some(close) = &task.close {
-            task_lines.push(format!(
-                "  closed at: {}",
-                task.closed_at
-                    .map(format_utc)
-                    .unwrap_or_else(|| "-".to_string())
-            ));
-            task_lines.push(format!(
-                "  closed: {} — {}",
-                if close.accepted {
-                    "accepted"
-                } else {
-                    "rejected"
-                },
-                close.note
-            ));
-        }
-    } else {
-        task_lines.push("  (none)".to_string());
-    }
-    sections.push(section("CURRENT TASK", false, vec![task_lines]));
+        None => vec![plain(vec!["  (none)".to_string()])],
+    };
+    sections.push(section("CURRENT TASK", false, task_items));
 
     // What the host could not do, in EJA's own words from the last decision: the
     // state refused it, or it could not be read as an action. EJA sees this before
@@ -256,71 +367,32 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             context
                 .refused
                 .iter()
-                .map(|note| vec![format!("  {note}")])
+                .map(|note| plain(vec![format!("  {note}")]))
                 .collect(),
         ));
     }
 
     // Evidence sits before the index: when a budget forces a trim, what EJA
     // actually looked at survives and old index entries are dropped first.
-    let mut evidence_items = Vec::new();
-    for observation in &context.evidence {
-        let selector = match &observation.selector {
-            Selector::Whole => String::new(),
-            Selector::Range { from, lines } => format!(" range {from}+{lines}"),
-            Selector::Bytes { from, bytes } => format!(" bytes {from}+{bytes}"),
-            Selector::Match { text, .. } => format!(" match \"{text}\""),
-        };
-        let mut item = vec![format!(
-            "  [{} {}]{}",
-            address_label(&observation.target),
-            observation.target,
-            selector
-        )];
-        if let Some(error) = &observation.error {
-            item.push(format!("    error: {error}"));
-        } else if observation.target.starts_with("log:")
-            && observation.result.get("events").is_some()
-        {
-            item.push(format!(
-                "    page from={} next={} total={} truncated={}",
-                observation.result["from"],
-                observation.result["next"],
-                observation.result["total"],
-                observation.result["truncated"]
-            ));
-            if let Some(partial) = observation.result.get("partial_events") {
-                item.push(format!(
-                    "    oversized events (read event:<id> with bytes): {partial}"
-                ));
-            }
-            let events: Vec<crate::Event> = observation
-                .result
-                .get("events")
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .unwrap_or_default();
-            for event in events {
-                item.push(format!(
-                    "    #{} [{}] {} scope={}: {}",
-                    event.id,
-                    label(event.kind),
-                    format_utc(event.at),
-                    event.scope,
-                    event.text
-                ));
-                if let Some(target) = event.closes {
-                    item.push(format!("      closes: #{target}"));
+    sections.push(section(
+        "EVIDENCE",
+        true,
+        context
+            .evidence
+            .iter()
+            .map(|observation| {
+                // An observation that names an address is unfolded by that
+                // address; one that names a host tool has none to give.
+                let address = crate::Address::parse(&observation.target)
+                    .is_some()
+                    .then(|| observation.target.clone());
+                Item {
+                    address,
+                    lines: evidence_lines(observation),
                 }
-                if let Some(data) = &event.data {
-                    item.push(format!("      data: {data}"));
-                }
-            }
-        } else {
-            item.push(format!("    {}", observation.result));
-        }
-        evidence_items.push(item);
-    }
-    sections.push(section("EVIDENCE", true, evidence_items));
+            })
+            .collect(),
+    ));
 
     sections.push(section(
         "ACTIVE IDENTITY",
@@ -330,13 +402,16 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .iter()
             .rev()
             .map(|event| {
-                vec![format!(
-                    "  #{} [{}] {}: {}",
-                    event.id,
-                    label(event.kind),
-                    format_utc(event.at),
-                    event.text
-                )]
+                addressed(
+                    event_address(event.id),
+                    vec![format!(
+                        "  #{} [{}] {}: {}",
+                        event.id,
+                        label(event.kind),
+                        format_utc(event.at),
+                        event.text
+                    )],
+                )
             })
             .collect(),
     ));
@@ -347,12 +422,15 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .history
             .iter()
             .map(|event| {
-                vec![format!(
-                    "  #{} [{}] {}",
-                    event.id,
-                    label(event.kind),
-                    event.text
-                )]
+                addressed(
+                    event_address(event.id),
+                    vec![format!(
+                        "  #{} [{}] {}",
+                        event.id,
+                        label(event.kind),
+                        event.text
+                    )],
+                )
             })
             .collect(),
     ));
@@ -370,13 +448,16 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         index
             .iter()
             .map(|task| {
-                vec![format!(
-                    "  #{} [{:?}/{}] {}",
-                    task.id,
-                    task.kind,
-                    task.status.as_str(),
-                    task.title
-                )]
+                addressed(
+                    task_address(task.id),
+                    vec![format!(
+                        "  #{} [{:?}/{}] {}",
+                        task.id,
+                        task.kind,
+                        task.status.as_str(),
+                        task.title
+                    )],
+                )
             })
             .collect(),
     ));
@@ -387,34 +468,19 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .relations
             .iter()
             .map(|edge| {
-                vec![format!(
-                    "  #{} -{}-> #{}",
-                    edge.from,
-                    relation(edge.kind),
-                    edge.to
-                )]
+                addressed(
+                    task_address(edge.from),
+                    vec![format!(
+                        "  #{} -{}-> #{}",
+                        edge.from,
+                        relation(edge.kind),
+                        edge.to
+                    )],
+                )
             })
             .collect(),
     ));
 
-    // The fold keeps the head whole, so the order is the priority: what this
-    // turn is about and what EJA just looked at come before any index.
-    // The self is not an index: goal and identity survive budget pressure, and
-    // the indexes fold first. Nothing here is prose about the subject.
-    const ORDER: [&str; 12] = [
-        "NOW (UTC)",
-        "CURRENT INPUT",
-        "CURRENT GOAL",
-        "ACTIVE IDENTITY",
-        "CURRENT TASK",
-        "EVIDENCE",
-        "REFUSED",
-        "OPEN COMMITMENTS",
-        "PENDING PROPOSALS",
-        "RECENT CONVERSATION",
-        "TASK INDEX",
-        "RELATIONS",
-    ];
     sections.sort_by_key(|section| {
         ORDER
             .iter()
@@ -424,29 +490,96 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     folded(&sections, budget)
 }
 
+/// One observation as the model reads it: what it is, and what it read.
+fn evidence_lines(observation: &Observation) -> Vec<String> {
+    let selector = match &observation.selector {
+        Selector::Whole => String::new(),
+        Selector::Range { from, lines } => format!(" range {from}+{lines}"),
+        Selector::Bytes { from, bytes } => format!(" bytes {from}+{bytes}"),
+        Selector::Match { text, .. } => format!(" match \"{text}\""),
+    };
+    let mut lines = vec![format!(
+        "  [{} {}]{}",
+        kind_label(observation.kind),
+        observation.target,
+        selector
+    )];
+    if let Some(error) = &observation.error {
+        lines.push(format!("    error: {error}"));
+        return lines;
+    }
+    if observation.target.starts_with("log:") && observation.result.get("events").is_some() {
+        lines.push(format!(
+            "    page from={} next={} total={} truncated={}",
+            observation.result["from"],
+            observation.result["next"],
+            observation.result["total"],
+            observation.result["truncated"]
+        ));
+        if let Some(partial) = observation.result.get("partial_events") {
+            lines.push(format!(
+                "    oversized events (read event:<id> with bytes): {partial}"
+            ));
+        }
+        let events: Vec<crate::Event> = observation
+            .result
+            .get("events")
+            .and_then(|value| <Vec<crate::Event>>::deserialize(value).ok())
+            .unwrap_or_default();
+        for event in events {
+            lines.push(format!(
+                "    #{} [{}] {} scope={}: {}",
+                event.id,
+                label(event.kind),
+                format_utc(event.at),
+                event.scope,
+                event.text
+            ));
+            if let Some(target) = event.closes {
+                lines.push(format!("      closes: #{target}"));
+            }
+            if let Some(data) = &event.data {
+                lines.push(format!("      data: {data}"));
+            }
+        }
+    } else {
+        lines.push(format!("    {}", observation.result));
+    }
+    lines
+}
+
 /// The projection is one space: sections in priority order, each whole while the
 /// declared budget allows, listed when it does not, and never cut mid-line.
 fn folded(sections: &[Section], budget: usize) -> String {
-    let bodies: Vec<String> = sections.iter().map(section_text).collect();
-    let regions: Vec<crate::fold::Region> = sections
+    // Measure without rendering: a section the budget folds into one line is
+    // never built in full.
+    let regions: Vec<fold::Region> = sections
         .iter()
-        .zip(&bodies)
-        .map(|(section, body)| {
-            crate::fold::Region::new(section.title, section_line(section), body.len())
+        .map(|section| {
+            fold::Region::new(
+                span(section).unwrap_or_default(),
+                section_line(section),
+                section_len(section),
+            )
         })
         .collect();
-    let view = crate::fold::assemble(&regions, budget);
-    crate::fold::text_within(&view, &bodies, "", budget)
+    let view = fold::assemble(&regions, budget);
+    fold::text_within(&view, &regions, "", budget, &|index| {
+        section_text(&sections[index])
+    })
 }
 
 pub fn parse_decision(raw: &str) -> Decision {
     let trimmed = raw.trim();
     let stripped = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
+        .strip_prefix("\u{60}\u{60}\u{60}json")
+        .or_else(|| trimmed.strip_prefix("\u{60}\u{60}\u{60}"))
         .map(|text| text.trim())
         .unwrap_or(trimmed);
-    let stripped = stripped.strip_suffix("```").unwrap_or(stripped).trim();
+    let stripped = stripped
+        .strip_suffix("\u{60}\u{60}\u{60}")
+        .unwrap_or(stripped)
+        .trim();
     let candidate = match (stripped.find('{'), stripped.rfind('}')) {
         (Some(start), Some(end)) if end > start => &stripped[start..=end],
         _ => stripped,
@@ -478,7 +611,7 @@ pub fn parse_decision(raw: &str) -> Decision {
             // One unreadable action does not discard the rest of the decision:
             // the readable actions still run and the loss is recorded in the reply.
             for item in list {
-                match serde_json::from_value::<Action>(item.clone()) {
+                match Action::deserialize(item) {
                     Ok(action) => actions.push(action),
                     Err(error) => notes.push(format!("{error}: {item}")),
                 }
@@ -564,13 +697,4 @@ impl Brain for OpenAiBrain {
             },
         }
     }
-}
-
-/// A target's label is derived from what it is: an address scheme, or the host
-/// tool it names. There is no second taxonomy of reads.
-fn address_label(target: &str) -> &str {
-    target
-        .split_once(':')
-        .map(|(scheme, _)| scheme)
-        .unwrap_or("tool")
 }

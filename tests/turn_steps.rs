@@ -347,7 +347,7 @@ fn repeated_observations_end_the_turn_when_the_view_stops_changing() {
     );
     let worker = CaptureWorker::default();
     let out = turn(&store, "inspect", &brain, &worker, &Ports::default()).unwrap();
-    assert!(out.end == eja::TurnEnd::Stalled);
+    assert_eq!(out.end, eja::TurnEnd::Stalled);
     // The same read twice: the second look carries no new information.
     assert_eq!(out.decisions, 2);
     assert!(out.reply.starts_with("[turn Stalled]"));
@@ -397,7 +397,7 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
         },
     )
     .unwrap();
-    assert!(out.end == eja::TurnEnd::Stalled);
+    assert_eq!(out.end, eja::TurnEnd::Stalled);
     assert!(out.reply.starts_with("[turn Stalled]"));
     assert_eq!(out.context.tasks[0].status, TaskStatus::Waiting);
     assert_eq!(out.dispatched.len(), 1);

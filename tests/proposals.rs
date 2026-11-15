@@ -1,7 +1,7 @@
 use eja::adapters::Ports;
 use eja::{
-    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind,
-    Store, Worker,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, State, Store,
+    Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -81,7 +81,7 @@ fn proposal_does_not_change_identity_until_confirmed() {
     )
     .expect("propose");
     assert_eq!(proposed.context.proposals.len(), 1);
-    assert!(open_commitments(&store.events().expect("events")).is_empty());
+    assert!(State::load(&store).expect("state").commitments().is_empty());
 
     let proposal_id = proposed.context.proposals[0].id;
     let confirm = QueueBrain::new(vec![decision(
@@ -102,7 +102,7 @@ fn proposal_does_not_change_identity_until_confirmed() {
     )
     .expect("confirm");
     assert!(confirmed.context.proposals.is_empty());
-    assert_eq!(open_commitments(&store.events().expect("events")).len(), 1);
+    assert_eq!(State::load(&store).expect("state").commitments().len(), 1);
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn a_proposal_cannot_be_confirmed_in_the_same_turn() {
         eja::now_utc(),
     )
     .expect("turn");
-    assert!(open_commitments(&store.events().expect("events")).is_empty());
+    assert!(State::load(&store).expect("state").commitments().is_empty());
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn rejection_leaves_identity_unchanged() {
     )
     .expect("reject");
     assert!(rejected.context.proposals.is_empty());
-    assert!(open_commitments(&store.events().expect("events")).is_empty());
+    assert!(State::load(&store).expect("state").commitments().is_empty());
 }
 
 #[test]
@@ -203,7 +203,10 @@ fn replacements_wait_for_confirmation_and_revalidate_the_target() {
     )
     .unwrap();
     assert_eq!(out.context.proposals.len(), 2);
-    assert_eq!(open_commitments(&store.events().unwrap())[0].id, old.id);
+    assert_eq!(
+        State::load(&store).expect("state").commitments()[0].id,
+        old.id
+    );
     let first = out.context.proposals[0].id;
     let stale = out.context.proposals[1].id;
     let confirm = QueueBrain::new(vec![decision(

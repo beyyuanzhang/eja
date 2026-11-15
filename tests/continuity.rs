@@ -1,8 +1,8 @@
 use chrono::{TimeZone, Utc};
 use eja::adapters::Ports;
 use eja::{
-    current_goal, open_commitments, project, turn_at, Action, Assignment, Brain, Decision,
-    EjaContext, Kind, ProposalKind, Store, TaskStatus, Worker,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, State, Store,
+    TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,7 +158,7 @@ fn user_input_does_not_become_a_goal() {
     assert_eq!(outcome.context.input, "what is the weather?");
     assert!(outcome.context.goal.is_none());
     let restarted = Store::new(&dir).expect("restart");
-    assert!(current_goal(&restarted.events().expect("events")).is_empty());
+    assert!(State::load(&restarted).expect("state").goal().is_none());
     assert!(eja::adapters::render_context(&outcome.context).contains("CURRENT GOAL:\n  (none)"));
 }
 
@@ -213,8 +213,11 @@ fn restart_and_model_switch_preserve_identity() {
     )
     .expect("continue");
 
-    let context =
-        project(&store, "what did I commit to?", None, day(2026, 11, 10, 10)).expect("context");
+    let context = State::load(&store).expect("state").project(
+        "what did I commit to?",
+        None,
+        day(2026, 11, 10, 10),
+    );
     assert_eq!(context.commitments.len(), 1);
     assert_eq!(
         context.commitments[0].text,
@@ -233,7 +236,7 @@ fn correction_by_id_survives_restart() {
         None,
         day(2026, 11, 9, 9),
     );
-    let commitment = open_commitments(&store.events().expect("events"))[0].clone();
+    let commitment = State::load(&store).expect("state").commitments()[0].clone();
 
     propose_and_confirm(
         &store,
@@ -245,7 +248,7 @@ fn correction_by_id_survives_restart() {
 
     let store = Store::new(&dir).expect("restart");
     let events = store.events().expect("events");
-    assert!(open_commitments(&events).is_empty());
+    assert!(State::fold(events.clone()).commitments().is_empty());
     assert!(events
         .iter()
         .any(|event| event.kind == Kind::Correction && event.closes == Some(commitment.id)));
@@ -277,7 +280,7 @@ fn correction_can_close_a_goal_without_language_matching() {
         day(2026, 11, 9, 10),
     );
     let events = store.events().expect("events");
-    assert!(current_goal(&events).is_empty());
+    assert!(State::fold(events.clone()).goal().is_none());
 }
 
 #[test]
@@ -304,7 +307,11 @@ fn replacements_preserve_their_kind_and_revision_chain_across_restart() {
             previous = Some(entry.id);
         }
         let restarted = Store::new(&dir).expect("restart");
-        let context = project(&restarted, "unrelated input", None, day(2026, 11, 10, 9)).unwrap();
+        let context = State::load(&restarted).expect("state").project(
+            "unrelated input",
+            None,
+            day(2026, 11, 10, 9),
+        );
         if kind == ProposalKind::Goal {
             assert_eq!(context.goal.as_ref().expect("goal").text, "latest");
         } else {
@@ -319,8 +326,8 @@ fn replacements_preserve_their_kind_and_revision_chain_across_restart() {
             day(2026, 11, 10, 10),
         );
         let events = Store::new(&dir).unwrap().events().unwrap();
-        assert!(current_goal(&events).is_empty());
-        assert!(open_commitments(&events).is_empty());
+        assert!(State::fold(events.clone()).goal().is_none());
+        assert!(State::fold(events.clone()).commitments().is_empty());
         assert_eq!(events.iter().filter(|e| e.kind == event_kind).count(), 3);
     }
 }
@@ -390,7 +397,9 @@ fn temporal_gap_is_numeric_and_language_free() {
     );
 
     let later = day(2026, 11, 12, 18);
-    let context = project(&store, "what is due?", None, later).expect("context");
+    let context = State::load(&store)
+        .expect("state")
+        .project("what is due?", None, later);
     assert_eq!(context.now, later.timestamp());
     assert_eq!(context.commitments[0].at, day(2026, 11, 9, 9).timestamp());
 }

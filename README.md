@@ -7,16 +7,20 @@ The core treats language as opaque data.
 
 ```
 S = fold(L)
-C = view_B(S, input, evidence)
+C = view_B(S, input)
 A = model(C)
 (O, W') = execute(A, W, grants, control)
 L' = L ++ events(A, O)
 ```
 
 The [architecture contract](docs/ARCHITECTURE.md) defines the invariants and the
-composition laws. The implementation has five core modules: domain, store,
-state, turn, and the shared control. Adapters own model transport, connectors and
-record reading.
+composition laws. The implementation has six core modules: domain, store, state,
+turn, the shared control, and the one renderer `fold`. Adapters own model
+transport, connectors and record reading.
+
+`S = fold(L)` is one value: `State` applies the journal event by event, and a
+turn reads the journal once and pushes every event it commits into the same
+value. Nothing validates an action against a second derivation of the log.
 
 ## Facts and views
 
@@ -42,6 +46,10 @@ record reading.
 - One address space covers every fact a view can read: `log:<target>`,
   `record:<aja>/<path>`, `world:<path>`. Any other target is a host read
   tool. A folded region and a live one are read the same way.
+- An observation says what it is — `look`, `witness` or `reconcile` — and its
+  target then names the subject. Its kind is a typed field, not a reserved text,
+  so a host tool may be named `witness` without becoming acceptance evidence.
+  The projection's evidence is folded from the events that recorded it.
 
 ## Tasks and authority
 
@@ -90,8 +98,12 @@ look {source: log | aja | world, target, selector}
 - World targets: `read_file`, `list_dir`, or a granted read-only connector.
   World tools select content through their own arguments.
 - A target may instead be an address: `log:event:12`, `log:task:1`,
-  `record:3/4` (one tool result), `record:3/report.md` (one frozen file),
-  `world:src/out.txt`. Addresses use the same selector semantics as any look.
+  `record:3/report.md` (one frozen file of aja 3), `world:src/out.txt` (one
+  path of the project). One selector vocabulary applies to the space each
+  authority is: a log page takes whole or range (an oversized event also takes
+  bytes), a frozen record file takes whole, range or match, and a world address
+  names one path and takes none. A target that is not an address is a host read
+  tool, which selects through its own arguments.
 
 Selectors are `{"select":"whole"}`, `{"select":"range","from":0,"lines":40}`,
 `{"select":"match","text":"passage","before":2,"after":4}`, and
@@ -110,15 +122,17 @@ scale for each region inside the declared budget:
 | Scale | What the model gets |
 |---|---|
 | record | the region whole |
-| index | one line, plus the handle that reaches it |
+| index | one line, plus the address that reaches it |
 | map | one line for a folded range of regions |
 
-The head stays whole while the budget allows, the rest is listed, and the oldest
-folds into an address. Nothing is summarized by a model and nothing is deleted:
-every folded region keeps its handle in the log or in the aja record, so
-reading it again is an address lookup. A aja whose transcript no longer fits
-even at map scale **stops** (`ended: budget`) and continues in a new aja; it
-never keeps re-sending a transcript pinned at the cap.
+The head stays whole while the budget allows, the rest is listed at index scale,
+and the oldest folds into one address range. Every region carries the address
+that reads it back — `log:event:12`, `log:task:3`, or the record entry an aja
+reads with `eja_read_record` — so the notice and the lines agree, and reading a
+folded region again is an address lookup. Nothing is summarized by a model and
+nothing is deleted. A aja whose transcript no longer fits even at map scale
+**stops** (`ended: budget`) and continues in a new aja; it never keeps
+re-sending a transcript pinned at the cap.
 
 ## Execution and resources
 
@@ -144,9 +158,16 @@ Default host budgets:
 One `Control` hierarchy propagates the turn deadline/cancellation to the brain,
 ajas, observations and model/tool calls. A child may shorten the deadline, never
 extend it. Every port requires this control explicitly; there is one entry point
-per operation. Dispatches run in action order. With one slot they also run one at
-a time in one shared world; with more slots the host must reserve an isolated
-world per run, and the journal still records reports in dispatch order. The host
+per operation. The one exception is cleanup: releasing a world runs after the
+run's budget may have expired, so the backend declares that bound itself rather
+than inheriting a spent control.
+
+Dispatches run in action order. With one slot they also run one at a time in one
+shared world; with more slots the host must reserve an isolated world per run, and
+the journal still records reports in dispatch order. The turn owns how many runs a
+decision starts; the world backend owns how many may exist at once, because it is
+the only thing that knows whether a world is isolated. A refused world refuses the
+run before it costs an aja id, and never reports itself as a budget stop. The host
 owns aja step and time limits; the disposable loop only manages its bounded
 message view.
 
@@ -165,12 +186,21 @@ missing predecessor records are explicit errors, never a silent fresh start.
 
 ## Compatibility
 
+0.13 makes the fold a value: a turn reads the journal once and pushes every event
+it commits into the same `State`, so one derivation serves validation and the
+projection. Evidence is that fold's output instead of a second copy a caller
+supplies, an observation carries a typed kind instead of a reserved target string,
+and every folded region names the address that reads it. The world backend is the
+only concurrency guard, a refused world costs no aja id, and the record keeps its
+frozen transcript when it is replayed. 0.12 logs stay readable: new fields default
+to absent.
+
 0.12 turns approvals into events, moves acceptance evidence into the task's own
 contract, adds a slot budget with isolated worlds and world reconciliation, and
 replaces the look source taxonomy with one address space. Older logs stay
 readable: new fields default to absent, and a proposal without an Approval event
-simply stays pending. A state directory written by 0.11 or earlier is still
-refused; there is no migration.
+simply stays pending. A state directory that predates the `ajas/` layout (it has
+`nodes/`) is refused by name; there is no migration.
 
 0.11 renames the execution record from `nodes/` to `ajas/` and the environment
 verbs `EJA_NODE_*` to `EJA_AJA_*`.

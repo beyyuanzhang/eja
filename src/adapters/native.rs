@@ -8,6 +8,7 @@ use crate::{
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
+    fmt::Write as FmtWrite,
     fs,
     io::{BufReader, Write},
     path::{Path, PathBuf},
@@ -20,6 +21,9 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
+
+/// How long one wait for the aja's next frame blocks before the control is read.
+const WORKER_POLL: Duration = Duration::from_millis(20);
 
 /// The aja's complete context, appended as it happens and frozen with the aja.
 /// The host sees every model response and tool call, so freezing the record never
@@ -68,7 +72,7 @@ struct Process {
 
 impl Process {
     fn start(binary: &Path, work: &Path, start: Start) -> Result<Self> {
-        if serde_json::to_vec(&start)?.len() > aja::FRAME_LIMIT {
+        if crate::measure::bytes(&start)? > aja::FRAME_LIMIT {
             return Err("AJA start frame exceeds limit".into());
         }
         let child = Command::new(binary)
@@ -108,18 +112,16 @@ impl Process {
         Ok(process)
     }
     fn next(&self, control: &Control) -> Result<Request> {
+        let receiver = self.receiver.as_ref().ok_or("worker closed")?;
         loop {
-            control.check()?;
-            match self
-                .receiver
-                .as_ref()
-                .ok_or("worker closed")?
-                .recv_timeout(Duration::from_millis(10))
-            {
+            // The wait is bounded by the run's own remaining budget, so a spent
+            // deadline is reported by the control instead of one tick later.
+            let wait = control.remaining()?.min(WORKER_POLL);
+            match receiver.recv_timeout(wait) {
                 Ok(Ok(request)) => return Ok(request),
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(error)) => return Err(error.into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(e) => return Err(e.into()),
+                Err(error) => return Err(error.into()),
             }
         }
     }
@@ -186,10 +188,9 @@ pub struct NativeWorker {
     checkpoints: PathBuf,
     /// The host's own state, never part of what a aja did to the project.
     state: PathBuf,
-    /// Where each run may change things. Isolation is the host's decision.
+    /// Where each run may change things. Isolation is the host's decision, and
+    /// the backend refuses a world that already has an owner.
     worlds: Arc<dyn Worlds>,
-    /// How many worlds may run at once.
-    slots: usize,
     active: Mutex<Vec<ActiveRun>>,
 }
 
@@ -223,7 +224,6 @@ impl NativeWorker {
             limits: Limits::default(),
             checkpoints,
             worlds: Arc::new(Shared::new(project.clone(), state.clone())),
-            slots: 1,
             state,
             active: Mutex::new(Vec::new()),
         })
@@ -231,10 +231,6 @@ impl NativeWorker {
     /// The worlds this host provides. Without one, every run shares the project.
     pub fn with_worlds(mut self, worlds: Arc<dyn Worlds>) -> Self {
         self.worlds = worlds;
-        self
-    }
-    pub fn with_slots(mut self, slots: usize) -> Self {
-        self.slots = slots.max(1);
         self
     }
     pub fn with_limits(mut self, limits: Limits) -> Result<Self> {
@@ -302,7 +298,7 @@ impl NativeWorker {
                             "budget".into(),
                         ));
                     }
-                    if serde_json::to_vec(&messages)?.len() > self.limits.context_bytes {
+                    if crate::measure::bytes(&messages)? > self.limits.context_bytes {
                         return Ok((
                             "AJA context budget exhausted; continue in a new aja".into(),
                             "budget".into(),
@@ -315,7 +311,7 @@ impl NativeWorker {
                         control,
                         false,
                     )?;
-                    if serde_json::to_vec(&value)?.len() > self.limits.response_bytes {
+                    if crate::measure::bytes(&value)? > self.limits.response_bytes {
                         return Err("AJA model output limit reached".into());
                     }
                     if let Err(error) = aja::validate_assistant(&value) {
@@ -356,7 +352,7 @@ impl NativeWorker {
                             }
                         }
                     };
-                    if serde_json::to_vec(&value)?.len() > aja::FRAME_LIMIT {
+                    if crate::measure::bytes(&value)? > aja::FRAME_LIMIT {
                         return Err("AJA tool output limit reached".into());
                     }
                     let entry = log.entries;
@@ -381,7 +377,7 @@ impl NativeWorker {
             // A tool result is bounded by the frame budget, not the model's reply
             // budget: the tool owns its own output bound, the record keeps the
             // whole result, and the transcript folds against its context budget.
-            if serde_json::to_vec(&response)?.len() > aja::FRAME_LIMIT {
+            if crate::measure::bytes(&response)? > aja::FRAME_LIMIT {
                 return Err("AJA tool output limit reached".into());
             }
             aja::send(process.input.as_mut().ok_or("worker closed")?, &response)?;
@@ -484,7 +480,7 @@ impl NativeWorker {
             },
         );
         if let Some(error) = &checkpoint_error {
-            digest.push_str(&format!("\ncheckpoint unavailable: {error}"));
+            let _ = write!(digest, "\ncheckpoint unavailable: {error}");
         }
         let manifest = json!({
             "assignment": assignment,
@@ -531,14 +527,24 @@ impl Worker for NativeWorker {
             return "0 steps, 0 tool calls, ended: error\ninvalid aja id".into();
         }
         let cancelled = Arc::new(AtomicBool::new(false));
+        let control = parent
+            .child(Duration::from_millis(self.limits.timeout_ms))
+            .cancelled_by(cancelled.clone());
+        // The world comes first: a run that cannot get one has started nothing, so
+        // it does not burn its aja id either. Isolation is the backend's rule, and
+        // it is the only place that decides how many runs may exist at once.
+        let world = match self.worlds.reserve(assignment.task_id, &control) {
+            Ok(world) => Held {
+                worlds: &*self.worlds,
+                world,
+            },
+            Err(error) => return format!("0 steps, 0 tool calls, ended: error\nno world: {error}"),
+        };
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-            if active.len() >= self.slots {
-                return "0 steps, 0 tool calls, ended: budget\nno free world".into();
-            }
             if let Err(e) = fs::create_dir(&aja) {
                 return format!(
-                    "0 steps, 0 tool calls, ended: error\nnode already reserved or unavailable: {e}"
+                    "0 steps, 0 tool calls, ended: error\naja already reserved or unavailable: {e}"
                 );
             }
             active.push(ActiveRun {
@@ -550,23 +556,13 @@ impl Worker for NativeWorker {
             active: &self.active,
             id: assignment.task_id,
         };
-        let control = parent
-            .child(Duration::from_millis(self.limits.timeout_ms))
-            .cancelled_by(cancelled.clone());
-        let world = match self.worlds.reserve(assignment.task_id, &control) {
-            Ok(world) => Held {
-                worlds: &*self.worlds,
-                world,
-            },
-            Err(error) => return format!("0 steps, 0 tool calls, ended: error\nno world: {error}"),
-        };
         let world = &world.world;
         let mut counts = std::collections::BTreeMap::new();
         let mut log = match ContextLog::create(&aja) {
             Ok(log) => log,
             Err(error) => {
                 return format!(
-                    "0 steps, 0 tool calls, ended: error\nnode context is unavailable: {error}"
+                    "0 steps, 0 tool calls, ended: error\naja context is unavailable: {error}"
                 )
             }
         };
@@ -603,7 +599,7 @@ impl Worker for NativeWorker {
                     value["change"].as_str().unwrap_or("unreported")
                 );
                 if let Some(commit) = value["commit"].as_str() {
-                    line.push_str(&format!(" at {commit}"));
+                    let _ = write!(line, " at {commit}");
                 }
                 line
             }
@@ -625,7 +621,7 @@ impl Worker for NativeWorker {
             parent,
         )
         .unwrap_or_else(|e| {
-            format!("{steps} steps, 0 tool calls, ended: error\nnode could not be frozen: {e}")
+            format!("{steps} steps, 0 tool calls, ended: error\naja could not be frozen: {e}")
         })
     }
 }

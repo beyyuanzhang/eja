@@ -3,8 +3,7 @@ use eja::{
         self, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, Shared,
         ToolGateway, Worktrees, Worlds,
     },
-    project, tasks, turn_at_with_options, Assignment, Result, Store, Task, TaskStatus, TurnEnd,
-    TurnOptions,
+    turn_at_with_options, Assignment, Result, State, Store, Task, TaskStatus, TurnEnd, TurnOptions,
 };
 use std::{collections::VecDeque, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -82,8 +81,26 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
     }
 }
 
+/// Requests a clean stop at the next control check. It only stores a flag, which
+/// is what makes it safe to run inside a signal handler.
 extern "C" fn on_sigint(_: libc::c_int) {
     eja::INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Installs the interrupt handler. `sigaction` is used instead of `signal` so the
+/// disposition and restarted calls do not depend on the platform's default.
+fn on_interrupt() {
+    // SAFETY: `on_sigint` is async-signal-safe (one atomic store), `sigaction`
+    // copies the handler and the mask before returning, and `sigemptyset`
+    // initializes the mask this block passes. `std::mem::zeroed` for `sigaction`
+    // gives the all-zero value C defines as "no flags, no handler".
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigint as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    }
 }
 
 fn main() -> ExitCode {
@@ -102,13 +119,21 @@ fn run() -> Result<()> {
         println!("{USAGE}\n\n  turn      one interaction: project, decide, act, record\n  show X    context, log, tasks, tools, task:ID, aja:ID, audit:ID");
         return Ok(());
     }
-    unsafe {
-        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
-    }
+    on_interrupt();
     if args.as_slice() == ["--aja-worker"] {
         return eja::aja::worker_main();
     }
     let (dir, config, mut options, command) = parse(args)?;
+    // A directory written before the aja rename keeps its executions under
+    // nodes/. This version reads the ajas/ layout and does not migrate, so it
+    // says so instead of reading the journal as a project with no executions.
+    if dir.join("nodes").exists() && !dir.join("ajas").exists() {
+        return Err(format!(
+            "{} records executions under nodes/, which this version does not read; there is no migration",
+            dir.display()
+        )
+        .into());
+    }
     let config = config.or_else(|| {
         let path = dir.join("mcp.json");
         path.exists().then_some(path)
@@ -137,7 +162,7 @@ fn run() -> Result<()> {
             let tools = Arc::new(HostTools::new(config.as_deref(), &project, &dir, &startup)?);
             let ajas = dir.join("ajas");
             let mut aja_limits = eja::aja::Limits::default();
-            aja_limits.steps = Some(env("EJA_AJA_STEPS", aja_limits.steps.unwrap())?);
+            aja_limits.steps = Some(env("EJA_AJA_STEPS", eja::aja::DEFAULT_STEPS)?);
             aja_limits.timeout_ms = env("EJA_AJA_TIMEOUT_MS", aja_limits.timeout_ms)?;
             // Parallel slots need isolated worlds. Without one the host runs a
             // single shared world, so only one execution may hold it.
@@ -164,7 +189,6 @@ fn run() -> Result<()> {
                 tools.clone() as Arc<dyn ToolGateway>,
             )?
             .with_limits(aja_limits)?
-            .with_slots(limits.slots)
             .with_worlds(worlds);
             let records = RecordFiles::with_checkpoints(ajas, dir.join("checkpoints"));
             let worlds: Option<&dyn Worlds> = match &isolated {
@@ -214,7 +238,7 @@ fn run() -> Result<()> {
             );
         }
         Command::Context => {
-            let context = project(&store, "", options.focus, eja::now_utc())?;
+            let context = State::load(&store)?.project("", options.focus, eja::now_utc());
             println!("{}", adapters::render_context(&context));
             println!(
                 "[{} tasks | focus #{}]",
@@ -253,7 +277,8 @@ fn run() -> Result<()> {
             }
         }
         Command::Tasks(only) => {
-            let all = tasks(&store.events()?);
+            let state = State::load(&store)?;
+            let all = state.tasks();
             if only.is_some_and(|id| !all.iter().any(|task| task.id == id)) {
                 return Err("no such task".into());
             }
@@ -265,13 +290,14 @@ fn run() -> Result<()> {
             }
         }
         Command::Audit(start) => {
-            let events = store.events()?;
-            let all = tasks(&events);
+            let state = State::load(&store)?;
+            let all = state.tasks();
             if !all.iter().any(|task| task.id == start) {
                 return Err("audit names an unknown task".into());
             }
-            let edges: Vec<_> = eja::relations(&events)
-                .into_iter()
+            let edges: Vec<_> = state
+                .relations()
+                .iter()
                 .filter(|edge| {
                     matches!(
                         edge.kind,
@@ -356,6 +382,13 @@ fn print_task(task: &Task) {
         "  origin: {}\n  request: {}\n  acceptance: {}",
         task.origin, task.request, task.acceptance
     );
+    if let Some(evidence) = &task.evidence {
+        println!("  evidence: {evidence}");
+        match (&task.evidence_result, task.evidence_id) {
+            (Some(result), Some(id)) => println!("  evidence observed #{id}: {result}"),
+            _ => println!("  evidence observed: no"),
+        }
+    }
     if let Some(digest) = &task.digest {
         println!(
             "  record at: {}",

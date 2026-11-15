@@ -1,7 +1,7 @@
 //! Host surface: one read over the three authorities, and the capabilities a
 //! host may add on top of it.
 use super::Worlds;
-use crate::{tasks, Address, Authority, Control, Event, Host, Result, Selector, TaskId};
+use crate::{Address, Authority, Control, Event, Host, Result, Selector, TaskId};
 use serde_json::Value;
 
 pub trait RecordReader {
@@ -97,11 +97,12 @@ fn page(log: &[Event], target: &str, selector: &Selector) -> Result<Value> {
         _ => {
             if let Some(raw) = target.strip_prefix("task:") {
                 let id: u64 = raw.parse().map_err(|_| "task target needs an id")?;
-                if !tasks(log).iter().any(|task| task.id == id) {
+                let scope = format!("task:{id}");
+                let scoped: Vec<&Event> = log.iter().filter(|event| event.scope == scope).collect();
+                if scoped.is_empty() {
                     return Err("no such task".into());
                 }
-                let scope = format!("task:{id}");
-                log.iter().filter(|event| event.scope == scope).collect()
+                scoped
             } else if let Some(raw) = target.strip_prefix("event:") {
                 let id: u64 = raw.parse().map_err(|_| "event target needs an id")?;
                 vec![log
@@ -144,7 +145,7 @@ fn page(log: &[Event], target: &str, selector: &Selector) -> Result<Value> {
                 "bytes": size - 1,
                 "address": format!("log:event:{}", event.id),
             });
-            let size = locator.to_string().len() + 1;
+            let size = crate::measure::value(&locator) + 1;
             if size > crate::aja::FRAME_LIMIT.saturating_sub(bytes) {
                 break;
             }

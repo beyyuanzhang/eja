@@ -11,6 +11,9 @@ pub const FRAME_LIMIT: usize = 256 * 1024;
 /// leaves that much room inside the frame the transport accepts.
 pub const FRAME_ENVELOPE: usize = 4 * 1024;
 
+/// The default model turns one aja may take. A host overrides it by declaration.
+pub const DEFAULT_STEPS: usize = 256;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limits {
     pub timeout_ms: u64,
@@ -23,7 +26,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             timeout_ms: 300_000,
-            steps: Some(256),
+            steps: Some(DEFAULT_STEPS),
             context_bytes: FRAME_LIMIT - FRAME_ENVELOPE,
             response_bytes: 64 * 1024,
         }
@@ -52,7 +55,29 @@ pub(crate) struct Start {
     pub messages: Vec<Value>,
 }
 
-#[derive(Serialize, Deserialize)]
+/// One frame a aja sends: the transcript it wants a model turn for, the call it
+/// wants made, and its final account. It borrows all three, so asking for a model
+/// turn never copies the context; `Request` is the same three frames as the host
+/// reads them.
+#[derive(Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub(crate) enum Ask<'a> {
+    Model {
+        messages: &'a [Value],
+    },
+    Tool {
+        #[serde(default)]
+        id: &'a str,
+        name: &'a str,
+        arguments: &'a Value,
+    },
+    Finish {
+        text: &'a str,
+        reason: &'a str,
+    },
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(crate) enum Request {
     Model {
@@ -96,10 +121,7 @@ pub(crate) fn receive<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead)
 
 #[cfg(test)]
 fn transcript_bytes(messages: &[Value]) -> usize {
-    messages
-        .iter()
-        .map(|message| message.to_string().len())
-        .sum()
+    messages.iter().map(crate::measure::value).sum()
 }
 /// Every model adapter and IPC consumer shares the same assistant contract.
 pub(crate) fn validate_assistant(message: &Value) -> Result<()> {
@@ -140,8 +162,8 @@ fn stopped(reason: &str) -> (String, String) {
     (format!("{reason}; continue in a new aja"), "budget".into())
 }
 
-fn request(reader: &mut impl BufRead, writer: &mut impl Write, request: Request) -> Result<Value> {
-    send(writer, &request)?;
+fn ask(reader: &mut impl BufRead, writer: &mut impl Write, ask: Ask<'_>) -> Result<Value> {
+    send(writer, &ask)?;
     receive(reader)
 }
 
@@ -160,11 +182,11 @@ fn run(
         if !fold::transcript(&mut messages, start.context_bytes) {
             return Ok(stopped("AJA context budget exhausted"));
         }
-        let message = request(
+        let message = ask(
             reader,
             writer,
-            Request::Model {
-                messages: messages.clone(),
+            Ask::Model {
+                messages: &messages,
             },
         )?;
         validate_assistant(&message)?;
@@ -193,13 +215,13 @@ fn run(
                     .as_str()
                     .ok_or("missing arguments")?,
             )?;
-            let result = request(
+            let result = ask(
                 reader,
                 writer,
-                Request::Tool {
-                    id: call["id"].as_str().unwrap_or_default().into(),
-                    name: name.into(),
-                    arguments,
+                Ask::Tool {
+                    id: call["id"].as_str().unwrap_or_default(),
+                    name,
+                    arguments: &arguments,
                 },
             )?;
             messages.push(
@@ -216,7 +238,13 @@ pub fn worker_main() -> Result<()> {
     let start: Start = receive(&mut reader)?;
     let (text, reason) =
         run(start, &mut reader, &mut writer).unwrap_or_else(|e| (e.to_string(), "error".into()));
-    send(&mut writer, &Request::Finish { text, reason })
+    send(
+        &mut writer,
+        &Ask::Finish {
+            text: &text,
+            reason: &reason,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -289,7 +317,42 @@ mod fold_tests {
         assert!(folded["content"]
             .as_str()
             .unwrap()
-            .contains("unfold by handle"));
+            .contains("unfold by address"));
+    }
+
+    #[test]
+    fn a_folded_step_cuts_its_line_at_a_character_boundary() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "u"}),
+        ];
+        // Three-byte characters: byte 80 of this line is not a character boundary,
+        // so a byte-index cut would panic instead of shortening the line.
+        let content = "中".repeat(40);
+        for round in 0..12 {
+            let id = format!("call_{round}");
+            messages.push(assistant_call(&id, "read_file"));
+            messages.push(tool_message(&id, &content));
+        }
+        assert!(fold::transcript(&mut messages, 800));
+        let folded = messages
+            .iter()
+            .find(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Earlier steps of this aja, folded:"))
+            })
+            .expect("a folded map");
+        let text = folded["content"].as_str().expect("text");
+        // Either landing scale is fine; what matters is that building the line did
+        // not cut a character in half.
+        assert!(
+            text.contains("step") || text.contains("older region"),
+            "{text}"
+        );
+        assert!(messages
+            .iter()
+            .all(|message| message["content"].is_string()));
     }
 
     #[test]

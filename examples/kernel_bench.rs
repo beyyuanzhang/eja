@@ -6,8 +6,8 @@ use chrono::{TimeZone, Utc};
 use eja::adapters::RecordFiles;
 use eja::adapters::{Ports, RecordReader};
 use eja::{
-    project, recover, turn_at, Action, Assignment, Brain, Decision, EjaContext, EventMeta, Kind,
-    Result, Store, Worker,
+    recover, turn_at, Action, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, Result,
+    State, Store, Worker,
 };
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -116,7 +116,9 @@ fn bench_project(root: &Path, events: usize, iterations: usize) -> (f64, f64, us
     let mut samples = Vec::new();
     for _ in 0..iterations {
         let start = Instant::now();
-        let _context = project(&store, "benchmark", None, now()).expect("project");
+        let _context = State::load(&store)
+            .expect("state")
+            .project("benchmark", None, now());
         samples.push(start.elapsed());
     }
     let size = fs::metadata(dir.join("log.jsonl")).expect("metadata").len() as usize;
@@ -198,12 +200,52 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
         .expect("turn");
         samples.push(start.elapsed());
     }
-    let tasks = eja::tasks(&store.events().expect("events"));
+    let tasks = State::load(&store).expect("state").tasks().to_vec();
     let done = tasks
         .iter()
         .filter(|task| task.status == eja::TaskStatus::Done)
         .count();
     (pct(&samples, 0.5), pct(&samples, 0.95), done)
+}
+
+/// A turn reads the journal once and validates every action against that fold, so
+/// a decision with many reads costs one read plus one commit per action rather than
+/// one full re-read and re-fold per action. The number that must stay flat is the
+/// cost of one action as the log grows.
+fn bench_turn_actions(root: &Path, events: usize, actions: usize) -> f64 {
+    let dir = root.join(format!("turn-actions-{events}-{actions}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("dir");
+    write_commitments(&dir.join("log.jsonl"), events);
+    let store = Store::new(&dir).expect("store");
+    let look = |index: usize| Action::Look {
+        target: format!("log:event:{}", index + 1),
+        arguments: serde_json::Value::Null,
+        selector: eja::Selector::Whole,
+    };
+    let brain = QueueBrain::new(vec![
+        Decision {
+            reply: "read".to_string(),
+            actions: (0..actions).map(look).collect(),
+            refused: Vec::new(),
+        },
+        Decision {
+            reply: "done".to_string(),
+            actions: Vec::new(),
+            refused: Vec::new(),
+        },
+    ]);
+    let start = Instant::now();
+    turn_at(
+        &store,
+        "inspect",
+        &brain,
+        &DoneWorker,
+        &Ports::default(),
+        now(),
+    )
+    .expect("turn");
+    start.elapsed().as_secs_f64() * 1000.0
 }
 
 fn bench_proposals(root: &Path, count: usize) -> f64 {
@@ -360,6 +402,13 @@ fn main() -> Result<()> {
     println!("empty turns: p50={empty_p50:.3} ms, p95={empty_p95:.3} ms");
     let (task_p50, task_p95, done) = bench_task_turns(&root, 20);
     println!("task turns: p50={task_p50:.3} ms, p95={task_p95:.3} ms, done={done}/20");
+
+    println!();
+    println!("## a turn with 200 reads (one journal read, one fold)");
+    for events in [1_000usize, 10_000, 50_000] {
+        let ms = bench_turn_actions(&root, events, 200);
+        println!("{events} events: {ms:.1} ms");
+    }
 
     println!();
     println!("## proposals");

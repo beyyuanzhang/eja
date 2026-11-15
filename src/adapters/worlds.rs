@@ -17,6 +17,10 @@ use std::{
 const ENTRIES: usize = 20_000;
 /// Names shown per change class before the rest are counted.
 const NAMES: usize = 6;
+/// Releasing a world is cleanup, and it runs after the run's own budget may have
+/// expired: it gets this declared bound of its own instead of inheriting a spent
+/// control. Cleanup never decides whether a run succeeded.
+const RELEASE: std::time::Duration = std::time::Duration::from_secs(30);
 
 type Inventory = BTreeMap<String, (u64, i64)>;
 
@@ -445,7 +449,7 @@ impl Worlds for Worktrees {
     fn release(&self, world: &World) {
         // The branch keeps the work; the directory is only a workspace.
         forget(&self.open, world.task);
-        let control = crate::Control::new(std::time::Duration::from_secs(30), Default::default());
+        let control = crate::Control::new(RELEASE, Default::default());
         let text = world.root.to_string_lossy().to_string();
         let _ = git(
             &self.project,

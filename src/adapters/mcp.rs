@@ -68,6 +68,9 @@ fn timeout() -> u64 {
     30_000
 }
 
+/// How long a cancelled request may take to acknowledge the cancellation.
+const CANCEL_TIMEOUT: Duration = Duration::from_millis(500);
+
 fn expand(value: &str) -> Result<String> {
     let mut result = String::new();
     let mut rest = value;
@@ -122,8 +125,10 @@ impl LocalServer {
             return;
         }
         self.stopped = true;
-        #[cfg(unix)]
         if let Some(id) = self.child.id() {
+            // SAFETY: the server was spawned into its own process group, so its id
+            // is a live group id owned by this process; killing that group ends the
+            // server and anything it started. A reaped group is a no-op error.
             unsafe {
                 libc::killpg(id as i32, libc::SIGKILL);
             }
@@ -254,7 +259,6 @@ impl McpTools {
                     for (key, value) in &config.env {
                         command.env(key, expand(value)?);
                     }
-                    #[cfg(unix)]
                     command.process_group(0);
                     let mut child = host.runtime.block_on(async { command.spawn() })?;
                     let output = child.stdout.take().ok_or("missing MCP stdout")?;
@@ -359,7 +363,7 @@ impl McpTools {
                         }
                         cursor = page.next_cursor;
                         match &cursor {
-                            None => return Ok::<Vec<Tool>, Box<dyn std::error::Error>>(all),
+                            None => return Ok::<Vec<Tool>, crate::Error>(all),
                             Some(c) if !seen.insert(c.clone()) => {
                                 return Err("MCP pagination cursor repeated".into())
                             }
@@ -477,31 +481,49 @@ impl ToolGateway for McpTools {
             .clone();
         let remaining = ctx.control.remaining()?.min(connection.timeout);
         let peer = connection.service.peer().clone();
-        let result = self.runtime.block_on(async {
-            let request = ClientRequest::CallToolRequest(CallToolRequest::new(
-                CallToolRequestParams::new(tool.name.clone()).with_arguments(args),
-            ));
-            let call_control=ctx.control.child(remaining);
-            let mut handle=super::controlled(&call_control,async {Ok(peer.send_cancellable_request(request,PeerRequestOptions::with_timeout(remaining)).await?) }).await?;
-            loop {
-                tokio::select! {
-                    response = &mut handle.rx => break Ok::<ServerResult, Box<dyn std::error::Error>>(response??),
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        let error = call_control.check().err().map(|e|e.to_string());
-                        if let Some(error) = error {
-                            let _ = tokio::time::timeout(Duration::from_millis(500), handle.cancel(Some(error.clone()))).await;
-                            return Err::<ServerResult, Box<dyn std::error::Error>>(error.into());
-                        }
-                    }
-                }
-            }
-        }).map_err(|e| format!("MCP {}: {e}", connection.name))?;
+        let result = self
+            .runtime
+            .block_on(async {
+                let request = ClientRequest::CallToolRequest(CallToolRequest::new(
+                    CallToolRequestParams::new(tool.name.clone()).with_arguments(args),
+                ));
+                let call_control = ctx.control.child(remaining);
+                let mut handle = super::controlled(&call_control, async {
+                    Ok(peer
+                        .send_cancellable_request(
+                            request,
+                            PeerRequestOptions::with_timeout(remaining),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?)
+                })
+                .await?;
+                let cancel_deadline = tokio::time::Instant::now() + call_control.remaining()?;
+                let response = tokio::select! {
+                    biased;
+                    response = &mut handle.rx => Some(response??),
+                    _ = tokio::time::sleep_until(cancel_deadline) => None,
+                    _ = super::cancelled(&call_control) => None,
+                };
+                // A stop asks the server to stop rather than dropping the call.
+                let Some(response) = response else {
+                    let error = super::stop_reason(&call_control);
+                    let _ = tokio::time::timeout(
+                        CANCEL_TIMEOUT,
+                        handle.cancel(Some(error.to_string())),
+                    )
+                    .await;
+                    return Err::<ServerResult, crate::Error>(error);
+                };
+                Ok::<ServerResult, crate::Error>(response)
+            })
+            .map_err(|e| format!("MCP {}: {e}", connection.name))?;
         ctx.control.check()?;
         let ServerResult::CallToolResult(result) = result else {
             return Err("MCP tool requires an unsupported interactive or task continuation".into());
         };
         let value = serde_json::to_value(result)?;
-        if serde_json::to_vec(&value)?.len() > crate::aja::FRAME_LIMIT {
+        if crate::measure::bytes(&value)? > crate::aja::FRAME_LIMIT {
             return Err("MCP tool output exceeds limit".into());
         }
         Ok(value)

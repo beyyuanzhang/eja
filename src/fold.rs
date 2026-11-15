@@ -3,11 +3,11 @@
 //! A view is a space of regions ordered by priority: the newest step first, the
 //! current input first, the evidence before the index. The renderer keeps the
 //! head whole while the declared budget allows, lists the rest as one line each,
-//! and folds the oldest into one address line. A folded region keeps its handle
-//! in the log or in the aja record, so reading it again is an address lookup,
-//! never a re-derivation: the space is folded, not summarized.
+//! and folds the oldest into one address range. Every region names the address
+//! that reads it back, so folding is an address lookup, never a re-derivation:
+//! the space is folded, not summarized.
 //!
-//! EJA's projection and an AJA transcript are the same call with a different
+//! EJA's projection and a aja transcript are the same call with a different
 //! payload. Nothing here writes state or calls a model.
 
 use crate::aja::Limits;
@@ -19,9 +19,9 @@ use serde_json::{json, Value};
 pub(crate) enum Level {
     /// The region's whole body.
     Record,
-    /// One line with the region's handle.
+    /// One line with the region's address.
     Index,
-    /// One line for the folded tail, compressed to the region's short line.
+    /// One address range for the folded tail.
     Map,
 }
 
@@ -36,10 +36,10 @@ impl Level {
 }
 
 /// One addressable region of a space. The caller keeps the bodies; a region is
-/// only what the renderer needs to choose a scale.
+/// only what the renderer needs to choose a scale and to name an address.
 pub(crate) struct Region {
-    /// Where the region lives: an event id, a aja record entry, a path.
-    pub handle: String,
+    /// Where the region lives: `log:event:12`, `log:task:3`, `record 3/7`.
+    pub address: String,
     /// One line that stands for the region at index scale.
     pub line: String,
     /// Serialized size of the body, so the renderer measures without allocating.
@@ -47,9 +47,9 @@ pub(crate) struct Region {
 }
 
 impl Region {
-    pub(crate) fn new(handle: impl Into<String>, line: impl Into<String>, bytes: usize) -> Self {
+    pub(crate) fn new(address: impl Into<String>, line: impl Into<String>, bytes: usize) -> Self {
         Self {
-            handle: handle.into(),
+            address: address.into(),
             line: line.into(),
             bytes,
         }
@@ -57,12 +57,14 @@ impl Region {
 }
 
 /// A space rendered within a budget: the head whole, the rest listed, the
-/// oldest folded into one address line.
+/// oldest folded into one address line. The texts stay in the regions.
 pub(crate) struct View {
     /// Indices of the regions kept whole, in order.
     pub record: Vec<usize>,
-    pub index: Vec<(String, String)>,
-    pub map: Vec<(String, String)>,
+    /// Indices of the regions listed as one line.
+    pub index: Vec<usize>,
+    /// The one line standing for everything older, when even lines do not fit.
+    pub map: Option<String>,
     /// The scale the last region landed at.
     pub level: Level,
 }
@@ -94,7 +96,7 @@ pub fn tool_result(value: &serde_json::Value, aja: u64, entry: usize) -> serde_j
     let reference = json!({"aja": aja, "entry": entry});
     let whole = json!({"record": reference, "result": value});
     let text = value.to_string();
-    if whole.to_string().len() <= TOOL_BYTES {
+    if crate::measure::value(&whole) <= TOOL_BYTES {
         return whole;
     }
     let mut payload = TOOL_BYTES / 2;
@@ -102,7 +104,7 @@ pub fn tool_result(value: &serde_json::Value, aja: u64, entry: usize) -> serde_j
         let view = json!({"record": reference, "truncated": true, "bytes": text.len(),
             "note": "the full result stays in the record; use eja_read_record",
             "head": prefix(&text, payload * 2 / 3), "tail": suffix(&text, payload / 3)});
-        if view.to_string().len() <= TOOL_BYTES {
+        if crate::measure::value(&view) <= TOOL_BYTES {
             return view;
         }
         payload /= 2;
@@ -114,6 +116,11 @@ pub fn tool_result(value: &serde_json::Value, aja: u64, entry: usize) -> serde_j
 /// oldest fold into a single address. Returns false when even that does not fit,
 /// which is the aja's stopping point, not a licence to keep re-sending at the cap.
 pub(crate) fn transcript(messages: &mut Vec<Value>, budget: usize) -> bool {
+    let size = |messages: &[Value]| messages.iter().map(crate::measure::value).sum::<usize>();
+    // The common case: the space already fits, so nothing is measured twice.
+    if size(messages) <= budget {
+        return true;
+    }
     let head = messages
         .iter()
         .take_while(|message| message["role"] == "system" || message["role"] == "user")
@@ -121,12 +128,7 @@ pub(crate) fn transcript(messages: &mut Vec<Value>, budget: usize) -> bool {
         .min(2);
     if messages.len() <= head {
         // Nothing to fold: the assignment itself must fit.
-        return messages
-            .iter()
-            .map(|message| message.to_string().len())
-            .sum::<usize>()
-            + 8
-            <= budget;
+        return size(messages) + 8 <= budget;
     }
     // A step is one assistant message with the tool results it asked for.
     let mut steps: Vec<(usize, usize)> = Vec::new();
@@ -144,47 +146,33 @@ pub(crate) fn transcript(messages: &mut Vec<Value>, budget: usize) -> bool {
     if steps.is_empty() {
         return true;
     }
-    let bodies: Vec<Vec<Value>> = steps
-        .iter()
-        .map(|(start, end)| messages[*start..*end].to_vec())
-        .collect();
     let regions: Vec<Region> = steps
         .iter()
-        .zip(&bodies)
         .enumerate()
         .rev()
-        .map(|(position, ((start, end), body))| {
-            let bytes = body.iter().map(|m| m.to_string().len()).sum::<usize>();
-            Region::new(
-                format!("step:{}", position + 1),
-                step_line(*start, *end, &messages[*start..*end]),
-                bytes,
-            )
-        })
+        .map(|(position, (start, end))| step_region(position + 1, &messages[*start..*end]))
         .collect();
-    let head_bytes: usize = messages[..head].iter().map(|m| m.to_string().len()).sum();
+    let head_bytes: usize = messages[..head].iter().map(crate::measure::value).sum();
     let view = assemble(&regions, budget.saturating_sub(head_bytes + 8));
-    let kept: Vec<usize> = view.record.iter().map(|i| steps.len() - 1 - *i).collect();
-    let tail = tail(&view, "Earlier steps of this aja, folded:");
+    let mut kept: Vec<usize> = view.record.iter().map(|i| steps.len() - 1 - *i).collect();
+    let tail = tail(&view, &regions, "Earlier steps of this aja, folded:");
     let mut rebuilt: Vec<Value> = messages[..head].to_vec();
     if let Some(text) = &tail {
         rebuilt.push(json!({"role":"user","content":text}));
     }
-    let mut ordered = kept;
-    ordered.sort_unstable();
-    for step in &ordered {
+    kept.sort_unstable();
+    for step in &kept {
         let (start, end) = steps[*step];
         rebuilt.extend_from_slice(&messages[start..end]);
     }
     *messages = rebuilt;
-    let size: usize = messages.iter().map(|m| m.to_string().len()).sum();
-    size <= budget
+    size(messages) <= budget
 }
 
-/// One line that stands for a step, naming the record entry that unfolds it.
-fn step_line(start: usize, end: usize, messages: &[Value]) -> String {
+/// One step as a region: its line names the record entry that unfolds it, and
+/// that same entry is the region's address.
+fn step_region(number: usize, messages: &[Value]) -> Region {
     let mut names: Vec<String> = Vec::new();
-    let mut address = String::new();
     if let Some(calls) = messages[0]["tool_calls"].as_array() {
         for call in calls {
             names.push(
@@ -195,6 +183,7 @@ fn step_line(start: usize, end: usize, messages: &[Value]) -> String {
             );
         }
     }
+    let mut address = String::new();
     let mut snippet = String::new();
     for message in messages.iter().skip(1) {
         let content = message["content"].as_str().unwrap_or("");
@@ -211,11 +200,10 @@ fn step_line(start: usize, end: usize, messages: &[Value]) -> String {
         }
         if snippet.is_empty() {
             snippet = content.replace(['\n', '\r'], " ");
-            snippet.truncate(80);
+            // Fold at a character boundary: a byte index is not a character index.
+            snippet.truncate(snippet.floor_char_boundary(80));
         }
     }
-    let _ = start;
-    let _ = end;
     let action = if names.is_empty() {
         "said".to_string()
     } else {
@@ -226,7 +214,12 @@ fn step_line(start: usize, end: usize, messages: &[Value]) -> String {
     } else {
         format!(" (record {address})")
     };
-    format!("  step: {action}{suffix} → {snippet}")
+    let bytes = messages.iter().map(crate::measure::value).sum();
+    Region::new(
+        address,
+        format!("  step{number}: {action}{suffix} → {snippet}"),
+        bytes,
+    )
 }
 
 pub(crate) fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Value> {
@@ -239,7 +232,7 @@ pub(crate) fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Va
             )
         },
     );
-    let system = format!("You are AJA, one independent work aja. Complete the assigned work using supplied tools. Your workspace is the current project; inherited messages describe earlier observations, not a restored world. {budget} Acceptance is the contract. Stop once it holds and report what you did. Tool results carry record addresses; use eja_read_record to read omitted passages. Never claim a failed tool succeeded.");
+    let system = format!("You are one AJA: a single bounded execution of the work assigned below. Complete it with the supplied tools. Your workspace is the current project; inherited messages describe earlier observations, not a restored world. {budget} Acceptance is the contract. Stop once it holds and report what you did. Tool results carry record addresses; use eja_read_record to read omitted passages. Never claim a failed tool succeeded.");
     let mut brief = assignment.objective.clone();
     if !assignment.input.trim().is_empty() && assignment.input.trim() != brief.trim() {
         brief.push_str("\n\nTask as given:\n");
@@ -292,7 +285,7 @@ fn line_bytes(line: &str) -> usize {
 
 fn footer(record: usize, index: usize, map: usize, level: Level) -> String {
     format!(
-        "\n[view {record} whole, {index} listed, {map} folded — landed at {}; unfold by handle]\n",
+        "\n[view {record} whole, {index} listed, {map} folded — landed at {}; unfold by address]\n",
         level.name()
     )
 }
@@ -311,19 +304,13 @@ const FOOTER: usize = 80;
 pub(crate) fn assemble(regions: &[Region], budget: usize) -> View {
     let count = regions.len();
     if count == 0 {
-        return build(regions, Vec::new(), Vec::new(), 0, budget);
+        return build(regions, Vec::new(), None, 0, budget);
     }
     let room = |extra: usize| budget.saturating_sub(FOOTER + extra);
 
     let whole: usize = regions.iter().map(|region| region.bytes + 8).sum();
     if whole <= room(0) {
-        return build(
-            regions,
-            vec![Level::Record; count],
-            Vec::new(),
-            count,
-            budget,
-        );
+        return build(regions, vec![Level::Record; count], None, count, budget);
     }
     let listed: usize = regions.iter().map(|region| line_bytes(&region.line)).sum();
     if listed <= room(0) {
@@ -336,7 +323,7 @@ pub(crate) fn assemble(regions: &[Region], budget: usize) -> View {
             left -= region.bytes + 8;
             widths[index] = Level::Record;
         }
-        return build(regions, widths, Vec::new(), count, budget);
+        return build(regions, widths, None, count, budget);
     }
     // Not even one line each: keep the head's lines and fold the tail into one
     // address range, so a space of any size still states where it went.
@@ -352,25 +339,37 @@ pub(crate) fn assemble(regions: &[Region], budget: usize) -> View {
         widths[kept] = Level::Index;
         kept += 1;
     }
-    let mut map = Vec::new();
-    if kept < count {
-        map.push((
-            String::new(),
-            format!(
-                "  … {} older region(s), {} .. {} — unfold by handle",
-                count - kept,
-                regions[kept].handle,
-                regions[count - 1].handle
-            ),
-        ));
-    }
+    let map = (kept < count).then(|| fold_line(regions, kept, count));
     build(regions, widths, map, kept, budget)
+}
+
+/// The one line that stands for the folded tail: the addresses that read it, or
+/// the fact that this space names none because the region itself is derived.
+fn fold_line(regions: &[Region], kept: usize, count: usize) -> String {
+    let folded = &regions[kept..count];
+    let first = folded.iter().find(|region| !region.address.is_empty());
+    let last = folded
+        .iter()
+        .rev()
+        .find(|region| !region.address.is_empty());
+    match (first, last) {
+        (Some(first), Some(last)) => format!(
+            "  … {} older region(s), {} .. {} — unfold by address",
+            count - kept,
+            first.address,
+            last.address
+        ),
+        _ => format!(
+            "  … {} older region(s) — this view is derived; its facts keep their ids",
+            count - kept
+        ),
+    }
 }
 
 fn build(
     regions: &[Region],
     widths: Vec<Level>,
-    map: Vec<(String, String)>,
+    map: Option<String>,
     shown: usize,
     budget: usize,
 ) -> View {
@@ -385,12 +384,14 @@ fn build(
             }
             Level::Index => {
                 bytes += line_bytes(&region.line);
-                index.push((region.handle.clone(), region.line.clone()));
+                index.push(position);
             }
             Level::Map => {}
         }
     }
-    bytes += map.iter().map(|(_, line)| line_bytes(line)).sum::<usize>();
+    if let Some(line) = &map {
+        bytes += line_bytes(line);
+    }
     let level = widths.last().copied().unwrap_or(Level::Map);
     // The declared budget is the contract. The only irreducible content is the
     // single fold line, so a budget smaller than that cannot be met by any view.
@@ -404,8 +405,14 @@ fn build(
 }
 
 /// Render a view as text within its declared budget.
-pub(crate) fn text_within(view: &View, bodies: &[String], title: &str, budget: usize) -> String {
-    let rendered = text(view, bodies, title);
+pub(crate) fn text_within(
+    view: &View,
+    regions: &[Region],
+    title: &str,
+    budget: usize,
+    body: &dyn Fn(usize) -> String,
+) -> String {
+    let rendered = text(view, regions, title, body);
     if rendered.len() <= budget {
         return rendered;
     }
@@ -417,62 +424,69 @@ pub(crate) fn text_within(view: &View, bodies: &[String], title: &str, budget: u
     rendered[..end].to_string()
 }
 
-/// Render a view as text: whole bodies first, then lines, then folded addresses.
-pub(crate) fn text(view: &View, bodies: &[String], title: &str) -> String {
+/// Render a view as text: whole bodies first, then lines, then the fold line.
+/// A body is produced on demand, so a region that the budget folded is never
+/// rendered in full.
+pub(crate) fn text(
+    view: &View,
+    regions: &[Region],
+    title: &str,
+    body: &dyn Fn(usize) -> String,
+) -> String {
     let mut out = String::new();
     if !title.is_empty() {
         out.push_str(title);
         out.push('\n');
     }
     for index in &view.record {
-        let body = bodies.get(*index).map_or("", String::as_str);
-        out.push_str(body);
+        let body = body(*index);
+        out.push_str(&body);
         if !body.ends_with('\n') {
             out.push('\n');
         }
     }
-    for (_, line) in &view.index {
-        out.push_str(line);
+    for index in &view.index {
+        out.push_str(&regions[*index].line);
         out.push('\n');
     }
-    for (_, line) in &view.map {
+    if let Some(line) = &view.map {
         out.push_str(line);
         out.push('\n');
     }
     // A whole view needs no notice: the landing scale matters only when the
     // budget forced something out.
-    if view.index.is_empty() && view.map.is_empty() {
+    if view.index.is_empty() && view.map.is_none() {
         return out;
     }
     out.push_str(&footer(
         view.record.len(),
         view.index.len(),
-        view.map.len(),
+        usize::from(view.map.is_some()),
         view.level,
     ));
     out
 }
 
-/// The folded part of a transcript: one address line per region that did not
-/// stay whole.
-pub(crate) fn tail(view: &View, title: &str) -> Option<String> {
-    if view.index.is_empty() && view.map.is_empty() {
+/// The folded part of a space: one address line per region that did not stay
+/// whole, plus the fold line for the rest.
+pub(crate) fn tail(view: &View, regions: &[Region], title: &str) -> Option<String> {
+    if view.index.is_empty() && view.map.is_none() {
         return None;
     }
     let mut out = String::from(title);
     out.push('\n');
-    for (_, line) in &view.index {
-        out.push_str(line);
+    for index in &view.index {
+        out.push_str(&regions[*index].line);
         out.push('\n');
     }
-    for (_, line) in &view.map {
+    if let Some(line) = &view.map {
         out.push_str(line);
         out.push('\n');
     }
     out.push_str(&footer(
         view.record.len(),
         view.index.len(),
-        view.map.len(),
+        usize::from(view.map.is_some()),
         view.level,
     ));
     Some(out)
@@ -484,7 +498,13 @@ mod tests {
 
     fn regions(count: usize, body: usize) -> Vec<Region> {
         (0..count)
-            .map(|index| Region::new(format!("event:{index}"), format!("  #{index} line"), body))
+            .map(|index| {
+                Region::new(
+                    format!("log:event:{index}"),
+                    format!("  #{index} line"),
+                    body,
+                )
+            })
             .collect()
     }
 
@@ -493,7 +513,7 @@ mod tests {
         let view = assemble(&regions(3, 10), 10_000);
         assert_eq!(view.level, Level::Record);
         assert_eq!(view.record.len(), 3);
-        assert!(view.index.is_empty() && view.map.is_empty());
+        assert!(view.index.is_empty() && view.map.is_none());
     }
 
     #[test]
@@ -506,20 +526,23 @@ mod tests {
     }
 
     #[test]
-    fn when_even_lines_do_not_fit_the_tail_folds_into_one_address() {
+    fn when_even_lines_do_not_fit_the_tail_folds_into_one_address_range() {
         let view = assemble(&regions(200, 10), 900);
-        assert_eq!(view.map.len(), 1);
+        let line = view.map.as_deref().expect("a fold line");
         assert_eq!(view.level, Level::Map);
-        assert!(view.map[0].1.contains("unfold by handle"));
+        assert!(line.contains("unfold by address"), "{line}");
+        // The range names the addresses that read the folded regions back.
+        assert!(line.contains("log:event:"), "{line}");
     }
 
     #[test]
     fn a_rendered_view_never_exceeds_its_budget() {
         for budget in [200usize, 500, 1_000, 4_000] {
             for count in [1usize, 3, 40, 400] {
-                let view = assemble(&regions(count, 64), budget);
+                let space = regions(count, 64);
+                let view = assemble(&space, budget);
                 let bodies: Vec<String> = (0..count).map(|_| "x".repeat(64)).collect();
-                let rendered = text(&view, &bodies, "");
+                let rendered = text(&view, &space, "", &|index| bodies[index].clone());
                 assert!(
                     rendered.len() <= budget,
                     "count={count} budget={budget} rendered={}",
@@ -531,11 +554,11 @@ mod tests {
 
     #[test]
     fn the_rendered_text_states_its_landing_scale() {
-        let view = assemble(&regions(6, 500), 2_000);
+        let space = regions(6, 500);
+        let view = assemble(&space, 2_000);
         let bodies: Vec<String> = (0..6).map(|_| "body".to_string()).collect();
-        let rendered = text(&view, &bodies, "SPACE");
+        let rendered = text(&view, &space, "SPACE", &|index| bodies[index].clone());
         assert!(rendered.starts_with("SPACE\n"));
         assert!(rendered.contains("[view "));
-        assert!(rendered.contains("unfold by handle"));
     }
 }

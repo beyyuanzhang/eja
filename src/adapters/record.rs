@@ -19,6 +19,10 @@ fn path(root: &Path, id: u64) -> Result<PathBuf> {
     }
     super::tools::relative_file(root, &format!("{id}/context.jsonl"))
 }
+fn bytes(messages: &[Value]) -> usize {
+    messages.iter().map(crate::measure::value).sum()
+}
+
 fn start(root: &Path, id: u64, control: &Control) -> Result<Value> {
     control.check()?;
     let line = BufReader::new(fs::File::open(path(root, id)?)?)
@@ -78,6 +82,9 @@ pub(crate) fn replay(
     for &aja in chain.iter().rev() {
         let mut pending = VecDeque::new();
         let mut unfinished = None;
+        // Fold only when the working set outgrows the budget: folding after every
+        // line would re-measure the whole transcript once per record entry.
+        let mut size = 0usize;
         for (index, line) in BufReader::new(fs::File::open(path(root, aja)?)?)
             .lines()
             .enumerate()
@@ -104,6 +111,7 @@ pub(crate) fn replay(
                             .filter(|message| message["role"] != "system")
                             .cloned(),
                     );
+                    size = bytes(&messages);
                 }
                 Some("assistant") => {
                     if !pending.is_empty() {
@@ -127,6 +135,7 @@ pub(crate) fn replay(
                             );
                         }
                     }
+                    size += crate::measure::value(&message);
                     messages.push(message);
                 }
                 Some("tool") => {
@@ -140,15 +149,18 @@ pub(crate) fn replay(
                     {
                         return Err("record tool ids do not match".into());
                     }
-                    messages.push(json!({"role":"tool","tool_call_id":id,"content":fold::tool_result(&entry["result"],aja,index).to_string()}));
+                    let result = fold::tool_result(&entry["result"], aja, index).to_string();
+                    size += result.len();
+                    messages.push(json!({"role":"tool","tool_call_id":id,"content":result}));
                     if pending.is_empty() {
                         unfinished = None;
                     }
                 }
                 _ => {}
             }
-            if pending.is_empty() {
+            if size > budget {
                 fold::transcript(&mut messages, budget);
+                size = bytes(&messages);
             }
         }
         // Keep the complete prefix of an interrupted call group. It may have had

@@ -111,7 +111,7 @@ impl ToolGateway for FileTools {
                     } else {
                         format!("{name} ({} bytes)", metadata.len())
                     };
-                    let size = serde_json::to_vec(&line)?.len() + 1;
+                    let size = crate::measure::bytes(&line)? + 1;
                     if bytes.saturating_add(size) < FRAME_LIMIT {
                         bytes += size;
                         entries.push(line);

@@ -173,8 +173,9 @@ fn approval_is_a_host_fact_and_one_atomic_identity_event_resolves_the_proposal()
     assert!(!events
         .iter()
         .any(|event| event.kind == Kind::User && event.data.is_some()));
-    assert!(project(&f.store(), "", None, now_utc())
-        .unwrap()
+    assert!(State::load(&f.store())
+        .expect("state")
+        .project("", None, now_utc())
         .proposals
         .is_empty());
 }
@@ -342,7 +343,10 @@ fn unrelated_tasks_do_not_change_world_capabilities() {
     let first = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
     run(&store, vec![aja("unrelated", true)], &worker);
     let second = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();
+    // The same observation is available after an unrelated task: the capability
+    // does not depend on the task index.
     assert_eq!(first.context.evidence, second.context.evidence);
+    assert_eq!(first.context.evidence.len(), 1);
     assert!(first.context.refused.is_empty() && second.context.refused.is_empty());
 }
 
@@ -464,7 +468,9 @@ fn history_is_discoverable_and_all_rendered_views_obey_utf8_byte_budgets() {
         &Ports::default(),
     )
     .unwrap();
-    let context = project(&store, "next", None, now_utc()).unwrap();
+    let context = State::load(&store)
+        .expect("state")
+        .project("next", None, now_utc());
     assert!(context
         .history
         .iter()
@@ -858,7 +864,9 @@ fn a_recorded_relationship_is_identity_content() {
     assert!(events
         .iter()
         .any(|event| event.kind == Kind::Relationship && event.text == text));
-    let context = project(&store, "", None, now_utc()).unwrap();
+    let context = State::load(&store)
+        .expect("state")
+        .project("", None, now_utc());
     assert!(
         context.identity.iter().any(|event| event.text == text),
         "a relationship is identity content, not a task edge"

@@ -1,7 +1,7 @@
 use eja::adapters::Ports;
 use eja::{
-    open_commitments, turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind,
-    Selector, Store, Worker,
+    turn_at, Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, Selector, State,
+    Store, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -97,7 +97,7 @@ fn recall_is_an_id_result_not_text_matching() {
         },
     )
     .expect("confirm");
-    let commitment = open_commitments(&store.events().expect("events"))[0].clone();
+    let commitment = State::load(&store).expect("state").commitments()[0].clone();
 
     let brain = QueueBrain::new(vec![
         decision(

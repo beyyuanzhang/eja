@@ -1,7 +1,7 @@
 use eja::adapters::Ports;
 use eja::{
-    recover, turn_at, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, Store, TaskStatus,
-    Worker,
+    recover, turn_at, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, State, Store,
+    TaskStatus, Worker,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -105,7 +105,7 @@ fn interrupted_assignment_is_reconciled_without_duplicate_dispatch() {
             .count(),
         1
     );
-    let task = eja::tasks(&events).remove(0);
+    let task = State::fold(events).tasks()[0].clone();
     assert_eq!(task.status, TaskStatus::Waiting);
     assert!(
         task.digest.as_deref().unwrap_or("").contains("interrupted"),

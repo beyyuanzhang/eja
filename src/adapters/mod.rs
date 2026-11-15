@@ -78,7 +78,7 @@ fn text_view(
         control.check()?;
         view["text"] = serde_json::json!(text);
         view["truncated"] = serde_json::json!(truncated);
-        if serde_json::to_vec(&view)?.len() <= crate::aja::FRAME_LIMIT {
+        if crate::measure::bytes(&view)? <= crate::aja::FRAME_LIMIT {
             return Ok(view);
         }
         if text.is_empty() {
@@ -109,6 +109,18 @@ pub(crate) fn text_page(text: &str, from: usize, bytes: usize, cap: usize) -> se
     serde_json::json!({"offset":offset,"next_offset":end,"total_bytes":text.len(),"truncated":end<text.len(),"text":&text[offset..end]})
 }
 
+/// How often a parked call re-reads the cancellation flag. Cancellation is a flag,
+/// not a future, so it can only be observed at a bounded cadence.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The error a stop reports, derived from the control rather than assumed.
+pub(crate) fn stop_reason(control: &crate::Control) -> crate::Error {
+    match control.check() {
+        Err(error) => error.into(),
+        Ok(()) => crate::ControlError::Cancelled.into(),
+    }
+}
+
 /// One cooperative wait for adapter futures. A deadline and cancellation cover
 /// request enqueueing as well as waiting for the eventual response.
 pub(crate) async fn controlled<T>(
@@ -116,11 +128,26 @@ pub(crate) async fn controlled<T>(
     future: impl std::future::Future<Output = crate::Result<T>>,
 ) -> crate::Result<T> {
     control.check()?;
+    let deadline = tokio::time::Instant::now() + control.remaining()?;
     tokio::pin!(future);
-    loop {
-        tokio::select! {
-            result = &mut future => {control.check()?;return result;},
-            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => control.check()?,
+    tokio::select! {
+        // A result that is already there wins over a deadline firing with it.
+        biased;
+        result = &mut future => {
+            control.check()?;
+            result
         }
+        _ = tokio::time::sleep_until(deadline) => Err(stop_reason(control)),
+        _ = cancelled(control) => Err(stop_reason(control)),
+    }
+}
+
+/// Resolve when the host cancels the run.
+pub(crate) async fn cancelled(control: &crate::Control) {
+    loop {
+        if control.check().is_err() {
+            return;
+        }
+        tokio::time::sleep(CANCEL_POLL).await;
     }
 }
