@@ -35,7 +35,8 @@ another authority. Folding never re-executes world effects.
    turn is the unit of waiting: a proposal that needs an approval ends the turn
    and the next turn carries it, so no journal lease is held for a human.
    A judgment counts only on evidence the host observed, not on the runner's
-   account: without it the judgment is undecidable, not failed.
+   account: acceptance needs it, and a rejection does not — so evidence that
+   cannot be obtained cannot strand a task.
 3. **Bounded, addressable views.** One renderer produces every model-facing
    view: EJA's projection and a aja transcript are the same call over different
    spaces (the log; the aja's own record). Regions are shown whole while the
@@ -152,9 +153,10 @@ transcript or manufacture an acceptance.
   before the next.
 - `Host::look`: read only, bound output, respect Control; one address space.
 - `Host::witness`: the host's own observation of declared acceptance evidence.
-  A host that declares none is still complete: the default refuses, and the
-  judgment stays undecidable. `Host::reconcile`: land one run's world, or
-  report its conflicts as the recorded outcome.
+  A host that declares none is still complete: the default refuses, so an
+  acceptance is unavailable and only a rejection is left open.
+  `Host::reconcile`: land one run's world, or report its conflicts as the
+  recorded outcome.
 - `Worlds`: reserve, settle, reconcile and release the world one execution may
   change. A world is a lease — where a run may write — and the backend keeps the
   reservation that turns it into an account: one line, measured, complete or
@@ -194,7 +196,7 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | The contract states no character, and goal/identity render before indexes | identity |
 | A folded region reads back through its address | identity |
 | A host approval authorizes only the turn it was recorded in | acceptance |
-| Declared evidence without a host observation leaves judgment undecidable | acceptance |
+| Acceptance needs observed evidence; a rejection needs none | acceptance |
 | Parallel slots run at once and the log keeps action order | worlds |
 | A worktree world settles and reconciles explicitly; conflicts are reported | worlds |
 

@@ -534,11 +534,13 @@ fn close_task(
             task.status.as_str()
         )));
     }
-    // Acceptance evidence is the host's, not the runner's. A declared witness
-    // without evidence leaves the judgment undecidable, which is not a failure.
-    if task.witness.is_some() && task.witness_id.is_none() {
+    // Acceptance needs the host's observation, not the runner's word. A
+    // rejection needs none: the point of the gate is that EJA may not accept
+    // what it cannot verify, not that it must wait forever for a witness that
+    // never answers.
+    if accepted && task.witness.is_some() && task.witness_id.is_none() {
         return Ok(Some(format!(
-            "close refused: task {task_id} asked for evidence and the host observed none; the judgment is undecidable"
+            "close refused: accepting task {task_id} needs the evidence its contract asked for and the host observed none; rejecting needs no evidence"
         )));
     }
     let data = serde_json::to_value(CloseOutcome {

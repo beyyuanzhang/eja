@@ -37,7 +37,8 @@ record reading.
   reads that event, so a caller's flag never becomes a second authority.
 - A task may declare **evidence** at open: what the host must observe before the
   task can be judged. The host's observation is recorded as one `Observed` event
-  scoped to the task; without it the judgment is undecidable, not failed.
+  scoped to the task. Acceptance needs that observation; a rejection does not,
+  so a witness that never answers cannot strand a task in the index.
 - One address space covers every fact a view can read: `log:<target>`,
   `record:<aja>/<path>`, `world:<path>`. Any other target is a host read
   tool. A folded region and a live one are read the same way.

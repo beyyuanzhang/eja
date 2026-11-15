@@ -140,7 +140,7 @@ fn declared_evidence_is_a_host_observation_and_the_judgment_can_use_it() {
 }
 
 #[test]
-fn without_host_evidence_the_judgment_is_undecidable_not_failed() {
+fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
     let store = store();
     let out = turn_at(
         &store,
@@ -172,10 +172,31 @@ fn without_host_evidence_the_judgment_is_undecidable_not_failed() {
         closed
             .refused
             .iter()
-            .any(|note| note.contains("undecidable")),
+            .any(|note| note.contains("needs the evidence")),
         "{:?}",
         closed.refused
     );
+
+    // Rejecting needs no evidence: a witness that never answers cannot strand
+    // the task in the index.
+    let rejected = turn_at(
+        &store,
+        "reject",
+        &Queue::new(vec![vec![Action::CloseTask {
+            task_id: 1,
+            accepted: false,
+            note: "evidence unavailable".into(),
+        }]]),
+        &NoWorker,
+        &Ports::default(),
+        eja::now_utc(),
+    )
+    .expect("reject");
+    assert_eq!(rejected.tasks[0].status, TaskStatus::Failed);
+    assert!(rejected.tasks[0]
+        .close
+        .as_ref()
+        .is_some_and(|close| !close.accepted));
 }
 
 #[test]
