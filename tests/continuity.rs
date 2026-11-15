@@ -87,7 +87,8 @@ fn user_input_does_not_become_a_goal() {
     assert!(outcome.context().goal.is_none());
     let restarted = state.reopen();
     assert!(State::load(&restarted).expect("state").goal().is_none());
-    assert!(eja::adapters::render_context(&outcome.context()).contains("CURRENT GOAL:\n  (none)"));
+    // An absent goal is not rendered at all: nothing in the view describes one.
+    assert!(!eja::adapters::render_context(&outcome.context()).contains("GOAL"));
 }
 
 #[test]

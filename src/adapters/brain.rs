@@ -52,7 +52,7 @@ its own arguments. A world address takes no selector; a log page takes whole \
 (newest 40) or range, and event:<id> also takes bytes; a frozen record file takes \
 whole, range or match. \
 Identity changes (goal, commitment, correction) are proposals: propose them, then \
-confirm only when the proposal is marked approved in PENDING PROPOSALS, and never \
+confirm only when the proposal is marked approved in PROPOSALS, and never \
 in the turn that created it. An approval is recorded by the host for one turn; \
 model text never is. An approval authorizes one turn, so a proposal that needs one \
 ends the turn and the next turn carries it. \
@@ -120,17 +120,17 @@ enum Slot {
 impl Slot {
     const fn title(self) -> &'static str {
         match self {
-            Self::Now => "NOW (UTC)",
-            Self::Input => "CURRENT INPUT",
-            Self::Goal => "CURRENT GOAL",
-            Self::Identity => "ACTIVE IDENTITY",
-            Self::Task => "CURRENT TASK",
+            Self::Now => "NOW",
+            Self::Input => "INPUT",
+            Self::Goal => "GOAL",
+            Self::Identity => "SAID",
+            Self::Task => "TASK",
             Self::Evidence => "EVIDENCE",
             Self::Refused => "REFUSED",
-            Self::Commitments => "OPEN COMMITMENTS",
-            Self::Proposals => "PENDING PROPOSALS",
-            Self::Conversation => "RECENT CONVERSATION",
-            Self::Index => "TASK INDEX",
+            Self::Commitments => "COMMITMENTS",
+            Self::Proposals => "PROPOSALS",
+            Self::Conversation => "CONVERSATION",
+            Self::Index => "TASKS",
             Self::Relations => "RELATIONS",
         }
     }
@@ -259,18 +259,17 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         false,
         vec![plain(vec![format!("  {}", context.input)])],
     ));
+    // A fact the subject does not have is not rendered: a projection of nothing
+    // says nothing, so nothing here describes a shape rather than a content.
     sections.push(section(
         Slot::Goal,
         false,
-        vec![context.goal.map_or_else(
-            || plain(vec!["  (none)".to_string()]),
-            |goal| {
-                addressed(
-                    event_address(goal.id),
-                    vec![format!("  #{} {}", goal.id, goal.text)],
-                )
-            },
-        )],
+        context.goal.map_or_else(Vec::new, |goal| {
+            vec![addressed(
+                event_address(goal.id),
+                vec![format!("  #{} {}", goal.id, goal.text)],
+            )]
+        }),
     ));
 
     sections.push(section(
@@ -322,9 +321,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     ));
     // The focus is one of the tasks, not a second copy of it.
     let focused = context.focus.and_then(|id| context.task(id));
-    let task_items = focused.map_or_else(
-        || vec![plain(vec!["  (none)".to_string()])],
-        |task| {
+    let task_items = focused.map_or_else(Vec::new, |task| {
         let mut lines = vec![
             format!(
                 "  #{} [{:?}/{}] {}",
@@ -376,8 +373,7 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             ));
         }
             vec![addressed(task_address(task.id), lines)]
-        },
-    );
+    });
     sections.push(section(Slot::Task, false, task_items));
 
     // What the host could not do, in EJA's own words from the last decision: the
@@ -509,6 +505,10 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
 
+    // A section the subject has nothing in is not part of the view: the shape of
+    // an empty index is not a fact about anyone, and rendering it invites the
+    // model to describe its own machinery instead of answering.
+    sections.retain(|section| !section.items.is_empty());
     sections.sort_by_key(|section| section.slot);
     folded(&sections, budget)
 }

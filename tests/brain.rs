@@ -48,7 +48,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
         .unwrap();
     let state = State::load(&store).unwrap();
     let context = state.project("revise the goal", None, eja::now_utc());
-    assert!(render_context(&context).contains("CURRENT INPUT"));
+    assert!(render_context(&context).contains("INPUT"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let port = listener.local_addr().expect("addr").port();
     let server = std::thread::spawn(move || {

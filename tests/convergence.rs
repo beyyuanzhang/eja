@@ -838,6 +838,6 @@ fn a_recorded_relationship_is_identity_content() {
         "a relationship is identity content, not a task edge"
     );
     let view = render_context_within(&context, usize::MAX);
-    assert!(view.contains("ACTIVE IDENTITY"), "{view}");
+    assert!(view.contains("SAID"), "{view}");
     assert!(view.contains(text), "{view}");
 }

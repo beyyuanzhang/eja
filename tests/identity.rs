@@ -47,9 +47,9 @@ fn the_self_survives_budget_pressure_before_the_indexes_do() {
 
     // Reading order is a claim about what the subject is.
     let whole = render_context(&context);
-    let goal = whole.find("CURRENT GOAL").expect("goal");
-    let identity = whole.find("ACTIVE IDENTITY").expect("identity");
-    let index = whole.find("TASK INDEX").expect("index");
+    let goal = whole.find("GOAL").expect("goal");
+    let identity = whole.find("SAID").expect("identity");
+    let index = whole.find("TASKS").expect("index");
     assert!(goal < identity && identity < index, "{whole}");
 
     // Tight, the index folds to an address and the self stays whole.

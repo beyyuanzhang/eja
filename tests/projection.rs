@@ -26,7 +26,7 @@ fn projection_keeps_every_recorded_commitment_and_says_so() {
 
     // Nothing is silently cut: an unbudgeted view shows everything whole.
     let full = render_context(&context);
-    assert!(full.contains("OPEN COMMITMENTS (210):"), "{full}");
+    assert!(full.contains("COMMITMENTS (210):"), "{full}");
     assert_eq!(
         full.matches("commitment ").count(),
         210,

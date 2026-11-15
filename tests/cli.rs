@@ -57,7 +57,7 @@ fn every_show_target_the_usage_line_offers_answers() {
     let fixture = State::new("cli-show");
     seeded(&fixture);
     for (target, expected) in [
-        ("context", "CURRENT INPUT"),
+        ("context", "INPUT"),
         ("log", "\"kind\":\"user\""),
         ("tasks", "a member"),
         ("tools", "["),
