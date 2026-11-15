@@ -419,3 +419,43 @@ fn two_state_directories_on_one_project_keep_separate_branches() {
     first.release(&a);
     second.release(&b);
 }
+#[test]
+fn the_shared_world_has_one_owner() {
+    let dir = temp_dir("owner");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let shared = Shared::new(project.clone(), dir.join(".eja"));
+    let control = control();
+    let first = shared.reserve(1, &control).expect("first reservation");
+    // A second run may not write the same directory while the first holds it.
+    let second = shared.reserve(2, &control);
+    assert!(second.is_err(), "a shared world has one owner");
+    shared.settle(&first, &control).expect("settle");
+    shared.release(&first);
+    // Once settled, the world is free again.
+    let third = shared.reserve(3, &control).expect("after settlement");
+    shared.release(&third);
+}
+
+#[test]
+fn settling_a_world_twice_is_refused() {
+    let dir = temp_dir("twice");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let shared = Shared::new(project, dir.join(".eja"));
+    let control = control();
+    let world = shared.reserve(1, &control).expect("reserve");
+    shared.settle(&world, &control).expect("settle");
+    assert!(
+        shared.settle(&world, &control).is_err(),
+        "one reservation settles once"
+    );
+}
+
+#[test]
+fn a_world_per_run_needs_a_git_project() {
+    let dir = temp_dir("no-git");
+    let refused = Worktrees::new(&dir, dir.join("worlds"), dir.join(".eja"), &control());
+    let error = refused.err().expect("a plain directory cannot be forked");
+    assert!(error.to_string().contains("git"), "{error}");
+}

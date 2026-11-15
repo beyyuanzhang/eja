@@ -103,3 +103,25 @@ fn addresses_are_one_scheme_and_plain_targets_are_host_tools() {
     assert!(eja::Address::parse("read_file").is_none());
     assert!(eja::Address::parse("log:").is_none());
 }
+#[test]
+fn an_address_without_its_authority_is_an_error_not_a_fallback() {
+    let events = Vec::new();
+    let ports = Ports::default();
+    let look = |target: &str, selector: Selector| {
+        ports.look(
+            target,
+            &serde_json::Value::Null,
+            &selector,
+            &events,
+            &control(),
+        )
+    };
+    // No record reader, no capabilities: each authority refuses instead of
+    // quietly reading something else.
+    assert!(look("record:1/report.md", Selector::Whole).is_err());
+    assert!(look("world:README.md", Selector::Whole).is_err());
+    // A world address names one path; it has no page to select.
+    assert!(look("world:README.md", Selector::Range { from: 0, lines: 1 }).is_err());
+    // An unknown target is a host tool, so with no capabilities it is refused too.
+    assert!(look("read_file", Selector::Whole).is_err());
+}

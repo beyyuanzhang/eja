@@ -247,8 +247,16 @@ impl Shared {
 
 impl Worlds for Shared {
     fn reserve(&self, task: u64, control: &Control) -> Result<World> {
-        keep(
-            &self.open,
+        let mut open = self.open.lock().unwrap_or_else(|error| error.into_inner());
+        // One mutable world has one owner. A host that wants two runs at once
+        // must give them isolated worlds, so this refuses instead of letting two
+        // runs write the same directory.
+        if !open.is_empty() {
+            return Err(
+                "the shared world has one owner; a second run needs an isolated world".into(),
+            );
+        }
+        open.insert(
             task,
             Reservation::start(&self.project, &self.private, control),
         );
