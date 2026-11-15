@@ -1,7 +1,7 @@
-use eja::adapters::Ports;
+use eja::adapters::{Capabilities, Ports};
 use eja::{
     turn_at, turn_at_with_options, Action, Assignment, Brain, Decision, EjaContext, Kind, Store,
-    TaskStatus, TurnOptions, Witness,
+    TaskStatus, TurnOptions,
 };
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -45,8 +45,8 @@ impl eja::Worker for NoWorker {
 
 /// Acceptance evidence is a host act, declared as one capability call.
 struct Checks;
-impl Witness for Checks {
-    fn observe(&self, request: &Value, _: &eja::Control) -> eja::Result<Value> {
+impl Capabilities for Checks {
+    fn witness(&self, request: &Value, _: &eja::Control) -> eja::Result<Value> {
         Ok(json!({"tool": request["tool"], "passed": true}))
     }
 }
@@ -80,7 +80,7 @@ fn declared_evidence_is_a_host_observation_and_the_judgment_can_use_it() {
     let store = store();
     let checks = Checks;
     let ports = Ports {
-        witness: Some(&checks),
+        capabilities: Some(&checks),
         ..Default::default()
     };
     let out = turn_at(
@@ -181,15 +181,15 @@ fn without_host_evidence_the_judgment_is_undecidable_not_failed() {
 #[test]
 fn a_host_that_cannot_answer_leaves_the_reason_in_the_log() {
     struct Broken;
-    impl Witness for Broken {
-        fn observe(&self, _: &Value, _: &eja::Control) -> eja::Result<Value> {
+    impl Capabilities for Broken {
+        fn witness(&self, _: &Value, _: &eja::Control) -> eja::Result<Value> {
             Err("the checker is offline".into())
         }
     }
     let store = store();
     let broken = Broken;
     let ports = Ports {
-        witness: Some(&broken),
+        capabilities: Some(&broken),
         ..Default::default()
     };
     turn_at(

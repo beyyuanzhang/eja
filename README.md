@@ -39,7 +39,7 @@ record reading.
   task can be judged. The host's observation is recorded as one `Observed` event
   scoped to the task; without it the judgment is undecidable, not failed.
 - One address space covers every fact a view can read: `log:<target>`,
-  `record:<aja>/<entry or path>`, `world:<path>`. Any other target is a host read
+  `record:<aja>/<path>`, `world:<path>`. Any other target is a host read
   tool. A folded region and a live one are read the same way.
 
 ## Tasks and authority

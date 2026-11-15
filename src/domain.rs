@@ -410,11 +410,6 @@ pub trait Host {
     }
 }
 
-/// One host capability that may answer an acceptance witness.
-pub trait Witness: Send + Sync {
-    fn observe(&self, request: &Value, control: &Control) -> Result<Value>;
-}
-
 pub trait Brain {
     fn decide(&self, context: &EjaContext, control: &Control) -> Decision;
 }
@@ -503,7 +498,7 @@ pub enum Authority {
 }
 
 /// An address names one region of one authority, so a folded region and a live
-/// one are read the same way: `log:event:12`, `record:3/4`, `record:3/report.md`,
+/// one are read the same way: `log:event:12`, `record:3/report.md`,
 /// `world:src/out.txt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Address {

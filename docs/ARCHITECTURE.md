@@ -17,7 +17,7 @@ L' = L ++ events(A, O)               recorded transition
 `L` owns identity, task and judgment facts. `R` owns raw execution evidence;
 `K` owns optional frozen workspace evidence. The mutable world `W` is external.
 Every view points at one **address** in one authority — `log:<target>`,
-`record:<aja>/<entry|path>`, `world:<path>` — and any target that is not an
+`record:<aja>/<path>`, `world:<path>` — and any target that is not an
 address is a host read tool. Folding and reading use that one namespace.
 One fact has one authority; keeping a derived index or snapshot does not create
 another authority. Folding never re-executes world effects.
@@ -147,20 +147,22 @@ transcript or manufacture an acceptance.
 ## Port contracts
 
 - `Brain::decide`: return a decision under the supplied Control.
-- `Worker::execute`: own and settle one run; return its observed digest. Runs
-  execute in action order; each completed report is recorded before the next.
+- `Worker::execute`: own one run in its reserved world; return its observed
+  digest. Runs execute in action order; each completed report is recorded
+  before the next.
 - `Host::look`: read only, bound output, respect Control; one address space.
 - `Host::witness`: the host's own observation of declared acceptance evidence.
   A host that declares none is still complete: the default refuses, and the
   judgment stays undecidable. `Host::reconcile`: land one run's world, or
   report its conflicts as the recorded outcome.
 - `Worlds`: reserve, settle, reconcile and release the world one execution may
-  change. Isolation is the host's decision; the kernel never assumes a
-  repository. Settlement is the only account of what a run changed: one
-  inventory delta per world, complete or explicitly unobserved.
+  change. A world is a lease — where a run may write — and the backend keeps the
+  reservation that turns it into an account: one line, measured, complete or
+  explicitly unobserved. Isolation is the host's decision; the kernel never
+  assumes a repository.
 - `Model` and `ToolGateway`: host effects under inherited grants/control.
-- `RecordReader` / `Observer`: capabilities composed by Ports, without another
-  state store or task authority.
+- `RecordReader` / `Capabilities`: what the host lets EJA read or witness,
+  composed by Ports, without another state store or task authority.
 
 Every operation requires an explicit Control, including aja-file selection,
 world observation and connector startup. There is no uncontrolled entry point or

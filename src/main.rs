@@ -151,10 +151,7 @@ fn run() -> Result<()> {
             } else {
                 None
             };
-            let shared = Arc::new(Shared {
-                project: project.clone(),
-                private: dir.clone(),
-            });
+            let shared = Arc::new(Shared::new(project.clone(), dir.clone()));
             let worlds: Arc<dyn Worlds> = match &isolated {
                 Some(worlds) => worlds.clone(),
                 None => shared.clone(),
@@ -176,8 +173,7 @@ fn run() -> Result<()> {
             };
             let ports = Ports {
                 aja: Some(&records),
-                world: Some(&*tools),
-                witness: Some(&*tools),
+                capabilities: Some(&*tools),
                 worlds,
             };
             let outcome = turn_at_with_options(

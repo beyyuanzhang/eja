@@ -1,5 +1,5 @@
 mod support;
-use eja::adapters::{Observer, Ports};
+use eja::adapters::{Capabilities, Ports};
 use eja::{turn, Action, Brain, Decision, EjaContext, Kind, Result, Selector, Store, Worker};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -30,7 +30,7 @@ impl Worker for EmptyWorker {
 
 struct Weather;
 
-impl Observer for Weather {
+impl Capabilities for Weather {
     fn observe(
         &self,
         tool: &str,
@@ -68,7 +68,7 @@ fn a_world_look_does_not_depend_on_waiting_tasks() {
         &brain,
         &EmptyWorker,
         &Ports {
-            world: Some(&Weather),
+            capabilities: Some(&Weather),
             ..Default::default()
         },
     )
@@ -121,7 +121,7 @@ fn observing_a_read_only_tool_records_a_view() {
         &brain,
         &EmptyWorker,
         &Ports {
-            world: Some(&Weather),
+            capabilities: Some(&Weather),
             ..Default::default()
         },
     )
@@ -155,7 +155,7 @@ fn eja_can_observe_project_files_but_never_write() {
     std::fs::create_dir_all(&private).expect("private");
     std::fs::write(project.join("note.txt"), "hello from the project").expect("write");
     let host = HostTools::new(None, &project, &private, &control()).expect("tools");
-    let value = Observer::observe(
+    let value = Capabilities::observe(
         &host,
         "read_file",
         &serde_json::json!({"path":"note.txt"}),
@@ -164,21 +164,21 @@ fn eja_can_observe_project_files_but_never_write() {
     .expect("project file is observable");
     assert!(value.to_string().contains("hello"));
     // There is no second area to read from any more; the world is one place.
-    assert!(Observer::observe(
+    assert!(Capabilities::observe(
         &host,
         "list_dir",
         &serde_json::json!({"path": ".."}),
         &control()
     )
     .is_err());
-    assert!(Observer::observe(
+    assert!(Capabilities::observe(
         &host,
         "write_file",
         &serde_json::json!({"path":"x.txt","text":"y"}),
         &control()
     )
     .is_err());
-    assert!(Observer::observe(
+    assert!(Capabilities::observe(
         &host,
         "read_file",
         &serde_json::json!({"path":"../state/secret"}),
@@ -187,7 +187,7 @@ fn eja_can_observe_project_files_but_never_write() {
     .is_err());
     // An edit is an effect: the observer names the refusal instead of pretending
     // the tool is a connector.
-    let edited = Observer::observe(
+    let edited = Capabilities::observe(
         &host,
         "edit_file",
         &serde_json::json!({"path":"note.txt","find":"hello","replace":"bye"}),

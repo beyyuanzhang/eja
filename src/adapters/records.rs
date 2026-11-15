@@ -104,41 +104,6 @@ impl Drop for Source {
 }
 
 impl RecordReader for RecordFiles {
-    /// One tool entry of one record, addressed as `aja/entry`. The record stays
-    /// the authority for the payload; this only pages it.
-    fn entry(
-        &self,
-        aja: u64,
-        entry: usize,
-        selector: &Selector,
-        control: &Control,
-    ) -> Result<Value> {
-        control.check()?;
-        let path = super::tools::relative_file(&self.root, &format!("{aja}/context.jsonl"))?;
-        for (index, line) in BufReader::new(fs::File::open(path)?).lines().enumerate() {
-            control.check()?;
-            if index != entry {
-                continue;
-            }
-            let value: Value = serde_json::from_str(&line?)?;
-            if value["kind"] != "tool" {
-                return Err("record entry is not a tool result".into());
-            }
-            let text = value["result"].to_string();
-            let (from, wanted) = match selector {
-                Selector::Whole => (0, text.len()),
-                Selector::Bytes { from, bytes } => (*from, *bytes),
-                _ => return Err("record entries are read whole or by bytes".into()),
-            };
-            let mut page = super::text_page(&text, from, wanted, crate::aja::FRAME_LIMIT / 8);
-            page["aja"] = json!(aja);
-            page["entry"] = json!(entry);
-            page["address"] = json!(format!("record:{aja}/{entry}"));
-            return Ok(page);
-        }
-        Err("record entry does not exist".into())
-    }
-
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value> {
         control.check()?;
         super::tools::relative_file(&self.root, path)?;

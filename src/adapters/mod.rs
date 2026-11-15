@@ -19,10 +19,10 @@ pub use brain::{
 pub use mcp::{HostTools, McpTools};
 pub use model::{Control, Model, OpenAiModel};
 pub use native::{NativeWorker, INTERRUPTED};
-pub use ports::{Observer, Ports, RecordReader};
+pub use ports::{Capabilities, Ports, RecordReader};
 pub use records::RecordFiles;
 pub use tools::{FileTools, ToolContext, ToolGateway};
-pub use worlds::{ProjectDelta, Shared, Worktrees, World, Worlds};
+pub use worlds::{Shared, Worktrees, World, Worlds};
 
 use crate::Kind;
 

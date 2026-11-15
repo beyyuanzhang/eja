@@ -1,5 +1,5 @@
 //! Single native worker path: same binary, private AJA mode, host-owned effects.
-use super::{Control, Model, ProjectDelta, Shared, ToolContext, ToolGateway, World, Worlds};
+use super::{Control, Model, Shared, ToolContext, ToolGateway, World, Worlds};
 use crate::fold;
 use crate::{
     aja::{self, Limits, Request, Start},
@@ -222,10 +222,7 @@ impl NativeWorker {
             tools,
             limits: Limits::default(),
             checkpoints,
-            worlds: Arc::new(Shared {
-                project: project.clone(),
-                private: state.clone(),
-            }),
+            worlds: Arc::new(Shared::new(project.clone(), state.clone())),
             slots: 1,
             state,
             active: Mutex::new(Vec::new()),
@@ -451,9 +448,8 @@ impl NativeWorker {
             aja,
             assignment,
             outcome,
-            change,
             world,
-            settled,
+            world_line,
         } = run;
         let (checkpoint, checkpoint_error) = match self.checkpoint(assignment, &world.root, control)
         {
@@ -479,14 +475,6 @@ impl NativeWorker {
         };
         let (text, reason) = (outcome.text, outcome.reason);
         let steps = outcome.steps;
-        // One line says which world this run was given and what it did to it.
-        let mut world_line = format!("world: {}: {}", world.label, change.line());
-        if let Some(commit) = settled
-            .and_then(|value| value.get("commit"))
-            .and_then(Value::as_str)
-        {
-            world_line.push_str(&format!(" at {commit}"));
-        }
         let mut digest = format!(
             "{steps} steps, {calls} tool calls{}, ended: {reason}\n{world_line}\n{text}",
             if histogram.is_empty() {
@@ -528,9 +516,8 @@ struct Run<'a> {
     aja: &'a Path,
     assignment: &'a Assignment,
     outcome: Outcome<'a>,
-    change: &'a ProjectDelta,
     world: &'a World,
-    settled: Option<&'a Value>,
+    world_line: String,
 }
 
 impl Worker for NativeWorker {
@@ -588,7 +575,6 @@ impl Worker for NativeWorker {
         let steps = log.assistants;
         // The world's account is measured before the run is revoked: an expired
         // deadline makes it honest ("unobserved"), not optimistic.
-        let change = world.change(&control);
         cancelled.store(true, Ordering::SeqCst);
         let (text, reason) = match result {
             Ok(outcome) => outcome,
@@ -604,10 +590,25 @@ impl Worker for NativeWorker {
         };
         let _ = log.record(json!({"kind": "finish", "text": &text, "reason": &reason}));
         drop(log);
-        let settled = self
+        // The account is the host's: measured against the reservation, and made
+        // durable before the aja is sealed.
+        let account = self
             .worlds
-            .settle(world, &change, &parent.child(Duration::from_secs(60)))
-            .ok();
+            .settle(world, &parent.child(Duration::from_secs(60)));
+        let world_line = match &account {
+            Ok(value) => {
+                let mut line = format!(
+                    "world: {}: {}",
+                    world.label,
+                    value["change"].as_str().unwrap_or("unreported")
+                );
+                if let Some(commit) = value["commit"].as_str() {
+                    line.push_str(&format!(" at {commit}"));
+                }
+                line
+            }
+            Err(error) => format!("world: {}: account unavailable ({error})", world.label),
+        };
         self.seal(
             Run {
                 aja: &aja,
@@ -618,9 +619,8 @@ impl Worker for NativeWorker {
                     steps,
                     counts: &counts,
                 },
-                change: &change,
                 world,
-                settled: settled.as_ref(),
+                world_line,
             },
             parent,
         )

@@ -1,35 +1,31 @@
 //! Host surface: one read over the three authorities, and the capabilities a
 //! host may add on top of it.
 use super::Worlds;
-use crate::{tasks, Address, Authority, Control, Event, Host, Result, Selector, TaskId, Witness};
+use crate::{tasks, Address, Authority, Control, Event, Host, Result, Selector, TaskId};
 use serde_json::Value;
 
 pub trait RecordReader {
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value>;
-    /// One region of one record: `aja/entry` names a tool result, `aja/path` a
-    /// frozen file. Reading either is one address lookup.
-    fn entry(
-        &self,
-        _aja: u64,
-        _entry: usize,
-        _selector: &Selector,
-        _control: &Control,
-    ) -> Result<Value> {
-        Err("this reader does not address record entries".into())
-    }
 }
 
-/// Host-declared read-only capabilities, under the caller's control.
-pub trait Observer: Send + Sync {
-    fn observe(&self, tool: &str, arguments: &Value, control: &Control) -> Result<Value>;
+/// The host's declared capabilities: what EJA may observe, and what may answer
+/// an acceptance witness. An observation is always safe; a witness is an
+/// effect-capable host act and must be declared, so both refuse by default.
+pub trait Capabilities: Send + Sync {
+    fn observe(&self, _tool: &str, _arguments: &Value, _control: &Control) -> Result<Value> {
+        Err("this host observes no tools".into())
+    }
+
+    fn witness(&self, _request: &Value, _control: &Control) -> Result<Value> {
+        Err("this host observes no acceptance evidence".into())
+    }
 }
 
 /// Host composition: what one deployment can read and observe.
 #[derive(Default, Clone, Copy)]
 pub struct Ports<'a> {
     pub aja: Option<&'a dyn RecordReader>,
-    pub world: Option<&'a dyn Observer>,
-    pub witness: Option<&'a dyn Witness>,
+    pub capabilities: Option<&'a dyn Capabilities>,
     pub worlds: Option<&'a dyn Worlds>,
 }
 
@@ -49,43 +45,36 @@ impl Host for Ports<'_> {
                 return Err("host tools select their result through arguments".into());
             }
             return self
-                .world
-                .ok_or("no world reader is configured")?
+                .capabilities
+                .ok_or("no host capabilities are configured")?
                 .observe(target, arguments, control);
         };
         match address.authority {
             Authority::Log => page(log, &address.id, selector),
-            Authority::Record => {
-                let (aja, rest) = address
-                    .id
-                    .split_once('/')
-                    .ok_or("record addresses are aja/entry or aja/path")?;
-                let aja: u64 = aja
-                    .parse()
-                    .map_err(|_| "record address needs a numeric aja")?;
-                let reader = self.aja.ok_or("no record reader is configured")?;
-                match rest.parse::<usize>() {
-                    Ok(entry) => reader.entry(aja, entry, selector, control),
-                    Err(_) => reader.slice(&address.id, selector, control),
-                }
-            }
+            Authority::Record => self.aja.ok_or("no record reader is configured")?.slice(
+                &address.id,
+                selector,
+                control,
+            ),
             Authority::World => {
                 if !matches!(selector, Selector::Whole) {
                     return Err("a world address names one path; select through arguments".into());
                 }
-                self.world.ok_or("no world reader is configured")?.observe(
-                    "read_file",
-                    &serde_json::json!({"path": address.id}),
-                    control,
-                )
+                self.capabilities
+                    .ok_or("no host capabilities are configured")?
+                    .observe(
+                        "read_file",
+                        &serde_json::json!({"path": address.id}),
+                        control,
+                    )
             }
         }
     }
 
     fn witness(&self, request: &Value, control: &Control) -> Result<Value> {
-        self.witness
+        self.capabilities
             .ok_or("this host observes no acceptance evidence")?
-            .observe(request, control)
+            .witness(request, control)
     }
 
     fn reconcile(&self, task: TaskId, control: &Control) -> Result<Value> {

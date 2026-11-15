@@ -31,13 +31,13 @@ the context bound needed to fit its working messages before transport.
 The host records full assistant messages and full tool results, with provider
 call ids. Each result returned to the aja is a view of at most 8 KiB, including
 its `{aja,entry}` address. Small results use `{record,result}`; larger ones have
-an explicit truncated head/tail. `eja_read_record {aja,entry,offset,bytes}` reads
+an explicit truncated head/tail. `eja_read_record {aja,offset,bytes}` reads
 at most 1 KiB from a full result in this aja or its explicit ancestry.
 
 Context fitting folds the transcript: the system prompt, the assignment, and the
 newest steps stay whole while the budget allows, older steps become one address
 line each, and the oldest fold into one address range. Nothing is deleted from
-the record, and every folded step is read back with its `record:<aja>/<entry>`
+the record, and every folded step is read back with its `record:<aja>/<path>`
 address — the same address space as `log:` and `world:`.
 A contract that cannot fit even at that scale ends with budget. Incomplete
 provider responses and invalid tool messages end with error.

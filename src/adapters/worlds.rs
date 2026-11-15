@@ -1,16 +1,16 @@
 //! Worlds: where one execution may change things, and how that comes back.
 //!
-//! The kernel reserves a world before a run and settles it after. Two worlds
-//! never run against each other, so parallel executions stay separate accounts
-//! of the same identity. The host decides what isolation means: the shared
-//! project, one git worktree per run, or something else entirely.
+//! The kernel reserves a world before a run and settles it after. A world is a
+//! lease — where this run may write — and nothing else: what the run did is the
+//! backend's account, measured against the reservation the backend kept.
 use super::process;
 use crate::{Control, Result};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
 };
 
 /// A project larger than this is reported as truncated instead of scanned.
@@ -22,7 +22,7 @@ type Inventory = BTreeMap<String, (u64, i64)>;
 
 /// What one run did to one world: the host's measurement, never the runner's claim.
 #[derive(Debug, Default)]
-pub struct ProjectDelta {
+struct ProjectDelta {
     created: Vec<String>,
     modified: Vec<String>,
     deleted: Vec<String>,
@@ -60,7 +60,7 @@ impl ProjectDelta {
         delta
     }
 
-    pub fn line(&self) -> String {
+    fn line(&self) -> String {
         let names = |list: &[String]| {
             let shown: Vec<&str> = list.iter().take(NAMES).map(String::as_str).collect();
             let rest = list.len().saturating_sub(shown.len());
@@ -164,70 +164,115 @@ fn snapshot(root: &Path, skip: &Path, control: &Control) -> (Inventory, bool) {
     (state, truncated)
 }
 
-/// One world reserved for one execution, with the state it started from.
+/// One world reserved for one execution: where it may write.
 pub struct World {
+    task: u64,
     pub label: String,
     pub root: PathBuf,
-    before: Inventory,
-    complete: bool,
-    skip: PathBuf,
-}
-
-impl World {
-    /// What this world now contains, measured against what it held at reservation.
-    pub fn change(&self, control: &Control) -> ProjectDelta {
-        let (after, truncated) = snapshot(&self.root, &self.skip, control);
-        ProjectDelta::between(&self.before, &after, self.complete, !truncated)
-    }
 }
 
 /// Reserve, settle, reconcile and release the world one execution may change.
 pub trait Worlds: Send + Sync {
     fn reserve(&self, task: u64, control: &Control) -> Result<World>;
-    /// The host's account of a finished run, including any backend step that
-    /// makes the world durable (a commit, a snapshot).
-    fn settle(&self, world: &World, change: &ProjectDelta, control: &Control) -> Result<Value>;
+    /// The host's account of a finished run, including whatever makes the world
+    /// durable. The account carries a one-line `change`, measured against the
+    /// reservation this backend kept — not against the runner's claims.
+    fn settle(&self, world: &World, control: &Control) -> Result<Value>;
     /// Bring one run's world back into the shared world.
     fn reconcile(&self, task: u64, control: &Control) -> Result<Value>;
     fn release(&self, world: &World);
 }
 
-fn prepare(label: String, root: PathBuf, skip: &Path, control: &Control) -> Result<World> {
-    // snapshot reports whether the walk was truncated, not whether it was whole.
-    let (before, truncated) = snapshot(&root, skip, control);
-    Ok(World {
-        label,
-        root,
-        before,
-        complete: !truncated,
-        skip: skip.to_path_buf(),
-    })
+/// What a backend remembers between reserve and settle.
+struct Reservation {
+    before: Inventory,
+    complete: bool,
+}
+
+impl Reservation {
+    fn start(root: &Path, skip: &Path, control: &Control) -> Self {
+        // snapshot reports whether the walk was truncated, not whether it was whole.
+        let (before, truncated) = snapshot(root, skip, control);
+        Self {
+            before,
+            complete: !truncated,
+        }
+    }
+
+    /// The account of one run. Settlement runs under its own deadline, so a
+    /// truncated run still gets a full measurement of the world it left.
+    fn delta(&self, root: &Path, skip: &Path, control: &Control) -> ProjectDelta {
+        let (after, truncated) = snapshot(root, skip, control);
+        ProjectDelta::between(&self.before, &after, self.complete, !truncated)
+    }
+}
+
+type Open = Mutex<HashMap<u64, Reservation>>;
+
+fn keep(open: &Open, task: u64, reservation: Reservation) {
+    open.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(task, reservation);
+}
+
+fn take(open: &Open, task: u64) -> Result<Reservation> {
+    open.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&task)
+        .ok_or_else(|| "this world has no open reservation".into())
+}
+
+fn forget(open: &Open, task: u64) {
+    open.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&task);
 }
 
 /// The default: every execution shares one world, so only one may run at a time.
 pub struct Shared {
-    pub project: PathBuf,
-    pub private: PathBuf,
+    project: PathBuf,
+    private: PathBuf,
+    open: Open,
+}
+
+impl Shared {
+    pub fn new(project: impl Into<PathBuf>, private: impl Into<PathBuf>) -> Self {
+        Self {
+            project: project.into(),
+            private: private.into(),
+            open: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl Worlds for Shared {
-    fn reserve(&self, _task: u64, control: &Control) -> Result<World> {
-        prepare(
-            "shared".to_string(),
-            self.project.clone(),
-            &self.private,
-            control,
-        )
+    fn reserve(&self, task: u64, control: &Control) -> Result<World> {
+        keep(
+            &self.open,
+            task,
+            Reservation::start(&self.project, &self.private, control),
+        );
+        Ok(World {
+            task,
+            label: "shared".to_string(),
+            root: self.project.clone(),
+        })
     }
-    fn settle(&self, _world: &World, change: &ProjectDelta, _control: &Control) -> Result<Value> {
-        Ok(json!({"world": "shared", "change": change.line()}))
+
+    fn settle(&self, world: &World, control: &Control) -> Result<Value> {
+        let reservation = take(&self.open, world.task)?;
+        let delta = reservation.delta(&world.root, &self.private, control);
+        Ok(json!({"world": "shared", "change": delta.line()}))
     }
+
     fn reconcile(&self, _task: u64, _control: &Control) -> Result<Value> {
-        Ok(
-            json!({"world": "shared", "merged": true, "detail": "the run happened in the shared world"}),
-        )
+        Ok(json!({"world": "shared", "merged": true,
+                  "detail": "the run happened in the shared world"}))
     }
-    fn release(&self, _world: &World) {}
+
+    fn release(&self, world: &World) {
+        forget(&self.open, world.task);
+    }
 }
 
 /// One git worktree and one branch per execution: parallel runs cannot overwrite
@@ -236,6 +281,7 @@ pub struct Worktrees {
     project: PathBuf,
     root: PathBuf,
     private: PathBuf,
+    open: Open,
 }
 
 fn git(cwd: &Path, args: &[&str], control: &Control) -> Result<String> {
@@ -279,6 +325,7 @@ impl Worktrees {
             project: PathBuf::from(top),
             root,
             private: private.into(),
+            open: Mutex::new(HashMap::new()),
         })
     }
 
@@ -311,15 +358,23 @@ impl Worlds for Worktrees {
             ],
             control,
         )?;
-        let label = format!("worktree {branch}");
-        let mut world = prepare(label, root, &self.private, control)?;
+        keep(
+            &self.open,
+            task,
+            Reservation::start(&root, &self.private, control),
+        );
         // An isolated world starts at a commit: uncommitted project changes stay
-        // behind, and the digest says so because the label carries the commit.
-        world.label = format!("{} at {}", world.label, &head[..head.len().min(12)]);
-        Ok(world)
+        // behind, and the label carries the commit the run started from.
+        Ok(World {
+            task,
+            label: format!("worktree {branch} at {}", &head[..head.len().min(12)]),
+            root,
+        })
     }
 
-    fn settle(&self, world: &World, change: &ProjectDelta, control: &Control) -> Result<Value> {
+    fn settle(&self, world: &World, control: &Control) -> Result<Value> {
+        let reservation = take(&self.open, world.task)?;
+        let delta = reservation.delta(&world.root, &self.private, control);
         git(&world.root, &["add", "-A", "--", "."], control)?;
         git(
             &world.root,
@@ -335,7 +390,7 @@ impl Worlds for Worktrees {
         let commit = git(&world.root, &["rev-parse", "HEAD"], control)?;
         Ok(json!({
             "world": world.label,
-            "change": change.line(),
+            "change": delta.line(),
             "commit": commit,
         }))
     }
@@ -372,6 +427,7 @@ impl Worlds for Worktrees {
 
     fn release(&self, world: &World) {
         // The branch keeps the work; the directory is only a workspace.
+        forget(&self.open, world.task);
         let control = crate::Control::new(std::time::Duration::from_secs(30), Default::default());
         let text = world.root.to_string_lossy().to_string();
         let _ = git(
@@ -381,6 +437,7 @@ impl Worlds for Worktrees {
         );
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

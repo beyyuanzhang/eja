@@ -537,7 +537,7 @@ fn host_declared_read_only_tools_are_observable() {
     config["read_only"] = json!(["echo"]);
     let path = f.config(json!({"mcpServers":{"fixture":config}}));
     let host = HostTools::new(Some(&path), &f.0, &f.0, &control(300_000)).unwrap();
-    let value = eja::adapters::Observer::observe(
+    let value = eja::adapters::Capabilities::observe(
         &host,
         "mcp__fixture__echo",
         &json!({"text":"probe"}),
@@ -548,7 +548,7 @@ fn host_declared_read_only_tools_are_observable() {
         value.to_string().contains("\"text\":\"probe\""),
         "the echo payload comes back: {value}"
     );
-    assert!(eja::adapters::Observer::observe(
+    assert!(eja::adapters::Capabilities::observe(
         &host,
         "mcp__fixture__fail",
         &json!({}),

@@ -1,7 +1,6 @@
 //! Shared, host-owned MCP clients. No connector state is passed to AJA.
-use super::Observer;
+use super::Capabilities;
 use super::{Control, FileTools, ToolContext, ToolGateway};
-use crate::Witness;
 use crate::{aja::FRAME_LIMIT, Assignment, Result};
 use rmcp::{
     model::{
@@ -568,11 +567,34 @@ impl ToolGateway for HostTools {
     }
 }
 
-impl Witness for HostTools {
+impl Capabilities for HostTools {
+    /// EJA may look at the world; it may never act. Files are readable only from
+    /// the project, connector tools only when declared read-only.
+    fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
+        let control = parent.child(Duration::from_secs(60));
+        let context = ToolContext {
+            aja_id: 0,
+            project: &self.project,
+            private: &self.private,
+            control: &control,
+        };
+        if tool == "read_file" || tool == "list_dir" {
+            return FileTools.call(&context, tool, arguments);
+        }
+        if tool == "write_file" || tool == "edit_file" {
+            return Err("EJA only observes; edits belong to ajas".into());
+        }
+        let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
+        if !mcp.is_read_only(tool) {
+            return Err("EJA may only observe read-only connector tools".into());
+        }
+        mcp.call(&context, tool, arguments)
+    }
+
     /// A witness is one declared host capability. The request names the tool; the
     /// host decides whether that name may answer it, and reading a file can have
     /// no effect, so the host's own read tools are always allowed.
-    fn observe(&self, request: &Value, control: &Control) -> Result<Value> {
+    fn witness(&self, request: &Value, control: &Control) -> Result<Value> {
         let tool = request["tool"]
             .as_str()
             .filter(|name| !name.is_empty())
@@ -597,30 +619,5 @@ impl Witness for HostTools {
             return Err(format!("{tool} is not a declared witness").into());
         }
         mcp.call(&context, tool, &arguments)
-    }
-}
-
-impl Observer for HostTools {
-    /// EJA may look at the world; it may never act. Files are readable only from
-    /// the project, connector tools only when declared read-only.
-    fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
-        let control = parent.child(Duration::from_secs(60));
-        let context = ToolContext {
-            aja_id: 0,
-            project: &self.project,
-            private: &self.private,
-            control: &control,
-        };
-        if tool == "read_file" || tool == "list_dir" {
-            return FileTools.call(&context, tool, arguments);
-        }
-        if tool == "write_file" || tool == "edit_file" {
-            return Err("EJA only observes; edits belong to ajas".into());
-        }
-        let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
-        if !mcp.is_read_only(tool) {
-            return Err("EJA may only observe read-only connector tools".into());
-        }
-        mcp.call(&context, tool, arguments)
     }
 }

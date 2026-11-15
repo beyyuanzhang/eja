@@ -196,9 +196,11 @@ fn a_worktree_world_is_settled_and_reconciled_explicitly() {
     assert!(world.root.join("base.txt").exists());
 
     std::fs::write(world.root.join("out.txt"), "result\n").unwrap();
-    let change = world.change(&control);
-    assert!(change.line().contains("out.txt"), "{}", change.line());
-    let settled = worlds.settle(&world, &change, &control).expect("settle");
+    let settled = worlds.settle(&world, &control).expect("settle");
+    assert!(
+        settled["change"].as_str().unwrap_or("").contains("out.txt"),
+        "{settled}"
+    );
     assert!(
         !settled["commit"].as_str().unwrap_or("").is_empty(),
         "{settled}"
@@ -226,8 +228,7 @@ fn a_conflicting_world_is_reported_and_never_merged_silently() {
     .expect("worlds");
     let world = worlds.reserve(2, &control).expect("reserve");
     std::fs::write(world.root.join("base.txt"), "from the run\n").unwrap();
-    let change = world.change(&control);
-    worlds.settle(&world, &change, &control).expect("settle");
+    worlds.settle(&world, &control).expect("settle");
     // The shared world moved on in the meantime.
     std::fs::write(project.join("base.txt"), "from the host\n").unwrap();
     git(&project, &["add", "-A"]);
@@ -268,26 +269,115 @@ fn an_isolated_world_starts_at_the_commit_not_at_the_working_tree() {
         "one\n",
         "the world is a commit, not the operator's working tree"
     );
-    // The run's own change is still the whole account.
+    // The run's own change is still the whole account, measured by the backend.
     std::fs::write(world.root.join("mine.txt"), "made here\n").unwrap();
-    let change = world.change(&control);
-    assert_eq!(change.line(), "+1 created (mine.txt)");
+    let settled = worlds.settle(&world, &control).expect("settle");
+    assert_eq!(
+        settled["change"],
+        serde_json::json!("+1 created (mine.txt)")
+    );
     worlds.release(&world);
 }
 
 #[test]
 fn a_shared_world_needs_no_reconciliation() {
     let project = temp_dir("shared");
-    let shared = Shared {
-        project: project.clone(),
-        private: project.join(".eja"),
-    };
+    let shared = Shared::new(project.clone(), project.join(".eja"));
     let control = control();
     let world = shared.reserve(1, &control).expect("reserve");
     assert_eq!(world.root, project);
-    let change = world.change(&control);
-    assert_eq!(change.line(), "unchanged");
+    let account = shared.settle(&world, &control).expect("settle");
+    assert_eq!(account["change"], serde_json::json!("unchanged"));
     let outcome = shared.reconcile(1, &control).expect("reconcile");
     assert_eq!(outcome["merged"], serde_json::json!(true));
     shared.release(&world);
+}
+/// A run that left an isolated world comes back only when asked, and the host's
+/// account is one recorded observation — never a silent merge.
+struct Done;
+impl Worker for Done {
+    fn execute(&self, _: &Assignment, _: &eja::Control) -> String {
+        "1 steps, 0 tool calls, ended: message\ndone".into()
+    }
+}
+
+#[test]
+fn reconciling_a_run_is_one_recorded_observation() {
+    let dir = temp_dir("reconcile");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let store = Store::new(&dir).expect("store");
+    let worlds = Shared::new(project.clone(), dir.join(".eja"));
+    let ports = eja::adapters::Ports {
+        worlds: Some(&worlds),
+        ..Default::default()
+    };
+    let options = TurnOptions::default();
+
+    // Turn one: the aja runs; its record exists but the world is still shared.
+    let brain = Queue::one(vec![open(1), Action::Dispatch { task_id: 1 }]);
+    turn_at_with_options(
+        &store,
+        "run",
+        &brain,
+        &Done,
+        &ports,
+        eja::now_utc(),
+        &options,
+    )
+    .expect("dispatch");
+
+    // Turn two: EJA asks for the world to come back.
+    let brain = Queue::one(vec![Action::Reconcile { task_id: 1 }]);
+    let out = turn_at_with_options(
+        &store,
+        "bring it back",
+        &brain,
+        &Done,
+        &ports,
+        eja::now_utc(),
+        &options,
+    )
+    .expect("reconcile");
+    let account = out
+        .evidence
+        .iter()
+        .find(|view| view.target == "world")
+        .expect("the account is evidence EJA sees");
+    assert_eq!(
+        account.result["merged"],
+        serde_json::json!(true),
+        "{account:?}"
+    );
+    assert!(
+        store.events().unwrap().iter().any(|event| {
+            event.kind == Kind::Observed
+                && event
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["target"] == serde_json::json!("world"))
+        }),
+        "the account is one immutable fact"
+    );
+
+    // A task with no run has no world to bring back.
+    let brain = Queue::one(vec![Action::Reconcile { task_id: 2 }]);
+    let refused = turn_at_with_options(
+        &store,
+        "nothing to reconcile",
+        &brain,
+        &Done,
+        &ports,
+        eja::now_utc(),
+        &options,
+    )
+    .expect("refusal");
+    assert!(
+        refused
+            .refused
+            .iter()
+            .any(|note| note.contains("reconcile refused")),
+        "{:?}",
+        refused.refused
+    );
 }

@@ -1,7 +1,7 @@
 //! Composition laws: these cross the boundaries that isolated feature tests miss.
 mod support;
 use eja::{
-    adapters::{render_context_within, Observer, Ports},
+    adapters::{render_context_within, Capabilities, Ports},
     *,
 };
 use serde_json::{json, Value};
@@ -303,7 +303,7 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
 }
 
 struct World;
-impl Observer for World {
+impl Capabilities for World {
     fn observe(&self, _: &str, _: &Value, _: &eja::Control) -> Result<Value> {
         Ok(json!({"fact":7}))
     }
@@ -321,7 +321,7 @@ fn unrelated_tasks_do_not_change_world_capabilities() {
     let store = f.store();
     let worker = WorkerLog::default();
     let ports = Ports {
-        world: Some(&World),
+        capabilities: Some(&World),
         ..Default::default()
     };
     let first = turn(&store, "read", &script(vec![look()]), &worker, &ports).unwrap();

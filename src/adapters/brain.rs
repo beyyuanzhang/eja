@@ -24,8 +24,8 @@ use that id instead of guessing it. \
 A dispatch returns the host's account of one run; the run's record is its evidence. \
 Treat a run's last message as its account, not as a verified outcome. \
 Every read is one action: a look names a target and a selector. A target is an \
-address -- log:event:12, log:task:1, log:history, record:3/4 (one tool result), \
-record:3/report.md (one frozen file), world:src/out.txt -- or a host read tool such \
+address -- log:event:12, log:task:1, log:history, record:3/report.md (one frozen \
+file of aja 3), world:src/out.txt -- or a host read tool such \
 as read_file, list_dir or a granted connector, which selects through arguments. \
 Identity changes (goal, commitment, correction) are proposals: propose them, then \
 confirm only when the proposal is marked approved in PENDING PROPOSALS, and never \
@@ -61,7 +61,7 @@ Action shapes: \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
 {\"op\":\"focus\",\"task_id\":1}; \
 {\"op\":\"look\",\"target\":\"log:task:1\"}; \
-{\"op\":\"look\",\"target\":\"record:3/4\",\"selector\":{\"select\":\"bytes\",\"from\":0,\"bytes\":4096}}; \
+{\"op\":\"look\",\"target\":\"world:read_file\",\"arguments\":{\"path\":\"a.txt\"}}; \
 {\"op\":\"look\",\"target\":\"world:read_file\",\"arguments\":{\"path\":\"README.md\"}}; \
 {\"op\":\"look\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
 Preconditions: dispatch runs only a task in open state; a task that has a aja \
