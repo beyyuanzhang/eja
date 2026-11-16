@@ -39,8 +39,9 @@ Open <http://127.0.0.1:4173>.
 Do not open `app/public/index.html` through `file://`; a static file has no HTTP
 origin for the API.
 
-`npm --prefix app/frontend run dev` is only a frontend contributor mode. It is
-not a second product entry.
+For frontend editing, `npm --prefix app/frontend run dev` serves the same
+<http://127.0.0.1:4173> address with hot reload. Stop the preview process first
+so only one frontend entry exists.
 
 For a frontend on another origin, build with its runtime address and allow that
 origin when starting the runtime:
