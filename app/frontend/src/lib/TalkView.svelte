@@ -155,7 +155,7 @@
                 aria-label={loop.title}
                 onclick={() => onOpenLoop(loop)}
               >
-                <i class="status-dot {loop.kind === "paused" ? "open" : "waiting"}"></i>
+                <i class="status-dot waiting"></i>
                 <span class="loop-copy">
                   <span class="loop-title">{loop.title}</span>
                 </span>

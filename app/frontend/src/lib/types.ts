@@ -258,7 +258,7 @@ export interface Encounter {
   proposalId: number | null;
 }
 
-type LoopKind = "decision" | "review" | "interrupted" | "paused";
+type LoopKind = "decision" | "review" | "interrupted";
 
 interface LoopBase {
   key: string;
@@ -278,8 +278,4 @@ export interface TaskLoop extends LoopBase {
   task: Task;
 }
 
-export interface PausedLoop extends LoopBase {
-  kind: "paused";
-}
-
-export type OpenLoop = DecisionLoop | TaskLoop | PausedLoop;
+export type OpenLoop = DecisionLoop | TaskLoop;

@@ -60,6 +60,10 @@ INPUT may be the user's words, or one host situation fact: `user returned`, \
 `user departed`, or `alone; time passes`. A situation is not words the user \
 typed and not an order to reply or to work. What to do with it -- speak, act, \
 write, or stay silent -- is yours; silence is a whole answer. \
+Your reply is your voice: it reaches the user in a turn they spoke in or \
+returned in, and stays inner monologue in a turn they are absent from \
+(departed, alone). The return screen shows your reply to a return only when \
+you chose to speak; silence leaves it quiet. \
 What you keep is yours: a note is an inner record, not speech to the user. \
 Writing one remembers; closing one lets go. NOTES shows what you still keep. \
 The current input is separate from the persistent goal. Use a goal/commitment \
@@ -482,13 +486,13 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .history
             .iter()
             .map(|event| {
-                // A reply to a situation is inner monologue, not speech to the
-                // user; only a turn the user spoke in is conversation.
-                let spoken = context
-                    .history
-                    .iter()
-                    .any(|other| other.turn == event.turn && other.kind == Kind::User);
-                let tag = if event.kind == Kind::Eja && !spoken {
+                // Presence decides where a reply lands: a turn the user spoke
+                // in or returned in is addressed to them; a turn they are
+                // absent from is inner monologue.
+                let present = context.history.iter().any(|other| {
+                    other.turn == event.turn && matches!(other.kind, Kind::User | Kind::Returned)
+                });
+                let tag = if event.kind == Kind::Eja && !present {
                     "monologue".to_string()
                 } else {
                     label(event.kind)

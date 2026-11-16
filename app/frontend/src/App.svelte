@@ -18,9 +18,9 @@
   import {
     ambientLoops,
     encounterLoops,
-    lastAddressedMessage,
     messagesSince,
     parkedMatches,
+    presenceVoice,
     readParkedEncounter,
     sourceLoop,
     storeEncounter,
@@ -60,11 +60,9 @@
   const busy = $derived(Boolean(pending || appState?.health.turnInFlight));
   const presenceMessage = $derived.by(() => {
     if (!appState || encounter) return null;
-    return lastAddressedMessage(appState.messages, appState.events);
+    return presenceVoice(appState.messages, appState.events);
   });
-  const loops = $derived(
-    appState ? ambientLoops(appState, parkedEncounter, busy) : [],
-  );
+  const loops = $derived(appState ? ambientLoops(appState, busy) : []);
   const actions = $derived(
     appState && encounter ? encounterLoops(appState, encounter, busy) : [],
   );
@@ -164,11 +162,6 @@
 
   function openLoop(loop: OpenLoop) {
     if (!appState) return;
-    if (loop.kind === "paused") {
-      resumeParked();
-      setView("talk");
-      return;
-    }
     if (parkedEncounter && parkedMatches(loop, parkedEncounter)) {
       resumeParked();
       setView("talk");
@@ -337,8 +330,7 @@
   $effect(() => {
     if (!appState || !parkedEncounter || encounter) return;
     const source = sourceLoop(appState, parkedEncounter);
-    const exchanged = messagesSince(appState.messages, parkedEncounter);
-    if (!source && !exchanged.length) {
+    if (!source) {
       parkedEncounter = null;
       storeEncounter(null);
     }

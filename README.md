@@ -45,6 +45,10 @@ of the loop it serves; nothing gets a layer of its own:
 - **Attention** — the projection and its slot order; what is salient is what
   the view shows, and EJA shapes it by what it writes and keeps.
 - **Judgment** — `model(C)`, the only place meaning is generated.
+  A reply is EJA's voice: it reaches the user in a turn they spoke in or
+  returned in, and stays inner monologue in a turn they are absent from.
+  Whether to speak at all is EJA's decision; silence leaves the return screen
+  quiet.
 - **Action** — `execute`, whose observations flow back into `L`, closing the loop.
 - **Rhythm** — the host's single `Pulse`: how often it looks, and how much quiet
   opens an `alone` situation. It is policy, not a second source of time.

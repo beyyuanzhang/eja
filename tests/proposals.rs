@@ -382,31 +382,50 @@ fn the_projection_shows_notes_and_timestamps_so_time_is_visible() {
 }
 
 #[test]
-fn a_situation_reply_is_monologue_not_conversation() {
-    let fixture = Fixture::new("monologue-tag");
+fn presence_decides_whether_a_reply_reaches_the_user() {
+    let fixture = Fixture::new("presence-tag");
     let store = fixture.store();
-    eja::turn_at_with_options(
-        &store,
-        "",
-        &Script::new(vec![decision(vec![])]),
-        &Done::default(),
-        &Ports::default(),
-        eja::now_utc(),
-        &TurnOptions {
-            gesture: Some(Kind::Returned),
-            ..Default::default()
-        },
-    )
-    .expect("situation turn");
+    let situation = |kind: Kind| {
+        eja::turn_at_with_options(
+            &store,
+            "",
+            &Script::new(vec![decision(vec![])]),
+            &Done::default(),
+            &Ports::default(),
+            eja::now_utc(),
+            &TurnOptions {
+                gesture: Some(kind),
+                ..Default::default()
+            },
+        )
+        .expect("situation turn")
+    };
+    let returned = situation(Kind::Returned);
+    let departed = situation(Kind::Departed);
+    let alone = situation(Kind::Alone);
     turn_at(&store, "hello", vec![decision(vec![])]);
     let state = State::load(&store).expect("state");
     let rendered = eja::adapters::render_context(&state.project("", None, eja::now_utc()));
-    assert!(rendered.contains("[monologue]"), "{rendered}");
-    let conversation = rendered.find("CONVERSATION").expect("conversation");
-    let body = &rendered[conversation..];
-    assert!(
-        body.lines()
-            .any(|line| line.contains("[eja]") && line.contains("#4")),
-        "the reply in a user turn stays conversation: {body}"
-    );
+    let body = &rendered[rendered.find("CONVERSATION").expect("conversation")..];
+    for (label, outcome, expected) in [
+        ("returned", &returned, "[eja]"),
+        ("departed", &departed, "[monologue]"),
+        ("alone", &alone, "[monologue]"),
+    ] {
+        let id = outcome
+            .context()
+            .history
+            .iter()
+            .find(|event| event.kind == Kind::Eja)
+            .map(|event| event.id)
+            .expect("reply event");
+        let line = body
+            .lines()
+            .find(|line| line.contains(&format!("#{id} ")))
+            .unwrap_or_default();
+        assert!(
+            line.contains(expected),
+            "{label} reply should render {expected}: {line}"
+        );
+    }
 }

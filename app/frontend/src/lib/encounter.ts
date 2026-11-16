@@ -62,27 +62,32 @@ export function messagesSince(messages: Message[], encounter: Encounter): Messag
   return messages.filter((message) => message.id > encounter.anchor);
 }
 
-// An eja message is addressed to the user only when a real user utterance
-// precedes it in the same turn. Replies to situations (return/leave/alone)
-// are inner monologue, never the return screen's voice.
-export function lastAddressedMessage(
+// The return screen's voice is eja's own reply to the latest return: spoken
+// only if eja chose to speak on that turn. A later departure or alone turn
+// means the user left; the voice rests until the next return.
+export function presenceVoice(
   messages: Message[],
   events: JournalEvent[],
 ): Message | null {
-  const userTurns = new Set(
-    events.filter((event) => event.kind === "user").map((event) => event.turn),
-  );
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
+  let latest: JournalEvent | null = null;
+  for (const event of events) {
     if (
-      message.role === "eja" &&
-      message.text.trim() &&
-      userTurns.has(message.turn)
+      event.kind === "returned" ||
+      event.kind === "departed" ||
+      event.kind === "alone"
     ) {
-      return message;
+      if (!latest || event.id > latest.id) latest = event;
     }
   }
-  return null;
+  if (!latest || latest.kind !== "returned") return null;
+  return (
+    messages.find(
+      (message) =>
+        message.role === "eja" &&
+        message.turn === latest.turn &&
+        message.text.trim(),
+    ) ?? null
+  );
 }
 
 function proposalLoop(proposal: Proposal): OpenLoop {
@@ -135,39 +140,16 @@ export function coreLoops(
   return sortLoops(loops);
 }
 
-function pausedLoop(state: AppState, encounter: Encounter): OpenLoop | null {
-  const exchanged = messagesSince(state.messages, encounter);
-  if (!exchanged.length) return null;
-  const last = exchanged[exchanged.length - 1];
-  const lastUser = [...exchanged].reverse().find((message) => message.role === "user");
-  return {
-    key: "paused",
-    kind: "paused",
-    eventId: last.id,
-    at: last.at,
-    title: truncate(lastUser?.text || last.text, 104) || `#${last.id}`,
-  };
-}
-
 function loopMatchesEncounter(loop: OpenLoop, encounter: Encounter): boolean {
   if (loop.kind === "decision") return encounter.proposalId === loop.proposal.id;
-  if (loop.kind === "review" || loop.kind === "interrupted") {
-    return encounter.taskId === loop.task.id;
-  }
-  return loop.kind === "paused";
+  return encounter.taskId === loop.task.id;
 }
 
 export function ambientLoops(
   state: AppState,
-  parked: Encounter | null,
   busy = state.health.turnInFlight,
 ): OpenLoop[] {
-  const loops = coreLoops(state, busy);
-  if (!parked) return loops;
-  if (loops.some((loop) => loopMatchesEncounter(loop, parked))) return loops;
-  const paused = pausedLoop(state, parked);
-  if (paused) loops.push(paused);
-  return sortLoops(loops);
+  return coreLoops(state, busy);
 }
 
 export function encounterLoops(
@@ -206,7 +188,6 @@ function sortLoops(loops: OpenLoop[]): OpenLoop[] {
     interrupted: 0,
     decision: 1,
     review: 2,
-    paused: 3,
   };
   return loops.sort(
     (left, right) => rank[left.kind] - rank[right.kind] || right.at - left.at,
