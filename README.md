@@ -32,6 +32,15 @@ value. Nothing validates an action against a second derivation of the log.
 into `S` and the input, so a projection copies no fact. A turn's outcome owns
 `S` and derives the view on demand; no projection outlives the facts it shows.
 
+## App
+
+`app/` is a small local host for continuous conversation with EJA. Its interface
+is Svelte 5 + TypeScript + Vite, built into the dependency-free Node host. It
+has one thread and two views over the same journal: **talk** is where you speak
+and decide, and **unfold** shows the task lanes, timing, dependencies and
+evidence. There is no new-chat or session control. See
+[app/README.md](app/README.md).
+
 ## Facts and views
 
 - `log.jsonl` is the authority for identity, task lifecycles, graph edges,

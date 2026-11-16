@@ -1,0 +1,82 @@
+import type { AppState, RawRecord, SettingsView } from "./types";
+
+async function readJson(response: Response): Promise<Record<string, unknown>> {
+  try {
+    return (await response.json()) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, { cache: "no-store", ...init });
+  const body = await readJson(response);
+  if (!response.ok) {
+    throw new Error(String(body.error || `HTTP ${response.status}`));
+  }
+  return body as T;
+}
+
+export function fetchState(): Promise<AppState> {
+  return request<AppState>("/api/state");
+}
+
+export function fetchSettings(): Promise<SettingsView> {
+  return request<SettingsView>("/api/settings");
+}
+
+export function saveSettings(body: unknown): Promise<SettingsView> {
+  return request<SettingsView>("/api/settings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export interface TurnResponse {
+  ok?: boolean;
+  error?: string;
+  stderr?: string;
+  stdout?: string;
+}
+
+export function sendTurn(
+  text: string,
+  options: { focus?: number | null; approvals?: number[] } = {},
+): Promise<TurnResponse> {
+  return request<TurnResponse>("/api/turn", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      text,
+      focus: options.focus ?? null,
+      approvals: options.approvals ?? [],
+    }),
+  });
+}
+
+export function fetchRaw(address: string): Promise<RawRecord> {
+  return request<RawRecord>(`/api/raw?address=${encodeURIComponent(address)}`);
+}
+
+export function friendlyError(message: string): string {
+  if (/model is not configured/i.test(message)) {
+    return "还没接上模型。先在设置里填好地址、密钥和模型。";
+  }
+  if (/eja binary not found/i.test(message)) {
+    return "没找到 eja。先运行 cargo build，或在设置里指定二进制路径。";
+  }
+  if (/a turn is already running/i.test(message)) {
+    return "它还在处理上一件事。";
+  }
+  if (/text is required/i.test(message)) {
+    return "还没有写下要交代的事。";
+  }
+  if (/text is longer|request body too large/i.test(message)) {
+    return "这次递过去的内容太长了。";
+  }
+  if (/stopped by SIGINT/i.test(message)) {
+    return "这一轮被停下了。";
+  }
+  return message;
+}
