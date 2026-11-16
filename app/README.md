@@ -8,9 +8,11 @@ interface. The app has two views over one continuous life:
 - **unfold** is the same journal seen as work: lanes, time, dependencies, and
   the evidence behind each node. It is read-only. Any action starts in talk.
 
-The drawer in the lower-left configures the harness only: model, connectors,
-limits, and the eja binary. Goals, commitments, and corrections stay in talk
-as proposals, where they can be approved.
+The drawer in the lower-left is the only settings entry. It configures the
+harness only: Providers, the eja/AJA model bindings, connectors, limits, and
+the eja binary. A Provider owns an endpoint and credentials; eja and AJA only
+choose a Provider and model from that list. Goals, commitments, and corrections
+stay in talk as proposals, where they can be approved.
 
 ## Run
 

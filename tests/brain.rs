@@ -216,3 +216,76 @@ fn json_mode_is_requested_only_where_a_json_object_is_expected() {
     let aja = server.join().expect("server");
     assert!(aja.get("response_format").is_none(), "{aja}");
 }
+
+#[test]
+fn provider_headers_reach_the_model_request_and_override_bearer_auth() {
+    use eja::adapters::{Control, Model, OpenAiModel};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut headers = Vec::new();
+        let mut length = None;
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                let value = value.trim().to_string();
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.parse::<usize>().unwrap());
+                }
+                headers.push((name.to_ascii_lowercase(), value));
+            }
+        }
+        let mut body = vec![0; length.expect("content length")];
+        reader.read_exact(&mut body).unwrap();
+        let response_body = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).expect("write");
+        headers
+    });
+
+    let control = Control::new(Duration::from_secs(5), Arc::new(AtomicBool::new(false)));
+    let model = OpenAiModel::new(format!("http://127.0.0.1:{port}"), "test-key", "test-model")
+        .with_headers(vec![
+            ("authorization".into(), "Bearer custom-key".into()),
+            ("x-opencode-session".into(), "stable-session".into()),
+        ]);
+    model
+        .complete(
+            &[serde_json::json!({"role":"user","content":"work"})],
+            &[],
+            &eja::aja::Limits::default(),
+            &control,
+            false,
+        )
+        .expect("model call");
+
+    let headers = server.join().expect("server");
+    let authorization = headers
+        .iter()
+        .filter(|(name, _)| name == "authorization")
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(authorization, vec!["Bearer custom-key"]);
+    assert!(headers
+        .iter()
+        .any(|(name, value)| name == "x-opencode-session" && value == "stable-session"));
+}

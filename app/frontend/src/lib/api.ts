@@ -1,4 +1,11 @@
-import type { AppState, RawRecord, SettingsView } from "./types";
+import type {
+  AppState,
+  ConnectorDraft,
+  ConnectorTestResult,
+  ModelDiscoverResult,
+  RawRecord,
+  SettingsView,
+} from "./types";
 
 async function readJson(response: Response): Promise<Record<string, unknown>> {
   try {
@@ -33,6 +40,22 @@ export function saveSettings(body: unknown): Promise<SettingsView> {
   });
 }
 
+export function discoverModels(body: unknown): Promise<ModelDiscoverResult> {
+  return request<ModelDiscoverResult>("/api/provider/discover", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function testConnector(connector: ConnectorDraft): Promise<ConnectorTestResult> {
+  return request<ConnectorTestResult>("/api/connectors/test", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ connector }),
+  });
+}
+
 export interface TurnResponse {
   ok?: boolean;
   error?: string;
@@ -61,7 +84,7 @@ export function fetchRaw(address: string): Promise<RawRecord> {
 
 export function friendlyError(message: string): string {
   if (/model is not configured/i.test(message)) {
-    return "还没接上模型。先在设置里填好地址、密钥和模型。";
+    return "还没接上模型。先在左下角的设置里选好 Provider 和模型。";
   }
   if (/eja binary not found/i.test(message)) {
     return "没找到 eja。先运行 cargo build，或在设置里指定二进制路径。";

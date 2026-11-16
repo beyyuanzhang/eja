@@ -33,6 +33,7 @@ pub struct OpenAiModel {
     base: String,
     key: String,
     model: String,
+    headers: Vec<(String, String)>,
     /// One event loop and one connection pool for every call. A client built per
     /// request would drop its pool and handshake again each time, and a runtime
     /// built per request would start and stop an event loop each time.
@@ -45,8 +46,15 @@ impl OpenAiModel {
             base: base.into(),
             key: key.into(),
             model: model.into(),
+            headers: Vec::new(),
             http: std::sync::OnceLock::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
+        self
     }
 
     /// The shared transport, built once. A worker thread drives the pool, and
@@ -64,12 +72,26 @@ impl OpenAiModel {
     }
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let (base, key, model) = super::llm_env()?;
-        Some(Self::new(
-            base,
-            key,
-            std::env::var("EJA_AJA_MODEL").unwrap_or(model),
-        ))
+        let (mut base, mut key, model) = super::llm_env()?;
+        if let Ok(value) = std::env::var("EJA_AJA_BASE_URL") {
+            if !value.is_empty() {
+                base = value;
+            }
+        }
+        if let Ok(value) = std::env::var("EJA_AJA_API_KEY") {
+            if !value.is_empty() {
+                key = value;
+            }
+        }
+        let headers = if std::env::var("EJA_AJA_HEADERS").is_ok() {
+            super::llm_headers("EJA_AJA_HEADERS")
+        } else {
+            super::llm_headers("LNA_HEADERS")
+        };
+        Some(
+            Self::new(base, key, std::env::var("EJA_AJA_MODEL").unwrap_or(model))
+                .with_headers(headers),
+        )
     }
     pub(crate) fn request(
         &self,
@@ -97,13 +119,34 @@ impl OpenAiModel {
             let mut attempt = 0;
             loop {
                 attempt += 1;
-                let sent = client
-                    .post(&url)
-                    .bearer_auth(&self.key)
-                    .json(&body)
-                    .timeout(timeout)
-                    .send()
-                    .await;
+                let has_authorization = self
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+                let mut request = client.post(&url);
+                if !self.key.is_empty() && !has_authorization {
+                    request = request.bearer_auth(&self.key);
+                }
+                for (name, value) in &self.headers {
+                    if matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "connection"
+                            | "content-length"
+                            | "content-type"
+                            | "host"
+                            | "transfer-encoding"
+                    ) {
+                        return Err(
+                            format!("provider header is managed by the client: {name}").into()
+                        );
+                    }
+                    let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| format!("invalid provider header name: {name}"))?;
+                    let value = reqwest::header::HeaderValue::from_str(value)
+                        .map_err(|_| "invalid provider header value".to_string())?;
+                    request = request.header(name, value);
+                }
+                let sent = request.json(&body).timeout(timeout).send().await;
                 let mut response = match sent {
                     Ok(response) => response,
                     Err(error) => {

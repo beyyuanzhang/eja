@@ -241,7 +241,7 @@ verbs `EJA_NODE_*` to `EJA_AJA_*`.
 export LNA_BASE_URL=https://your-provider/v1
 export LNA_API_KEY=...
 export LNA_MODEL=...
-# Optional aja model: EJA_AJA_MODEL
+# Optional aja endpoint/model: EJA_AJA_BASE_URL, EJA_AJA_API_KEY, EJA_AJA_MODEL
 
 cargo run -- --dir /tmp/eja turn "draft a release checklist"
 cargo run -- --dir /tmp/eja show tasks

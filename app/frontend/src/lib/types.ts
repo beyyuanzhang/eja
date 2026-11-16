@@ -129,18 +129,16 @@ export interface AppState {
 }
 
 export interface SettingsView {
-  model: {
-    baseUrl: string;
-    model: string;
-    ajaModel: string;
-    hasApiKey: boolean;
-    apiKeyHint: string;
-    effectiveBaseUrl: string;
-    effectiveModel: string;
+  providers: ProviderView[];
+  roles: {
+    eja: RoleBinding;
+    aja: RoleBinding;
   };
   connectors: {
-    mcpConfig: string;
-    effective: string;
+    servers: ConnectorView[];
+    managed: boolean;
+    configPath: string;
+    error: string | null;
   };
   limits: {
     slots: number;
@@ -158,6 +156,90 @@ export interface SettingsView {
     mcp: boolean;
     state: boolean;
   };
+}
+
+export interface ProviderView {
+  id: string;
+  name: string;
+  baseUrl: string;
+  models: string[];
+  hasApiKey: boolean;
+  local: boolean;
+  headers: KeyValueView[];
+}
+
+export interface ProviderDraft {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  clearApiKey?: boolean;
+  models: string[];
+  hasApiKey: boolean;
+  local: boolean;
+  headers: KeyValueDraft[];
+}
+
+export interface RoleBinding {
+  providerId: string;
+  model: string;
+}
+
+export interface KeyValueView {
+  key: string;
+  value: string;
+  secret: boolean;
+  hasValue: boolean;
+  redacted: boolean;
+}
+
+export interface ConnectorView {
+  name: string;
+  mode: "command" | "url";
+  command: string;
+  url: string;
+  args: string[];
+  cwd: string;
+  env: KeyValueView[];
+  headers: KeyValueView[];
+  enabled: boolean;
+  timeoutMs: number;
+}
+
+export interface KeyValueDraft {
+  key: string;
+  value: string;
+  secret: boolean;
+  hasValue: boolean;
+  redacted: boolean;
+}
+
+export interface ConnectorDraft {
+  name: string;
+  mode: "command" | "url";
+  command: string;
+  url: string;
+  args: string[];
+  cwd: string;
+  env: KeyValueDraft[];
+  headers: KeyValueDraft[];
+  enabled: boolean;
+  timeoutMs: number;
+}
+
+export interface ModelDiscoverResult {
+  ok: boolean;
+  models?: string[];
+  latencyMs: number;
+  error?: string;
+}
+
+export interface ConnectorTestResult {
+  ok: boolean;
+  count?: number;
+  latencyMs: number;
+  error?: string;
+  stderr?: string;
 }
 
 export interface RawRecord {

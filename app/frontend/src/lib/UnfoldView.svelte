@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { Clock3, LocateFixed, MessageCircle, Waypoints } from "lucide-svelte";
-  import { onMount, tick } from "svelte";
+  import { Clock3, LocateFixed, Waypoints } from "lucide-svelte";
+  import { tick } from "svelte";
   import { axisTime, duration, niceStep, taskEnd, taskStatus, truncate } from "./format";
   import type { Relation, Task } from "./types";
 
@@ -15,17 +15,14 @@
     visible: boolean;
     selectedTask: number | null;
     onSelect: (id: number) => void;
-    onTalk: () => void;
   }
 
-  let { tasks, relations, counts, now, visible, selectedTask, onSelect, onTalk }: Props =
+  let { tasks, relations, counts, now, visible, selectedTask, onSelect }: Props =
     $props();
 
   let viewport = $state<HTMLDivElement>();
   let width = $state(1000);
   let measured = false;
-  let lastNowScroll = 0;
-  let observer: ResizeObserver | null = null;
 
   const labelWidth = $derived(width <= 640 ? 112 : width <= 900 ? 138 : 196);
 
@@ -225,25 +222,18 @@
     });
   }
 
-  onMount(() => {
-    if (!viewport) return;
-    observer = new ResizeObserver(([entry]) => {
+  $effect(() => {
+    const element = viewport;
+    if (!element) return;
+    const observer = new ResizeObserver(([entry]) => {
       width = Math.max(320, entry.contentRect.width);
       if (!measured) {
         measured = true;
         void tick().then(() => scrollToNow("auto"));
       }
     });
-    observer.observe(viewport);
-    return () => observer?.disconnect();
-  });
-
-  $effect(() => {
-    if (!visible || !viewport) return;
-    if (lastNowScroll === 0) {
-      lastNowScroll = now;
-      void tick().then(() => scrollToNow("auto"));
-    }
+    observer.observe(element);
+    return () => observer.disconnect();
   });
 </script>
 
@@ -273,12 +263,7 @@
   {#if !tasks.length}
     <div class="empty">
       <div class="empty-orb"><span></span></div>
-      <h2>还没有展开的工作</h2>
-      <p>去 talk 里交代一件，它会在这里长出来。</p>
-      <button class="secondary-button" type="button" onclick={onTalk}>
-        <MessageCircle size={14} />
-        回到 talk
-      </button>
+      <h2>还没有展开</h2>
     </div>
   {:else}
     <div class="timeline-scroll" bind:this={viewport}>
@@ -772,12 +757,6 @@
     font-size: 25px;
     font-weight: 450;
     letter-spacing: -0.025em;
-  }
-
-  .empty p {
-    margin: 5px 0 18px;
-    color: var(--muted);
-    font-size: 12px;
   }
 
   @keyframes running-sweep {

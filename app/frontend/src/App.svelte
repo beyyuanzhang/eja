@@ -227,6 +227,7 @@
     settingsOpen = true;
     settingsLoading = true;
     settingsLoadError = "";
+    settings = null;
     try {
       settings = await fetchSettings();
     } catch (error) {
@@ -310,10 +311,10 @@
 <div class="app-shell">
   <header class="topbar">
     <div class="brand-side">
-      <button class="brand" type="button" aria-label="回到交流" onclick={() => setView("talk")}>
+      <div class="brand">
         <span class="brand-mark" aria-hidden="true"><i></i></span>
         <span class="wordmark">eja</span>
-      </button>
+      </div>
     </div>
 
     <nav class="view-switch" aria-label="视图">
@@ -341,18 +342,9 @@
     </nav>
 
     <div class="top-tools">
-      <span class="ambient-status" title={ambient.text}>
+      <span class="ambient-status" title={ambient.text} aria-label={ambient.text}>
         <i class="status-dot {ambient.tone}"></i>
-        <span>{ambient.text}</span>
       </span>
-      <button
-        class="mobile-settings icon-button"
-        type="button"
-        aria-label="打开设置"
-        onclick={() => void openSettings()}
-      >
-        <Settings2 size={17} strokeWidth={1.65} />
-      </button>
     </div>
   </header>
 
@@ -399,9 +391,7 @@
             onApprove={approveProposal}
             onDismiss={dismissProposal}
             onRaw={(address) => void openRaw(address)}
-            onOpenSettings={() => void openSettings()}
             onRead={markRead}
-            onUnfold={() => setView("unfold")}
           />
         </div>
 
@@ -414,7 +404,6 @@
             visible={view === "unfold"}
             selectedTask={selectedTaskId}
             onSelect={openTask}
-            onTalk={() => setView("talk")}
           />
         </div>
       </div>
@@ -429,7 +418,6 @@
     onclick={() => void openSettings()}
   >
     <Settings2 size={16} strokeWidth={1.65} />
-    <span>设置</span>
   </button>
 
   {#if toastText}
@@ -509,11 +497,6 @@
     gap: 10px;
     border-radius: 10px;
     color: var(--ink);
-    transition: opacity 150ms ease;
-  }
-
-  .brand:hover {
-    opacity: 0.72;
   }
 
   .brand-mark {
@@ -605,30 +588,17 @@
 
   .ambient-status {
     display: inline-flex;
-    max-width: 230px;
+    width: 30px;
     height: 30px;
     align-items: center;
-    gap: 7px;
-    padding: 0 10px;
+    justify-content: center;
     border-radius: 999px;
-    color: var(--muted);
-    font-size: 10px;
-  }
-
-  .ambient-status span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .ambient-status .status-dot {
     width: 6px;
     height: 6px;
     flex-basis: 6px;
-  }
-
-  .mobile-settings {
-    display: none;
   }
 
   .journal-warning {
@@ -791,11 +761,10 @@
     bottom: max(15px, env(safe-area-inset-bottom));
     left: 16px;
     z-index: 35;
-    display: inline-flex;
+    display: grid;
+    width: 34px;
     height: 34px;
-    align-items: center;
-    gap: 7px;
-    padding: 0 11px;
+    place-items: center;
     border: 1px solid rgba(36, 35, 31, 0.1);
     border-radius: 999px;
     background: color-mix(in srgb, var(--surface) 80%, transparent);
@@ -904,13 +873,9 @@
       display: none;
     }
 
-    .mobile-settings {
-      display: inline-flex;
-      justify-self: end;
-    }
-
     .settings-trigger {
-      display: none;
+      bottom: max(12px, env(safe-area-inset-bottom));
+      left: 12px;
     }
 
     .journal-warning {

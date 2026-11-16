@@ -6,8 +6,6 @@
     Copy,
     FileText,
     Paperclip,
-    Settings2,
-    Sparkles,
     X,
   } from "lucide-svelte";
   import { tick } from "svelte";
@@ -36,9 +34,7 @@
     onApprove: (id: number) => void;
     onDismiss: (id: number) => void;
     onRaw: (address: string) => void;
-    onOpenSettings: () => void;
     onRead: (id: number) => void;
-    onUnfold: () => void;
   }
 
   let {
@@ -54,9 +50,7 @@
     onApprove,
     onDismiss,
     onRaw,
-    onOpenSettings,
     onRead,
-    onUnfold,
   }: Props = $props();
 
   let scroller = $state<HTMLDivElement>();
@@ -108,16 +102,16 @@
 
   const presence = $derived.by(() => {
     if (!health.binary) {
-      return { tone: "failed", text: "还没有找到 eja", action: "设置" };
+      return { tone: "failed", text: "还没有找到 eja" };
     }
     if (!health.model && messages.length === 0) {
-      return { tone: "waiting", text: "模型还没有接上", action: "设置" };
+      return { tone: "waiting", text: "模型还没有接上" };
     }
     if (pending || health.turnInFlight) {
-      return { tone: "running", text: "eja 正在想这件事", action: "" };
+      return { tone: "running", text: "eja 正在想这件事" };
     }
     if (proposals.length) {
-      return { tone: "waiting", text: "有一件事等你决定", action: "" };
+      return { tone: "waiting", text: "有一件事等你决定" };
     }
     const running = tasks.filter((task) => task.status === "running");
     if (running.length) {
@@ -125,18 +119,17 @@
       return {
         tone: "running",
         text: `正在办 · ${lead?.title ?? "一件事"}${running.length > 1 ? ` +${running.length - 1}` : ""}`,
-        action: "",
       };
     }
     const waiting = tasks.filter((task) => task.status === "waiting");
     if (waiting.length) {
-      return { tone: "waiting", text: `等它收尾 · ${leadTask(waiting)?.title ?? "一件事"}`, action: "" };
+      return { tone: "waiting", text: `等它收尾 · ${leadTask(waiting)?.title ?? "一件事"}` };
     }
     const open = tasks.filter((task) => task.status === "open");
     if (open.length) {
-      return { tone: "open", text: `还没开始 · ${leadTask(open)?.title ?? "一件事"}`, action: "" };
+      return { tone: "open", text: `还没开始 · ${leadTask(open)?.title ?? "一件事"}` };
     }
-    return { tone: "open", text: "它在", action: "" };
+    return { tone: "open", text: "它在" };
   });
 
   function isNearBottom(): boolean {
@@ -223,8 +216,9 @@
     optimistic?.text;
     pending;
     if (firstLayout || atBottom) {
+      const initial = firstLayout;
       firstLayout = false;
-      void scrollToBottom(firstLayout ? "auto" : "smooth");
+      void scrollToBottom(initial ? "auto" : "smooth");
     }
   });
 
@@ -282,28 +276,6 @@
             <span></span>
           </div>
           <h1>我在这儿。</h1>
-          <p>不用整理成一个完整任务。先说眼前这一件。</p>
-          <div class="empty-actions">
-            <button
-              type="button"
-              onclick={() => {
-                draft = "把现在的进展讲给我。";
-                void tick().then(() => {
-                  resizeComposer();
-                  textarea?.focus();
-                });
-              }}
-            >
-              <Sparkles size={13} strokeWidth={1.7} />
-              看看现在
-            </button>
-            <button type="button" onclick={onUnfold}>展开工作</button>
-          </div>
-          {#if !health.model}
-            <button class="connect-link" type="button" onclick={onOpenSettings}>
-              先接上模型
-            </button>
-          {/if}
         </div>
       {:else}
         {#if hiddenCount > 0}
@@ -339,9 +311,6 @@
                     onclick={() => onRaw(`log:event:${item.message.id}`)}
                   >
                     log:event:{item.message.id}
-                  </button>
-                  <button class="text-button" type="button" onclick={onUnfold}>
-                    看工作
                   </button>
                   <button
                     class="copy-button"
@@ -402,12 +371,6 @@
           <i class="status-dot {presence.tone}"></i>
           <span>{presence.text}</span>
         </span>
-        {#if presence.action}
-          <button class="presence-action" type="button" onclick={onOpenSettings}>
-            <Settings2 size={12} />
-            {presence.action}
-          </button>
-        {/if}
       </div>
 
       <form
@@ -462,10 +425,6 @@
           </button>
         </div>
       </form>
-      <div class="composer-foot">
-        <span>Enter 发送 · Shift Enter 换行</span>
-        <span class="privacy">记录只留在这台电脑</span>
-      </div>
       <input
         bind:this={fileInput}
         class="sr-only"
@@ -575,48 +534,6 @@
     font-size: 34px;
     font-weight: 420;
     letter-spacing: -0.035em;
-  }
-
-  .empty-state p {
-    margin: 7px 0 0;
-    color: var(--muted);
-    font-size: 13px;
-  }
-
-  .empty-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 22px;
-  }
-
-  .empty-actions button {
-    display: inline-flex;
-    height: 32px;
-    align-items: center;
-    gap: 6px;
-    padding: 0 12px;
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    background: rgba(255, 254, 250, 0.66);
-    color: var(--ink-soft);
-    font-size: 11.5px;
-    transition:
-      background 150ms ease,
-      border-color 150ms ease;
-  }
-
-  .empty-actions button:hover {
-    border-color: var(--line-strong);
-    background: var(--surface);
-  }
-
-  .connect-link {
-    margin-top: 15px;
-    color: var(--accent-deep);
-    font-size: 11.5px;
-    text-decoration: underline;
-    text-underline-offset: 3px;
   }
 
   .assistant-message {
@@ -780,7 +697,7 @@
     z-index: 5;
     flex: 0 0 auto;
     background: linear-gradient(180deg, rgba(248, 247, 242, 0), rgba(248, 247, 242, 0.92) 22%, var(--paper) 54%);
-    padding: 16px 20px calc(14px + env(safe-area-inset-bottom));
+    padding: 16px 20px calc(14px + env(safe-area-inset-bottom)) 58px;
   }
 
   .composer-inner {
@@ -809,18 +726,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .presence-action {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    color: var(--muted);
-    font-size: 10.5px;
-  }
-
-  .presence-action:hover {
-    color: var(--ink);
   }
 
   .composer {
@@ -882,6 +787,11 @@
     color: var(--ink);
     font-size: 14.5px;
     line-height: 1.55;
+    scrollbar-width: none;
+  }
+
+  textarea::-webkit-scrollbar {
+    display: none;
   }
 
   textarea::placeholder {
@@ -955,20 +865,6 @@
     color: var(--ink);
   }
 
-  .composer-foot {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 7px 0;
-    color: var(--faint);
-    font-size: 9.5px;
-  }
-
-  .privacy::before {
-    margin-right: 4px;
-    content: "·";
-  }
-
   .drop-overlay {
     position: absolute;
     inset: 4px 12px 12px;
@@ -1037,11 +933,7 @@
     }
 
     .composer-zone {
-      padding: 12px 12px calc(11px + env(safe-area-inset-bottom));
-    }
-
-    .composer-foot {
-      display: none;
+      padding: 12px 12px calc(11px + env(safe-area-inset-bottom)) 56px;
     }
 
     .presence {
@@ -1078,9 +970,5 @@
       font-size: 31px;
     }
 
-    .empty-actions {
-      flex-wrap: wrap;
-      justify-content: center;
-    }
   }
 </style>

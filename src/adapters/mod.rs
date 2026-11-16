@@ -47,6 +47,16 @@ fn llm_env() -> Option<(String, String, String)> {
     Some((base, key, model))
 }
 
+fn llm_headers(name: &str) -> Vec<(String, String)> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| {
+            serde_json::from_str::<std::collections::BTreeMap<String, String>>(&raw).ok()
+        })
+        .map(|headers| headers.into_iter().collect())
+        .unwrap_or_default()
+}
+
 /// Cut a line at a byte budget without splitting a character.
 pub(crate) fn cut_chars(line: &str, limit: usize) -> &str {
     let mut end = limit.min(line.len());

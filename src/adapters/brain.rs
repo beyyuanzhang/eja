@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 
-use super::{label, llm_env, Control, Model, OpenAiModel};
+use super::{label, llm_env, llm_headers, Control, Model, OpenAiModel};
 
 const fn relation(kind: crate::RelationKind) -> &'static str {
     match kind {
@@ -667,7 +667,7 @@ impl OpenAiBrain {
         let Some((base, key, model)) = llm_env() else {
             return Ok(None);
         };
-        let mut brain = Self::new(base, key, model);
+        let mut brain = Self::new(base, key, model).with_headers(llm_headers("LNA_HEADERS"));
         if let Ok(raw) = std::env::var("EJA_CONTEXT_BYTES") {
             let budget = raw.parse().map_err(|_| "invalid EJA_CONTEXT_BYTES")?;
             brain = brain.with_context_budget(budget)?;
@@ -679,6 +679,10 @@ impl OpenAiBrain {
             model: OpenAiModel::new(base, key, model),
             context_budget: DEFAULT_CONTEXT_BYTES,
         }
+    }
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.model = self.model.with_headers(headers);
+        self
     }
     pub fn with_context_budget(mut self, budget: usize) -> crate::Result<Self> {
         if budget == 0 {

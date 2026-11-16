@@ -10,6 +10,7 @@
     step = 1,
     suffix = "",
     zeroLabel = "默认",
+    onchange,
   }: {
     label: string;
     description?: string;
@@ -19,10 +20,12 @@
     step?: number;
     suffix?: string;
     zeroLabel?: string;
+    onchange?: () => void;
   } = $props();
 
   function setValue(next: number) {
     value = Math.min(max, Math.max(min, Number.isFinite(next) ? next : min));
+    onchange?.();
   }
 </script>
 
