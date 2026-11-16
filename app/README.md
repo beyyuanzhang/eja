@@ -1,10 +1,10 @@
 # eja app
 
 A small local host for the eja journal, with a Svelte 5 + TypeScript + Vite
-interface. The app has two views over one continuous life:
+interface. It has one attention surface and two views over the same life:
 
-- **talk** is the conversation. It is not a session list or a new-chat client;
-  the journal itself is the thread.
+- **talk** is either the return screen or one active encounter. It is not a
+  session list, a new-chat client, or an endless transcript.
 - **unfold** is the same journal seen as work: lanes, time, dependencies, and
   the evidence behind each node. It is read-only. Any action starts in talk.
 
@@ -35,6 +35,43 @@ npm --prefix app/frontend run preview
 ```
 
 Open <http://127.0.0.1:4173>.
+
+## Talk lifecycle
+
+The lifecycle is a projection, not another authority. Core facts stay in
+`log.jsonl`; the browser owns only the pointer to the one encounter currently in
+front of the user. It does not generate Eja's voice: every sentence shown as Eja
+comes from the journal.
+
+| Visible state | Source |
+|---|---|
+| decision | an open proposal |
+| review | a waiting task, or an open group whose children are terminal |
+| interrupted | a task left running after no turn is in flight |
+| paused | a local encounter anchor with exchanges after it |
+| working | a running task while a turn is actually in flight; not an open loop |
+
+`bye` clears the local encounter pointer. It does not close tasks, resolve
+proposals, write a session event, or make the conversation disappear from Eja's
+context. If work is still waiting, it remains on the return screen. Leaving
+without `bye` keeps the encounter anchor, so the next visit can show it as one
+paused conversation.
+
+Presence is Eja's own voice, never client copy. The return screen shows the
+latest non-empty Eja message from the journal. When the user comes back after
+something changed, or presses `bye`, the client sends one structured gesture
+(`return` / `leave`). The runtime records it as a `returned` / `departed` fact
+with no user message, then runs one real turn: whether to say anything, and
+what, is Eja's decision. Greetings are throttled per client and never repeat
+over an unchanged journal.
+
+Opening a task loop sets that task as the focus of the next real turn. Review and
+continuation happen through the user's own message; the client has no canned
+sentences for them. Proposal approval is one structured host approval and adds no
+invented user text. The only text sent to Eja is what the user typed.
+
+There is no prompt template, persona copy, session table, thread list, second
+task store, or client-side proposal resolution in the app.
 
 Do not open `app/public/index.html` through `file://`; a static file has no HTTP
 origin for the API.

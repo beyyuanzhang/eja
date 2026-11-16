@@ -67,7 +67,9 @@
       list.push({
         id: "independent",
         title: "独立工作",
-        meta: active ? `${roots.length} 件 · ${active} 未结` : `${roots.length} 件`,
+        meta: active
+          ? `${roots.length} 任务 · ${active} 运行`
+          : `${roots.length} 任务`,
         group: null,
         tasks: roots,
       });
@@ -84,8 +86,8 @@
         id: `group-${group.id}`,
         title: group.title,
         meta: children.length
-          ? `${done}/${children.length} 收好${active ? ` · ${active} 未结` : ""}`
-          : "还没有展开",
+          ? `${done}/${children.length} 完成${active ? ` · ${active} 运行` : ""}`
+          : "0",
         group,
         tasks: children,
       });
@@ -208,10 +210,10 @@
 
   const summary = $derived(
     counts.running
-      ? `${counts.running} 个在办 · ${tasks.length} 个节点`
+      ? `${counts.running} 运行 · ${tasks.length} 任务`
       : counts.waiting
-        ? `${counts.waiting} 个等判断 · ${tasks.length} 个节点`
-        : `${tasks.length} 个节点 · 都收好了`,
+        ? `${counts.waiting} 等待 · ${tasks.length} 任务`
+        : `${tasks.length} 任务`,
   );
 
   function scrollToNow(behavior: ScrollBehavior = "smooth") {
@@ -248,10 +250,10 @@
     </div>
     <div class="head-tools">
       <div class="legend" aria-label="状态图例">
-        <span><i class="status-dot running"></i>在办</span>
-        <span><i class="status-dot waiting"></i>等判断</span>
-        <span><i class="status-dot done"></i>已收下</span>
-        <span><i class="status-dot failed"></i>未通过</span>
+        <span><i class="status-dot running"></i>运行中</span>
+        <span><i class="status-dot waiting"></i>等待</span>
+        <span><i class="status-dot done"></i>完成</span>
+        <span><i class="status-dot failed"></i>失败</span>
       </div>
       <button class="now-button" type="button" onclick={() => scrollToNow()}>
         <LocateFixed size={13} />

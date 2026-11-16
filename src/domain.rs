@@ -33,6 +33,15 @@ pub enum Kind {
     /// A host-recorded approval of one pending proposal, for this turn. Approval
     /// is a fact like any other, never a caller's flag.
     Approval,
+    /// The host noticed the user returned to the foreground. It is a fact about
+    /// presence, not a message: it authorizes nothing and says no words.
+    Returned,
+    /// The host noticed the user left the foreground encounter. Tasks, proposals
+    /// and memory stay exactly as they were.
+    Departed,
+    /// The host noticed EJA is alone: nobody has called it for a while. Like
+    /// presence, it is a situation, not a message and not an order.
+    Alone,
     /// The host rejected an action: the state did not allow it, or it could not
     /// be read as one of EJA's own actions. EJA reads these back in its projection.
     Refused,
@@ -63,6 +72,9 @@ impl Kind {
             Self::TaskClosed => "task_closed",
             Self::Observed => "observed",
             Self::Approval => "approval",
+            Self::Returned => "returned",
+            Self::Departed => "departed",
+            Self::Alone => "alone",
             Self::Refused => "refused",
         }
     }
@@ -611,6 +623,9 @@ pub struct TurnOptions {
     /// Approval is supplied by the host, never inferred from model output.
     pub approvals: Vec<u64>,
     pub focus: Option<TaskId>,
+    /// One host situation fact opening this turn: `Returned`, `Departed` or
+    /// `Alone`. The host validates the variant; nothing else may enter here.
+    pub gesture: Option<Kind>,
     pub limits: TurnLimits,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -695,6 +710,9 @@ mod tests {
             Kind::TaskClosed,
             Kind::Observed,
             Kind::Approval,
+            Kind::Returned,
+            Kind::Departed,
+            Kind::Alone,
             Kind::Refused,
         ] {
             let wire = serde_json::to_value(kind).expect("a unit variant serializes");

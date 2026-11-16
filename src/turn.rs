@@ -984,15 +984,52 @@ pub fn turn_at_with_options<'i>(
     if options.focus.is_some_and(|id| !state.knows(id)) {
         return Err("focus names an unknown task".into());
     }
-    commit(
-        store,
-        &mut state,
-        Kind::User,
-        "eja",
-        input,
-        turn_no,
-        EventMeta::new(at),
-    )?;
+    let situation = match options.gesture {
+        None => None,
+        Some(kind @ (Kind::Returned | Kind::Departed | Kind::Alone)) => Some(kind),
+        Some(_) => return Err("gesture names an unknown situation".into()),
+    };
+    if situation.is_some() && !options.approvals.is_empty() {
+        return Err("a situation carries no approvals".into());
+    }
+    if situation.is_some() && options.focus.is_some() {
+        return Err("a situation carries no focus".into());
+    }
+    if input.trim().is_empty() && options.approvals.is_empty() && situation.is_none() {
+        return Err("a turn needs text, an approval or a situation".into());
+    }
+    if situation.is_none() && !input.trim().is_empty() {
+        commit(
+            store,
+            &mut state,
+            Kind::User,
+            "eja",
+            input,
+            turn_no,
+            EventMeta::new(at),
+        )?;
+    }
+    if let Some(kind) = situation {
+        commit(
+            store,
+            &mut state,
+            kind,
+            "eja",
+            "",
+            turn_no,
+            EventMeta::new(at),
+        )?;
+    }
+    let input = if situation.is_some() {
+        match situation {
+            Some(Kind::Returned) => "user returned",
+            Some(Kind::Departed) => "user departed",
+            Some(Kind::Alone) => "alone; time passes",
+            _ => "",
+        }
+    } else {
+        input
+    };
     // An approval is a fact, not a caller's flag: it is recorded once, with the
     // turn it authorizes, and every later read comes from the journal.
     for proposal_id in &options.approvals {
@@ -1016,7 +1053,7 @@ pub fn turn_at_with_options<'i>(
         .filter(|task| task.status.is_active())
         .collect();
     let mut focus = options.focus.or_else(|| {
-        if active.len() == 1 && active[0].status == TaskStatus::Waiting {
+        if situation.is_none() && active.len() == 1 && active[0].status == TaskStatus::Waiting {
             Some(active[0].id)
         } else {
             None

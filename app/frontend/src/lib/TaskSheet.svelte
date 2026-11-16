@@ -5,7 +5,6 @@
     ChevronRight,
     Copy,
     ExternalLink,
-    MessageCircle,
     X,
   } from "lucide-svelte";
   import { fade, fly } from "svelte/transition";
@@ -16,12 +15,11 @@
     task: Task;
     tasks: Task[];
     onClose: () => void;
-    onAsk: (task: Task) => void;
     onRaw: (address: string) => void;
     onSelectRelated: (id: number) => void;
   }
 
-  let { task, tasks, onClose, onAsk, onRaw, onSelectRelated }: Props = $props();
+  let { task, tasks, onClose, onRaw, onSelectRelated }: Props = $props();
 
   let copied = $state("");
   const status = $derived(taskStatus(task));
@@ -166,7 +164,7 @@
                 <span>eja 判</span>
                 {#if task.close}
                   <em class:negative={!task.close.accepted}>
-                    {task.close.accepted ? "收下" : "退回"}
+                    {task.close.accepted ? "完成" : "失败"}
                   </em>
                 {:else}
                   <em>还没判</em>
@@ -232,10 +230,6 @@
     </div>
 
     <footer class="sheet-foot">
-      <button class="primary-button ask" type="button" onclick={() => onAsk(task)}>
-        <MessageCircle size={14} />
-        问这个
-      </button>
       <button class="secondary-button" type="button" onclick={() => onRaw(`log:task:${task.id}`)}>
         <ExternalLink size={13} />
         原始记录
@@ -645,10 +639,6 @@
     border-top: 1px solid var(--line);
     background: rgba(251, 250, 246, 0.92);
     backdrop-filter: blur(14px);
-  }
-
-  .sheet-foot .ask {
-    gap: 6px;
   }
 
   .copy-address {

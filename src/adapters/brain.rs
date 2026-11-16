@@ -56,6 +56,10 @@ confirm only when the proposal is marked approved in PROPOSALS, and never \
 in the turn that created it. An approval is recorded by the host for one turn; \
 model text never is. An approval authorizes one turn, so a proposal that needs one \
 ends the turn and the next turn carries it. \
+INPUT may be the user's words, or one host situation fact: `user returned`, \
+`user departed`, or `alone; time passes`. A situation is not words the user \
+typed and not an order to reply or to work. What to do with it -- speak, act, \
+write, or stay silent -- is yours; silence is a whole answer. \
 The current input is separate from the persistent goal. Use a goal/commitment \
 proposal without target_id to add one; with target_id to replace an active event \
 of the same kind. Use correction with target_id only to withdraw that event. \
@@ -257,7 +261,14 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
     sections.push(section(
         Slot::Input,
         false,
-        vec![plain(vec![format!("  {}", context.input)])],
+        vec![plain(vec![format!(
+            "  {}",
+            if context.input.is_empty() {
+                "(no input this turn)"
+            } else {
+                context.input
+            }
+        )])],
     ));
     // A fact the subject does not have is not rendered: a projection of nothing
     // says nothing, so nothing here describes a shape rather than a content.

@@ -298,7 +298,12 @@ impl State {
             history: self
                 .events
                 .iter()
-                .filter(|event| matches!(event.kind, Kind::User | Kind::Eja))
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        Kind::User | Kind::Eja | Kind::Returned | Kind::Departed | Kind::Alone
+                    )
+                })
                 .filter(|event| event.turn < history_before)
                 .rev()
                 .collect(),
@@ -426,7 +431,12 @@ impl State {
                 }
             }
             Kind::TaskRelation => self.relate(event),
-            Kind::User | Kind::Eja | Kind::Refused => {}
+            Kind::User
+            | Kind::Eja
+            | Kind::Refused
+            | Kind::Returned
+            | Kind::Departed
+            | Kind::Alone => {}
         }
     }
 

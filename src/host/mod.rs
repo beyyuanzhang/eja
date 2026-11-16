@@ -20,7 +20,7 @@ use eja::{
         Control, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, Shared,
         ToolGateway, Worktrees, Worlds,
     },
-    turn_at_with_options, Assignment, Store, TurnOptions,
+    turn_at_with_options, Assignment, Kind, Store, TurnOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -79,6 +79,8 @@ struct TurnRequest {
     focus: Option<u64>,
     #[serde(default)]
     approvals: Vec<u64>,
+    #[serde(default)]
+    gesture: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +160,45 @@ pub fn serve(options: Options) -> eja::Result<()> {
                 .map_or("(not configured)", |role| role.model.as_str())
         );
         let cors_host = host.clone();
+        let pulse_host = host.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                if pulse_host.cancelled.load(Ordering::SeqCst)
+                    || pulse_host.turn_in_flight.load(Ordering::SeqCst)
+                {
+                    continue;
+                }
+                let Ok(effective) = pulse_host.settings.effective_current() else {
+                    continue;
+                };
+                if !effective.model_ready() {
+                    continue;
+                }
+                let Ok(store) = Store::new(&pulse_host.state_dir) else {
+                    continue;
+                };
+                let Ok(events) = store.events() else {
+                    continue;
+                };
+                let Some(last) = events.last() else {
+                    continue;
+                };
+                if last.kind == Kind::Alone || eja::now_utc().timestamp() - last.at < 1800 {
+                    continue;
+                }
+                if pulse_host.turn_in_flight.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                let pulse = pulse_host.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _reset = TurnFlag(&pulse.turn_in_flight);
+                    let _ = execute_turn(&pulse, "", None, Vec::new(), Some(Kind::Alone));
+                })
+                .await;
+            }
+        });
         let app = Router::new()
             .route("/api/state", get(get_state))
             .route("/api/settings", get(get_settings).post(save_settings))
@@ -530,11 +571,22 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
     let body = read_json(request).await?;
     let turn: TurnRequest = serde_json::from_value(body)?;
     let text = turn.text.trim();
-    if text.is_empty() {
+    let approvals: Vec<u64> = turn.approvals.into_iter().filter(|id| *id > 0).collect();
+    let gesture = match turn.gesture.as_deref() {
+        None | Some("") => None,
+        Some("return") => Some(Kind::Returned),
+        Some("leave") => Some(Kind::Departed),
+        Some("alone") => Some(Kind::Alone),
+        Some(_) => return Err(ApiError::bad("unknown gesture")),
+    };
+    if text.is_empty() && approvals.is_empty() && gesture.is_none() {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
-            message: "text is required".to_owned(),
+            message: "a turn needs text, an approval or a situation".to_owned(),
         });
+    }
+    if gesture.is_some() && !approvals.is_empty() {
+        return Err(ApiError::bad("a situation carries no approvals"));
     }
     if text.chars().count() > MAX_TEXT {
         return Err(ApiError {
@@ -557,7 +609,8 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
             &host_for_turn,
             &text,
             turn.focus.filter(|id| *id > 0),
-            turn.approvals.into_iter().filter(|id| *id > 0).collect(),
+            approvals,
+            gesture,
         )
     })
     .await
@@ -575,6 +628,7 @@ fn execute_turn(
     text: &str,
     focus: Option<u64>,
     approvals: Vec<u64>,
+    gesture: Option<Kind>,
 ) -> ApiResult<String> {
     let effective = host.settings.effective_current()?;
     if !effective.model_ready() {
@@ -664,6 +718,7 @@ fn execute_turn(
     let mut options = TurnOptions {
         approvals,
         focus,
+        gesture,
         cancelled: host.cancelled.clone(),
         ..TurnOptions::default()
     };

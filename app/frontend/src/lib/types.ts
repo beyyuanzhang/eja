@@ -250,3 +250,36 @@ export interface ComposerSeed {
   text: string;
   nonce: number;
 }
+
+export interface Encounter {
+  anchor: number;
+  startedAt: number;
+  taskId: number | null;
+  proposalId: number | null;
+}
+
+type LoopKind = "decision" | "review" | "interrupted" | "paused";
+
+interface LoopBase {
+  key: string;
+  kind: LoopKind;
+  eventId: number;
+  at: number;
+  title: string;
+}
+
+export interface DecisionLoop extends LoopBase {
+  kind: "decision";
+  proposal: Proposal;
+}
+
+export interface TaskLoop extends LoopBase {
+  kind: "review" | "interrupted";
+  task: Task;
+}
+
+export interface PausedLoop extends LoopBase {
+  kind: "paused";
+}
+
+export type OpenLoop = DecisionLoop | TaskLoop | PausedLoop;

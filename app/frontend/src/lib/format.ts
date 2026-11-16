@@ -70,31 +70,14 @@ export interface StatusPresentation {
 
 const STATUS: Record<TaskStatus, StatusPresentation> = {
   open: { label: "未开始", tone: "open" },
-  running: { label: "在办", tone: "running" },
-  waiting: { label: "等判断", tone: "waiting" },
-  done: { label: "已收下", tone: "done" },
-  failed: { label: "未通过", tone: "failed" },
+  running: { label: "运行中", tone: "running" },
+  waiting: { label: "等待", tone: "waiting" },
+  done: { label: "完成", tone: "done" },
+  failed: { label: "失败", tone: "failed" },
 };
 
 export function taskStatus(task: Task | null | undefined): StatusPresentation {
   return STATUS[task?.status ?? "open"] ?? STATUS.open;
-}
-
-export function dayKey(seconds: number): string {
-  const date = new Date(seconds * 1000);
-  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
-}
-
-export function dayLabel(seconds: number): string {
-  const date = new Date(seconds * 1000);
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const target = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const diff = Math.round((today.getTime() - target.getTime()) / 86_400_000);
-  if (diff === 0) return "今天";
-  if (diff === 1) return "昨天";
-  if (diff < 7) return `${diff} 天前`;
-  return `${date.getMonth() + 1}月${date.getDate()}日`;
 }
 
 export function truncate(value: string, limit = 130): string {

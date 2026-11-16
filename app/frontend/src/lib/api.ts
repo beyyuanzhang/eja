@@ -67,7 +67,11 @@ export interface TurnResponse {
 
 export function sendTurn(
   text: string,
-  options: { focus?: number | null; approvals?: number[] } = {},
+  options: {
+    focus?: number | null;
+    approvals?: number[];
+    gesture?: "return" | "leave" | "alone";
+  } = {},
 ): Promise<TurnResponse> {
   return request<TurnResponse>("/api/turn", {
     method: "POST",
@@ -76,6 +80,7 @@ export function sendTurn(
       text,
       focus: options.focus ?? null,
       approvals: options.approvals ?? [],
+      ...(options.gesture ? { gesture: options.gesture } : {}),
     }),
   });
 }
@@ -91,7 +96,7 @@ export function friendlyError(message: string): string {
   if (/a turn is already running/i.test(message)) {
     return "它还在处理上一件事。";
   }
-  if (/text is required/i.test(message)) {
+  if (/needs text, an approval or a situation/i.test(message)) {
     return "还没有写下要交代的事。";
   }
   if (/text is longer|request body too large/i.test(message)) {

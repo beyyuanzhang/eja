@@ -214,21 +214,6 @@ a {
   color: var(--ink);
 }
 
-.text-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--muted);
-  font-size: 12px;
-  text-underline-offset: 3px;
-  transition: color 150ms ease;
-}
-
-.text-button:hover {
-  color: var(--ink);
-  text-decoration: underline;
-}
-
 .chip {
   display: inline-flex;
   height: 24px;

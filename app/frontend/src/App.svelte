@@ -15,10 +15,21 @@
     saveSettings,
     sendTurn,
   } from "./lib/api";
-  import { leadTask } from "./lib/format";
+  import {
+    ambientLoops,
+    encounterLoops,
+    lastAddressedMessage,
+    messagesSince,
+    parkedMatches,
+    readParkedEncounter,
+    sourceLoop,
+    storeEncounter,
+  } from "./lib/encounter";
   import type {
     AppState,
     ComposerSeed,
+    Encounter,
+    OpenLoop,
     OptimisticMessage,
     RawRecord,
     SettingsView,
@@ -26,78 +37,54 @@
     ViewName,
   } from "./lib/types";
 
-  const READ_KEY = "eja.readThrough";
-  const VIEW_KEY = "eja.view";
-
   let appState = $state<AppState | null>(null);
   let view = $state<ViewName>("talk");
   let initialLoading = $state(true);
   let fatal = $state("");
   let pending = $state(false);
   let optimistic = $state<OptimisticMessage | null>(null);
-  let focus = $state<number | null>(null);
   let composerSeed = $state<ComposerSeed | null>(null);
-  let dismissedProposalIds = $state<Set<number>>(new Set());
+  let parkedEncounter = $state<Encounter | null>(null);
+  let encounter = $state<Encounter | null>(null);
   let selectedTaskId = $state<number | null>(null);
   let raw = $state<RawRecord | null>(null);
   let settingsOpen = $state(false);
   let settings = $state<SettingsView | null>(null);
   let settingsLoading = $state(false);
   let settingsLoadError = $state("");
-  let lastRead = $state(readStoredNumber(READ_KEY));
   let toastText = $state("");
   let toastError = $state(false);
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let stateFetch: Promise<void> | null = null;
 
-  const activeProposals = $derived(
-    appState?.proposals.filter((proposal) => !dismissedProposalIds.has(proposal.id)) ?? [],
+  const busy = $derived(Boolean(pending || appState?.health.turnInFlight));
+  const presenceMessage = $derived.by(() => {
+    if (!appState || encounter) return null;
+    return lastAddressedMessage(appState.messages);
+  });
+  const loops = $derived(
+    appState ? ambientLoops(appState, parkedEncounter, busy) : [],
+  );
+  const actions = $derived(
+    appState && encounter ? encounterLoops(appState, encounter, busy) : [],
+  );
+  const encounterMessages = $derived(
+    appState && encounter ? messagesSince(appState.messages, encounter) : [],
   );
   const selectedTask = $derived(
     selectedTaskId == null
       ? null
       : (appState?.tasks.find((task) => task.id === selectedTaskId) ?? null),
   );
-  const unreadCount = $derived(
-    appState
-      ? appState.messages.filter((message) => message.role === "eja" && message.id > lastRead).length
-      : 0,
-  );
   const pollDelay = $derived(pending || appState?.health.turnInFlight ? 2000 : 5000);
 
-  const ambient = $derived.by(() => {
-    if (!appState) return { tone: "open", text: "正在靠近" };
-    if (!appState.health.model) return { tone: "waiting", text: "模型未接上" };
-    if (pending || appState.health.turnInFlight) return { tone: "running", text: "它正在办" };
-    if (activeProposals.length) return { tone: "waiting", text: "等你决定" };
-    const running = appState.tasks.filter((task) => task.status === "running");
-    if (running.length) {
-      return {
-        tone: "running",
-        text: `${leadTask(running)?.title ?? "一件事"}${running.length > 1 ? ` +${running.length - 1}` : ""}`,
-      };
-    }
-    const waiting = appState.tasks.filter((task) => task.status === "waiting");
-    if (waiting.length) return { tone: "waiting", text: `${waiting.length} 件等收尾` };
-    return { tone: "open", text: "它在" };
+  const statusTone = $derived.by(() => {
+    if (!appState) return "open";
+    if (pending || appState.health.turnInFlight) return "running";
+    if (encounter ? actions.length > 0 : loops.length > 0) return "waiting";
+    if (!appState.health.model) return "waiting";
+    return "done";
   });
-
-  function readStoredNumber(key: string): number {
-    try {
-      const value = Number(localStorage.getItem(key) || "0");
-      return Number.isInteger(value) && value > 0 ? value : 0;
-    } catch {
-      return 0;
-    }
-  }
-
-  function writeStored(key: string, value: string) {
-    try {
-      localStorage.setItem(key, value);
-    } catch {
-      // Private browsing can reject storage; read state remains in memory.
-    }
-  }
 
   function showToast(message: string, error = false) {
     if (toastTimer) clearTimeout(toastTimer);
@@ -143,42 +130,105 @@
     }
   }
 
-  function restoreIfUnsent(text: string, after: number, taskFocus: number | null) {
+  function restoreIfUnsent(text: string, after: number) {
     const recorded = appState?.messages.some(
       (message) =>
         message.id > after && message.role === "user" && message.text.trim() === text.trim(),
     );
     if (recorded) return false;
-    focus = taskFocus;
     composerSeed = { text, nonce: Date.now() };
     return true;
   }
 
+  function resumeParked() {
+    if (!parkedEncounter) return false;
+    encounter = parkedEncounter;
+    parkedEncounter = null;
+    storeEncounter(encounter);
+    return true;
+  }
+
+  function beginEncounter(source: Partial<Encounter> = {}) {
+    if (!appState) return false;
+    encounter = {
+      anchor: source.anchor ?? appState.lastEvent,
+      startedAt: source.startedAt ?? Math.floor(Date.now() / 1000),
+      taskId: source.taskId ?? null,
+      proposalId: source.proposalId ?? null,
+    };
+    parkedEncounter = null;
+    storeEncounter(encounter);
+    setView("talk");
+    return true;
+  }
+
+  function openLoop(loop: OpenLoop) {
+    if (!appState) return;
+    if (loop.kind === "paused") {
+      resumeParked();
+      setView("talk");
+      return;
+    }
+    if (parkedEncounter && parkedMatches(loop, parkedEncounter)) {
+      resumeParked();
+      setView("talk");
+      return;
+    }
+    if (loop.kind === "decision") {
+      beginEncounter({ proposalId: loop.proposal.id });
+      return;
+    }
+    beginEncounter({ taskId: loop.task.id });
+  }
+
+  function leaveEncounter() {
+    if (!encounter || pending || appState?.health.turnInFlight) return;
+    encounter = null;
+    parkedEncounter = null;
+    storeEncounter(null);
+    setView("talk");
+    void gesture("leave");
+  }
+
   async function transmit(
     text: string,
-    options: { approvals?: number[] } = {},
+    options: {
+      approvals?: number[];
+      focus?: number | null;
+      restore?: boolean;
+      message?: boolean;
+      gesture?: "return" | "leave" | "alone";
+    } = {},
   ): Promise<boolean> {
     if (pending || !appState) return false;
+    if (!options.gesture) {
+      if (!encounter && !beginEncounter()) return false;
+      if (!encounter) return false;
+    }
     const before = appState.lastEvent;
-    const turnFocus = focus;
-    focus = null;
+    const turnFocus =
+      options.focus === undefined ? (encounter?.taskId ?? null) : options.focus;
     pending = true;
-    optimistic = { text, at: Math.floor(Date.now() / 1000) };
+    optimistic =
+      options.message === false || options.gesture
+        ? null
+        : { text, at: Math.floor(Date.now() / 1000) };
     try {
       const result = await sendTurn(text, {
         focus: turnFocus,
         approvals: options.approvals ?? [],
+        gesture: options.gesture,
       });
       await refreshState({ quiet: true });
       if (result.ok === false) {
-        restoreIfUnsent(text, before, turnFocus);
+        if (options.restore !== false) restoreIfUnsent(text, before);
         showToast(result.error || result.stderr || "这一轮没有走完。", true);
         return false;
       }
       return true;
     } catch (error) {
       await refreshState({ quiet: true });
-      restoreIfUnsent(text, before, turnFocus);
+      if (options.restore !== false) restoreIfUnsent(text, before);
       showToast(error instanceof Error ? error.message : String(error), true);
       return false;
     } finally {
@@ -187,31 +237,29 @@
     }
   }
 
-  function setView(next: ViewName) {
-    view = next;
-    writeStored(VIEW_KEY, next);
+  async function gesture(kind: "return" | "leave" | "alone") {
+    if (!appState || pending || appState.health.turnInFlight) return;
+    await transmit("", { gesture: kind, restore: false, message: false });
   }
 
-  function markRead(id: number) {
-    if (!Number.isInteger(id) || id <= lastRead) return;
-    lastRead = id;
-    writeStored(READ_KEY, String(id));
+  function setView(next: ViewName) {
+    view = next;
   }
 
   function approveProposal(id: number) {
-    focus = null;
-    dismissedProposalIds = new Set(
-      [...dismissedProposalIds].filter((proposalId) => proposalId !== id),
-    );
-    void transmit("可以，就这么定。", { approvals: [id] });
-  }
-
-  function dismissProposal(id: number) {
-    dismissedProposalIds = new Set([...dismissedProposalIds, id]);
+    void transmit("", {
+      approvals: [id],
+      restore: false,
+      message: false,
+    });
   }
 
   function openTask(id: number) {
     selectedTaskId = id;
+  }
+
+  function inspectTask(task: Task) {
+    selectedTaskId = task.id;
   }
 
   async function openRaw(address: string) {
@@ -250,16 +298,6 @@
     }
   }
 
-  function askAbout(task: Task) {
-    selectedTaskId = null;
-    focus = task.id;
-    composerSeed = {
-      text: `关于「${task.title}」，`,
-      nonce: Date.now(),
-    };
-    setView("talk");
-  }
-
   function handleKeydown(event: KeyboardEvent) {
     if ((event.metaKey || event.ctrlKey) && event.key === ",") {
       event.preventDefault();
@@ -279,21 +317,31 @@
   }
 
   onMount(() => {
-    try {
-      const storedView = localStorage.getItem(VIEW_KEY);
-      if (storedView === "unfold" || storedView === "talk") view = storedView;
-    } catch {
-      // The in-memory default remains talk.
-    }
-    void refreshState();
+    parkedEncounter = readParkedEncounter();
+    void refreshState().then(() => {
+      if (!encounter && !busy) void gesture("return");
+    });
     const onVisibility = () => {
-      if (!document.hidden) void refreshState({ quiet: true });
+      if (document.hidden) return;
+      void refreshState({ quiet: true }).then(() => {
+        if (!encounter && !busy) void gesture("return");
+      });
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
       if (toastTimer) clearTimeout(toastTimer);
     };
+  });
+
+  $effect(() => {
+    if (!appState || !parkedEncounter || encounter) return;
+    const source = sourceLoop(appState, parkedEncounter);
+    const exchanged = messagesSince(appState.messages, parkedEncounter);
+    if (!source && !exchanged.length) {
+      parkedEncounter = null;
+      storeEncounter(null);
+    }
   });
 
   $effect(() => {
@@ -325,9 +373,6 @@
         onclick={() => setView("talk")}
       >
         <span>talk</span>
-        {#if unreadCount > 0 && view !== "talk"}
-          <i class="unread-dot" aria-label={`${unreadCount} 条新消息`}></i>
-        {/if}
       </button>
       <button
         type="button"
@@ -341,8 +386,8 @@
     </nav>
 
     <div class="top-tools">
-      <span class="ambient-status" title={ambient.text} aria-label={ambient.text}>
-        <i class="status-dot {ambient.tone}"></i>
+      <span class="ambient-status" aria-hidden="true">
+        <i class="status-dot {statusTone}"></i>
       </span>
     </div>
   </header>
@@ -378,19 +423,22 @@
       <div class="view-stage">
         <div class="view-pane" class:active={view === "talk"} aria-hidden={view !== "talk"}>
           <TalkView
-            messages={appState.messages}
-            proposals={activeProposals}
+            mode={encounter ? "encounter" : "ambient"}
+            {loops}
+            {actions}
+            messages={encounterMessages}
+            presence={presenceMessage}
             tasks={appState.tasks}
             health={appState.health}
             {pending}
             {optimistic}
             visible={view === "talk"}
             seed={composerSeed}
+            onOpenLoop={openLoop}
             onSend={(text) => void transmit(text)}
             onApprove={approveProposal}
-            onDismiss={dismissProposal}
-            onRaw={(address) => void openRaw(address)}
-            onRead={markRead}
+            onInspectTask={inspectTask}
+            onBye={leaveEncounter}
           />
         </div>
 
@@ -439,7 +487,6 @@
     task={selectedTask}
     tasks={appState?.tasks ?? []}
     onClose={() => (selectedTaskId = null)}
-    onAsk={askAbout}
     onRaw={(address) => void openRaw(address)}
     onSelectRelated={openTask}
   />
@@ -565,16 +612,6 @@
     box-shadow:
       0 1px 2px rgba(36, 35, 31, 0.08),
       0 5px 14px rgba(36, 35, 31, 0.045);
-  }
-
-  .unread-dot {
-    position: absolute;
-    top: 5px;
-    right: 7px;
-    width: 4px;
-    height: 4px;
-    border-radius: 50%;
-    background: var(--accent);
   }
 
   .top-tools {
@@ -866,10 +903,6 @@
     .view-switch button {
       min-width: 70px;
       padding: 0 13px;
-    }
-
-    .ambient-status {
-      display: none;
     }
 
     .settings-trigger {
