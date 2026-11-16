@@ -7,7 +7,9 @@ use eja::{
 };
 use std::{collections::VecDeque, path::PathBuf, process::ExitCode, sync::Arc};
 
-const USAGE: &str = "usage: eja --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET";
+mod host;
+
+const USAGE: &str = "usage: eja --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET | serve [--dir DIR] [--project DIR] [--host HOST] [--port PORT] [--allow-origin ORIGIN]";
 
 enum Command {
     Turn(String),
@@ -116,8 +118,11 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("{USAGE}\n\n  turn      one interaction: project, decide, act, record\n  show X    context, log, tasks, tools, task:ID, aja:ID, audit:ID");
+        println!("{USAGE}\n\n  turn      one interaction: project, decide, act, record\n  show X    context, log, tasks, tools, task:ID, aja:ID, audit:ID\n  serve     start the HTTP runtime for one or more frontends");
         return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "serve") {
+        return serve(&args[1..]);
     }
     on_interrupt();
     if args.as_slice() == ["--aja-worker"] {
@@ -354,6 +359,55 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn serve(args: &[String]) -> Result<()> {
+    let mut dir = PathBuf::from(".eja");
+    let mut project = std::env::current_dir()?;
+    let mut host = "127.0.0.1".to_owned();
+    let mut port = 8787;
+    let mut allowed_origins = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{arg} requires a value"))?;
+        match arg.as_str() {
+            "--dir" => dir = PathBuf::from(value),
+            "--project" => project = PathBuf::from(value),
+            "--host" => host.clone_from(value),
+            "--allow-origin" => {
+                allowed_origins.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|origin| !origin.is_empty())
+                        .map(|origin| origin.trim_end_matches('/').to_owned()),
+                );
+            }
+            "--port" => {
+                port = value
+                    .parse()
+                    .map_err(|_| format!("invalid --port: {value}"))?;
+            }
+            _ => return Err(format!("unknown serve option: {arg}").into()),
+        }
+        index += 2;
+    }
+    if !project.is_absolute() {
+        project = std::env::current_dir()?.join(project);
+    }
+    if !dir.is_absolute() {
+        dir = project.join(dir);
+    }
+    host::serve(host::Options {
+        state_dir: dir,
+        project_dir: project,
+        host,
+        port,
+        allowed_origins,
+    })
 }
 
 fn counts(items: &[Task]) -> String {

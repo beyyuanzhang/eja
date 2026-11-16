@@ -9,65 +9,80 @@ interface. The app has two views over one continuous life:
   the evidence behind each node. It is read-only. Any action starts in talk.
 
 The drawer in the lower-left is the only settings entry. It configures the
-harness only: Providers, the eja/AJA model bindings, connectors, limits, and
-the eja binary. A Provider owns an endpoint and credentials; eja and AJA only
-choose a Provider and model from that list. Goals, commitments, and corrections
-stay in talk as proposals, where they can be approved.
+harness only: Providers, the eja/AJA model bindings, connectors, and limits. A
+Provider owns an endpoint and credentials; eja and AJA only choose a Provider
+and model from that list. Goals, commitments, and corrections stay in talk as
+proposals, where they can be approved.
 
 ## Run
 
-From the repository root:
+The runtime and frontend are separate programs. The runtime is an HTTP server;
+the frontend talks to it through `/api`. Start the runtime from the repository
+root:
 
 ```sh
-cargo build
-npm --prefix app/frontend install
-npm --prefix app/frontend run build
-node app/server.mjs --dir .eja --project .
+cargo run -- serve --dir .eja --project .
 ```
 
-Then open <http://127.0.0.1:8787>. If the model is already configured through
-environment variables, it is used as a fallback. The binary is discovered from
-`target/debug/eja`, `target/release/eja`, or `EJA_BIN`.
-
-Do not open `app/public/index.html` directly. A `file://` page has no API host,
-so the app shows a startup instruction instead of pretending to be connected.
-
-For frontend work, run the host and Vite together:
+In another terminal, start the frontend:
 
 ```sh
-node app/server.mjs --dir .eja --project .
+npm --prefix app/frontend install
 npm --prefix app/frontend run dev
 ```
 
-Open <http://127.0.0.1:5173>. Vite proxies `/api` to the host on port `8787`.
+Open <http://127.0.0.1:5173>. Vite proxies `/api` to the runtime on port
+`8787`.
+
+For a built frontend, build it once and use Vite's preview server:
+
+```sh
+npm --prefix app/frontend run build
+npm --prefix app/frontend run preview
+```
+
+Open <http://127.0.0.1:4173>.
+
+Do not open `app/public/index.html` through `file://`; a static file has no HTTP
+origin for the API.
+
+For a frontend on another origin, build with its runtime address and allow that
+origin when starting the runtime:
+
+```sh
+VITE_API_BASE=http://127.0.0.1:8787 npm --prefix app/frontend run build
+eja serve --allow-origin https://frontend.example
+```
+
 `npm --prefix app/frontend run check` runs the Svelte and TypeScript checks.
 Production builds are written to `app/public`.
 
-The Node host itself still has no runtime dependencies; npm is only required to
-build or develop the interface.
-
-Options:
+Runtime options:
 
 ```text
 --dir DIR       eja state directory (default: .eja)
 --project DIR   project the aja works in (default: cwd)
 --port PORT     HTTP port (default: 8787)
 --host HOST     bind address (default: 127.0.0.1)
---binary FILE   eja binary (default: auto-detect)
+--allow-origin  additional frontend origin (repeatable or comma-separated)
 ```
 
 ## One source of truth
 
 Both views read `log.jsonl` through `GET /api/state`; the browser keeps no
-second task state. Sending a message starts the real `eja turn` process. The
-host streams nothing and writes no journal events itself.
+second task state. Sending a message runs a real turn inside the runtime. The
+API streams nothing and writes no journal events of its own.
 
 `GET /api/raw?address=...` exposes the evidence behind a UI address:
 `log:event:`, `log:task:`, `record:`, and `world:`. Reads are bounded and
 confined to their roots.
 
-Settings are stored in `app/settings.json` with POSIX mode `0600` where
-available. The file is ignored by git; do not copy it into a repository.
+Settings are stored in `<stateDir>/app-settings.json` with POSIX mode `0600`
+where available. An older `app/settings.json` is read once and migrated. The
+current file is ignored by git; do not copy it into a repository.
+
+The runtime binds to loopback by default. It has no authentication, so binding
+with `--host 0.0.0.0` is only appropriate on a trusted network.
 
 ## Why the two views are shaped this way
 

@@ -34,12 +34,22 @@ into `S` and the input, so a projection copies no fact. A turn's outcome owns
 
 ## App
 
-`app/` is a small local host for continuous conversation with EJA. Its interface
-is Svelte 5 + TypeScript + Vite, built into the dependency-free Node host. It
-has one thread and two views over the same journal: **talk** is where you speak
-and decide, and **unfold** shows the task lanes, timing, dependencies and
-evidence. There is no new-chat or session control. See
-[app/README.md](app/README.md).
+`app/` is an independently served Svelte 5 + TypeScript + Vite interface for
+continuous conversation with EJA. It has one thread and two views over the same
+journal: **talk** is where you speak and decide, and **unfold** shows the task
+lanes, timing, dependencies and evidence. There is no new-chat or session
+control.
+
+The HTTP runtime is part of the `eja` executable; the frontend is not embedded:
+
+```sh
+cargo run -- serve --dir .eja --project .
+npm --prefix app/frontend run dev
+```
+
+Open <http://127.0.0.1:5173>. The runtime listens on
+<http://127.0.0.1:8787> and can serve any number of separately hosted
+frontends. See [app/README.md](app/README.md).
 
 ## Facts and views
 

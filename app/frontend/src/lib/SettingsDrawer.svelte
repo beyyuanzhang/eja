@@ -47,7 +47,6 @@
   let turnTimeoutMs = $state(0);
   let ajaSteps = $state(0);
   let ajaTimeoutMs = $state(0);
-  let binary = $state("");
   let saving = $state(false);
   let saved = $state(false);
   let dirty = $state(false);
@@ -96,7 +95,6 @@
     turnTimeoutMs = value.limits.turnTimeoutMs;
     ajaSteps = value.limits.ajaSteps;
     ajaTimeoutMs = value.limits.ajaTimeoutMs;
-    binary = value.binary;
     dirty = false;
   }
 
@@ -129,7 +127,6 @@
       roles,
       connectors: { servers: serializeConnectors() },
       limits: { slots, turnTimeoutMs, ajaSteps, ajaTimeoutMs },
-      binary: binary.trim(),
     });
     saving = false;
     if (ok) {
@@ -240,6 +237,17 @@
             <div class="workspace-page">
               <div class="path-list">
                 <div class="path-row">
+                  <span class="path-kind">runtime</span>
+                  <code>{settings?.runtimePath}</code>
+                  <button
+                    type="button"
+                    aria-label="复制运行时路径"
+                    onclick={() => copyPath(settings?.runtimePath || "", "runtime")}
+                  >
+                    {#if copiedPath === "runtime"}<Check size={13} />{:else}<Copy size={13} />{/if}
+                  </button>
+                </div>
+                <div class="path-row">
                   <span class="path-kind">state</span>
                   <code>{settings?.stateDir}</code>
                   <button
@@ -262,18 +270,6 @@
                   </button>
                 </div>
               </div>
-
-              <label class="binary-field">
-                <span>eja</span>
-                <input
-                  bind:value={binary}
-                  oninput={markDirty}
-                  type="text"
-                  placeholder={settings?.effectiveBinary || "target/debug/eja"}
-                  autocomplete="off"
-                  spellcheck="false"
-                />
-              </label>
             </div>
           {/if}
         </div>
@@ -520,42 +516,6 @@
   .path-row button:hover {
     background: var(--surface-2);
     color: var(--ink);
-  }
-
-  .binary-field {
-    display: grid;
-    min-height: 58px;
-    grid-template-columns: 56px minmax(0, 1fr);
-    align-items: center;
-    gap: 9px;
-    padding: 9px 11px 9px 13px;
-    border: 1px solid var(--line);
-    border-radius: 11px;
-    background: rgba(255, 254, 250, 0.62);
-  }
-
-  .binary-field > span {
-    color: var(--faint);
-    font-family: var(--mono);
-    font-size: 8px;
-  }
-
-  .binary-field input {
-    width: 100%;
-    height: 35px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    outline: 0;
-    background: var(--surface);
-    padding: 0 9px;
-    color: var(--ink);
-    font-family: var(--mono);
-    font-size: 9px;
-  }
-
-  .binary-field input:focus {
-    border-color: rgba(189, 96, 66, 0.34);
-    box-shadow: 0 0 0 3px rgba(189, 96, 66, 0.055);
   }
 
   :global(.spin) {

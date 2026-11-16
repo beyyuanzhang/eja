@@ -367,12 +367,12 @@
         <div class="fatal-mark"><AlertCircle size={18} strokeWidth={1.6} /></div>
         <h1>没连上。</h1>
         <p>{fatal}</p>
-        <pre>node app/server.mjs --dir .eja --project .</pre>
+        <pre>cargo run -- serve --dir .eja --project .</pre>
         <div class="fatal-actions">
           <button class="primary-button" type="button" onclick={() => void refreshState()}>
             再试一次
           </button>
-          <span>然后打开 http://127.0.0.1:8787</span>
+          <span>确认运行时已在 8787 端口启动</span>
         </div>
       </div>
     {:else if appState}

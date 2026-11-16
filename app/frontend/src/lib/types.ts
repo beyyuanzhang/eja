@@ -146,8 +146,7 @@ export interface SettingsView {
     ajaSteps: number;
     ajaTimeoutMs: number;
   };
-  binary: string;
-  effectiveBinary: string;
+  runtimePath: string;
   stateDir: string;
   projectDir: string;
   health: {

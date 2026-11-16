@@ -680,6 +680,7 @@ impl OpenAiBrain {
             context_budget: DEFAULT_CONTEXT_BYTES,
         }
     }
+    #[must_use]
     pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
         self.model = self.model.with_headers(headers);
         self

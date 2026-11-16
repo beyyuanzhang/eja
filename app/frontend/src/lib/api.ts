@@ -7,6 +7,8 @@ import type {
   SettingsView,
 } from "./types";
 
+const API_BASE = String(import.meta.env.VITE_API_BASE || "").replace(/\/+$/, "");
+
 async function readJson(response: Response): Promise<Record<string, unknown>> {
   try {
     return (await response.json()) as Record<string, unknown>;
@@ -16,7 +18,7 @@ async function readJson(response: Response): Promise<Record<string, unknown>> {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { cache: "no-store", ...init });
+  const response = await fetch(`${API_BASE}${url}`, { cache: "no-store", ...init });
   const body = await readJson(response);
   if (!response.ok) {
     throw new Error(String(body.error || `HTTP ${response.status}`));
@@ -85,9 +87,6 @@ export function fetchRaw(address: string): Promise<RawRecord> {
 export function friendlyError(message: string): string {
   if (/model is not configured/i.test(message)) {
     return "还没接上模型。先在左下角的设置里选好 Provider 和模型。";
-  }
-  if (/eja binary not found/i.test(message)) {
-    return "没找到 eja。先运行 cargo build，或在设置里指定二进制路径。";
   }
   if (/a turn is already running/i.test(message)) {
     return "它还在处理上一件事。";

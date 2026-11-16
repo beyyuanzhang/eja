@@ -50,10 +50,10 @@
           if (!boot) return;
           boot.classList.add("help-mode");
           boot.innerHTML =
-            '<div class="boot-help"><h1>请从本机启动</h1>' +
-            '<p>直接打开 HTML 不会连上 eja 的日志与模型。</p>' +
-            '<pre>cargo build\nnode app/server.mjs --dir .eja --project .</pre>' +
-            '<p>然后打开 http://127.0.0.1:8787</p></div>';
+            '<div class="boot-help"><h1>请通过 HTTP 打开</h1>' +
+            '<p>运行时与前端是两个独立服务，静态文件不能连接 eja。</p>' +
+            '<pre>cargo run -- serve --dir .eja --project .\nnpm --prefix app/frontend run preview</pre>' +
+            '<p>然后打开 http://127.0.0.1:4173</p></div>';
         });
       }
     </script>
