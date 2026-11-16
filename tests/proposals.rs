@@ -380,3 +380,33 @@ fn the_projection_shows_notes_and_timestamps_so_time_is_visible() {
         "history lines carry a timestamp: {line}"
     );
 }
+
+#[test]
+fn a_situation_reply_is_monologue_not_conversation() {
+    let fixture = Fixture::new("monologue-tag");
+    let store = fixture.store();
+    eja::turn_at_with_options(
+        &store,
+        "",
+        &Script::new(vec![decision(vec![])]),
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            gesture: Some(Kind::Returned),
+            ..Default::default()
+        },
+    )
+    .expect("situation turn");
+    turn_at(&store, "hello", vec![decision(vec![])]);
+    let state = State::load(&store).expect("state");
+    let rendered = eja::adapters::render_context(&state.project("", None, eja::now_utc()));
+    assert!(rendered.contains("[monologue]"), "{rendered}");
+    let conversation = rendered.find("CONVERSATION").expect("conversation");
+    let body = &rendered[conversation..];
+    assert!(
+        body.lines()
+            .any(|line| line.contains("[eja]") && line.contains("#4")),
+        "the reply in a user turn stays conversation: {body}"
+    );
+}

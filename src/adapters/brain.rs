@@ -1,7 +1,7 @@
 //! EJA's model transport: one bounded projection in, one typed decision out.
 use crate::fold;
 use crate::{
-    format_utc, Action, Brain, Decision, EjaContext, Observation, ObservationKind, Selector,
+    format_utc, Action, Brain, Decision, EjaContext, Kind, Observation, ObservationKind, Selector,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -482,12 +482,23 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .history
             .iter()
             .map(|event| {
+                // A reply to a situation is inner monologue, not speech to the
+                // user; only a turn the user spoke in is conversation.
+                let spoken = context
+                    .history
+                    .iter()
+                    .any(|other| other.turn == event.turn && other.kind == Kind::User);
+                let tag = if event.kind == Kind::Eja && !spoken {
+                    "monologue".to_string()
+                } else {
+                    label(event.kind)
+                };
                 addressed(
                     event_address(event.id),
                     vec![format!(
                         "  #{} [{}] {}: {}",
                         event.id,
-                        label(event.kind),
+                        tag,
                         format_utc(event.at),
                         event.text
                     )],
