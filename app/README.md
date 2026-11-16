@@ -16,27 +16,20 @@ proposals, where they can be approved.
 
 ## Run
 
-The runtime and frontend are separate programs. The runtime is an HTTP server;
-the frontend talks to it through `/api`. Start the runtime from the repository
-root:
+The app has one address: <http://127.0.0.1:4173>. The runtime and frontend
+remain separate programs, but the runtime's port is internal transport, not a
+second app entry.
+
+Start the runtime from the repository root:
 
 ```sh
 cargo run -- serve --dir .eja --project .
 ```
 
-In another terminal, start the frontend:
+In another terminal, build and start the frontend:
 
 ```sh
 npm --prefix app/frontend install
-npm --prefix app/frontend run dev
-```
-
-Open <http://127.0.0.1:5173>. Vite proxies `/api` to the runtime on port
-`8787`.
-
-For a built frontend, build it once and use Vite's preview server:
-
-```sh
 npm --prefix app/frontend run build
 npm --prefix app/frontend run preview
 ```
@@ -45,6 +38,9 @@ Open <http://127.0.0.1:4173>.
 
 Do not open `app/public/index.html` through `file://`; a static file has no HTTP
 origin for the API.
+
+`npm --prefix app/frontend run dev` is only a frontend contributor mode. It is
+not a second product entry.
 
 For a frontend on another origin, build with its runtime address and allow that
 origin when starting the runtime:

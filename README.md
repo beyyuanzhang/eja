@@ -44,12 +44,14 @@ The HTTP runtime is part of the `eja` executable; the frontend is not embedded:
 
 ```sh
 cargo run -- serve --dir .eja --project .
-npm --prefix app/frontend run dev
+npm --prefix app/frontend run build
+npm --prefix app/frontend run preview
 ```
 
-Open <http://127.0.0.1:5173>. The runtime listens on
-<http://127.0.0.1:8787> and can serve any number of separately hosted
-frontends. See [app/README.md](app/README.md).
+Open <http://127.0.0.1:4173>. That is the only app address. The runtime's
+<http://127.0.0.1:8787> endpoint is internal API transport, not a second app.
+Any number of separately hosted frontends may use the same runtime. See
+[app/README.md](app/README.md).
 
 ## Facts and views
 
