@@ -101,9 +101,6 @@
   );
 
   const presence = $derived.by(() => {
-    if (!health.binary) {
-      return { tone: "failed", text: "还没有找到 eja" };
-    }
     if (!health.model && messages.length === 0) {
       return { tone: "waiting", text: "模型还没有接上" };
     }

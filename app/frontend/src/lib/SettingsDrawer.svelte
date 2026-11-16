@@ -61,6 +61,26 @@
 
   const heading = $derived(sections.find((item) => item.id === section)?.label || "");
   const HeadingIcon = $derived(sections.find((item) => item.id === section)?.Icon || Settings2);
+  const paths = $derived([
+    {
+      key: "runtime",
+      label: "runtime",
+      value: settings?.runtimePath ?? "",
+      ariaLabel: "复制运行时路径",
+    },
+    {
+      key: "state",
+      label: "state",
+      value: settings?.stateDir ?? "",
+      ariaLabel: "复制状态目录",
+    },
+    {
+      key: "project",
+      label: "project",
+      value: settings?.projectDir ?? "",
+      ariaLabel: "复制项目目录",
+    },
+  ]);
 
   function connectorDraft(value: ConnectorView): ConnectorDraft {
     return {
@@ -236,39 +256,19 @@
           {:else}
             <div class="workspace-page">
               <div class="path-list">
-                <div class="path-row">
-                  <span class="path-kind">runtime</span>
-                  <code>{settings?.runtimePath}</code>
-                  <button
-                    type="button"
-                    aria-label="复制运行时路径"
-                    onclick={() => copyPath(settings?.runtimePath || "", "runtime")}
-                  >
-                    {#if copiedPath === "runtime"}<Check size={13} />{:else}<Copy size={13} />{/if}
-                  </button>
-                </div>
-                <div class="path-row">
-                  <span class="path-kind">state</span>
-                  <code>{settings?.stateDir}</code>
-                  <button
-                    type="button"
-                    aria-label="复制状态目录"
-                    onclick={() => copyPath(settings?.stateDir || "", "state")}
-                  >
-                    {#if copiedPath === "state"}<Check size={13} />{:else}<Copy size={13} />{/if}
-                  </button>
-                </div>
-                <div class="path-row">
-                  <span class="path-kind">project</span>
-                  <code>{settings?.projectDir}</code>
-                  <button
-                    type="button"
-                    aria-label="复制项目目录"
-                    onclick={() => copyPath(settings?.projectDir || "", "project")}
-                  >
-                    {#if copiedPath === "project"}<Check size={13} />{:else}<Copy size={13} />{/if}
-                  </button>
-                </div>
+                {#each paths as path (path.key)}
+                  <div class="path-row">
+                    <span class="path-kind">{path.label}</span>
+                    <code>{path.value}</code>
+                    <button
+                      type="button"
+                      aria-label={path.ariaLabel}
+                      onclick={() => copyPath(path.value, path.key)}
+                    >
+                      {#if copiedPath === path.key}<Check size={13} />{:else}<Copy size={13} />{/if}
+                    </button>
+                  </div>
+                {/each}
               </div>
             </div>
           {/if}

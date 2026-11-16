@@ -131,8 +131,6 @@ impl Folded {
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Health {
-    pub binary: bool,
-    pub binary_path: String,
     pub model: bool,
     pub model_name: String,
     pub state: bool,
@@ -149,9 +147,7 @@ impl serde::Serialize for Health {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Health", 10)?;
-        state.serialize_field("binary", &self.binary)?;
-        state.serialize_field("binaryPath", &self.binary_path)?;
+        let mut state = serializer.serialize_struct("Health", 8)?;
         state.serialize_field("model", &self.model)?;
         state.serialize_field("modelName", &self.model_name)?;
         state.serialize_field("state", &self.state)?;
@@ -513,8 +509,6 @@ mod tests {
 
     fn health() -> Health {
         Health {
-            binary: true,
-            binary_path: "eja".to_owned(),
             model: true,
             model_name: "model".to_owned(),
             state: true,

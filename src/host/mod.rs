@@ -191,9 +191,6 @@ fn state_json(host: &Host) -> Value {
         .effective_current()
         .unwrap_or_else(|_| host.settings.effective(StoredSettings::default()));
     let health = state::Health {
-        binary: true,
-        binary_path: std::env::current_exe()
-            .map_or_else(|_| "eja".to_owned(), |path| path.display().to_string()),
         model: effective.model_ready(),
         model_name: effective
             .roles

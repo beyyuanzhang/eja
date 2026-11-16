@@ -67,7 +67,6 @@
 
   const ambient = $derived.by(() => {
     if (!appState) return { tone: "open", text: "正在靠近" };
-    if (!appState.health.binary) return { tone: "failed", text: "没有找到 eja" };
     if (!appState.health.model) return { tone: "waiting", text: "模型未接上" };
     if (pending || appState.health.turnInFlight) return { tone: "running", text: "它正在办" };
     if (activeProposals.length) return { tone: "waiting", text: "等你决定" };
@@ -372,7 +371,7 @@
           <button class="primary-button" type="button" onclick={() => void refreshState()}>
             再试一次
           </button>
-          <span>确认运行时已在 8787 端口启动</span>
+          <span>确认运行时已启动</span>
         </div>
       </div>
     {:else if appState}

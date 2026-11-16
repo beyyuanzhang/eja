@@ -223,16 +223,6 @@ pub struct ConnectorView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(clippy::struct_excessive_bools)]
-pub struct SettingsHealth {
-    pub binary: bool,
-    pub model: bool,
-    pub mcp: bool,
-    pub state: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ConnectorsView {
     pub servers: Vec<ConnectorView>,
     pub managed: bool,
@@ -250,7 +240,6 @@ pub struct SettingsView {
     pub runtime_path: String,
     pub state_dir: String,
     pub project_dir: String,
-    pub health: SettingsHealth,
 }
 
 #[derive(Debug, Clone)]
@@ -497,12 +486,6 @@ impl SettingsStore {
                 .map_or_else(|_| "eja".to_owned(), |path| path.display().to_string()),
             state_dir: self.dir.display().to_string(),
             project_dir: self.project.display().to_string(),
-            health: SettingsHealth {
-                binary: true,
-                model: effective.model_ready(),
-                mcp: effective.mcp_ready(),
-                state: self.dir.is_dir(),
-            },
         }
     }
 

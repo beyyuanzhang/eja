@@ -88,8 +88,6 @@ export interface Identity {
 }
 
 export interface Health {
-  binary: boolean;
-  binaryPath: string;
   model: boolean;
   modelName: string;
   state: boolean;
@@ -149,12 +147,6 @@ export interface SettingsView {
   runtimePath: string;
   stateDir: string;
   projectDir: string;
-  health: {
-    binary: boolean;
-    model: boolean;
-    mcp: boolean;
-    state: boolean;
-  };
 }
 
 export interface ProviderView {
