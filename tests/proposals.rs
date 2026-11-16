@@ -301,3 +301,82 @@ fn invalid_revision_targets_do_not_create_proposals() {
     assert!(out.context().goal.is_none());
     assert_eq!(out.context().commitments[0].id, old.id);
 }
+
+#[test]
+fn a_note_is_memory_not_speech_and_closing_lets_go() {
+    let fixture = Fixture::new("note-memory");
+    let store = fixture.store();
+    let written = turn_at(
+        &store,
+        "remember this",
+        vec![decision(vec![Action::Note {
+            text: "the user prefers quiet mornings".to_string(),
+            closes: None,
+        }])],
+    );
+    let note_id = written.context().notes[0].id;
+    assert_eq!(written.context().notes.len(), 1);
+    let events = store.events().expect("events");
+    assert!(events.iter().any(|event| event.kind == Kind::Note));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != Kind::Eja || !event.text.contains("quiet mornings")),
+        "a note is inner memory, never speech to the user"
+    );
+
+    let closed = turn_at(
+        &store,
+        "let it go",
+        vec![decision(vec![Action::Note {
+            text: String::new(),
+            closes: Some(note_id),
+        }])],
+    );
+    assert!(closed.context().notes.is_empty(), "closing a note lets go");
+
+    let refused = turn_at(
+        &store,
+        "close again",
+        vec![decision(vec![Action::Note {
+            text: String::new(),
+            closes: Some(note_id),
+        }])],
+    );
+    assert!(
+        refused
+            .context()
+            .refused
+            .iter()
+            .any(|note| note.contains("no open note")),
+        "closing an already-closed note is refused, not silent"
+    );
+}
+
+#[test]
+fn the_projection_shows_notes_and_timestamps_so_time_is_visible() {
+    let fixture = Fixture::new("note-projection");
+    let store = fixture.store();
+    turn_at(
+        &store,
+        "remember",
+        vec![decision(vec![Action::Note {
+            text: "quiet mornings matter".to_string(),
+            closes: None,
+        }])],
+    );
+    let state = State::load(&store).expect("state");
+    let rendered = eja::adapters::render_context(&state.project("", None, eja::now_utc()));
+    assert!(rendered.contains("NOTES"), "{rendered}");
+    assert!(rendered.contains("quiet mornings matter"), "{rendered}");
+    let conversation = rendered.find("CONVERSATION").expect("conversation");
+    let line = rendered[conversation..]
+        .lines()
+        .find(|line| line.contains("[user]"))
+        .unwrap_or_default();
+    assert!(line.contains("remember"), "{line}");
+    assert!(
+        line.contains(':'),
+        "history lines carry a timestamp: {line}"
+    );
+}

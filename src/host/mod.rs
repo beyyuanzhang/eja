@@ -38,6 +38,21 @@ const MAX_BODY: usize = 2 * 1024 * 1024;
 const MAX_TEXT: usize = 200_000;
 const MAX_OUTPUT: usize = 2 * 1024 * 1024;
 const MAX_RAW: usize = 128 * 1024;
+
+/// The one place the rhythm is defined. It is policy, not a second source of
+/// time: how often the host looks, and how much quiet opens an `alone`
+/// situation. What that quiet means is decided by EJA, not here. The facts it
+/// compares are the journal's own `at` stamps, sampled from the OS clock once
+/// per turn; the host keeps no clock of its own.
+struct Pulse {
+    tick: Duration,
+    quiet: i64,
+}
+
+const PULSE: Pulse = Pulse {
+    tick: Duration::from_secs(60),
+    quiet: 1800,
+};
 const PROVIDER_TIMEOUT_MS: u64 = 15_000;
 const CONNECTOR_TEST_LIMIT_MS: u64 = 30_000;
 
@@ -162,7 +177,7 @@ pub fn serve(options: Options) -> eja::Result<()> {
         let cors_host = host.clone();
         let pulse_host = host.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            let mut ticker = tokio::time::interval(PULSE.tick);
             loop {
                 ticker.tick().await;
                 if pulse_host.cancelled.load(Ordering::SeqCst)
@@ -185,7 +200,7 @@ pub fn serve(options: Options) -> eja::Result<()> {
                 let Some(last) = events.last() else {
                     continue;
                 };
-                if last.kind == Kind::Alone || eja::now_utc().timestamp() - last.at < 1800 {
+                if last.kind == Kind::Alone || eja::now_utc().timestamp() - last.at < PULSE.quiet {
                     continue;
                 }
                 if pulse_host.turn_in_flight.swap(true, Ordering::SeqCst) {
@@ -226,7 +241,6 @@ async fn get_state(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
 
 fn state_json(host: &Host) -> Value {
     let journal = state::Journal::read(&host.state_dir);
-    let folded = state::fold(&journal);
     let effective = host
         .settings
         .effective_current()
@@ -249,7 +263,13 @@ fn state_json(host: &Host) -> Value {
         torn: journal.torn,
         turn_in_flight: host.turn_in_flight.load(Ordering::SeqCst),
     };
-    folded.state(now_seconds(), &host.state_dir, &host.project_dir, &health)
+    state::state_json(
+        &journal,
+        now_seconds(),
+        &host.state_dir,
+        &host.project_dir,
+        &health,
+    )
 }
 
 async fn get_settings(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {

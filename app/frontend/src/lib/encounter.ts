@@ -1,6 +1,7 @@
 import type {
   AppState,
   Encounter,
+  JournalEvent,
   Message,
   OpenLoop,
   Proposal,
@@ -61,18 +62,25 @@ export function messagesSince(messages: Message[], encounter: Encounter): Messag
   return messages.filter((message) => message.id > encounter.anchor);
 }
 
-export function lastAddressedMessage(messages: Message[]): Message | null {
-  let lastUser = -1;
+// An eja message is addressed to the user only when a real user utterance
+// precedes it in the same turn. Replies to situations (return/leave/alone)
+// are inner monologue, never the return screen's voice.
+export function lastAddressedMessage(
+  messages: Message[],
+  events: JournalEvent[],
+): Message | null {
+  const userTurns = new Set(
+    events.filter((event) => event.kind === "user").map((event) => event.turn),
+  );
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === "user") {
-      lastUser = index;
-      break;
-    }
-  }
-  if (lastUser < 0) return null;
-  for (let index = messages.length - 1; index > lastUser; index -= 1) {
     const message = messages[index];
-    if (message.role === "eja" && message.text.trim()) return message;
+    if (
+      message.role === "eja" &&
+      message.text.trim() &&
+      userTurns.has(message.turn)
+    ) {
+      return message;
+    }
   }
   return null;
 }

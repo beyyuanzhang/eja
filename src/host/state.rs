@@ -1,10 +1,12 @@
-use eja::{Event, Kind};
+//! The host reads the journal and serializes the one core fold.
+//!
+//! There is no second fold here: `eja::State` is the only derivation of the
+//! log, and this module only reads the raw lines (tolerating a torn tail) and
+//! renders that one state as the API's JSON. Semantics live in the core.
+
+use eja::{Event, Kind, RelationKind, State, Task, TaskStatus};
 use serde_json::{json, Map, Value};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
-};
+use std::{fs, path::Path};
 
 pub struct Journal {
     pub events: Vec<Event>,
@@ -63,71 +65,6 @@ impl Journal {
     }
 }
 
-pub struct Folded {
-    events: Vec<Value>,
-    messages: Vec<Value>,
-    tasks: Vec<Value>,
-    relations: Vec<Value>,
-    proposals: Vec<Value>,
-    identity: Map<String, Value>,
-    refused: Vec<Value>,
-    last_turn: u64,
-}
-
-impl Folded {
-    pub fn task(&self, id: u64) -> Option<&Value> {
-        self.tasks
-            .iter()
-            .find(|task| task.get("id").and_then(Value::as_u64) == Some(id))
-    }
-
-    pub fn state(&self, now: i64, state_dir: &Path, project_dir: &Path, health: &Health) -> Value {
-        let count = |status: &str| {
-            self.tasks
-                .iter()
-                .filter(|task| task.get("status").and_then(Value::as_str) == Some(status))
-                .count()
-        };
-        let goal = self
-            .identity
-            .get("goals")
-            .and_then(Value::as_array)
-            .and_then(|goals| goals.first())
-            .cloned()
-            .unwrap_or(Value::Null);
-        json!({
-            "now": now,
-            "stateDir": state_dir.display().to_string(),
-            "projectDir": project_dir.display().to_string(),
-            "events": self.events,
-            "messages": self.messages,
-            "tasks": self.tasks,
-            "relations": self.relations,
-            "proposals": self.proposals,
-            "identity": Value::Object(self.identity.clone()),
-            "currentGoal": goal,
-            "refused": self.refused,
-            "counts": {
-                "tasks": self.tasks.len(),
-                "open": count("open"),
-                "running": count("running"),
-                "waiting": count("waiting"),
-                "done": count("done"),
-                "failed": count("failed"),
-                "messages": self.messages.len(),
-            },
-            "lastTurn": self.last_turn,
-            "lastEvent": self
-                .events
-                .last()
-                .and_then(|event| event.get("id"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            "health": health,
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Health {
@@ -144,7 +81,7 @@ pub struct Health {
 impl serde::Serialize for Health {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: serde::ser::Serializer,
     {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("Health", 8)?;
@@ -160,304 +97,174 @@ impl serde::Serialize for Health {
     }
 }
 
-pub fn journal_events(journal: &Journal) -> Vec<Value> {
-    journal
-        .events
+fn field(data: Option<&Value>, name: &str) -> Value {
+    data.and_then(|data| data.get(name))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn entry(event: &Event) -> Value {
+    json!({
+        "id": event.id,
+        "text": event.text,
+        "at": event.at,
+        "closes": event.closes,
+        "proposal_id": field(event.data.as_ref(), "proposal_id"),
+    })
+}
+
+fn children_of(state: &State, id: u64) -> Vec<u64> {
+    state
+        .relations()
         .iter()
-        .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+        .filter(|edge| edge.kind == RelationKind::PartOf && edge.to == id)
+        .map(|edge| edge.from)
         .collect()
 }
 
-pub fn fold(journal: &Journal) -> Folded {
-    let events = journal_events(journal);
-    let mut tasks = BTreeMap::<u64, Value>::new();
-    let mut task_events = BTreeMap::<u64, Vec<u64>>::new();
-    let mut relations = Vec::new();
-    let mut proposals = BTreeMap::<u64, Value>::new();
-    let mut closed = BTreeSet::new();
-    let mut goals = Vec::new();
-    let mut commitments = Vec::new();
-    let mut corrections = Vec::new();
-    let mut decisions = Vec::new();
-    let mut relationships = Vec::new();
-    let mut messages = Vec::new();
-    let mut refused = Vec::new();
-    let mut last_turn = 0;
+fn task_json(state: &State, task: &Task) -> Value {
+    let run = task.run.as_ref();
+    json!({
+        "id": task.id,
+        "kind": task.kind,
+        "title": task.title,
+        "request": task.request,
+        "origin": task.origin,
+        "acceptance": task.acceptance,
+        "status": task.status.as_str(),
+        "created_at": task.created_at,
+        "assigned_at": task.assigned_at,
+        "reported_at": task.reported_at,
+        "closed_at": task.closed_at,
+        "close": task.close,
+        "assignment": task.assignment,
+        "run": {
+            "digest": run.and_then(|run| run.digest.clone()),
+            "evidence": run.and_then(|run| run.evidence.clone()).unwrap_or(Value::Null),
+            "evidence_id": run.and_then(|run| run.evidence_id),
+            "evidence_result": run.and_then(|run| run.evidence_result.clone()).unwrap_or(Value::Null),
+            "witness_at": run.and_then(|run| run.witness_at),
+            "reconcile": run.and_then(|run| run.reconcile.clone()).unwrap_or(Value::Null),
+        },
+        "event_ids": task.event_ids,
+        "children": children_of(state, task.id),
+    })
+}
 
-    for event in &journal.events {
-        last_turn = last_turn.max(event.turn);
-        if let Some(id) = event.closes {
-            closed.insert(id);
-        }
-        if matches!(event.kind, Kind::User | Kind::Eja) {
-            messages.push(json!({
+fn is_closed(state: &State, id: u64) -> bool {
+    state.events().iter().any(|event| event.closes == Some(id))
+}
+
+/// The API state: one core fold, serialized. Nothing here re-derives meaning.
+pub fn state_json(
+    journal: &Journal,
+    now: i64,
+    state_dir: &Path,
+    project_dir: &Path,
+    health: &Health,
+) -> Value {
+    let state = State::fold(journal.events.clone());
+    let events: Vec<Value> = journal
+        .events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+        .collect();
+    let messages: Vec<Value> = state
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind, Kind::User | Kind::Eja))
+        .map(|event| {
+            json!({
                 "id": event.id,
                 "role": event.kind.as_str(),
                 "text": event.text,
                 "at": event.at,
                 "turn": event.turn,
                 "data": event.data,
-            }));
-        }
-        let task_id = scope_task_id(&event.scope);
-        if let Some(task_id) = task_id {
-            task_events.entry(task_id).or_default().push(event.id);
-        }
-        let data = event.data.as_ref().and_then(Value::as_object);
-        match event.kind {
-            Kind::TaskOpened => {
-                let Some(id) = task_id else {
-                    continue;
-                };
-                let kind = data
-                    .and_then(|data| data.get("kind"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("aja");
-                let title = data
-                    .and_then(|data| data.get("title"))
-                    .and_then(Value::as_str)
-                    .filter(|title| !title.is_empty())
-                    .map_or_else(
-                        || {
-                            if event.text.is_empty() {
-                                format!("task {id}")
-                            } else {
-                                event.text.clone()
-                            }
-                        },
-                        ToOwned::to_owned,
-                    );
-                tasks.insert(
-                    id,
-                    json!({
-                        "id": id,
-                        "kind": if kind == "group" { "group" } else { "aja" },
-                        "title": title,
-                        "request": string_field(data, "request"),
-                        "origin": string_field(data, "origin"),
-                        "acceptance": string_field(data, "acceptance"),
-                        "status": "open",
-                        "created_at": event.at,
-                        "assigned_at": null,
-                        "reported_at": null,
-                        "closed_at": null,
-                        "close": null,
-                        "assignment": null,
-                        "run": {
-                            "digest": null,
-                            "evidence": data.and_then(|data| data.get("evidence")).cloned().unwrap_or(Value::Null),
-                            "evidence_id": null,
-                            "evidence_result": null,
-                            "witness_at": null,
-                            "reconcile": null,
-                        },
-                        "event_ids": [event.id],
-                        "children": [],
-                    }),
-                );
-            }
-            Kind::TaskAssigned => {
-                if let Some(task) = task_id.and_then(|id| tasks.get_mut(&id)) {
-                    task["status"] = json!("running");
-                    task["assigned_at"] = json!(event.at);
-                    task["assignment"] = event.data.clone().unwrap_or(Value::Null);
-                }
-            }
-            Kind::WorkerReport => {
-                if let Some(task) = task_id.and_then(|id| tasks.get_mut(&id)) {
-                    task["status"] = json!("waiting");
-                    task["reported_at"] = json!(event.at);
-                    task["run"]["digest"] = json!(event.text);
-                }
-            }
-            Kind::Observed => {
-                let observed = data
-                    .and_then(|data| data.get("kind"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if observed == "witness" {
-                    if let Some(task) = task_id.and_then(|id| tasks.get_mut(&id)) {
-                        task["run"]["evidence_id"] = json!(event.id);
-                        task["run"]["evidence_result"] = data
-                            .and_then(|data| data.get("result"))
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        task["run"]["witness_at"] = json!(event.at);
-                    }
-                } else if observed == "reconcile" {
-                    let target = data
-                        .and_then(|data| data.get("target"))
-                        .and_then(Value::as_str)
-                        .and_then(scope_task_id)
-                        .or(task_id);
-                    if let Some(task) = target.and_then(|id| tasks.get_mut(&id)) {
-                        task["run"]["reconcile"] = data
-                            .and_then(|data| data.get("result"))
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                    }
-                }
-            }
-            Kind::TaskClosed => {
-                if let Some(task) = task_id.and_then(|id| tasks.get_mut(&id)) {
-                    let accepted = data
-                        .and_then(|data| data.get("accepted"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    task["close"] = event.data.clone().unwrap_or(Value::Null);
-                    task["closed_at"] = json!(event.at);
-                    task["status"] = json!(if accepted { "done" } else { "failed" });
-                }
-            }
-            Kind::TaskRelation => {
-                let from = data
-                    .and_then(|data| data.get("from"))
-                    .and_then(Value::as_u64);
-                let to = data.and_then(|data| data.get("to")).and_then(Value::as_u64);
-                let kind = data
-                    .and_then(|data| data.get("kind"))
-                    .and_then(Value::as_str);
-                if let (Some(from), Some(to), Some(kind)) = (from, to, kind) {
-                    relations.push(json!({ "from": from, "to": to, "kind": kind }));
-                }
-            }
-            Kind::Proposal => {
-                let kind = data
-                    .and_then(|data| data.get("kind"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("change");
-                let target_id = data
-                    .and_then(|data| data.get("target_id"))
-                    .and_then(Value::as_u64);
-                proposals.insert(
-                    event.id,
-                    json!({
-                        "id": event.id,
-                        "kind": kind,
-                        "target_id": target_id,
-                        "text": event.text,
-                        "at": event.at,
-                        "turn": event.turn,
-                    }),
-                );
-            }
-            Kind::ProposalConfirmed | Kind::ProposalRejected => {
-                if let Some(id) = data
-                    .and_then(|data| data.get("proposal_id"))
-                    .and_then(Value::as_u64)
-                {
-                    proposals.remove(&id);
-                }
-            }
-            Kind::Goal | Kind::Commitment | Kind::Correction => {
-                let proposal_id = data
-                    .and_then(|data| data.get("proposal_id"))
-                    .and_then(Value::as_u64);
-                if let Some(id) = proposal_id {
-                    proposals.remove(&id);
-                }
-                let entry = json!({
-                    "id": event.id,
-                    "text": event.text,
-                    "at": event.at,
-                    "closes": event.closes,
-                    "proposal_id": proposal_id,
-                });
-                match event.kind {
-                    Kind::Goal => goals.push((event.id, entry)),
-                    Kind::Commitment => commitments.push((event.id, entry)),
-                    _ => corrections.push((event.id, entry)),
-                }
-            }
-            Kind::RecordDecision => decisions.push((
-                event.id,
-                json!({ "id": event.id, "text": event.text, "at": event.at }),
-            )),
-            Kind::Relationship => relationships.push((
-                event.id,
-                json!({ "id": event.id, "text": event.text, "at": event.at }),
-            )),
-            Kind::Refused => refused.push(json!({
+            })
+        })
+        .collect();
+    let tasks: Vec<Value> = state
+        .tasks()
+        .iter()
+        .map(|task| task_json(&state, task))
+        .collect();
+    let count = |status: TaskStatus| {
+        state
+            .tasks()
+            .iter()
+            .filter(|task| task.status == status)
+            .count()
+    };
+    let mut identity = Map::new();
+    let mut put = |name: &str, kind: Kind, keep_closed: bool| {
+        let mut entries: Vec<Value> = state
+            .events()
+            .iter()
+            .filter(|event| event.kind == kind)
+            .filter(|event| keep_closed || !is_closed(&state, event.id))
+            .map(entry)
+            .collect();
+        entries.reverse();
+        identity.insert(name.to_owned(), Value::Array(entries));
+    };
+    put("goals", Kind::Goal, false);
+    put("commitments", Kind::Commitment, false);
+    put("corrections", Kind::Correction, true);
+    put("decisions", Kind::RecordDecision, true);
+    put("relationships", Kind::Relationship, true);
+    let proposals: Vec<Value> = state
+        .proposals()
+        .iter()
+        .map(|proposal| {
+            json!({
+                "id": proposal.id,
+                "kind": proposal.data.kind,
+                "target_id": proposal.data.target_id,
+                "text": proposal.text,
+                "at": proposal.at,
+                "turn": proposal.turn,
+            })
+        })
+        .collect();
+    let refused: Vec<Value> = state
+        .events()
+        .iter()
+        .filter(|event| event.kind == Kind::Refused)
+        .map(|event| {
+            json!({
                 "id": event.id,
                 "text": event.text,
                 "at": event.at,
                 "scope": event.scope,
-            })),
-            _ => {}
-        }
-    }
-
-    for task in tasks.values_mut() {
-        if let Some(ids) =
-            task_events.get(&task.get("id").and_then(Value::as_u64).unwrap_or_default())
-        {
-            task["event_ids"] = json!(ids);
-        }
-    }
-    let task_ids: BTreeSet<u64> = tasks.keys().copied().collect();
-    for relation in &relations {
-        if relation.get("kind").and_then(Value::as_str) != Some("part_of") {
-            continue;
-        }
-        let child = relation.get("from").and_then(Value::as_u64);
-        let parent = relation.get("to").and_then(Value::as_u64);
-        if let (Some(child), Some(parent)) = (child, parent) {
-            if child != parent && task_ids.contains(&child) && task_ids.contains(&parent) {
-                if let Some(children) = tasks
-                    .get_mut(&parent)
-                    .and_then(|task| task.get_mut("children"))
-                    .and_then(Value::as_array_mut)
-                {
-                    children.push(json!(child));
-                }
-            }
-        }
-    }
-
-    sort_desc(&mut goals, &closed, true);
-    sort_desc(&mut commitments, &closed, true);
-    sort_desc(&mut corrections, &closed, false);
-    sort_desc(&mut decisions, &closed, false);
-    sort_desc(&mut relationships, &closed, false);
-    let identity = Map::from_iter([
-        ("goals".to_owned(), values(goals)),
-        ("commitments".to_owned(), values(commitments)),
-        ("corrections".to_owned(), values(corrections)),
-        ("decisions".to_owned(), values(decisions)),
-        ("relationships".to_owned(), values(relationships)),
-    ]);
-    Folded {
-        events,
-        messages,
-        tasks: tasks.into_values().collect(),
-        relations,
-        proposals: proposals.into_values().collect(),
-        identity,
-        refused,
-        last_turn,
-    }
-}
-
-fn string_field(data: Option<&Map<String, Value>>, name: &str) -> String {
-    data.and_then(|data| data.get(name))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn scope_task_id(scope: &str) -> Option<u64> {
-    scope.strip_prefix("task:")?.parse().ok()
-}
-
-fn sort_desc(entries: &mut Vec<(u64, Value)>, closed: &BTreeSet<u64>, filter_closed: bool) {
-    entries.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
-    if filter_closed {
-        entries.retain(|(id, _)| !closed.contains(id));
-    }
-}
-
-fn values(entries: Vec<(u64, Value)>) -> Value {
-    Value::Array(entries.into_iter().map(|(_, value)| value).collect())
+            })
+        })
+        .collect();
+    json!({
+        "now": now,
+        "stateDir": state_dir.display().to_string(),
+        "projectDir": project_dir.display().to_string(),
+        "events": events,
+        "messages": messages,
+        "tasks": tasks,
+        "relations": state.relations(),
+        "proposals": proposals,
+        "identity": Value::Object(identity),
+        "currentGoal": state.goal().map_or(Value::Null, entry),
+        "refused": refused,
+        "counts": {
+            "tasks": state.tasks().len(),
+            "open": count(TaskStatus::Open),
+            "running": count(TaskStatus::Running),
+            "waiting": count(TaskStatus::Waiting),
+            "done": count(TaskStatus::Done),
+            "failed": count(TaskStatus::Failed),
+            "messages": messages.len(),
+        },
+        "lastTurn": state.turn(),
+        "lastEvent": state.last_id(),
+        "health": health,
+    })
 }
 
 pub fn journal_event(journal: &Journal, id: u64) -> Option<Value> {
@@ -469,27 +276,20 @@ pub fn journal_event(journal: &Journal, id: u64) -> Option<Value> {
 }
 
 pub fn journal_task(journal: &Journal, id: u64) -> Option<Value> {
-    let folded = fold(journal);
-    let task = folded.task(id)?.clone();
-    let ids: BTreeSet<u64> = task
-        .get("event_ids")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_u64)
-        .collect();
+    let state = State::fold(journal.events.clone());
+    let task = state.task(id)?;
     let events: Vec<Value> = journal
         .events
         .iter()
-        .filter(|event| ids.contains(&event.id))
+        .filter(|event| task.event_ids.contains(&event.id))
         .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
         .collect();
-    Some(json!({ "task": task, "events": events }))
+    Some(json!({ "task": task_json(&state, task), "events": events }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{fold, journal_task, Health, Journal};
+    use super::{journal_task, state_json, Health, Journal};
     use eja::{Event, Kind};
     use serde_json::{json, Value};
     use std::path::Path;
@@ -521,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn the_projection_keeps_tasks_messages_and_edges() {
+    fn the_api_serializes_the_one_core_fold() {
         let events = vec![
             event(1, 1, "eja", Kind::User, "group this", json!({})),
             event(
@@ -567,7 +367,7 @@ mod tests {
                 "task:2",
                 Kind::TaskAssigned,
                 "",
-                json!({"task_id": 2}),
+                json!({"task_id": 2, "objective": "build", "input": "cargo build", "acceptance": "exit zero", "issued_at": 1}),
             ),
             event(6, 1, "task:2", Kind::WorkerReport, "built", json!({})),
             event(
@@ -576,7 +376,7 @@ mod tests {
                 "task:2",
                 Kind::Observed,
                 "",
-                json!({"kind": "witness", "result": {"ok": true}}),
+                json!({"kind": "witness", "target": "world:out", "arguments": {}, "result": {"ok": true}}),
             ),
             event(
                 8,
@@ -593,8 +393,8 @@ mod tests {
             error: None,
             torn: false,
         };
-        let folded = fold(&journal);
-        let state = folded.state(
+        let state = state_json(
+            &journal,
             1_700_000_100,
             Path::new("/state"),
             Path::new("/project"),

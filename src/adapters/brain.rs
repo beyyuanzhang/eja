@@ -60,6 +60,8 @@ INPUT may be the user's words, or one host situation fact: `user returned`, \
 `user departed`, or `alone; time passes`. A situation is not words the user \
 typed and not an order to reply or to work. What to do with it -- speak, act, \
 write, or stay silent -- is yours; silence is a whole answer. \
+What you keep is yours: a note is an inner record, not speech to the user. \
+Writing one remembers; closing one lets go. NOTES shows what you still keep. \
 The current input is separate from the persistent goal. Use a goal/commitment \
 proposal without target_id to add one; with target_id to replace an active event \
 of the same kind. Use correction with target_id only to withdraw that event. \
@@ -81,6 +83,7 @@ Action shapes: \
 {\"op\":\"confirm\",\"proposal_id\":1}; \
 {\"op\":\"reject\",\"proposal_id\":1,\"note\":\"...\"}; \
 {\"op\":\"decision|relationship\",\"text\":\"...\"}; \
+{\"op\":\"note\",\"text\":\"...\",\"closes\":1}; \
 {\"op\":\"open_group\",\"title\":\"...\",\"acceptance\":\"...\"}; \
 {\"op\":\"open_task\",\"title\":\"...\",\"request\":\"...\",\"acceptance\":\"...\",\
 \"evidence\":{\"tool\":\"<host tool>\",\"arguments\":{}},\"run\":true}; \
@@ -116,6 +119,7 @@ enum Slot {
     Refused,
     Commitments,
     Proposals,
+    Notes,
     Conversation,
     Index,
     Relations,
@@ -133,6 +137,7 @@ impl Slot {
             Self::Refused => "REFUSED",
             Self::Commitments => "COMMITMENTS",
             Self::Proposals => "PROPOSALS",
+            Self::Notes => "NOTES",
             Self::Conversation => "CONVERSATION",
             Self::Index => "TASKS",
             Self::Relations => "RELATIONS",
@@ -451,6 +456,26 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .collect(),
     ));
     sections.push(section(
+        Slot::Notes,
+        true,
+        context
+            .notes
+            .iter()
+            .map(|event| {
+                addressed(
+                    event_address(event.id),
+                    vec![format!(
+                        "  #{} [{}] {}: {}",
+                        event.id,
+                        label(event.kind),
+                        format_utc(event.at),
+                        event.text
+                    )],
+                )
+            })
+            .collect(),
+    ));
+    sections.push(section(
         Slot::Conversation,
         true,
         context
@@ -460,9 +485,10 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                 addressed(
                     event_address(event.id),
                     vec![format!(
-                        "  #{} [{}] {}",
+                        "  #{} [{}] {}: {}",
                         event.id,
                         label(event.kind),
+                        format_utc(event.at),
                         event.text
                     )],
                 )

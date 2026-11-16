@@ -732,6 +732,27 @@ fn apply_actions(
             Action::RecordDecision { .. } | Action::RecordRelationship { .. } => {
                 append_identity(ctx.store, state, action, ctx.turn, ctx.at)?;
             }
+            Action::Note { text, closes } => {
+                if let Some(target) = closes {
+                    let open_note = state.notes().iter().any(|note| note.id == *target);
+                    if !open_note {
+                        let told = refuse(
+                            ctx.store,
+                            state,
+                            ctx,
+                            &format!("note refused: no open note {target}"),
+                        )?;
+                        effect.noted(told);
+                        continue;
+                    }
+                }
+                let meta = closes.map_or_else(
+                    || EventMeta::new(ctx.at),
+                    |target| EventMeta::closing(ctx.at, target),
+                );
+                commit(ctx.store, state, Kind::Note, "eja", text, ctx.turn, meta)?;
+                effect.fact();
+            }
             Action::Propose {
                 kind,
                 target_id,

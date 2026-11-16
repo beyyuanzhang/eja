@@ -42,6 +42,9 @@ pub enum Kind {
     /// The host noticed EJA is alone: nobody has called it for a while. Like
     /// presence, it is a situation, not a message and not an order.
     Alone,
+    /// EJA's own inner record: what it chooses to remember. Writing one is
+    /// remembering; closing one is letting go. It is not speech to the user.
+    Note,
     /// The host rejected an action: the state did not allow it, or it could not
     /// be read as one of EJA's own actions. EJA reads these back in its projection.
     Refused,
@@ -75,13 +78,14 @@ impl Kind {
             Self::Returned => "returned",
             Self::Departed => "departed",
             Self::Alone => "alone",
+            Self::Note => "note",
             Self::Refused => "refused",
         }
     }
 
     #[must_use]
     pub const fn is_closable(self) -> bool {
-        matches!(self, Self::Goal | Self::Commitment)
+        matches!(self, Self::Goal | Self::Commitment | Self::Note)
     }
 }
 
@@ -119,9 +123,9 @@ pub struct ProposalView<'a> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposalData {
-    pub(crate) kind: ProposalKind,
+    pub kind: ProposalKind,
     #[serde(default)]
-    pub(crate) target_id: Option<u64>,
+    pub target_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +167,15 @@ impl EventMeta {
             data: Some(value),
         }
     }
+
+    #[must_use]
+    pub const fn closing(at: i64, target: u64) -> Self {
+        Self {
+            at,
+            closes: Some(target),
+            data: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +197,18 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "open" => Some(Self::Open),
+            "running" => Some(Self::Running),
+            "waiting" => Some(Self::Waiting),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -267,8 +292,14 @@ pub struct Task {
     pub acceptance: String,
     pub status: TaskStatus,
     pub created_at: i64,
+    pub assigned_at: Option<i64>,
+    pub reported_at: Option<i64>,
     pub closed_at: Option<i64>,
     pub close: Option<CloseOutcome>,
+    /// The facts of this task's own scope, in journal order.
+    pub event_ids: Vec<u64>,
+    /// The assignment exactly as dispatched, once it ran.
+    pub assignment: Option<Value>,
     /// The facts of a task that executes. A group aggregates and never runs, so
     /// it has none of them and no reader has to ask whether a field means
     /// anything for the kind it is looking at.
@@ -287,6 +318,9 @@ pub struct Run {
     /// The observation that answered it, when the host produced one.
     pub evidence_id: Option<u64>,
     pub evidence_result: Option<Value>,
+    pub witness_at: Option<i64>,
+    /// The host's account of one explicit reconciliation, when it happened.
+    pub reconcile: Option<Value>,
 }
 
 impl Run {
@@ -331,6 +365,8 @@ pub struct EjaContext<'a> {
     pub now: i64,
     pub input: &'a str,
     pub history: Vec<&'a Event>,
+    /// What EJA chose to remember: its open inner records, newest first.
+    pub notes: Vec<&'a Event>,
     pub goal: Option<&'a Event>,
     pub identity: Vec<&'a Event>,
     pub commitments: Vec<&'a Event>,
@@ -396,6 +432,12 @@ pub enum Action {
     #[serde(rename = "relationship")]
     RecordRelationship {
         text: String,
+    },
+    /// An inner record, not speech: writing remembers, closing lets go.
+    Note {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closes: Option<u64>,
     },
     OpenGroup {
         title: String,
@@ -713,6 +755,7 @@ mod tests {
             Kind::Returned,
             Kind::Departed,
             Kind::Alone,
+            Kind::Note,
             Kind::Refused,
         ] {
             let wire = serde_json::to_value(kind).expect("a unit variant serializes");

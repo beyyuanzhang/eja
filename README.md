@@ -32,6 +32,35 @@ value. Nothing validates an action against a second derivation of the log.
 into `S` and the input, so a projection copies no fact. A turn's outcome owns
 `S` and derives the view on demand; no projection outlives the facts it shows.
 
+## The prototype and its constitution
+
+The formula above is the whole prototype. Every mechanism must name which part
+of the loop it serves; nothing gets a layer of its own:
+
+- **Sensation** — facts entering `L` (your words, approvals, situations,
+  observations). All writes go through the one turn entry; the host only
+  offers facts, never meaning.
+- **Memory** — `fold`, plus what EJA itself keeps: an open `note` is a memory,
+  closing it is letting go. Notes are inner records, not speech.
+- **Attention** — the projection and its slot order; what is salient is what
+  the view shows, and EJA shapes it by what it writes and keeps.
+- **Judgment** — `model(C)`, the only place meaning is generated.
+- **Action** — `execute`, whose observations flow back into `L`, closing the loop.
+- **Rhythm** — the host's single `Pulse`: how often it looks, and how much quiet
+  opens an `alone` situation. It is policy, not a second source of time.
+
+Constitution:
+
+1. One authority per function. `log.jsonl` is the only source of truth; the API
+   serializes the one core fold and never re-derives it.
+2. Time has one source: the OS clock, sampled once per turn and stamped on every
+   event of that turn. The core keeps no clock; the host compares journal stamps.
+3. Whatever EJA is, it must point at an event it wrote or witnessed. No persona
+   or fixed vocabulary is injected; the prompt states mechanics only.
+4. The subject persists; executions are disposable.
+5. Silence and inaction are whole outcomes at every step.
+6. Every action's observation returns to the journal as a fact.
+
 ## App
 
 `app/` is an independently served Svelte 5 + TypeScript + Vite interface for

@@ -33,12 +33,12 @@ impl Evidence<'_> {
 
 /// A proposal that no event has resolved yet. Its own event id is its identity.
 #[derive(Debug, Clone)]
-struct OpenProposal {
-    id: u64,
-    data: ProposalData,
-    text: String,
-    at: i64,
-    turn: u64,
+pub struct OpenProposal {
+    pub id: u64,
+    pub data: ProposalData,
+    pub text: String,
+    pub at: i64,
+    pub turn: u64,
 }
 
 /// The logical state: durable facts folded once.
@@ -51,6 +51,8 @@ pub struct State {
     goals: Vec<usize>,
     commitments: Vec<usize>,
     identity: Vec<usize>,
+    /// Indices of `Note` events, oldest first; open ones are what EJA remembers.
+    notes: Vec<usize>,
     /// Tasks by id.
     tasks: Vec<Task>,
     /// Execution and containment edges, sorted and unique.
@@ -168,6 +170,20 @@ impl State {
     #[must_use]
     pub fn commitments(&self) -> Vec<&Event> {
         self.open(&self.commitments)
+    }
+
+    /// What EJA chose to remember: open inner records, newest first.
+    #[must_use]
+    pub fn notes(&self) -> Vec<&Event> {
+        let mut open = self.open(&self.notes);
+        open.reverse();
+        open
+    }
+
+    /// Every open proposal, oldest first, whatever turn it was created in.
+    #[must_use]
+    pub fn proposals(&self) -> &[OpenProposal] {
+        &self.proposals
     }
 
     #[must_use]
@@ -308,6 +324,7 @@ impl State {
                 .rev()
                 .collect(),
             goal: self.goal(),
+            notes: self.notes(),
             identity: self.identity(),
             commitments: self.commitments(),
             relations: &self.edges,
@@ -332,11 +349,12 @@ impl State {
         let index = self.events.len();
         if let Some(id) = task_id_in_scope(&event.scope) {
             self.last_task_id = self.last_task_id.max(id);
-        }
-        if event.kind.is_closable() || event.kind == Kind::Correction {
-            if let Some(target) = event.closes {
-                self.closed.insert(target);
+            if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
+                task.event_ids.push(event.id);
             }
+        }
+        if let Some(target) = event.closes {
+            self.closed.insert(target);
         }
         match event.kind {
             Kind::Goal => {
@@ -352,6 +370,12 @@ impl State {
                 self.resolve(event);
             }
             Kind::RecordDecision | Kind::Relationship => self.identity.push(index),
+            Kind::Note => {
+                // A note that closes another is a letting-go, not a memory.
+                if event.closes.is_none() {
+                    self.notes.push(index);
+                }
+            }
             Kind::ProposalConfirmed | Kind::ProposalRejected => self.resolve(event),
             Kind::Proposal => {
                 if let Some(data) = decode::<ProposalData>(event) {
@@ -374,11 +398,10 @@ impl State {
                 let Some(id) = task_id_in_scope(&event.scope) else {
                     return;
                 };
-                if event.data.is_none() {
-                    return;
-                }
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
                     task.status = TaskStatus::Running;
+                    task.assigned_at = Some(event.at);
+                    task.assignment.clone_from(&event.data);
                 }
             }
             Kind::WorkerReport => {
@@ -389,17 +412,29 @@ impl State {
                     let run = task.run.get_or_insert_with(Run::default);
                     run.digest = Some(event.text.clone());
                     run.digest_at = Some(event.at);
+                    task.reported_at = Some(event.at);
                     task.status = TaskStatus::Waiting;
                 }
             }
             Kind::Observed => {
-                let Some(id) = task_id_in_scope(&event.scope) else {
-                    return;
-                };
                 let Some(data) = event.data.as_ref() else {
                     return;
                 };
                 let Some(observation) = Observation::read(data) else {
+                    return;
+                };
+                if observation.kind == ObservationKind::Reconcile {
+                    let target = task_id_in_scope(observation.target)
+                        .or_else(|| task_id_in_scope(&event.scope));
+                    if let Some(task) =
+                        target.and_then(|id| self.tasks.iter_mut().find(|task| task.id == id))
+                    {
+                        let run = task.run.get_or_insert_with(Run::default);
+                        run.reconcile = Some(observation.result.clone());
+                    }
+                    return;
+                }
+                let Some(id) = task_id_in_scope(&event.scope) else {
                     return;
                 };
                 // Acceptance evidence is one observation the host made. An
@@ -411,6 +446,7 @@ impl State {
                     let run = task.run.get_or_insert_with(Run::default);
                     run.evidence_id = Some(event.id);
                     run.evidence_result = Some(observation.result.clone());
+                    run.witness_at = Some(event.at);
                 }
             }
             Kind::TaskClosed => {
@@ -462,8 +498,12 @@ impl State {
             acceptance: open.acceptance.to_string(),
             status: TaskStatus::Open,
             created_at: event.at,
+            assigned_at: None,
+            reported_at: None,
             closed_at: None,
             close: None,
+            event_ids: vec![event.id],
+            assignment: None,
             // Only a task that executes carries a run; a group never does.
             run: (open.kind == TaskKind::Aja).then(|| Run::opened(open.evidence)),
         };

@@ -60,7 +60,7 @@
   const busy = $derived(Boolean(pending || appState?.health.turnInFlight));
   const presenceMessage = $derived.by(() => {
     if (!appState || encounter) return null;
-    return lastAddressedMessage(appState.messages);
+    return lastAddressedMessage(appState.messages, appState.events);
   });
   const loops = $derived(
     appState ? ambientLoops(appState, parkedEncounter, busy) : [],
