@@ -87,6 +87,7 @@ fn assignment(id: u64) -> Assignment {
         task_id: id,
         objective: "use the granted connector".into(),
         issued_at: 123,
+        workspace: String::new(),
         acceptance: String::new(),
         input: String::new(),
         resume: None,
@@ -129,6 +130,10 @@ fn stdio_discovery_grants_results_and_owned_process_group() {
     assert_eq!(
         tool_names(&host),
         [
+            "read_file",
+            "list_dir",
+            "edit_file",
+            "write_file",
             "mcp__fixture__a_b",
             "mcp__fixture__echo",
             "mcp__fixture__fail"

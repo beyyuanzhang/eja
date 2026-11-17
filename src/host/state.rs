@@ -131,6 +131,7 @@ fn task_json(state: &State, task: &Task) -> Value {
         "request": task.request,
         "origin": task.origin,
         "acceptance": task.acceptance,
+        "workspace": task.workspace,
         "status": task.status.as_str(),
         "created_at": task.created_at,
         "assigned_at": task.assigned_at,
@@ -161,6 +162,7 @@ pub fn state_json(
     now: i64,
     state_dir: &Path,
     project_dir: &Path,
+    workspaces: &[(String, String)],
     health: &Health,
 ) -> Value {
     let state = State::fold(journal.events.clone());
@@ -244,6 +246,10 @@ pub fn state_json(
         "now": now,
         "stateDir": state_dir.display().to_string(),
         "projectDir": project_dir.display().to_string(),
+        "workspaces": workspaces
+            .iter()
+            .map(|(name, root)| json!({"name": name, "root": root}))
+            .collect::<Vec<_>>(),
         "events": events,
         "messages": messages,
         "tasks": tasks,
@@ -398,6 +404,7 @@ mod tests {
             1_700_000_100,
             Path::new("/state"),
             Path::new("/project"),
+            &[("default".to_owned(), "/project".to_owned())],
             &health(),
         );
 

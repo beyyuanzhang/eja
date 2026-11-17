@@ -5,6 +5,7 @@
     ChevronRight,
     Copy,
     ExternalLink,
+    FolderGit2,
     X,
   } from "lucide-svelte";
   import { fade, fly } from "svelte/transition";
@@ -70,6 +71,12 @@
             <span class="origin">来自 · {task.origin}</span>
           {/if}
         </div>
+        {#if task.workspace}
+          <div class="workspace-root">
+            <FolderGit2 size={11} strokeWidth={1.65} />
+            <code>{task.workspace}</code>
+          </div>
+        {/if}
         <div class="title-row">
           <h2>{task.title}</h2>
           <button class="icon-button close" type="button" aria-label="关闭" onclick={onClose}>
@@ -311,6 +318,23 @@
   .origin::before {
     margin-right: 8px;
     content: "·";
+  }
+
+  .workspace-root {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 7px;
+    color: var(--faint);
+  }
+
+  .workspace-root code {
+    overflow: hidden;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 8.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .title-row {

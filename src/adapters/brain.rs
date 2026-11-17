@@ -63,6 +63,8 @@ it opens. Never state a proposed change as done or already in effect. \
 A denied proposal stays pending: withdraw it with a correction proposal, or \
 ask differently; do not confirm it. \
 A correction may also target a pending proposal to withdraw the question itself. \
+A correction asks the user nothing: the host approves it when you propose it, \
+so confirm it in a later turn without waiting for an answer. \
 INPUT may be the user's words, or one host situation fact: `user returned`, \
 `user departed`, or `alone; time passes`. A situation is not words the user \
 typed and not an order to reply or to work. What to do with it -- speak, act, \
@@ -88,6 +90,9 @@ without the host's observation an acceptance is undecidable, not failed, and a \
 rejection needs no evidence. A run that left an isolated world can be reconciled \
 explicitly; the outcome, conflicts included, is recorded evidence. \
 Tasks are execution ajas; open_group creates a non-executable container. \
+WORKSPACES lists the roots the host grants, default first; open_task may carry \
+\"workspace\":\"<name>\" to fix where its runs write, and omits it for the default. \
+The name is resolved once, when the task opens; the task then states its root. \
 Dispatches in one decision run in action order; the host may run them at once when \
 it has isolated worlds. A continuation is a new task related to the previous one \
 with {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
@@ -99,7 +104,7 @@ Action shapes: \
 {\"op\":\"note\",\"text\":\"...\",\"closes\":1}; \
 {\"op\":\"open_group\",\"title\":\"...\",\"acceptance\":\"...\"}; \
 {\"op\":\"open_task\",\"title\":\"...\",\"request\":\"...\",\"acceptance\":\"...\",\
-\"evidence\":{\"tool\":\"<host tool>\",\"arguments\":{}},\"run\":true}; \
+\"workspace\":\"<name>\",\"evidence\":{\"tool\":\"<host tool>\",\"arguments\":{}},\"run\":true}; \
 {\"op\":\"reconcile\",\"task_id\":1}; \
 {\"op\":\"dispatch\",\"task_id\":1}; \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
@@ -135,6 +140,7 @@ enum Slot {
     Notes,
     Conversation,
     Index,
+    Workspaces,
     Relations,
 }
 
@@ -153,6 +159,7 @@ impl Slot {
             Self::Notes => "NOTES",
             Self::Conversation => "CONVERSATION",
             Self::Index => "TASKS",
+            Self::Workspaces => "WORKSPACES",
             Self::Relations => "RELATIONS",
         }
     }
@@ -365,6 +372,9 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             format!("  request: {}", task.request),
             format!("  acceptance: {}", task.acceptance),
         ];
+        if !task.workspace.is_empty() {
+            lines.push(format!("  workspace: {}", task.workspace));
+        }
         if let Some(run) = &task.run {
             if let Some(digest) = &run.digest {
                 lines.push(format!(
@@ -542,14 +552,28 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                 addressed(
                     task_address(task.id),
                     vec![format!(
-                        "  #{} [{:?}/{}] {}",
+                        "  #{} [{:?}/{}] {}{}",
                         task.id,
                         task.kind,
                         task.status.as_str(),
-                        task.title
+                        task.title,
+                        if task.workspace.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" @{}", task.workspace)
+                        }
                     )],
                 )
             })
+            .collect(),
+    ));
+    sections.push(section(
+        Slot::Workspaces,
+        true,
+        context
+            .workspaces
+            .iter()
+            .map(|(name, root)| plain(vec![format!("  {name} -> {root}")]))
             .collect(),
     ));
     sections.push(section(

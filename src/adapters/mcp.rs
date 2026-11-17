@@ -559,6 +559,8 @@ pub struct HostTools {
     mcp: Option<McpTools>,
     project: PathBuf,
     private: PathBuf,
+    workspace_tools: bool,
+    roots: Vec<PathBuf>,
 }
 impl HostTools {
     pub fn new(
@@ -573,19 +575,76 @@ impl HostTools {
                 .transpose()?,
             project: project.canonicalize()?,
             private: private.canonicalize()?,
+            workspace_tools: true,
+            roots: Vec::new(),
         })
+    }
+
+    /// The roots the host grants this deployment. The host's own reads reach
+    /// every granted workspace; a run still writes only its own world.
+    #[must_use]
+    pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.roots = roots;
+        self
+    }
+
+    fn read(&self, tool: &str, arguments: &Value, control: &Control) -> Result<Value> {
+        let path = arguments["path"].as_str().ok_or("missing path")?;
+        let roots: Vec<PathBuf> = if self.roots.is_empty() {
+            vec![self.project.clone()]
+        } else {
+            self.roots.clone()
+        };
+        let full = super::granted_path(&roots, path)?;
+        if full.starts_with(&self.private) {
+            return Err("the host's private state is not readable".into());
+        }
+        let root = roots
+            .iter()
+            .find(|root| full.starts_with(root))
+            .ok_or("path is outside every granted workspace")?;
+        let context = ToolContext {
+            aja_id: 0,
+            project: root,
+            private: &self.private,
+            control,
+        };
+        FileTools.call(&context, tool, arguments)
+    }
+
+    /// The built-in workspace file tools are a grant the host may switch off;
+    /// connectors are unaffected.
+    #[must_use]
+    pub const fn with_workspace_tools(mut self, enabled: bool) -> Self {
+        self.workspace_tools = enabled;
+        self
     }
 }
 impl ToolGateway for HostTools {
-    /// A aja acts only through the host's declared connectors. There are no
-    /// built-in file tools: the workspace is reached the way the host provides
-    /// it, so writing a deliverable costs the same as working on it.
+    /// A aja works its granted workspace through the built-in file tools, and
+    /// reaches anything beyond it only through the host's declared connectors.
+    /// The file tools resolve every path inside the run's world and refuse the
+    /// host's private state, so the grant cannot widen the workspace.
     fn definitions(&self, assignment: &Assignment) -> Vec<Value> {
-        self.mcp
-            .as_ref()
-            .map_or_else(Vec::new, |mcp| mcp.definitions(assignment))
+        let mut definitions = if self.workspace_tools {
+            FileTools.definitions(assignment)
+        } else {
+            Vec::new()
+        };
+        definitions.extend(
+            self.mcp
+                .as_ref()
+                .map_or_else(Vec::new, |mcp| mcp.definitions(assignment)),
+        );
+        definitions
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
+        if matches!(name, "read_file" | "list_dir" | "edit_file" | "write_file") {
+            if !self.workspace_tools {
+                return Err("the workspace file tools are switched off".into());
+            }
+            return FileTools.call(ctx, name, args);
+        }
         if !name.starts_with("mcp__") {
             return Err(format!("{name} is not a declared connector tool").into());
         }
@@ -598,21 +657,21 @@ impl ToolGateway for HostTools {
 
 impl Capabilities for HostTools {
     /// EJA may look at the world; it may never act. Files are readable only from
-    /// the project, connector tools only when declared read-only.
+    /// the granted workspaces, connector tools only when declared read-only.
     fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
         let control = parent.child(Duration::from_secs(60));
+        if tool == "read_file" || tool == "list_dir" {
+            return self.read(tool, arguments, &control);
+        }
+        if tool == "write_file" || tool == "edit_file" {
+            return Err("EJA only observes; edits belong to ajas".into());
+        }
         let context = ToolContext {
             aja_id: 0,
             project: &self.project,
             private: &self.private,
             control: &control,
         };
-        if tool == "read_file" || tool == "list_dir" {
-            return FileTools.call(&context, tool, arguments);
-        }
-        if tool == "write_file" || tool == "edit_file" {
-            return Err("EJA only observes; edits belong to ajas".into());
-        }
         let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
         if !mcp.is_read_only(tool) {
             return Err("EJA may only observe read-only connector tools".into());
@@ -634,15 +693,15 @@ impl Capabilities for HostTools {
             .unwrap_or_else(|| json!({}));
         let control = control.child(Duration::from_secs(120));
         control.check()?;
+        if tool == "read_file" || tool == "list_dir" {
+            return self.read(tool, &arguments, &control);
+        }
         let context = ToolContext {
             aja_id: 0,
             project: &self.project,
             private: &self.private,
             control: &control,
         };
-        if tool == "read_file" || tool == "list_dir" {
-            return FileTools.call(&context, tool, &arguments);
-        }
         let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
         if !mcp.is_witness(tool) {
             return Err(format!("{tool} is not a declared witness").into());

@@ -97,6 +97,11 @@ pub struct ConnectorSettings {
     pub servers: Vec<StoredConnector>,
     #[serde(default)]
     pub managed: bool,
+    /// The built-in workspace file tools: always granted, switchable, never
+    /// deletable. They are not a connector process, so they live beside the
+    /// server list rather than inside it.
+    #[serde(default = "default_true")]
+    pub workspace_tools: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,6 +115,10 @@ pub struct StoredSettings {
     pub connectors: ConnectorSettings,
     #[serde(default)]
     pub limits: Limits,
+    /// The granted workspaces: name → root. The default workspace is the
+    /// host's project directory and is never stored here.
+    #[serde(default)]
+    pub workspaces: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -176,12 +185,17 @@ struct SaveInput {
     connectors: ConnectorSaveInput,
     #[serde(default)]
     limits: Limits,
+    #[serde(default)]
+    workspaces: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ConnectorSaveInput {
     #[serde(default)]
     servers: Vec<ConnectorInput>,
+    #[serde(default)]
+    workspace_tools: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +225,7 @@ pub struct ProviderView {
 pub struct ConnectorView {
     pub name: String,
     pub mode: &'static str,
+    pub builtin: bool,
     pub command: String,
     pub url: String,
     pub args: Vec<String>,
@@ -237,6 +252,7 @@ pub struct SettingsView {
     pub roles: Roles,
     pub connectors: ConnectorsView,
     pub limits: Limits,
+    pub workspaces: BTreeMap<String, String>,
     pub runtime_path: String,
     pub state_dir: String,
     pub project_dir: String,
@@ -267,6 +283,7 @@ pub struct ActiveConnectors {
     pub servers: Vec<StoredConnector>,
     pub managed: bool,
     pub error: Option<String>,
+    pub workspace_tools: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +293,7 @@ pub struct Effective {
     pub roles: EffectiveRoles,
     pub mcp_path: Option<PathBuf>,
     pub limits: Limits,
+    pub workspace_tools: bool,
 }
 
 impl Effective {
@@ -285,8 +303,9 @@ impl Effective {
     }
 
     pub fn mcp_ready(&self) -> bool {
-        self.mcp_path.as_ref().is_some_and(|path| path.is_file())
-            && self.connectors.servers.iter().any(|server| server.enabled)
+        self.workspace_tools
+            || (self.mcp_path.as_ref().is_some_and(|path| path.is_file())
+                && self.connectors.servers.iter().any(|server| server.enabled))
     }
 }
 
@@ -320,6 +339,10 @@ impl SettingsStore {
                 limits: Limits {
                     slots: 1,
                     ..Limits::default()
+                },
+                connectors: ConnectorSettings {
+                    workspace_tools: true,
+                    ..ConnectorSettings::default()
                 },
                 ..StoredSettings::default()
             });
@@ -369,14 +392,21 @@ impl SettingsStore {
         let roles = normalize_roles(input.roles, &providers)?;
         let connectors =
             normalize_connectors(input.connectors.servers, &self.active(&current).servers)?;
+        let workspace_tools = input
+            .connectors
+            .workspace_tools
+            .unwrap_or(current.connectors.workspace_tools);
+        let workspaces = normalize_workspaces(input.workspaces, &self.project, &self.dir)?;
         let next = StoredSettings {
             providers,
             roles,
             connectors: ConnectorSettings {
                 servers: connectors,
                 managed: true,
+                workspace_tools,
             },
             limits: input.limits.sane(),
+            workspaces,
         };
         let raw = serde_json::to_value(&next)?;
         write_private_json(&self.path, &raw)?;
@@ -402,6 +432,7 @@ impl SettingsStore {
                 servers: settings.connectors.servers.clone(),
                 managed: true,
                 error: None,
+                workspace_tools: settings.connectors.workspace_tools,
             };
         }
         let Some(path) = self.legacy_mcp_path() else {
@@ -409,6 +440,7 @@ impl SettingsStore {
                 servers: settings.connectors.servers.clone(),
                 managed: false,
                 error: None,
+                workspace_tools: settings.connectors.workspace_tools,
             };
         };
         match read_legacy_mcp(&path) {
@@ -420,17 +452,20 @@ impl SettingsStore {
                 },
                 managed: false,
                 error: None,
+                workspace_tools: settings.connectors.workspace_tools,
             },
             Err(error) => ActiveConnectors {
                 servers: settings.connectors.servers.clone(),
                 managed: false,
                 error: Some(format!("{}: {error}", path.display())),
+                workspace_tools: settings.connectors.workspace_tools,
             },
         }
     }
 
     pub fn effective(&self, settings: StoredSettings) -> Effective {
         let connectors = self.active(&settings);
+        let workspace_tools = connectors.workspace_tools;
         let eja = configured_role(&settings, "eja").or_else(|| environment_role(false));
         let aja = configured_role(&settings, "aja")
             .or_else(|| environment_role(true))
@@ -459,6 +494,7 @@ impl SettingsStore {
             roles: EffectiveRoles { eja, aja },
             mcp_path,
             limits,
+            workspace_tools,
         }
     }
 
@@ -468,12 +504,11 @@ impl SettingsStore {
             providers: settings.providers.iter().map(public_provider).collect(),
             roles: settings.roles.clone(),
             connectors: ConnectorsView {
-                servers: effective
-                    .connectors
-                    .servers
-                    .iter()
-                    .map(public_connector)
-                    .collect(),
+                servers: std::iter::once(builtin_workspace_view(
+                    effective.connectors.workspace_tools,
+                ))
+                .chain(effective.connectors.servers.iter().map(public_connector))
+                .collect(),
                 managed: effective.connectors.managed,
                 config_path: effective
                     .mcp_path
@@ -482,6 +517,7 @@ impl SettingsStore {
                 error: effective.connectors.error.clone(),
             },
             limits: settings.limits.clone(),
+            workspaces: settings.workspaces.clone(),
             runtime_path: env::current_exe()
                 .map_or_else(|_| "eja".to_owned(), |path| path.display().to_string()),
             state_dir: self.dir.display().to_string(),
@@ -491,6 +527,20 @@ impl SettingsStore {
 
     pub fn effective_current(&self) -> ApiResult<Effective> {
         Ok(self.effective(self.read()?))
+    }
+
+    /// The workspace grant for one turn: the default root first, then every
+    /// granted name whose root still exists. A root that vanished is not
+    /// granted, so a task can never name a world the host cannot give.
+    pub fn grant(&self, settings: &StoredSettings) -> Vec<(String, String)> {
+        let mut grant = vec![("default".to_owned(), self.project.display().to_string())];
+        for (name, root) in &settings.workspaces {
+            let path = Path::new(root);
+            if path.is_dir() && path != self.project.as_path() {
+                grant.push((name.clone(), root.clone()));
+            }
+        }
+        grant
     }
 
     pub fn connector_for_test(&self, body: &Value) -> ApiResult<StoredConnector> {
@@ -657,12 +707,67 @@ fn normalize_roles(input: Roles, providers: &[Provider]) -> ApiResult<Roles> {
     Ok(input)
 }
 
+fn normalize_workspaces(
+    input: BTreeMap<String, String>,
+    project: &Path,
+    dir: &Path,
+) -> ApiResult<BTreeMap<String, String>> {
+    if input.len() > 16 {
+        return Err(ApiError::bad("最多可以配置 16 个工作区"));
+    }
+    let mut output = BTreeMap::new();
+    for (name, root) in input {
+        let name = name.trim().to_owned();
+        if !valid_name(&name, 32) || name == "default" {
+            return Err(ApiError::bad(
+                "工作区名称需为 1–32 个字母、数字、下划线或短横线，且不能是 default",
+            ));
+        }
+        let root = root.trim();
+        if root.is_empty() {
+            return Err(ApiError::bad(format!("工作区 {name} 需要一个目录路径")));
+        }
+        let path = Path::new(root)
+            .canonicalize()
+            .map_err(|_| ApiError::bad(format!("工作区 {name} 的目录不存在：{root}")))?;
+        if !path.is_dir() {
+            return Err(ApiError::bad(format!("工作区 {name} 的路径不是目录")));
+        }
+        if path.starts_with(dir) || dir.starts_with(&path) {
+            return Err(ApiError::bad(format!("工作区 {name} 不能与状态目录重叠")));
+        }
+        if path
+            == project
+                .canonicalize()
+                .unwrap_or_else(|_| project.to_path_buf())
+        {
+            return Err(ApiError::bad(format!(
+                "工作区 {name} 就是默认工作区，无需另加"
+            )));
+        }
+        let root = path.display().to_string();
+        if output.values().any(|existing| existing == &root) {
+            return Err(ApiError::bad(format!(
+                "工作区 {name} 的目录已被另一个工作区使用"
+            )));
+        }
+        output.insert(name, root);
+    }
+    Ok(output)
+}
+
 fn normalize_connectors(
     values: Vec<ConnectorInput>,
     previous: &[StoredConnector],
 ) -> ApiResult<Vec<StoredConnector>> {
     if values.len() > 32 {
         return Err(ApiError::bad("最多可以配置 32 个连接器"));
+    }
+    if values
+        .iter()
+        .any(|value| value.name.trim() == BUILTIN_WORKSPACE)
+    {
+        return Err(ApiError::bad("workspace 是内置连接器，不能另建同名连接器"));
     }
     let prior: BTreeMap<_, _> = previous
         .iter()
@@ -925,6 +1030,7 @@ fn public_connector(connector: &StoredConnector) -> ConnectorView {
         } else {
             "url"
         },
+        builtin: false,
         command: connector.command.clone().unwrap_or_default(),
         url: connector.url.clone().unwrap_or_default(),
         args: connector.args.clone(),
@@ -935,6 +1041,27 @@ fn public_connector(connector: &StoredConnector) -> ConnectorView {
         timeout_ms: connector.timeout_ms,
     }
 }
+
+/// The built-in workspace connector as the settings list shows it: one row,
+/// switchable, with nothing to edit and nothing to delete.
+fn builtin_workspace_view(enabled: bool) -> ConnectorView {
+    ConnectorView {
+        name: BUILTIN_WORKSPACE.to_owned(),
+        mode: "command",
+        builtin: true,
+        command: String::new(),
+        url: String::new(),
+        args: Vec::new(),
+        cwd: String::new(),
+        env: Vec::new(),
+        headers: Vec::new(),
+        enabled,
+        timeout_ms: 0,
+    }
+}
+
+/// The reserved name of the built-in workspace file tools.
+pub const BUILTIN_WORKSPACE: &str = "workspace";
 
 fn public_key_values(values: &BTreeMap<String, String>) -> Vec<KeyValueView> {
     values
@@ -1204,6 +1331,45 @@ mod tests {
         let settings: StoredSettings = store.read().unwrap();
         assert_eq!(settings.limits.slots, 1);
         assert!(settings.providers.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_builtin_workspace_connector_is_switchable_and_reserved() {
+        let root = root();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = SettingsStore::new(project, root.join(".eja"));
+        let effective = store.effective_current().unwrap();
+        assert!(effective.workspace_tools, "on by default");
+        let view = store.view(&effective);
+        assert_eq!(view.connectors.servers[0].name, "workspace");
+        assert!(view.connectors.servers[0].builtin);
+        assert!(view.connectors.servers[0].enabled);
+
+        let base = json!({
+            "providers": [],
+            "roles": {"eja": {"providerId": "", "model": ""}, "aja": {"providerId": "", "model": ""}},
+            "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0}
+        });
+        let mut off = base.clone();
+        off["connectors"] = json!({"servers": [], "workspaceTools": false});
+        let saved = store.write(off).unwrap();
+        assert!(!saved.connectors.workspace_tools);
+        assert!(
+            saved.connectors.servers.is_empty(),
+            "the builtin is not a stored server"
+        );
+
+        // A save that does not mention the switch keeps it.
+        let mut keep = base.clone();
+        keep["connectors"] = json!({"servers": []});
+        let saved = store.write(keep).unwrap();
+        assert!(!saved.connectors.workspace_tools);
+
+        let mut clash = base;
+        clash["connectors"] = json!({"servers": [{"name": "workspace", "command": "x"}]});
+        assert!(store.write(clash).is_err(), "the name is reserved");
         let _ = std::fs::remove_dir_all(root);
     }
 }

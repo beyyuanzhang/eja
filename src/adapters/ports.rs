@@ -78,10 +78,15 @@ impl Host for Ports<'_> {
             .witness(request, control)
     }
 
-    fn reconcile(&self, task: TaskId, control: &Control) -> Result<Value> {
+    fn reconcile(
+        &self,
+        task: TaskId,
+        root: Option<&std::path::Path>,
+        control: &Control,
+    ) -> Result<Value> {
         self.worlds
             .ok_or("this host isolates no worlds")?
-            .reconcile(task, control)
+            .reconcile(task, root, control)
     }
 }
 

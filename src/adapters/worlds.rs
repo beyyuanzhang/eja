@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 /// A project larger than this is reported as truncated instead of scanned.
@@ -176,13 +176,15 @@ pub struct World {
 
 /// Reserve, settle, reconcile and release the world one execution may change.
 pub trait Worlds: Send + Sync {
-    fn reserve(&self, task: u64, control: &Control) -> Result<World>;
+    /// `root` names the granted workspace this run works in; `None` is the
+    /// host's default. A backend that owns several roots isolates them apart.
+    fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World>;
     /// The host's account of a finished run, including whatever makes the world
     /// durable. The account carries a one-line `change`, measured against the
     /// reservation this backend kept — not against the runner's claims.
     fn settle(&self, world: &World, control: &Control) -> Result<Value>;
     /// Bring one run's world back into the shared world.
-    fn reconcile(&self, task: u64, control: &Control) -> Result<Value>;
+    fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value>;
     fn release(&self, world: &World);
 }
 
@@ -210,18 +212,21 @@ impl Reservation {
     }
 }
 
-type Open = Mutex<HashMap<u64, Reservation>>;
+/// What a backend holds per run: the root it owns, and the inventory it keeps.
+type Held = (PathBuf, Reservation);
+type Open = Mutex<HashMap<u64, Held>>;
 
-fn keep(open: &Open, task: u64, reservation: Reservation) {
+fn keep(open: &Open, task: u64, root: &Path, reservation: Reservation) {
     open.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(task, reservation);
+        .insert(task, (root.to_path_buf(), reservation));
 }
 
 fn take(open: &Open, task: u64) -> Result<Reservation> {
     open.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&task)
+        .map(|(_, reservation)| reservation)
         .ok_or_else(|| "this world has no open reservation".into())
 }
 
@@ -246,25 +251,36 @@ impl Shared {
             open: Mutex::new(HashMap::new()),
         }
     }
+
+    fn root_of<'a>(&'a self, root: Option<&'a Path>) -> &'a Path {
+        root.unwrap_or(&self.project)
+    }
 }
 
 impl Worlds for Shared {
-    fn reserve(&self, task: u64, control: &Control) -> Result<World> {
+    fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World> {
+        let root = self.root_of(root);
+        if !root.is_dir() {
+            return Err(format!("workspace is not a directory: {}", root.display()).into());
+        }
         let mut open = self
             .open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // One mutable world has one owner. A host that wants two runs at once
-        // must give them isolated worlds, so this refuses instead of letting two
-        // runs write the same directory.
-        if !open.is_empty() {
+        // One mutable world has one owner per root. Two runs in two granted
+        // workspaces may hold their own roots at once; a second run in a root
+        // that is held is refused instead of letting two runs write it.
+        if open.values().any(|(held, _)| held == root) {
             return Err(
                 "the shared world has one owner; a second run needs an isolated world".into(),
             );
         }
         open.insert(
             task,
-            Reservation::start(&self.project, &self.private, control),
+            (
+                root.to_path_buf(),
+                Reservation::start(root, &self.private, control),
+            ),
         );
         // The reservation is recorded; the map must not stay locked while the
         // world is handed back.
@@ -272,7 +288,7 @@ impl Worlds for Shared {
         Ok(World {
             task,
             label: "shared".to_string(),
-            root: self.project.clone(),
+            root: root.to_path_buf(),
         })
     }
 
@@ -282,7 +298,7 @@ impl Worlds for Shared {
         Ok(json!({"world": "shared", "change": delta.line()}))
     }
 
-    fn reconcile(&self, _task: u64, _control: &Control) -> Result<Value> {
+    fn reconcile(&self, _task: u64, _root: Option<&Path>, _control: &Control) -> Result<Value> {
         Ok(json!({"world": "shared", "merged": true,
                   "detail": "the run happened in the shared world"}))
     }
@@ -394,7 +410,10 @@ impl Worktrees {
 }
 
 impl Worlds for Worktrees {
-    fn reserve(&self, task: u64, control: &Control) -> Result<World> {
+    fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World> {
+        if root.is_some_and(|root| root != self.project.as_path()) {
+            return Err("an isolated world belongs to its own git project".into());
+        }
         let root = self.root.join(task.to_string());
         if root.exists() {
             let text = root.to_string_lossy().to_string();
@@ -420,6 +439,7 @@ impl Worlds for Worktrees {
         keep(
             &self.open,
             task,
+            &self.project,
             Reservation::start(&root, &self.private, control),
         );
         // An isolated world starts at a commit: uncommitted project changes stay
@@ -454,7 +474,10 @@ impl Worlds for Worktrees {
         }))
     }
 
-    fn reconcile(&self, task: u64, control: &Control) -> Result<Value> {
+    fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value> {
+        if root.is_some_and(|root| root != self.project.as_path()) {
+            return Err("an isolated world belongs to its own git project".into());
+        }
         let branch = self.branch(task);
         match git(
             &self.project,
@@ -494,6 +517,79 @@ impl Worlds for Worktrees {
             &["worktree", "remove", "--force", &text],
             &control,
         );
+    }
+}
+
+/// One backend per granted root.
+///
+/// A run reserves the world of the workspace its task named, and every root
+/// keeps the isolation rule of its own backend. Roots without a backend of
+/// their own share the default.
+pub struct WorkspaceWorlds {
+    default: Arc<dyn Worlds>,
+    roots: BTreeMap<PathBuf, Arc<dyn Worlds>>,
+    /// The backend that reserved each run: an isolated world's root is a
+    /// worktree path, not the granted root, so settle and release must return
+    /// to the backend that owns the reservation.
+    held: Mutex<HashMap<u64, Arc<dyn Worlds>>>,
+}
+
+impl WorkspaceWorlds {
+    pub fn new(default: Arc<dyn Worlds>, roots: BTreeMap<PathBuf, Arc<dyn Worlds>>) -> Self {
+        Self {
+            default,
+            roots,
+            held: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn backend(&self, root: Option<&Path>) -> &Arc<dyn Worlds> {
+        root.and_then(|root| self.roots.get(root))
+            .unwrap_or(&self.default)
+    }
+
+    fn reserved(&self, world: &World) -> Arc<dyn Worlds> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&world.task)
+            .cloned()
+            .unwrap_or_else(|| self.backend(Some(&world.root)).clone())
+    }
+}
+
+impl Worlds for WorkspaceWorlds {
+    fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World> {
+        let backend = self.backend(root);
+        let world = backend.reserve(task, root, control)?;
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task, backend.clone());
+        Ok(world)
+    }
+
+    fn settle(&self, world: &World, control: &Control) -> Result<Value> {
+        let backend = self.reserved(world);
+        let account = backend.settle(world, control);
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&world.task);
+        account
+    }
+
+    fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value> {
+        self.backend(root).reconcile(task, root, control)
+    }
+
+    fn release(&self, world: &World) {
+        let backend = self.reserved(world);
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&world.task);
+        backend.release(world);
     }
 }
 

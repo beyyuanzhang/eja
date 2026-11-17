@@ -207,6 +207,7 @@ pub fn task(title: &str) -> Action {
         title: title.to_string(),
         request: title.to_string(),
         acceptance: "output".to_string(),
+        workspace: None,
         evidence: None,
         run: false,
     }
@@ -217,6 +218,7 @@ pub fn aja(title: &str) -> Action {
         title: title.to_string(),
         request: title.to_string(),
         acceptance: "output".to_string(),
+        workspace: None,
         evidence: None,
         run: true,
     }

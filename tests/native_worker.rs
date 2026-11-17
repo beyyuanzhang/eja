@@ -70,6 +70,7 @@ fn assignment(id: u64) -> Assignment {
     Assignment {
         task_id: id,
         objective: format!("aja {id} work"),
+        workspace: String::new(),
         issued_at: 123,
         acceptance: String::new(),
         input: String::new(),

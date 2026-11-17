@@ -489,7 +489,9 @@ impl Worker for NativeWorker {
         // The world comes first: a run that cannot get one has started nothing, so
         // it does not burn its aja id either. Isolation is the backend's rule, and
         // it is the only place that decides how many runs may exist at once.
-        let world = match self.worlds.reserve(assignment.task_id, &control) {
+        let root = (!assignment.workspace.is_empty())
+            .then_some(std::path::Path::new(assignment.workspace.as_str()));
+        let world = match self.worlds.reserve(assignment.task_id, root, &control) {
             Ok(world) => Held {
                 worlds: &*self.worlds,
                 world,

@@ -144,12 +144,32 @@ function groupReview(task: Task, tasks: Task[]): boolean {
   });
 }
 
+function eventProposalId(event: JournalEvent): number | null {
+  if (!event.data || typeof event.data !== "object") return null;
+  const value = (event.data as Record<string, unknown>).proposal_id;
+  return typeof value === "number" ? value : null;
+}
+
+// Proposal ids are never re-asked, so a rejection or denial already answers
+// the question; a correction withdraws rather than asks.
+function answeredProposal(proposal: Proposal, events: JournalEvent[]): boolean {
+  if (proposal.kind === "correction") return true;
+  return events.some(
+    (event) =>
+      (event.kind === "proposal_rejected" || event.kind === "denial") &&
+      eventProposalId(event) === proposal.id,
+  );
+}
+
 export function coreLoops(
   state: AppState,
   busy = state.health.turnInFlight,
 ): OpenLoop[] {
   const loops: OpenLoop[] = [];
-  for (const proposal of state.proposals) loops.push(proposalLoop(proposal));
+  for (const proposal of state.proposals) {
+    if (answeredProposal(proposal, state.events)) continue;
+    loops.push(proposalLoop(proposal));
+  }
   for (const task of state.tasks) {
     if (task.kind === "aja" && task.status === "waiting") {
       loops.push(taskLoop(task, "review"));

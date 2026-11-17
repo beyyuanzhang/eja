@@ -37,13 +37,17 @@ pub struct TurnOutcome<'a> {
     input: std::borrow::Cow<'a, str>,
     focus: Option<TaskId>,
     now: chrono::DateTime<chrono::Utc>,
+    /// The grant this turn projected with, kept so the outcome's view states
+    /// the same workspaces the decisions saw.
+    workspaces: Vec<(String, String)>,
 }
 
 impl TurnOutcome<'_> {
     /// `C = view(S, input)`: the projection of the state this turn ended with.
     #[must_use]
     pub fn context(&self) -> EjaContext<'_> {
-        self.state.project(&self.input, self.focus, self.now)
+        self.state
+            .project_with_workspaces(&self.input, self.focus, self.now, &self.workspaces)
     }
 }
 
@@ -152,6 +156,23 @@ fn recover_state(store: &Store, state: &mut State, turn: u64, at: i64) -> Result
     Ok(recovered)
 }
 
+/// Record the host's approval of one proposal, as the turn's own fact. The
+/// journal stays the authority: a later read sees the approval like any other.
+fn approve(store: &Store, state: &mut State, proposal_id: u64, turn: u64, at: i64) -> Result<()> {
+    commit(
+        store,
+        state,
+        Kind::Approval,
+        "eja",
+        "",
+        turn,
+        EventMeta::data(
+            at,
+            serde_json::json!({"proposal_id": proposal_id, "source": "host"}),
+        ),
+    )
+}
+
 fn propose(
     store: &Store,
     state: &mut State,
@@ -175,6 +196,12 @@ fn propose(
         turn,
         EventMeta::data(at, serde_json::to_value(ProposalData { kind, target_id })?),
     )?;
+    // A correction withdraws; it asks the user nothing. The host records its
+    // approval in the same turn, so the withdrawal can be confirmed without a
+    // question ever reaching the user.
+    if kind == ProposalKind::Correction {
+        approve(store, state, state.last_id(), turn, at)?;
+    }
     Ok(None)
 }
 
@@ -340,6 +367,26 @@ fn open_task(ctx: &ActionCtx<'_>, state: &mut State, input: &TaskOpen<'_>) -> Re
         EventMeta::data(ctx.at, serde_json::to_value(input)?),
     )?;
     Ok(id)
+}
+
+/// Resolve the workspace a task names against this turn's grant. An omitted
+/// name is the default (the first granted root); an unknown name is refused.
+fn resolve_workspace<'a>(
+    options: &'a TurnOptions,
+    name: Option<&str>,
+) -> std::result::Result<&'a str, String> {
+    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(options
+            .workspaces
+            .first()
+            .map_or("", |(_, root)| root.as_str()));
+    };
+    options
+        .workspaces
+        .iter()
+        .find(|(granted, _)| granted == name)
+        .map(|(_, root)| root.as_str())
+        .ok_or_else(|| format!("open_task refused: no granted workspace named {name}"))
 }
 
 fn link_tasks(
@@ -510,6 +557,7 @@ fn reserve_dispatch(
     let assignment = Assignment {
         task_id: task.id,
         objective: task.request.clone(),
+        workspace: task.workspace.clone(),
         input: task.origin.clone(),
         acceptance: task.acceptance.clone(),
         resume,
@@ -673,7 +721,8 @@ fn reconcile(
             "reconcile refused: task {task_id} has no run to reconcile"
         )));
     }
-    let result = match ctx.host.reconcile(task_id, ctx.control) {
+    let root = (!task.workspace.is_empty()).then_some(std::path::Path::new(&task.workspace));
+    let result = match ctx.host.reconcile(task_id, root, ctx.control) {
         Ok(result) => result,
         Err(error) => return Ok(Err(format!("reconcile refused: {error}"))),
     };
@@ -844,6 +893,7 @@ fn apply_actions(
                         request: "",
                         origin: ctx.input,
                         acceptance,
+                        workspace: "",
                         evidence: None,
                     },
                 )?;
@@ -854,9 +904,18 @@ fn apply_actions(
                 title,
                 request,
                 acceptance,
+                workspace,
                 evidence,
                 run,
             } => {
+                let workspace = match resolve_workspace(ctx.options, workspace.as_deref()) {
+                    Ok(root) => root,
+                    Err(note) => {
+                        let told = refuse(ctx.store, state, ctx, &note)?;
+                        effect.noted(told);
+                        continue;
+                    }
+                };
                 let id = open_task(
                     ctx,
                     state,
@@ -866,6 +925,7 @@ fn apply_actions(
                         request,
                         origin: ctx.input,
                         acceptance,
+                        workspace,
                         evidence: evidence.clone(),
                     },
                 )?;
@@ -1140,18 +1200,7 @@ pub fn turn_at_with_options<'i>(
     // An approval is a fact, not a caller's flag: it is recorded once, with the
     // turn it authorizes, and every later read comes from the journal.
     for proposal_id in &options.approvals {
-        commit(
-            store,
-            &mut state,
-            Kind::Approval,
-            "eja",
-            "",
-            turn_no,
-            EventMeta::data(
-                at,
-                serde_json::json!({"proposal_id": proposal_id, "source": "host"}),
-            ),
-        )?;
+        approve(store, &mut state, *proposal_id, turn_no, at)?;
     }
     // A denial is the user's answer, recorded like an approval: the proposal
     // stays pending until EJA itself withdraws or re-asks.
@@ -1212,7 +1261,7 @@ pub fn turn_at_with_options<'i>(
         // this decision: the actions that follow commit facts, which needs the
         // fold mutably.
         let decision = {
-            let context = state.project(&input, focus, now);
+            let context = state.project_with_workspaces(&input, focus, now, &options.workspaces);
             brain.decide(&context, &control)
         };
         if let Err(error) = control.check() {
@@ -1289,11 +1338,12 @@ pub fn turn_at_with_options<'i>(
     recover_state(store, &mut state, turn_no, at)?;
     // A turn that asks the user a question delivers the question, not a reply:
     // the answer comes first, and EJA speaks to it in the turn the answer opens.
-    // The model's text for this turn stays its monologue.
+    // The model's text for this turn stays its monologue. A correction the host
+    // approved itself asks nothing, so it does not silence the turn.
     let fresh_question = state
         .pending_proposals(turn_no)
         .iter()
-        .any(|proposal| proposal.turn == turn_no);
+        .any(|proposal| proposal.turn == turn_no && !proposal.approved);
     if fresh_question && end == TurnEnd::Complete {
         reply = String::new();
     }
@@ -1309,5 +1359,6 @@ pub fn turn_at_with_options<'i>(
         input,
         focus,
         now,
+        workspaces: options.workspaces.clone(),
     })
 }

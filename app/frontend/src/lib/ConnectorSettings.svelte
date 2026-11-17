@@ -2,6 +2,7 @@
   import {
     AlertCircle,
     ChevronRight,
+    FolderGit2,
     Globe2,
     Plus,
     TerminalSquare,
@@ -32,6 +33,7 @@
   function blank(): ConnectorDraft {
     return {
       name: "",
+      builtin: false,
       mode: "command",
       command: "",
       url: "",
@@ -97,16 +99,36 @@
     <div class="connector-list">
       {#each connectors as connector, index (connector.name)}
         <article class:disabled={!connector.enabled}>
-          <button class="connector-main" type="button" onclick={() => edit(connector, index)}>
-            <span class="connector-mark" class:remote={connector.mode === "url"}>
-              {#if connector.mode === "url"}<Globe2 size={17} />{:else}<TerminalSquare size={17} />{/if}
-            </span>
-            <span class="connector-copy">
-              <strong>{connector.name}</strong>
-              <code title={endpoint(connector)}>{endpoint(connector)}</code>
-            </span>
-            <ChevronRight size={14} />
-          </button>
+          {#if connector.builtin}
+            <div class="connector-main builtin">
+              <span class="connector-mark">
+                <FolderGit2 size={17} />
+              </span>
+              <span class="connector-copy">
+                <strong>工作区文件</strong>
+              </span>
+              <label class="enabled-toggle" title={connector.enabled ? "停用" : "启用"}>
+                <input
+                  type="checkbox"
+                  bind:checked={connector.enabled}
+                  aria-label={connector.enabled ? "停用工作区文件" : "启用工作区文件"}
+                  onchange={onDirty}
+                />
+                <span></span>
+              </label>
+            </div>
+          {:else}
+            <button class="connector-main" type="button" onclick={() => edit(connector, index)}>
+              <span class="connector-mark" class:remote={connector.mode === "url"}>
+                {#if connector.mode === "url"}<Globe2 size={17} />{:else}<TerminalSquare size={17} />{/if}
+              </span>
+              <span class="connector-copy">
+                <strong>{connector.name}</strong>
+                <code title={endpoint(connector)}>{endpoint(connector)}</code>
+              </span>
+              <ChevronRight size={14} />
+            </button>
+          {/if}
         </article>
       {/each}
     </div>
@@ -258,6 +280,53 @@
 
   .connector-main > :global(svg) {
     color: var(--faint);
+  }
+
+  .connector-main.builtin {
+    grid-template-columns: 36px minmax(0, 1fr) 34px;
+  }
+
+  .enabled-toggle {
+    position: relative;
+    display: flex;
+    width: 34px;
+    height: 22px;
+    cursor: pointer;
+  }
+
+  .enabled-toggle input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .enabled-toggle span {
+    width: 31px;
+    height: 18px;
+    margin: auto;
+    border-radius: 999px;
+    background: var(--surface-3);
+    transition: background 150ms ease;
+  }
+
+  .enabled-toggle span::after {
+    display: block;
+    width: 14px;
+    height: 14px;
+    margin: 2px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(36, 35, 31, 0.15);
+    content: "";
+    transition: transform 150ms ease;
+  }
+
+  .enabled-toggle input:checked + span {
+    background: var(--accent);
+  }
+
+  .enabled-toggle input:checked + span::after {
+    transform: translateX(13px);
   }
 
   .empty-add {

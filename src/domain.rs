@@ -254,6 +254,9 @@ pub struct Edge {
 pub struct Assignment {
     pub task_id: TaskId,
     pub objective: String,
+    /// The workspace root this run works in; empty means the host's default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace: String,
     /// What the task must satisfy; the aja's exit criterion.
     #[serde(default)]
     pub acceptance: String,
@@ -275,6 +278,9 @@ pub struct TaskOpen<'a> {
     pub(crate) request: &'a str,
     pub(crate) origin: &'a str,
     pub(crate) acceptance: &'a str,
+    /// The granted workspace this task belongs to; empty means the default.
+    #[serde(default, skip_serializing_if = "str::is_empty")]
+    pub(crate) workspace: &'a str,
     /// A host-interpreted request for acceptance evidence. A judgment counts only
     /// when the host observed that evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,6 +303,8 @@ pub struct Task {
     pub request: String,
     pub origin: String,
     pub acceptance: String,
+    /// The granted workspace root, fixed when the task was opened.
+    pub workspace: String,
     pub status: TaskStatus,
     pub created_at: i64,
     pub assigned_at: Option<i64>,
@@ -371,6 +379,8 @@ impl Task {
 pub struct EjaContext<'a> {
     pub now: i64,
     pub input: &'a str,
+    /// The workspaces the host grants: (name, root). The first is the default.
+    pub workspaces: &'a [(String, String)],
     pub history: Vec<&'a Event>,
     /// What EJA chose to remember: its open inner records, newest first.
     pub notes: Vec<&'a Event>,
@@ -454,6 +464,9 @@ pub enum Action {
         title: String,
         request: String,
         acceptance: String,
+        /// A granted workspace name; omitted means the default workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
         /// What the host must observe before the task can be judged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<Value>,
@@ -610,7 +623,12 @@ pub trait Host {
 
     /// Bring one run's world back into the shared world. The account, conflicts
     /// included, is evidence; the host never merges silently.
-    fn reconcile(&self, _task: TaskId, _control: &Control) -> Result<Value> {
+    fn reconcile(
+        &self,
+        _task: TaskId,
+        _root: Option<&std::path::Path>,
+        _control: &Control,
+    ) -> Result<Value> {
         Err("this host isolates no worlds".into())
     }
 }
@@ -677,6 +695,9 @@ pub struct TurnOptions {
     /// One host situation fact opening this turn: `Returned`, `Departed` or
     /// `Alone`. The host validates the variant; nothing else may enter here.
     pub gesture: Option<Kind>,
+    /// The workspaces the host grants this turn: (name, root), default first.
+    /// A task may only name one of these; the fold stores the resolved root.
+    pub workspaces: Vec<(String, String)>,
     pub limits: TurnLimits,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }

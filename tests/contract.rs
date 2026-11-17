@@ -32,6 +32,7 @@ fn worker_receives_the_task_contract_and_original_input() {
                 title: "expanded title".to_string(),
                 request: "EJA expanded request".to_string(),
                 acceptance: "EJA acceptance only".to_string(),
+                workspace: None,
                 evidence: None,
                 run: true,
             }]),

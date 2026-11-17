@@ -2,8 +2,10 @@ mod settings;
 mod state;
 mod util;
 
+pub use settings::SettingsStore;
+
 use self::{
-    settings::{connector_config, RoleConfig, SettingsStore, StoredConnector, StoredSettings},
+    settings::{connector_config, RoleConfig, StoredConnector, StoredSettings},
     util::{clip, now_seconds, safe_file, ApiError, ApiResult},
 };
 use axum::{
@@ -266,11 +268,13 @@ fn state_json(host: &Host) -> Value {
         torn: journal.torn,
         turn_in_flight: host.turn_in_flight.load(Ordering::SeqCst),
     };
+    let grant = host.settings.grant(&effective.settings);
     state::state_json(
         &journal,
         now_seconds(),
         &host.state_dir,
         &host.project_dir,
+        &grant,
         &health,
     )
 }
@@ -524,6 +528,7 @@ fn probe_connector(
         let definitions = tools.definitions(&Assignment {
             task_id: 0,
             objective: String::new(),
+            workspace: String::new(),
             acceptance: String::new(),
             input: String::new(),
             resume: None,
@@ -692,12 +697,12 @@ fn execute_turn(
     .with_headers(header_pairs(aja_role));
     let startup = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
     let config = effective.mcp_path.as_deref().filter(|path| path.is_file());
-    let tools = Arc::new(HostTools::new(
-        config,
-        &host.project_dir,
-        &host.state_dir,
-        &startup,
-    )?);
+    let grant = host.settings.grant(&effective.settings);
+    let tools = Arc::new(
+        HostTools::new(config, &host.project_dir, &host.state_dir, &startup)?
+            .with_workspace_tools(effective.workspace_tools)
+            .with_roots(grant.iter().map(|(_, root)| PathBuf::from(root)).collect()),
+    );
     let ajas = host.state_dir.join("ajas");
     let mut aja_limits = eja::aja::Limits::default();
     if effective.limits.aja_steps > 0 {
@@ -706,24 +711,13 @@ fn execute_turn(
     if effective.limits.aja_timeout_ms > 0 {
         aja_limits.timeout_ms = effective.limits.aja_timeout_ms;
     }
-    let isolated = if effective.limits.slots > 1 {
-        Some(Arc::new(Worktrees::new(
-            &host.project_dir,
-            host.state_dir.join("worlds"),
-            &host.state_dir,
-            &startup,
-        )?))
-    } else {
-        None
-    };
-    let shared = Arc::new(Shared::new(
-        host.project_dir.clone(),
-        host.state_dir.clone(),
-    ));
-    let worlds: Arc<dyn Worlds> = match &isolated {
-        Some(worlds) => worlds.clone(),
-        None => shared.clone(),
-    };
+    let worlds = build_worlds(
+        &host.project_dir,
+        &host.state_dir,
+        &grant,
+        effective.limits.slots,
+        &startup,
+    );
     let worker = NativeWorker::new(
         std::env::current_exe()?,
         &ajas,
@@ -732,16 +726,12 @@ fn execute_turn(
         tools.clone() as Arc<dyn ToolGateway>,
     )?
     .with_limits(aja_limits)?
-    .with_worlds(worlds);
+    .with_worlds(worlds.clone());
     let records = RecordFiles::with_checkpoints(ajas, host.state_dir.join("checkpoints"));
-    let worlds: &dyn Worlds = match &isolated {
-        Some(worlds) => worlds.as_ref(),
-        None => shared.as_ref(),
-    };
     let ports = Ports {
         aja: Some(&records),
         capabilities: Some(&*tools),
-        worlds: Some(worlds),
+        worlds: Some(worlds.as_ref()),
     };
     let store = Store::new(&host.state_dir)?;
     let mut options = TurnOptions {
@@ -749,6 +739,7 @@ fn execute_turn(
         denials,
         focus,
         gesture,
+        workspaces: grant,
         cancelled: host.cancelled.clone(),
         ..TurnOptions::default()
     };
@@ -774,6 +765,47 @@ fn header_pairs(role: &RoleConfig) -> Vec<(String, String)> {
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+/// One backend per granted root. With parallel slots a git root gets isolated
+/// worktrees and any other root shares itself; with one slot every root is
+/// shared. The default root is the first grant, so a task that names nothing
+/// works where the host was started.
+pub fn build_worlds(
+    project: &Path,
+    state_dir: &Path,
+    grant: &[(String, String)],
+    slots: usize,
+    startup: &Control,
+) -> Arc<dyn Worlds> {
+    let mut roots: BTreeMap<PathBuf, Arc<dyn Worlds>> = BTreeMap::new();
+    for (index, (_, root)) in grant.iter().enumerate() {
+        let path = PathBuf::from(root)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(root));
+        if roots.contains_key(&path) {
+            continue;
+        }
+        let backend: Arc<dyn Worlds> = if slots > 1 {
+            match Worktrees::new(
+                &path,
+                state_dir.join("worlds").join(index.to_string()),
+                state_dir,
+                startup,
+            ) {
+                Ok(worlds) => Arc::new(worlds),
+                Err(_) => Arc::new(Shared::new(path.clone(), state_dir.to_path_buf())),
+            }
+        } else {
+            Arc::new(Shared::new(path.clone(), state_dir.to_path_buf()))
+        };
+        roots.insert(path, backend);
+    }
+    let default = roots
+        .get(project)
+        .cloned()
+        .unwrap_or_else(|| Arc::new(Shared::new(project.to_path_buf(), state_dir.to_path_buf())));
+    Arc::new(eja::adapters::WorkspaceWorlds::new(default, roots))
 }
 
 async fn get_raw(
@@ -821,7 +853,22 @@ async fn get_raw(
         })));
     }
     if let Some(relative) = address.strip_prefix("world:") {
-        let (content, bytes, truncated) = safe_file(&host.project_dir, relative, MAX_RAW)?;
+        let grant = host.settings.grant(
+            &host
+                .settings
+                .effective_current()
+                .unwrap_or_else(|_| host.settings.effective(StoredSettings::default()))
+                .settings,
+        );
+        let mut found = None;
+        for (_, root) in &grant {
+            if let Ok(view) = safe_file(Path::new(root), relative, MAX_RAW) {
+                found = Some(view);
+                break;
+            }
+        }
+        let (content, bytes, truncated) =
+            found.ok_or_else(|| ApiError::missing("not found in any granted workspace"))?;
         return Ok(Json(json!({
             "address": address,
             "kind": "text",

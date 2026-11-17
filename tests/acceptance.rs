@@ -20,6 +20,7 @@ fn run_steps() -> Vec<Decision> {
                 title: "ship".into(),
                 request: "ship it".into(),
                 acceptance: "it ships".into(),
+                workspace: None,
                 evidence: Some(json!({"tool": "checks", "arguments": {}})),
                 run: false,
             },

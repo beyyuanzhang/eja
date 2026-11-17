@@ -1,7 +1,6 @@
 use eja::{
     adapters::{
-        self, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, Shared,
-        ToolGateway, Worktrees, Worlds,
+        self, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolGateway,
     },
     turn_at_with_options, Assignment, Result, State, Store, Task, TaskStatus, TurnEnd, TurnOptions,
 };
@@ -167,28 +166,25 @@ fn run() -> Result<()> {
                 .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?;
             let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
             let project = std::env::current_dir()?;
-            let tools = Arc::new(HostTools::new(config.as_deref(), &project, &dir, &startup)?);
+            // The CLI shares the runtime's grant: the same settings file names
+            // the same workspaces, so a task opened here resolves like one
+            // opened over HTTP.
+            let settings = host::SettingsStore::new(project.clone(), dir.clone());
+            let stored = settings.read().unwrap_or_default();
+            let grant = settings.grant(&stored);
+            options.workspaces.clone_from(&grant);
+            let tools = Arc::new(
+                HostTools::new(config.as_deref(), &project, &dir, &startup)?
+                    .with_workspace_tools(stored.connectors.workspace_tools)
+                    .with_roots(grant.iter().map(|(_, root)| PathBuf::from(root)).collect()),
+            );
             let ajas = dir.join("ajas");
             let mut aja_limits = eja::aja::Limits::default();
             aja_limits.steps = Some(env("EJA_AJA_STEPS", eja::aja::DEFAULT_STEPS)?);
             aja_limits.timeout_ms = env("EJA_AJA_TIMEOUT_MS", aja_limits.timeout_ms)?;
             // Parallel slots need isolated worlds. Without one the host runs a
             // single shared world, so only one execution may hold it.
-            let isolated = if limits.slots > 1 {
-                Some(Arc::new(Worktrees::new(
-                    &project,
-                    dir.join("worlds"),
-                    &dir,
-                    &startup,
-                )?))
-            } else {
-                None
-            };
-            let shared = Arc::new(Shared::new(project.clone(), dir.clone()));
-            let worlds: Arc<dyn Worlds> = match &isolated {
-                Some(worlds) => worlds.clone(),
-                None => shared.clone(),
-            };
+            let worlds = host::build_worlds(&project, &dir, &grant, limits.slots, &startup);
             let worker = NativeWorker::new(
                 std::env::current_exe()?,
                 &ajas,
@@ -197,17 +193,12 @@ fn run() -> Result<()> {
                 tools.clone() as Arc<dyn ToolGateway>,
             )?
             .with_limits(aja_limits)?
-            .with_worlds(worlds);
+            .with_worlds(worlds.clone());
             let records = RecordFiles::with_checkpoints(ajas, dir.join("checkpoints"));
-            // A run always has a world: isolated when asked for, shared otherwise.
-            let worlds: &dyn Worlds = match &isolated {
-                Some(worlds) => worlds.as_ref(),
-                None => shared.as_ref(),
-            };
             let ports = Ports {
                 aja: Some(&records),
                 capabilities: Some(&*tools),
-                worlds: Some(worlds),
+                worlds: Some(worlds.as_ref()),
             };
             let outcome = turn_at_with_options(
                 &store,
@@ -270,6 +261,7 @@ fn run() -> Result<()> {
             let assignment = Assignment {
                 task_id: options.focus.unwrap_or(0),
                 objective: String::new(),
+                workspace: String::new(),
                 acceptance: String::new(),
                 input: String::new(),
                 resume: None,
@@ -444,6 +436,9 @@ fn print_task(task: &Task) {
         "  origin: {}\n  request: {}\n  acceptance: {}",
         task.origin, task.request, task.acceptance
     );
+    if !task.workspace.is_empty() {
+        println!("  workspace: {}", task.workspace);
+    }
     if let Some(run) = &task.run {
         if let Some(evidence) = &run.evidence {
             println!("  evidence: {evidence}");

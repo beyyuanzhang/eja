@@ -2,7 +2,7 @@
 
 mod support;
 
-use eja::adapters::{Ports, Shared, Worktrees, Worlds};
+use eja::adapters::{Ports, Shared, WorkspaceWorlds, Worktrees, Worlds};
 use eja::{turn_at_with_options, Action, Assignment, Control, Kind, TurnOptions, Worker};
 use std::path::PathBuf;
 use std::sync::{
@@ -53,6 +53,7 @@ fn open(index: u64) -> Action {
         title: format!("job {index}"),
         request: format!("request {index}"),
         acceptance: "it holds".into(),
+        workspace: None,
         evidence: None,
         run: false,
     }
@@ -171,7 +172,7 @@ fn a_worktree_world_is_settled_and_reconciled_explicitly() {
         &control,
     )
     .expect("worlds");
-    let world = worlds.reserve(1, &control).expect("reserve");
+    let world = worlds.reserve(1, None, &control).expect("reserve");
     assert!(world.root.join("base.txt").exists());
 
     std::fs::write(world.root.join("out.txt"), "result\n").unwrap();
@@ -185,7 +186,7 @@ fn a_worktree_world_is_settled_and_reconciled_explicitly() {
         "{settled}"
     );
 
-    let outcome = worlds.reconcile(1, &control).expect("reconcile");
+    let outcome = worlds.reconcile(1, None, &control).expect("reconcile");
     assert_eq!(outcome["merged"], serde_json::json!(true), "{outcome}");
     assert!(
         project.join("out.txt").exists(),
@@ -206,7 +207,7 @@ fn a_conflicting_world_is_reported_and_never_merged_silently() {
         &control,
     )
     .expect("worlds");
-    let world = worlds.reserve(2, &control).expect("reserve");
+    let world = worlds.reserve(2, None, &control).expect("reserve");
     std::fs::write(world.root.join("base.txt"), "from the run\n").unwrap();
     worlds.settle(&world, &control).expect("settle");
     // The shared world moved on in the meantime.
@@ -214,7 +215,7 @@ fn a_conflicting_world_is_reported_and_never_merged_silently() {
     git(&project, &["add", "-A"]);
     git(&project, &["commit", "--quiet", "-m", "host move"]);
 
-    let outcome = worlds.reconcile(2, &control).expect("reconcile");
+    let outcome = worlds.reconcile(2, None, &control).expect("reconcile");
     assert_eq!(outcome["merged"], serde_json::json!(false), "{outcome}");
     assert!(
         !outcome["conflicts"]
@@ -244,7 +245,7 @@ fn an_isolated_world_starts_at_the_commit_not_at_the_working_tree() {
         &control,
     )
     .expect("worlds");
-    let world = worlds.reserve(3, &control).expect("reserve");
+    let world = worlds.reserve(3, None, &control).expect("reserve");
     assert_eq!(
         std::fs::read_to_string(world.root.join("base.txt")).unwrap(),
         "one\n",
@@ -266,11 +267,11 @@ fn a_shared_world_needs_no_reconciliation() {
     let project = tree(&state);
     let shared = Shared::new(project.clone(), project.join(".eja"));
     let control = control();
-    let world = shared.reserve(1, &control).expect("reserve");
+    let world = shared.reserve(1, None, &control).expect("reserve");
     assert_eq!(world.root, project);
     let account = shared.settle(&world, &control).expect("settle");
     assert_eq!(account["change"], serde_json::json!("unchanged"));
-    let outcome = shared.reconcile(1, &control).expect("reconcile");
+    let outcome = shared.reconcile(1, None, &control).expect("reconcile");
     assert_eq!(outcome["merged"], serde_json::json!(true));
     shared.release(&world);
 }
@@ -379,8 +380,8 @@ fn two_state_directories_on_one_project_keep_separate_branches() {
         &control,
     )
     .expect("second instance");
-    let a = first.reserve(1, &control).expect("first reserve");
-    let b = second.reserve(1, &control).expect("second reserve");
+    let a = first.reserve(1, None, &control).expect("first reserve");
+    let b = second.reserve(1, None, &control).expect("second reserve");
     // Both instances reserved task 1. Each owns a branch of its own, so the
     // second reservation cannot resign the first instance's refs.
     let listed = std::process::Command::new("git")
@@ -407,14 +408,16 @@ fn the_shared_world_has_one_owner() {
     std::fs::create_dir_all(&project).unwrap();
     let shared = Shared::new(project, state.path().join(".eja"));
     let control = control();
-    let first = shared.reserve(1, &control).expect("first reservation");
+    let first = shared
+        .reserve(1, None, &control)
+        .expect("first reservation");
     // A second run may not write the same directory while the first holds it.
-    let second = shared.reserve(2, &control);
+    let second = shared.reserve(2, None, &control);
     assert!(second.is_err(), "a shared world has one owner");
     shared.settle(&first, &control).expect("settle");
     shared.release(&first);
     // Once settled, the world is free again.
-    let third = shared.reserve(3, &control).expect("after settlement");
+    let third = shared.reserve(3, None, &control).expect("after settlement");
     shared.release(&third);
 }
 
@@ -425,7 +428,7 @@ fn settling_a_world_twice_is_refused() {
     std::fs::create_dir_all(&project).unwrap();
     let shared = Shared::new(project, state.path().join(".eja"));
     let control = control();
-    let world = shared.reserve(1, &control).expect("reserve");
+    let world = shared.reserve(1, None, &control).expect("reserve");
     shared.settle(&world, &control).expect("settle");
     assert!(
         shared.settle(&world, &control).is_err(),
@@ -440,4 +443,193 @@ fn a_world_per_run_needs_a_git_project() {
     let refused = Worktrees::new(&dir, dir.join("worlds"), dir.join(".eja"), &control());
     let error = refused.err().expect("a plain directory cannot be forked");
     assert!(error.to_string().contains("git"), "{error}");
+}
+
+/// A worker that writes one marker into the world it was given, so a test can
+/// see which root a run actually held.
+struct Marker;
+
+impl Worker for Marker {
+    fn execute(&self, assignment: &Assignment, _: &Control) -> String {
+        let root = std::path::Path::new(&assignment.workspace);
+        std::fs::write(
+            root.join(format!("marker-{}.txt", assignment.task_id)),
+            "here\n",
+        )
+        .expect("marker");
+        format!(
+            "1 steps, 0 tool calls, ended: message\nmarked {}",
+            assignment.task_id
+        )
+    }
+}
+
+#[test]
+fn two_granted_workspaces_hold_their_own_roots_at_once() {
+    let state = State::new("two-roots");
+    let store = state.store();
+    let root = tree(&state);
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    std::fs::create_dir_all(&alpha).unwrap();
+    std::fs::create_dir_all(&beta).unwrap();
+    let worlds = Arc::new(Shared::new(alpha.clone(), root.join(".eja")));
+    let brain = Script::once(vec![
+        Action::OpenTask {
+            title: "in alpha".into(),
+            request: "mark alpha".into(),
+            acceptance: "marked".into(),
+            workspace: Some("alpha".into()),
+            evidence: None,
+            run: true,
+        },
+        Action::OpenTask {
+            title: "in beta".into(),
+            request: "mark beta".into(),
+            acceptance: "marked".into(),
+            workspace: Some("beta".into()),
+            evidence: None,
+            run: true,
+        },
+    ]);
+    let options = TurnOptions {
+        workspaces: vec![
+            ("default".into(), alpha.display().to_string()),
+            ("alpha".into(), alpha.display().to_string()),
+            ("beta".into(), beta.display().to_string()),
+        ],
+        limits: eja::TurnLimits {
+            slots: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let out = turn_at_with_options(
+        &store,
+        "mark both",
+        &brain,
+        &Marker,
+        &Ports {
+            worlds: Some(worlds.as_ref()),
+            ..Default::default()
+        },
+        eja::now_utc(),
+        &options,
+    )
+    .expect("turn");
+    assert_eq!(out.dispatched, vec![1, 2]);
+    assert!(
+        alpha.join("marker-1.txt").exists(),
+        "alpha holds its own run"
+    );
+    assert!(beta.join("marker-2.txt").exists(), "beta holds its own run");
+    assert!(!alpha.join("marker-2.txt").exists());
+    let tasks = out.context().tasks;
+    assert_eq!(tasks[0].workspace, alpha.display().to_string());
+    assert_eq!(tasks[1].workspace, beta.display().to_string());
+    // The root is fixed in the journal, not re-resolved from the grant.
+    let reopened = eja::State::load(&state.reopen()).expect("reload");
+    assert_eq!(
+        reopened.task(2).expect("task").workspace,
+        beta.display().to_string()
+    );
+}
+
+#[test]
+fn a_task_naming_an_ungranted_workspace_is_refused() {
+    let state = State::new("ungranted");
+    let store = state.store();
+    let brain = Script::once(vec![Action::OpenTask {
+        title: "elsewhere".into(),
+        request: "work elsewhere".into(),
+        acceptance: "done".into(),
+        workspace: Some("nowhere".into()),
+        evidence: None,
+        run: true,
+    }]);
+    let out = turn_at_with_options(
+        &store,
+        "go",
+        &brain,
+        &Marker,
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            workspaces: vec![("default".into(), "/tmp".into())],
+            ..Default::default()
+        },
+    )
+    .expect("turn");
+    assert!(out.dispatched.is_empty());
+    assert!(
+        out.context().tasks.is_empty(),
+        "no task opens on a refused name"
+    );
+    assert!(
+        out.context()
+            .refused
+            .iter()
+            .any(|note| note.contains("nowhere")),
+        "{:?}",
+        out.context().refused
+    );
+}
+
+#[test]
+fn each_granted_git_root_reconciles_into_its_own_project() {
+    let state = State::new("two-git-roots");
+    let root = tree(&state);
+    let control = control();
+    let mut projects = Vec::new();
+    let mut backends: std::collections::BTreeMap<PathBuf, Arc<dyn Worlds>> =
+        std::collections::BTreeMap::new();
+    for name in ["alpha", "beta"] {
+        let project = root.join(name);
+        std::fs::create_dir_all(&project).unwrap();
+        git(&project, &["init", "--quiet"]);
+        std::fs::write(project.join("base.txt"), "one\n").unwrap();
+        git(&project, &["add", "-A"]);
+        git(&project, &["commit", "--quiet", "-m", "base"]);
+        let worlds: Arc<dyn Worlds> = Arc::new(
+            Worktrees::new(
+                &project,
+                root.join(".eja/worlds").join(name),
+                root.join(".eja"),
+                &control,
+            )
+            .expect("worktrees"),
+        );
+        backends.insert(project.clone(), worlds);
+        projects.push(project);
+    }
+    let default = backends[&projects[0]].clone();
+    let worlds = WorkspaceWorlds::new(default, backends);
+    let first = worlds
+        .reserve(1, Some(&projects[0]), &control)
+        .expect("alpha");
+    let second = worlds
+        .reserve(2, Some(&projects[1]), &control)
+        .expect("beta");
+    std::fs::write(first.root.join("out.txt"), "alpha\n").unwrap();
+    std::fs::write(second.root.join("out.txt"), "beta\n").unwrap();
+    worlds.settle(&first, &control).expect("settle alpha");
+    worlds.settle(&second, &control).expect("settle beta");
+    let merged = worlds
+        .reconcile(1, Some(&projects[0]), &control)
+        .expect("reconcile alpha");
+    assert_eq!(merged["merged"], serde_json::json!(true), "{merged}");
+    let merged = worlds
+        .reconcile(2, Some(&projects[1]), &control)
+        .expect("reconcile beta");
+    assert_eq!(merged["merged"], serde_json::json!(true), "{merged}");
+    assert_eq!(
+        std::fs::read_to_string(projects[0].join("out.txt")).unwrap(),
+        "alpha\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(projects[1].join("out.txt")).unwrap(),
+        "beta\n"
+    );
+    worlds.release(&first);
+    worlds.release(&second);
 }

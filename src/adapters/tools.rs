@@ -66,6 +66,41 @@ pub fn workspace_path(root: &Path, name: &str) -> Result<PathBuf> {
     relative_file(root, name)
 }
 
+/// Resolve a path against several granted roots, first match wins.
+///
+/// An absolute path must stay inside one grant; a relative one is tried in
+/// each. This is the host's read boundary: every workspace it granted, and
+/// nothing else.
+pub fn granted_path(roots: &[PathBuf], name: &str) -> Result<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        for root in roots {
+            if let Ok(inside) = path.strip_prefix(root) {
+                return if inside.as_os_str().is_empty() {
+                    Ok(root.clone())
+                } else {
+                    relative_file(root, &inside.to_string_lossy())
+                };
+            }
+        }
+        return Err("absolute paths must stay inside a granted workspace".into());
+    }
+    // A relative name is tried in each root; a root that merely lacks the file
+    // does not end the search, but a traversal or symlink refusal does.
+    let mut missing = false;
+    for root in roots {
+        match relative_file(root, name) {
+            Ok(full) if full.exists() => return Ok(full),
+            Ok(_) => missing = true,
+            Err(error) => return Err(error),
+        }
+    }
+    if missing {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+    }
+    Err("path is outside every granted workspace".into())
+}
+
 pub struct FileTools;
 
 impl ToolGateway for FileTools {

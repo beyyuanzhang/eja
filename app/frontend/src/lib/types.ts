@@ -42,6 +42,7 @@ export interface Task {
   title: string;
   request: string;
   origin: string;
+  workspace: string;
   acceptance: string;
   status: TaskStatus;
   created_at: number;
@@ -114,6 +115,7 @@ export interface AppState {
   events: JournalEvent[];
   messages: Message[];
   tasks: Task[];
+  workspaces: { name: string; root: string }[];
   relations: Relation[];
   proposals: Proposal[];
   identity: Identity;
@@ -146,6 +148,7 @@ export interface SettingsView {
   runtimePath: string;
   stateDir: string;
   projectDir: string;
+  workspaces: Record<string, string>;
 }
 
 export interface ProviderView {
@@ -185,6 +188,7 @@ export interface KeyValueView {
 
 export interface ConnectorView {
   name: string;
+  builtin: boolean;
   mode: "command" | "url";
   command: string;
   url: string;
@@ -206,6 +210,7 @@ export interface KeyValueDraft {
 
 export interface ConnectorDraft {
   name: string;
+  builtin: boolean;
   mode: "command" | "url";
   command: string;
   url: string;

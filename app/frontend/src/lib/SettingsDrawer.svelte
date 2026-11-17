@@ -8,7 +8,9 @@
     FolderGit2,
     Gauge,
     LoaderCircle,
+    Plus,
     Settings2,
+    Trash2,
     X,
   } from "lucide-svelte";
   import { fade, fly } from "svelte/transition";
@@ -24,6 +26,11 @@
   } from "./types";
 
   type Section = "model" | "connectors" | "runtime" | "workspace";
+
+  interface WorkspaceDraft {
+    name: string;
+    path: string;
+  }
 
   interface Props {
     open: boolean;
@@ -43,6 +50,7 @@
     aja: { providerId: "", model: "" },
   });
   let connectors = $state<ConnectorDraft[]>([]);
+  let workspaces = $state<WorkspaceDraft[]>([]);
   let slots = $state(1);
   let turnTimeoutMs = $state(0);
   let ajaSteps = $state(0);
@@ -85,6 +93,7 @@
   function connectorDraft(value: ConnectorView): ConnectorDraft {
     return {
       name: value.name,
+      builtin: value.builtin,
       mode: value.mode,
       command: value.command,
       url: value.url,
@@ -111,6 +120,10 @@
       aja: { ...value.roles.aja },
     };
     connectors = value.connectors.servers.map(connectorDraft);
+    workspaces = Object.entries(value.workspaces).map(([name, path]) => ({
+      name,
+      path,
+    }));
     slots = value.limits.slots;
     turnTimeoutMs = value.limits.turnTimeoutMs;
     ajaSteps = value.limits.ajaSteps;
@@ -124,11 +137,34 @@
   }
 
   function serializeConnectors() {
-    return connectors.map((connector) => ({
-      ...connector,
-      env: connector.env.map((item) => ({ ...item })),
-      headers: connector.headers.map((item) => ({ ...item })),
-    }));
+    return connectors
+      .filter((connector) => !connector.builtin)
+      .map((connector) => ({
+        ...connector,
+        env: connector.env.map((item) => ({ ...item })),
+        headers: connector.headers.map((item) => ({ ...item })),
+      }));
+  }
+
+  function serializeWorkspaces() {
+    const entries: [string, string][] = [];
+    for (const item of workspaces) {
+      const name = item.name.trim();
+      const path = item.path.trim();
+      if (!name && !path) continue;
+      entries.push([name, path]);
+    }
+    return Object.fromEntries(entries);
+  }
+
+  function addWorkspace() {
+    workspaces = [...workspaces, { name: "", path: "" }];
+    markDirty();
+  }
+
+  function removeWorkspace(index: number) {
+    workspaces = workspaces.filter((_, itemIndex) => itemIndex !== index);
+    markDirty();
   }
 
   async function saveAll() {
@@ -145,8 +181,12 @@
         ...(provider.clearApiKey ? { clearApiKey: true } : {}),
       })),
       roles,
-      connectors: { servers: serializeConnectors() },
+      connectors: {
+        servers: serializeConnectors(),
+        workspaceTools: connectors.find((connector) => connector.builtin)?.enabled ?? true,
+      },
       limits: { slots, turnTimeoutMs, ajaSteps, ajaTimeoutMs },
+      workspaces: serializeWorkspaces(),
     });
     saving = false;
     if (ok) {
@@ -269,6 +309,51 @@
                     </button>
                   </div>
                 {/each}
+              </div>
+
+              <div class="ws-list">
+                <div class="ws-row">
+                  <code class="ws-name">default</code>
+                  <code class="ws-path">{settings?.projectDir ?? ""}</code>
+                  <span class="ws-slot"></span>
+                </div>
+                {#each workspaces as item, index}
+                  <div class="ws-row">
+                    <input
+                      class="ws-name"
+                      bind:value={item.name}
+                      oninput={markDirty}
+                      type="text"
+                      placeholder="name"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-label="工作区名"
+                    />
+                    <input
+                      class="ws-path"
+                      bind:value={item.path}
+                      oninput={markDirty}
+                      type="text"
+                      placeholder="/path/to/dir"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-label="工作区路径"
+                    />
+                    <button
+                      class="ws-remove"
+                      type="button"
+                      aria-label="移除工作区"
+                      onclick={() => removeWorkspace(index)}
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                {/each}
+
+                <button class="ws-add" type="button" onclick={addWorkspace}>
+                  <Plus size={13} />
+                  添加工作区
+                </button>
               </div>
             </div>
           {/if}
@@ -518,6 +603,89 @@
     color: var(--ink);
   }
 
+  .ws-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .ws-row {
+    display: grid;
+    grid-template-columns: minmax(110px, 0.6fr) minmax(170px, 1.4fr) 30px;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .ws-row input {
+    width: 100%;
+    height: 36px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    outline: 0;
+    background: var(--surface);
+    padding: 0 9px;
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 9px;
+  }
+
+  .ws-row input:focus {
+    border-color: rgba(189, 96, 66, 0.34);
+    box-shadow: 0 0 0 3px rgba(189, 96, 66, 0.055);
+  }
+
+  .ws-row input::placeholder {
+    color: var(--faint);
+  }
+
+  .ws-row code {
+    overflow: hidden;
+    padding: 0 9px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .ws-slot {
+    width: 30px;
+    height: 30px;
+  }
+
+  .ws-remove {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    flex: 0 0 30px;
+    place-items: center;
+    border-radius: 7px;
+    color: var(--faint);
+  }
+
+  .ws-remove:hover {
+    background: var(--danger-wash);
+    color: var(--danger);
+  }
+
+  .ws-add {
+    display: inline-flex;
+    height: 32px;
+    align-items: center;
+    align-self: flex-start;
+    gap: 5px;
+    margin-top: 1px;
+    padding: 0 9px;
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 9px;
+  }
+
+  .ws-add:hover {
+    background: var(--surface-2);
+    color: var(--ink-soft);
+  }
+
   :global(.spin) {
     animation: spin 0.9s linear infinite;
   }
@@ -581,6 +749,24 @@
       flex-basis: 60px;
       padding: 0 16px;
       padding-bottom: env(safe-area-inset-bottom);
+    }
+
+    .ws-row {
+      grid-template-columns: minmax(0, 1fr) 30px;
+    }
+
+    .ws-row .ws-name {
+      grid-column: 1;
+    }
+
+    .ws-row .ws-path {
+      grid-column: 1;
+    }
+
+    .ws-remove,
+    .ws-slot {
+      grid-column: 2;
+      grid-row: 1 / 3;
     }
   }
 </style>

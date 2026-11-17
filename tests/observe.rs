@@ -69,6 +69,7 @@ fn observing_a_read_only_tool_records_a_view() {
             title: "sky".into(),
             request: "check the sky".into(),
             acceptance: String::new(),
+            workspace: None,
             evidence: None,
             run: true,
         }]),
@@ -160,4 +161,58 @@ fn eja_can_observe_project_files_but_never_write() {
         .unwrap_err()
         .to_string()
         .contains("edits belong to ajas"));
+}
+
+#[test]
+fn the_host_reads_every_granted_workspace_and_nothing_else() {
+    use eja::adapters::HostTools;
+    let fixture = State::new("observe-grants");
+    let alpha = fixture.path().join("alpha");
+    let beta = fixture.path().join("beta");
+    let private = fixture.path().join("state");
+    std::fs::create_dir_all(&alpha).unwrap();
+    std::fs::create_dir_all(&beta).unwrap();
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::write(alpha.join("a.txt"), "in alpha").unwrap();
+    std::fs::write(beta.join("b.txt"), "in beta").unwrap();
+    std::fs::write(private.join("secret.txt"), "private").unwrap();
+    let host = HostTools::new(None, &alpha, &private, &control())
+        .expect("tools")
+        .with_roots(vec![alpha.clone(), beta.clone()]);
+    let value = Capabilities::observe(
+        &host,
+        "read_file",
+        &serde_json::json!({"path":"b.txt"}),
+        &control(),
+    )
+    .expect("a granted workspace is readable");
+    assert!(value.to_string().contains("in beta"));
+    let value = Capabilities::observe(
+        &host,
+        "read_file",
+        &serde_json::json!({"path": beta.join("b.txt").display().to_string()}),
+        &control(),
+    )
+    .expect("absolute paths inside a grant resolve");
+    assert!(value.to_string().contains("in beta"));
+    assert!(
+        Capabilities::observe(
+            &host,
+            "read_file",
+            &serde_json::json!({"path": private.join("secret.txt").display().to_string()}),
+            &control(),
+        )
+        .is_err(),
+        "the private state stays unreadable"
+    );
+    assert!(
+        Capabilities::observe(
+            &host,
+            "read_file",
+            &serde_json::json!({"path":"../state/secret.txt"}),
+            &control(),
+        )
+        .is_err(),
+        "traversal outside the grants is refused"
+    );
 }

@@ -550,3 +550,81 @@ fn a_denial_is_a_fact_and_the_question_stays_open() {
     assert!(confirmed.context().proposals.is_empty());
     assert!(State::load(&store).expect("state").commitments().is_empty());
 }
+
+#[test]
+fn a_correction_asks_nothing_and_withdraws_on_the_next_turn() {
+    let fixture = Fixture::new("correction-withdrawal");
+    let store = fixture.store();
+    let proposed = turn_at(
+        &store,
+        "call me mars",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "the user is mars".to_string(),
+        }])],
+    );
+    let question_id = proposed.context().proposals[0].id;
+
+    // The withdrawal is proposed with a reply in the same turn: a correction
+    // asks the user nothing, so the turn keeps its voice.
+    let brain = Script::new(vec![
+        decision(vec![Action::Propose {
+            kind: ProposalKind::Correction,
+            target_id: Some(question_id),
+            text: "the name was declined".to_string(),
+        }]),
+        Decision {
+            reply: "then I will not ask again".to_string(),
+            actions: vec![],
+            refused: vec![],
+        },
+    ]);
+    let withdrawn = eja::turn_at_with_options(
+        &store,
+        "never mind",
+        &brain,
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions::default(),
+    )
+    .expect("withdrawal turn");
+    assert_eq!(withdrawn.reply, "then I will not ask again");
+    let context = withdrawn.context();
+    let correction = context
+        .proposals
+        .iter()
+        .find(|proposal| proposal.kind == ProposalKind::Correction)
+        .expect("correction proposal");
+    assert!(
+        correction.approved,
+        "the host approved the withdrawal itself"
+    );
+    let correction_id = correction.id;
+    assert!(
+        context.proposals.iter().any(|p| p.id == question_id),
+        "the question stays open until the withdrawal is confirmed"
+    );
+
+    // No user approval is supplied: the host's own approval is in the journal.
+    let confirmed = turn_at(
+        &store,
+        "go on",
+        vec![decision(vec![Action::Confirm {
+            proposal_id: correction_id,
+        }])],
+    );
+    assert!(confirmed.context().proposals.is_empty());
+    assert!(State::load(&store).expect("state").commitments().is_empty());
+    let events = store.events().expect("events");
+    assert!(events.iter().any(|event| {
+        event.kind == Kind::ProposalRejected
+            && event
+                .data
+                .as_ref()
+                .and_then(|data| data.get("proposal_id"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(question_id)
+    }));
+}

@@ -12,6 +12,7 @@ fn interrupted_assignment_is_reconciled_without_duplicate_dispatch() {
         task_id: 1,
         objective: "do it".to_string(),
         issued_at: 100,
+        workspace: String::new(),
         acceptance: String::new(),
         input: String::new(),
         resume: None,

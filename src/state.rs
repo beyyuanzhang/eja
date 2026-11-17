@@ -259,6 +259,18 @@ impl State {
             .filter(|(approved_in, _)| *approved_in == turn)
             .map(|(_, proposal)| *proposal)
             .collect();
+        // A correction asks the user nothing, so the host's approval of it is
+        // not bound to one turn: it stands until the withdrawal is confirmed.
+        for proposal in &self.proposals {
+            if proposal.data.kind == ProposalKind::Correction
+                && self
+                    .approvals
+                    .iter()
+                    .any(|(approved_in, approved)| *approved == proposal.id && *approved_in <= turn)
+            {
+                out.push(proposal.id);
+            }
+        }
         out.sort_unstable();
         out.dedup();
         out
@@ -315,6 +327,19 @@ impl State {
         focus: Option<TaskId>,
         now: DateTime<Utc>,
     ) -> EjaContext<'a> {
+        self.project_with_workspaces(input, focus, now, &[])
+    }
+
+    /// The projection with the host's workspace grant: the names a task may
+    /// choose this turn. The fold itself keeps no configuration.
+    #[must_use]
+    pub fn project_with_workspaces<'a>(
+        &'a self,
+        input: &'a str,
+        focus: Option<TaskId>,
+        now: DateTime<Utc>,
+        workspaces: &'a [(String, String)],
+    ) -> EjaContext<'a> {
         let turn = self.turn();
         // The current input is separate from the conversation it belongs to.
         let history_before = self.events.last().map_or(0, |last| {
@@ -324,6 +349,7 @@ impl State {
         EjaContext {
             now: now.timestamp(),
             input,
+            workspaces,
             history: self
                 .events
                 .iter()
@@ -520,6 +546,7 @@ impl State {
             request: open.request.to_string(),
             origin: open.origin.to_string(),
             acceptance: open.acceptance.to_string(),
+            workspace: open.workspace.to_string(),
             status: TaskStatus::Open,
             created_at: event.at,
             assigned_at: None,
