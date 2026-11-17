@@ -232,7 +232,7 @@
 
   async function gesture(kind: "return" | "leave" | "alone") {
     if (!appState || pending || appState.health.turnInFlight) return;
-    await transmit("", { gesture: kind, restore: false, message: false });
+    await transmit("", { gesture: kind, restore: false, message: false, focus: null });
   }
 
   function setView(next: ViewName) {
