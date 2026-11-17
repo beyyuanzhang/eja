@@ -108,6 +108,19 @@ struct RawQuery {
     address: String,
 }
 
+/// The state query: a view's local busy flag and encounter bookmark. Without
+/// an anchor the loops are the return screen's; with one, the encounter's.
+#[derive(Deserialize, Default)]
+struct StateQuery {
+    #[serde(default)]
+    busy: String,
+    anchor: Option<u64>,
+    #[serde(rename = "taskId")]
+    task_id: Option<u64>,
+    #[serde(rename = "proposalId")]
+    proposal_id: Option<u64>,
+}
+
 pub fn serve(options: Options) -> eja::Result<()> {
     if options.port == 0 {
         return Err("--port must be between 1 and 65535".into());
@@ -257,11 +270,20 @@ pub fn serve(options: Options) -> eja::Result<()> {
     })
 }
 
-async fn get_state(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
-    Ok(Json(state_json(&host)))
+async fn get_state(
+    State(host): State<Arc<Host>>,
+    Query(query): Query<StateQuery>,
+) -> ApiResult<Json<Value>> {
+    let encounter = query.anchor.map(|anchor| state::Encounter {
+        anchor,
+        task: query.task_id,
+        proposal: query.proposal_id,
+    });
+    let busy = !matches!(query.busy.as_str(), "" | "0" | "false");
+    Ok(Json(state_json(&host, busy, encounter)))
 }
 
-fn state_json(host: &Host) -> Value {
+fn state_json(host: &Host, busy: bool, encounter: Option<state::Encounter>) -> Value {
     let journal = state::Journal::read(&host.state_dir);
     let effective = host
         .settings
@@ -285,7 +307,12 @@ fn state_json(host: &Host) -> Value {
         torn: journal.torn,
         turn_in_flight: host.turn_in_flight.load(Ordering::SeqCst),
     };
-    state::state_json(&journal, &health)
+    state::state_json(
+        &journal,
+        &health,
+        busy || host.turn_in_flight.load(Ordering::SeqCst),
+        encounter,
+    )
 }
 
 async fn get_settings(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
@@ -898,7 +925,7 @@ async fn get_raw(
 }
 
 async fn get_health(State(host): State<Arc<Host>>) -> Json<Value> {
-    Json(state_json(&host)["health"].clone())
+    Json(state_json(&host, false, None)["health"].clone())
 }
 
 async fn api_not_found() -> Response {

@@ -15,13 +15,8 @@
     sendTurn,
   } from "./lib/api";
   import {
-    coreLoops,
-    encounterLoops,
     parkedMatches,
-    presenceVoice,
     readParkedEncounter,
-    spokenSince,
-    sourceLoop,
     storeEncounter,
   } from "./lib/encounter";
   import type {
@@ -42,7 +37,6 @@
   let composerSeed = $state<ComposerSeed | null>(null);
   let parkedEncounter = $state<Encounter | null>(null);
   let encounter = $state<Encounter | null>(null);
-  let answeredProposals = $state<Set<number>>(new Set());
   let restoredParked = $state(false);
   let selectedTaskId = $state<number | null>(null);
   let raw = $state<RawRecord | null>(null);
@@ -56,19 +50,10 @@
   let stateFetch: Promise<void> | null = null;
 
   const busy = $derived(Boolean(pending || appState?.health.turnInFlight));
-  const presenceMessage = $derived.by(() => {
-    if (!appState || encounter) return null;
-    return presenceVoice(appState.messages, appState.events);
-  });
-  const loops = $derived(appState ? coreLoops(appState, busy) : []);
-  const actions = $derived(
-    appState && encounter ? encounterLoops(appState, encounter, busy) : [],
-  );
-  const encounterMessages = $derived(
-    appState && encounter
-      ? spokenSince(appState.messages, appState.events, encounter)
-      : [],
-  );
+  const presenceMessage = $derived(encounter ? null : (appState?.presence ?? null));
+  const loops = $derived(appState?.loops ?? []);
+  const actions = $derived(encounter ? (appState?.loops ?? []) : []);
+  const encounterMessages = $derived(appState?.spoken ?? []);
   const selectedTask = $derived(
     selectedTaskId == null
       ? null
@@ -103,7 +88,7 @@
     const quiet = options.quiet ?? false;
     stateFetch = (async () => {
       try {
-        appState = await fetchState();
+        appState = await fetchState({ busy, encounter });
         fatal = "";
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -121,9 +106,9 @@
   }
 
   function restoreIfUnsent(text: string, after: number) {
-    const recorded = appState?.messages.some(
-      (message) =>
-        message.id > after && message.role === "user" && message.text.trim() === text.trim(),
+    const recorded = appState?.events.some(
+      (event) =>
+        event.id > after && event.kind === "user" && event.text.trim() === text.trim(),
     );
     if (recorded) return false;
     composerSeed = { text, nonce: Date.now() };
@@ -132,7 +117,6 @@
 
   function resumeParked() {
     if (!parkedEncounter) return false;
-    answeredProposals = new Set();
     restoredParked = false;
     encounter = parkedEncounter;
     parkedEncounter = null;
@@ -142,7 +126,6 @@
 
   function beginEncounter(source: Partial<Encounter> = {}) {
     if (!appState) return false;
-    answeredProposals = new Set();
     restoredParked = false;
     encounter = {
       anchor: source.anchor ?? appState.lastEvent,
@@ -169,7 +152,6 @@
 
   function leaveEncounter() {
     if (!encounter || pending || appState?.health.turnInFlight) return;
-    answeredProposals = new Set();
     encounter = null;
     parkedEncounter = null;
     storeEncounter(null);
@@ -231,7 +213,6 @@
   }
 
   function approveProposal(id: number) {
-    answeredProposals = new Set([...answeredProposals, id]);
     void transmit("", {
       approvals: [id],
       restore: false,
@@ -240,7 +221,6 @@
   }
 
   function denyProposal(id: number) {
-    answeredProposals = new Set([...answeredProposals, id]);
     void transmit("", {
       denials: [id],
       restore: false,
@@ -327,7 +307,7 @@
 
   $effect(() => {
     if (!appState || !parkedEncounter || encounter || !restoredParked) return;
-    const source = sourceLoop(appState, parkedEncounter);
+    const source = appState.loops.some((loop) => parkedMatches(loop, parkedEncounter!));
     if (!source) {
       parkedEncounter = null;
       storeEncounter(null);
@@ -378,11 +358,7 @@
       <TalkView
         mode={encounter ? "encounter" : "ambient"}
         {loops}
-        actions={actions.filter(
-          (action) =>
-            action.kind !== "decision" ||
-            !answeredProposals.has(action.proposal.id),
-        )}
+        {actions}
         messages={encounterMessages}
         presence={presenceMessage}
         tasks={appState.tasks}

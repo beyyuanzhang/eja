@@ -77,9 +77,10 @@ export interface Health {
 
 export interface AppState {
   events: JournalEvent[];
-  messages: Message[];
   tasks: Task[];
-  proposals: Proposal[];
+  loops: OpenLoop[];
+  presence: Message | null;
+  spoken: Message[];
   lastEvent: number;
   health: Health;
 }

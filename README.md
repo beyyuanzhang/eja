@@ -85,6 +85,10 @@ Open <http://127.0.0.1:4173>. That is the only app address. The runtime's
 Any number of separately hosted frontends may use the same runtime. See
 [app/README.md](app/README.md).
 
+`app/macos` is a native SwiftUI frontend over the same HTTP contract. Build it
+with `app/macos/build.sh` and open `app/macos/dist/Eja.app`; the runtime stays
+separate.
+
 ## Facts and views
 
 - `log.jsonl` is the authority for identity, task lifecycles, graph edges,

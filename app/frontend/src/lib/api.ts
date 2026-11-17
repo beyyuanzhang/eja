@@ -2,6 +2,7 @@ import type {
   AppState,
   ConnectorDraft,
   ConnectorTestResult,
+  Encounter,
   ModelDiscoverResult,
   RawRecord,
   SettingsView,
@@ -26,8 +27,23 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-export function fetchState(): Promise<AppState> {
-  return request<AppState>("/api/state");
+export function fetchState(
+  options: { busy?: boolean; encounter?: Encounter | null } = {},
+): Promise<AppState> {
+  const query = new URLSearchParams();
+  if (options.busy) query.set("busy", "1");
+  if (options.encounter) {
+    query.set("anchor", String(options.encounter.anchor));
+    if (options.encounter.taskId != null) {
+      query.set("taskId", String(options.encounter.taskId));
+    }
+    if (options.encounter.proposalId != null) {
+      query.set("proposalId", String(options.encounter.proposalId));
+    }
+  }
+  const encoded = query.toString();
+  const suffix = encoded ? `?${encoded}` : "";
+  return request<AppState>(`/api/state${suffix}`);
 }
 
 export function fetchSettings(): Promise<SettingsView> {

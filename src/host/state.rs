@@ -4,9 +4,20 @@
 //! log, and this module only reads the raw lines (tolerating a torn tail) and
 //! renders that one state as the API's JSON. Semantics live in the core.
 
-use eja::{Event, Kind, RelationKind, State, Task};
+use eja::{
+    Event, Kind, OpenProposal, ProposalKind, RelationKind, State, Task, TaskKind, TaskStatus,
+};
 use serde_json::{json, Value};
 use std::{fs, path::Path};
+
+/// The view's local encounter bookmark. The runtime owns every derivation;
+/// the bookmark only says which exchange this view is looking at.
+#[derive(Clone, Copy, Default)]
+pub struct Encounter {
+    pub anchor: u64,
+    pub task: Option<u64>,
+    pub proposal: Option<u64>,
+}
 
 pub struct Journal {
     pub events: Vec<Event>,
@@ -136,55 +147,235 @@ fn task_json(state: &State, task: &Task) -> Value {
 }
 
 /// The API state: one core fold, serialized. Nothing here re-derives meaning.
-pub fn state_json(journal: &Journal, health: &Health) -> Value {
+pub fn state_json(
+    journal: &Journal,
+    health: &Health,
+    busy: bool,
+    encounter: Option<Encounter>,
+) -> Value {
     let state = State::fold(journal.events.clone());
     let events: Vec<Value> = journal
         .events
         .iter()
         .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
         .collect();
-    let messages: Vec<Value> = state
+    let tasks: Vec<Value> = state
+        .tasks()
+        .iter()
+        .map(|task| task_json(&state, task))
+        .collect();
+    let mut view = json!({
+        "events": events,
+        "tasks": &tasks,
+        "lastEvent": state.last_id(),
+        "health": health,
+        "presence": presence_voice(&state),
+    });
+    let loops = open_loops(&state, &tasks, busy);
+    let loops = match encounter {
+        None => loops,
+        Some(bookmark) => loops
+            .into_iter()
+            .filter(|item| in_encounter(item, &state, bookmark))
+            .collect(),
+    };
+    view["loops"] = Value::Array(loops);
+    view["spoken"] = encounter.map_or_else(
+        || Value::Array(Vec::new()),
+        |bookmark| spoken(&state, bookmark),
+    );
+    view
+}
+
+/// The exchange an encounter shows: what was said since its bookmark, without
+/// eja's inner voice. An eja message belongs to the conversation only when the
+/// user was present in its turn.
+fn spoken(state: &State, bookmark: Encounter) -> Value {
+    let present: Vec<u64> = state
         .events()
         .iter()
-        .filter(|event| matches!(event.kind, Kind::User | Kind::Eja))
-        .map(|event| {
+        .filter(|event| {
+            matches!(event.kind, Kind::User | Kind::Returned | Kind::Denial)
+                || (event.kind == Kind::Approval
+                    && event
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("source"))
+                        .and_then(Value::as_str)
+                        != Some("eja"))
+        })
+        .map(|event| event.turn)
+        .collect();
+    Value::Array(
+        state
+            .events()
+            .iter()
+            .filter(|event| event.id > bookmark.anchor)
+            .filter(|event| matches!(event.kind, Kind::User | Kind::Eja))
+            .filter(|event| event.kind == Kind::User || present.contains(&event.turn))
+            .map(|event| {
+                json!({
+                    "id": event.id,
+                    "role": event.kind.as_str(),
+                    "text": event.text,
+                    "at": event.at,
+                    "turn": event.turn,
+                    "data": event.data,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The return screen's voice: eja's own reply to the latest return, spoken
+/// only if it chose to speak on that turn. A later departure or alone turn
+/// means the user left; the voice rests until the next return.
+fn presence_voice(state: &State) -> Value {
+    let latest = state
+        .events()
+        .iter()
+        .rev()
+        .find(|event| matches!(event.kind, Kind::Returned | Kind::Departed | Kind::Alone));
+    let Some(latest) = latest.filter(|event| event.kind == Kind::Returned) else {
+        return Value::Null;
+    };
+    state
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind == Kind::Eja && event.turn == latest.turn && !event.text.trim().is_empty()
+        })
+        .map_or(Value::Null, |event| {
             json!({
                 "id": event.id,
-                "role": event.kind.as_str(),
+                "role": "eja",
                 "text": event.text,
                 "at": event.at,
                 "turn": event.turn,
                 "data": event.data,
             })
         })
-        .collect();
-    let tasks: Vec<Value> = state
-        .tasks()
-        .iter()
-        .map(|task| task_json(&state, task))
-        .collect();
-    let proposals: Vec<Value> = state
-        .proposals()
-        .iter()
-        .map(|proposal| {
-            json!({
-                "id": proposal.id,
-                "kind": proposal.data.kind,
-                "target_id": proposal.data.target_id,
-                "text": proposal.text,
-                "at": proposal.at,
-                "turn": proposal.turn,
-            })
-        })
-        .collect();
+}
+
+fn proposal_json(proposal: &OpenProposal) -> Value {
     json!({
-        "events": events,
-        "messages": messages,
-        "tasks": tasks,
-        "proposals": proposals,
-        "lastEvent": state.last_id(),
-        "health": health,
+        "id": proposal.id,
+        "kind": proposal.data.kind,
+        "target_id": proposal.data.target_id,
+        "text": proposal.text,
+        "at": proposal.at,
+        "turn": proposal.turn,
     })
+}
+
+fn loop_title(text: &str, id: u64) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(104).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else if head.is_empty() {
+        format!("#{id}")
+    } else {
+        head
+    }
+}
+
+fn task_loop(task: &Task, json: &Value, kind: &str) -> Value {
+    json!({
+        "key": format!("task:{}", task.id),
+        "kind": kind,
+        "eventId": task.event_ids.iter().max().copied().unwrap_or(task.id),
+        "at": task.reported_at.or(task.closed_at).or(task.assigned_at).unwrap_or(task.created_at),
+        "title": loop_title(&task.title, task.id),
+        "task": json,
+    })
+}
+
+/// A rejection or denial already answers the question; a correction withdraws
+/// rather than asks. Proposal ids are never re-asked.
+fn answered(proposal: &OpenProposal, state: &State) -> bool {
+    if proposal.data.kind == ProposalKind::Correction {
+        return true;
+    }
+    state.events().iter().any(|event| {
+        matches!(event.kind, Kind::ProposalRejected | Kind::Denial)
+            && event
+                .data
+                .as_ref()
+                .and_then(|data| data.get("proposal_id"))
+                .and_then(Value::as_u64)
+                == Some(proposal.id)
+    })
+}
+
+fn group_review(task: &Task, children: &[u64], tasks: &[Task]) -> bool {
+    task.kind == TaskKind::Group
+        && task.status == TaskStatus::Open
+        && !children.is_empty()
+        && children.iter().all(|id| {
+            tasks
+                .iter()
+                .find(|child| child.id == *id)
+                .is_some_and(|child| matches!(child.status, TaskStatus::Done | TaskStatus::Failed))
+        })
+}
+
+/// What still asks for the user: interrupted runs first, then decisions, then
+/// reviews; newest first inside a rank.
+fn open_loops(state: &State, tasks: &[Value], busy: bool) -> Vec<Value> {
+    let mut loops: Vec<(u8, i64, Value)> = Vec::new();
+    for proposal in state.proposals() {
+        if answered(proposal, state) {
+            continue;
+        }
+        loops.push((
+            1,
+            proposal.at,
+            json!({
+                "key": format!("proposal:{}", proposal.id),
+                "kind": "decision",
+                "eventId": proposal.id,
+                "at": proposal.at,
+                "title": loop_title(&proposal.text, proposal.id),
+                "proposal": proposal_json(proposal),
+            }),
+        ));
+    }
+    for (task, json) in state.tasks().iter().zip(tasks) {
+        let kind = if task.kind == TaskKind::Aja && task.status == TaskStatus::Waiting {
+            Some(("review", 2))
+        } else if task.status == TaskStatus::Running && !busy {
+            Some(("interrupted", 0))
+        } else if group_review(task, &children_of(state, task.id), state.tasks()) {
+            Some(("review", 2))
+        } else {
+            None
+        };
+        if let Some((kind, rank)) = kind {
+            let item = task_loop(task, json, kind);
+            let at = item["at"].as_i64().unwrap_or_default();
+            loops.push((rank, at, item));
+        }
+    }
+    loops.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    loops.into_iter().map(|(_, _, item)| item).collect()
+}
+
+fn in_encounter(item: &Value, state: &State, bookmark: Encounter) -> bool {
+    let boundary = state
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.kind == Kind::User && event.id > bookmark.anchor)
+        .map_or(bookmark.anchor, |event| event.id);
+    if item["eventId"].as_u64().unwrap_or_default() > boundary {
+        return true;
+    }
+    match item["kind"].as_str() {
+        Some("decision") => item["proposal"]["id"].as_u64() == bookmark.proposal,
+        _ => item["task"]["id"].as_u64() == bookmark.task,
+    }
 }
 
 pub fn journal_event(journal: &Journal, id: u64) -> Option<Value> {
@@ -209,7 +400,7 @@ pub fn journal_task(journal: &Journal, id: u64) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{journal_task, state_json, Health, Journal};
+    use super::{journal_task, state_json, Encounter, Health, Journal};
     use eja::{Event, Kind};
     use serde_json::{json, Value};
 
@@ -312,9 +503,17 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(&journal, &health());
+        let state = state_json(&journal, &health(), false, None);
 
-        assert_eq!(state["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            state["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event["kind"].as_str(), Some("user" | "eja")))
+                .count(),
+            2
+        );
         assert_eq!(state["events"].as_array().unwrap().len(), 9);
         assert_eq!(state["lastEvent"], 9);
         assert_eq!(state["tasks"][0]["children"], json!([2]));
@@ -330,6 +529,116 @@ mod tests {
         let raw = journal_task(&journal, 2).expect("task");
         assert_eq!(raw["task"]["title"], "build");
         assert_eq!(raw["events"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn the_return_voice_rests_after_a_departure() {
+        let journal = Journal {
+            events: vec![
+                event(1, 1, "eja", Kind::Returned, "", json!({})),
+                event(2, 1, "eja", Kind::Eja, "welcome back", json!({})),
+                event(3, 2, "eja", Kind::Departed, "", json!({})),
+            ],
+            error: None,
+            torn: false,
+        };
+        let state = state_json(&journal, &health(), false, None);
+        assert_eq!(state["presence"], Value::Null);
+        let journal = Journal {
+            events: vec![
+                event(1, 1, "eja", Kind::Returned, "", json!({})),
+                event(2, 1, "eja", Kind::Eja, "welcome back", json!({})),
+            ],
+            error: None,
+            torn: false,
+        };
+        let state = state_json(&journal, &health(), false, None);
+        assert_eq!(state["presence"]["text"], "welcome back");
+    }
+
+    #[test]
+    fn loops_answer_once_and_sort_by_need() {
+        let journal = Journal {
+            events: vec![
+                event(1, 1, "eja", Kind::User, "do it", json!({})),
+                event(
+                    2,
+                    1,
+                    "eja",
+                    Kind::Proposal,
+                    "may I rename you",
+                    json!({"kind": "commitment", "target_id": null}),
+                ),
+                event(3, 2, "eja", Kind::Denial, "", json!({"proposal_id": 2})),
+                event(
+                    4,
+                    3,
+                    "eja",
+                    Kind::Proposal,
+                    "a second question",
+                    json!({"kind": "goal", "target_id": null}),
+                ),
+                event(
+                    5,
+                    3,
+                    "task:7",
+                    Kind::TaskOpened,
+                    "build",
+                    json!({"kind": "aja", "title": "build", "request": "r", "origin": "user", "acceptance": "a"}),
+                ),
+                event(
+                    6,
+                    3,
+                    "task:7",
+                    Kind::TaskAssigned,
+                    "",
+                    json!({"task_id": 7}),
+                ),
+                event(7, 3, "task:7", Kind::WorkerReport, "done", json!({})),
+            ],
+            error: None,
+            torn: false,
+        };
+        let state = state_json(&journal, &health(), false, None);
+        let loops = state["loops"].as_array().unwrap();
+        assert_eq!(loops.len(), 2, "{loops:?}");
+        assert_eq!(loops[0]["kind"], "decision");
+        assert_eq!(loops[0]["proposal"]["id"], 4);
+        assert_eq!(loops[1]["kind"], "review");
+        // A running task with no turn in flight is an interrupted loop.
+        let running = Journal {
+            events: journal
+                .events
+                .iter()
+                .filter(|event| event.id != 7)
+                .cloned()
+                .collect(),
+            error: None,
+            torn: false,
+        };
+        let state = state_json(&running, &health(), false, None);
+        let loops = state["loops"].as_array().unwrap();
+        assert_eq!(loops[0]["kind"], "interrupted");
+        let state = state_json(&running, &health(), true, None);
+        assert!(state["loops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["kind"] != "interrupted"));
+        // The encounter bookmark keeps its own decision and newer events.
+        let state = state_json(
+            &journal,
+            &health(),
+            false,
+            Some(Encounter {
+                anchor: 3,
+                task: None,
+                proposal: Some(4),
+            }),
+        );
+        let loops = state["loops"].as_array().unwrap();
+        assert!(loops.iter().any(|item| item["proposal"]["id"] == 4));
+        assert!(loops.iter().any(|item| item["kind"] == "review"));
     }
 
     #[test]
