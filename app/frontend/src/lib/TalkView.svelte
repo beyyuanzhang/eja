@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ArrowUp, Check, ChevronRight } from "lucide-svelte";
+  import { ArrowUp, Check, ChevronRight, X } from "lucide-svelte";
   import { tick } from "svelte";
   import { fade } from "svelte/transition";
   import Markdown from "./Markdown.svelte";
@@ -28,6 +28,7 @@
     onOpenLoop: (loop: OpenLoop) => void;
     onSend: (text: string) => void;
     onApprove: (proposalId: number) => void;
+    onDeny: (proposalId: number) => void;
     onInspectTask: (task: Task) => void;
     onBye: () => void;
   }
@@ -47,6 +48,7 @@
     onOpenLoop,
     onSend,
     onApprove,
+    onDeny,
     onInspectTask,
     onBye,
   }: Props = $props();
@@ -221,16 +223,28 @@
               {#if action.kind === "decision"}
                 <section class="action-panel decision" aria-label="proposal">
                   <p class="action-copy">{action.proposal.text}</p>
-                  <button
-                    class="approve"
-                    type="button"
-                    aria-label="approve"
-                    title="approve"
-                    disabled={pending}
-                    onclick={() => onApprove(action.proposal.id)}
-                  >
-                    <Check size={16} strokeWidth={1.8} />
-                  </button>
+                  <span class="decision-tools">
+                    <button
+                      class="deny"
+                      type="button"
+                      aria-label="deny"
+                      title="deny"
+                      disabled={pending}
+                      onclick={() => onDeny(action.proposal.id)}
+                    >
+                      <X size={15} strokeWidth={1.8} />
+                    </button>
+                    <button
+                      class="approve"
+                      type="button"
+                      aria-label="approve"
+                      title="approve"
+                      disabled={pending}
+                      onclick={() => onApprove(action.proposal.id)}
+                    >
+                      <Check size={16} strokeWidth={1.8} />
+                    </button>
+                  </span>
                 </section>
               {:else if action.kind === "review" || action.kind === "interrupted"}
                 <section class="action-panel task" aria-label={action.kind}>
@@ -579,6 +593,7 @@
   }
 
   .approve,
+  .deny,
   .inspect {
     display: inline-flex;
     align-items: center;
@@ -615,6 +630,29 @@
   }
 
   .approve:disabled {
+    opacity: 0.45;
+  }
+
+  .decision-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .deny {
+    width: 34px;
+    height: 34px;
+    border: 1px solid var(--line);
+    background: transparent;
+  }
+
+  .deny:hover:not(:disabled) {
+    background: var(--surface-2);
+    color: var(--ink);
+    transform: translateY(-1px);
+  }
+
+  .deny:disabled {
     opacity: 0.45;
   }
 

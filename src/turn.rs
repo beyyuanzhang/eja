@@ -34,7 +34,7 @@ pub struct TurnOutcome<'a> {
     state: State,
     /// The input this turn was about, borrowed from the caller like every other
     /// text a view shows.
-    input: &'a str,
+    input: std::borrow::Cow<'a, str>,
     focus: Option<TaskId>,
     now: chrono::DateTime<chrono::Utc>,
 }
@@ -43,7 +43,7 @@ impl TurnOutcome<'_> {
     /// `C = view(S, input)`: the projection of the state this turn ended with.
     #[must_use]
     pub fn context(&self) -> EjaContext<'_> {
-        self.state.project(self.input, self.focus, self.now)
+        self.state.project(&self.input, self.focus, self.now)
     }
 }
 
@@ -209,10 +209,61 @@ fn confirm_proposal(
             "confirm refused: the target of proposal {proposal_id} is no longer active"
         )));
     }
+    // A correction withdraws; it never establishes. Against a proposal it is a
+    // rejection; against an identity fact it closes the target and keeps the
+    // reason as a correction record, not as a new commitment or goal.
+    if proposal.kind == ProposalKind::Correction {
+        let target = proposal.target_id.expect("correction carries a target");
+        let reason = proposal.text.to_string();
+        let target_is_proposal = state
+            .pending_proposals(turn)
+            .iter()
+            .any(|pending| pending.id == target);
+        if target_is_proposal {
+            let note = reject_proposal(store, state, target, &reason, turn, at)?;
+            if note.is_none() {
+                commit(
+                    store,
+                    state,
+                    Kind::ProposalRejected,
+                    "eja",
+                    "",
+                    turn,
+                    EventMeta::data(
+                        at,
+                        serde_json::json!({"proposal_id": proposal_id, "note": reason}),
+                    ),
+                )?;
+            }
+            return Ok(note);
+        }
+        commit(
+            store,
+            state,
+            Kind::Correction,
+            "eja",
+            &reason,
+            turn,
+            EventMeta {
+                at,
+                closes: Some(target),
+                data: Some(serde_json::json!({"proposal_id": proposal_id})),
+            },
+        )?;
+        commit(
+            store,
+            state,
+            Kind::ProposalConfirmed,
+            "eja",
+            "",
+            turn,
+            EventMeta::data(at, serde_json::json!({"proposal_id": proposal_id})),
+        )?;
+        return Ok(None);
+    }
     // One event both establishes the replacement and closes its predecessor.
-    // A Correction has no replacement: it only withdraws its target. The text is
-    // borrowed from the fold, which the commit below needs mutably, so it is
-    // taken before the commit — the event owns its text anyway.
+    // The text is borrowed from the fold, which the commit below needs mutably,
+    // so it is taken before the commit — the event owns its text anyway.
     let text = proposal.text.to_string();
     commit(
         store,
@@ -1013,11 +1064,18 @@ pub fn turn_at_with_options<'i>(
     if situation.is_some() && !options.approvals.is_empty() {
         return Err("a situation carries no approvals".into());
     }
+    if situation.is_some() && !options.denials.is_empty() {
+        return Err("a situation carries no denials".into());
+    }
     if situation.is_some() && options.focus.is_some() {
         return Err("a situation carries no focus".into());
     }
-    if input.trim().is_empty() && options.approvals.is_empty() && situation.is_none() {
-        return Err("a turn needs text, an approval or a situation".into());
+    if input.trim().is_empty()
+        && options.approvals.is_empty()
+        && options.denials.is_empty()
+        && situation.is_none()
+    {
+        return Err("a turn needs text, an approval, a denial or a situation".into());
     }
     if situation.is_none() && !input.trim().is_empty() {
         commit(
@@ -1041,15 +1099,43 @@ pub fn turn_at_with_options<'i>(
             EventMeta::new(at),
         )?;
     }
-    let input = if situation.is_some() {
+    let input: std::borrow::Cow<'i, str> = if situation.is_some() {
         match situation {
-            Some(Kind::Returned) => "user returned",
-            Some(Kind::Departed) => "user departed",
-            Some(Kind::Alone) => "alone; time passes",
-            _ => "",
+            Some(Kind::Returned) => "user returned".into(),
+            Some(Kind::Departed) => "user departed".into(),
+            Some(Kind::Alone) => "alone; time passes".into(),
+            _ => "".into(),
         }
+    } else if input.trim().is_empty()
+        && (!options.approvals.is_empty() || !options.denials.is_empty())
+    {
+        // The user's answer is this turn's input: a fact, not invented words.
+        let mut parts = Vec::new();
+        if !options.approvals.is_empty() {
+            parts.push(format!(
+                "user approved proposal(s) {}",
+                options
+                    .approvals
+                    .iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !options.denials.is_empty() {
+            parts.push(format!(
+                "user denied proposal(s) {}",
+                options
+                    .denials
+                    .iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        parts.join("; ").into()
     } else {
-        input
+        input.into()
     };
     // An approval is a fact, not a caller's flag: it is recorded once, with the
     // turn it authorizes, and every later read comes from the journal.
@@ -1058,6 +1144,22 @@ pub fn turn_at_with_options<'i>(
             store,
             &mut state,
             Kind::Approval,
+            "eja",
+            "",
+            turn_no,
+            EventMeta::data(
+                at,
+                serde_json::json!({"proposal_id": proposal_id, "source": "host"}),
+            ),
+        )?;
+    }
+    // A denial is the user's answer, recorded like an approval: the proposal
+    // stays pending until EJA itself withdraws or re-asks.
+    for proposal_id in &options.denials {
+        commit(
+            store,
+            &mut state,
+            Kind::Denial,
             "eja",
             "",
             turn_no,
@@ -1082,7 +1184,7 @@ pub fn turn_at_with_options<'i>(
     });
     let ctx = ActionCtx {
         store,
-        input,
+        input: &input,
         turn: turn_no,
         at,
         worker,
@@ -1110,7 +1212,7 @@ pub fn turn_at_with_options<'i>(
         // this decision: the actions that follow commit facts, which needs the
         // fold mutably.
         let decision = {
-            let context = state.project(input, focus, now);
+            let context = state.project(&input, focus, now);
             brain.decide(&context, &control)
         };
         if let Err(error) = control.check() {
@@ -1185,6 +1287,16 @@ pub fn turn_at_with_options<'i>(
         meta.data = Some(serde_json::json!({"end": end, "reason": reason}));
     }
     recover_state(store, &mut state, turn_no, at)?;
+    // A turn that asks the user a question delivers the question, not a reply:
+    // the answer comes first, and EJA speaks to it in the turn the answer opens.
+    // The model's text for this turn stays its monologue.
+    let fresh_question = state
+        .pending_proposals(turn_no)
+        .iter()
+        .any(|proposal| proposal.turn == turn_no);
+    if fresh_question && end == TurnEnd::Complete {
+        reply = String::new();
+    }
     commit(store, &mut state, Kind::Eja, "eja", &reply, turn_no, meta)?;
     Ok(TurnOutcome {
         reply,

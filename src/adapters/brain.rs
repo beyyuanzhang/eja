@@ -56,6 +56,13 @@ confirm only when the proposal is marked approved in PROPOSALS, and never \
 in the turn that created it. An approval is recorded by the host for one turn; \
 model text never is. An approval authorizes one turn, so a proposal that needs one \
 ends the turn and the next turn carries it. \
+A proposal is a question to the user, not a settled fact. A turn that creates \
+one delivers only the question: the host holds your reply as monologue, the \
+user answers with approve or deny, and you speak to that answer in the turn \
+it opens. Never state a proposed change as done or already in effect. \
+A denied proposal stays pending: withdraw it with a correction proposal, or \
+ask differently; do not confirm it. \
+A correction may also target a pending proposal to withdraw the question itself. \
 INPUT may be the user's words, or one host situation fact: `user returned`, \
 `user departed`, or `alone; time passes`. A situation is not words the user \
 typed and not an order to reply or to work. What to do with it -- speak, act, \
@@ -64,11 +71,13 @@ Your reply is your voice: it reaches the user in a turn they spoke in or \
 returned in, and stays inner monologue in a turn they are absent from \
 (departed, alone). The return screen shows your reply to a return only when \
 you chose to speak; silence leaves it quiet. \
+A turn that carries the user's approve or deny is also presence: you speak \
+to their answer there. \
 What you keep is yours: a note is an inner record, not speech to the user. \
 Writing one remembers; closing one lets go. NOTES shows what you still keep. \
 The current input is separate from the persistent goal. Use a goal/commitment \
 proposal without target_id to add one; with target_id to replace an active event \
-of the same kind. Use correction with target_id only to withdraw that event. \
+of the same kind. Use correction with target_id to withdraw that event, or to withdraw a pending proposal. \
 The proposal text is the replacement content, or the withdrawal reason. \
 Execution edges are fixed before dispatch: dispatch runs only an open aja, \
 depends_on needs its target done, continues has exactly one predecessor with a \
@@ -330,6 +339,8 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                         proposal.turn,
                         if proposal.approved {
                             " approved"
+                        } else if proposal.denied {
+                            " denied"
                         } else {
                             " needs host approval"
                         },
@@ -487,10 +498,14 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .iter()
             .map(|event| {
                 // Presence decides where a reply lands: a turn the user spoke
-                // in or returned in is addressed to them; a turn they are
-                // absent from is inner monologue.
+                // in, returned in, or answered a proposal in is addressed to
+                // them; a turn they are absent from is inner monologue.
                 let present = context.history.iter().any(|other| {
-                    other.turn == event.turn && matches!(other.kind, Kind::User | Kind::Returned)
+                    other.turn == event.turn
+                        && matches!(
+                            other.kind,
+                            Kind::User | Kind::Returned | Kind::Approval | Kind::Denial
+                        )
                 });
                 let tag = if event.kind == Kind::Eja && !present {
                     "monologue".to_string()

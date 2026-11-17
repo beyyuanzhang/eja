@@ -33,6 +33,9 @@ pub enum Kind {
     /// A host-recorded approval of one pending proposal, for this turn. Approval
     /// is a fact like any other, never a caller's flag.
     Approval,
+    /// The user declined one pending proposal. Like approval, a fact about the
+    /// user's answer, never inferred from model output.
+    Denial,
     /// The host noticed the user returned to the foreground. It is a fact about
     /// presence, not a message: it authorizes nothing and says no words.
     Returned,
@@ -75,6 +78,7 @@ impl Kind {
             Self::TaskClosed => "task_closed",
             Self::Observed => "observed",
             Self::Approval => "approval",
+            Self::Denial => "denial",
             Self::Returned => "returned",
             Self::Departed => "departed",
             Self::Alone => "alone",
@@ -119,6 +123,9 @@ pub struct ProposalView<'a> {
     pub turn: u64,
     /// True when the host recorded an approval for this turn.
     pub approved: bool,
+    /// True when the user declined this proposal; it stays pending so EJA can
+    /// withdraw it or ask differently.
+    pub denied: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -664,6 +671,8 @@ impl TurnLimits {
 pub struct TurnOptions {
     /// Approval is supplied by the host, never inferred from model output.
     pub approvals: Vec<u64>,
+    /// The user's declines, supplied by the host like approvals.
+    pub denials: Vec<u64>,
     pub focus: Option<TaskId>,
     /// One host situation fact opening this turn: `Returned`, `Departed` or
     /// `Alone`. The host validates the variant; nothing else may enter here.
@@ -752,6 +761,7 @@ mod tests {
             Kind::TaskClosed,
             Kind::Observed,
             Kind::Approval,
+            Kind::Denial,
             Kind::Returned,
             Kind::Departed,
             Kind::Alone,

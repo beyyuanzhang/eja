@@ -145,7 +145,9 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
     ]);
     let out = reading(&store, "inspect", &brain, &Done::default());
     assert_eq!(out.decisions, 5);
-    assert_eq!(out.reply, "final answer");
+    // the turn ends on an unanswered question: the question goes first, the
+    // report waits for the answer's turn
+    assert!(out.reply.is_empty());
     assert_ne!(out.end, eja::TurnEnd::Stalled);
     assert_eq!(out.context().focus.unwrap(), 1);
     let context = out.context();
@@ -195,6 +197,13 @@ fn interleaved_reads_preserve_focus_evidence_and_mixed_state_writes() {
             .count(),
         1
     );
+    let next = reading(
+        &store,
+        "go on",
+        &Script::new(vec![answer("final answer", vec![])]),
+        &Done::default(),
+    );
+    assert_eq!(next.reply, "final answer");
 }
 
 #[test]

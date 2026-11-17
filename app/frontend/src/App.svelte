@@ -18,10 +18,10 @@
   import {
     ambientLoops,
     encounterLoops,
-    messagesSince,
     parkedMatches,
     presenceVoice,
     readParkedEncounter,
+    spokenSince,
     sourceLoop,
     storeEncounter,
   } from "./lib/encounter";
@@ -46,6 +46,8 @@
   let composerSeed = $state<ComposerSeed | null>(null);
   let parkedEncounter = $state<Encounter | null>(null);
   let encounter = $state<Encounter | null>(null);
+  let answeredProposals = $state<Set<number>>(new Set());
+  let restoredParked = $state(false);
   let selectedTaskId = $state<number | null>(null);
   let raw = $state<RawRecord | null>(null);
   let settingsOpen = $state(false);
@@ -67,7 +69,9 @@
     appState && encounter ? encounterLoops(appState, encounter, busy) : [],
   );
   const encounterMessages = $derived(
-    appState && encounter ? messagesSince(appState.messages, encounter) : [],
+    appState && encounter
+      ? spokenSince(appState.messages, appState.events, encounter)
+      : [],
   );
   const selectedTask = $derived(
     selectedTaskId == null
@@ -140,6 +144,8 @@
 
   function resumeParked() {
     if (!parkedEncounter) return false;
+    answeredProposals = new Set();
+    restoredParked = false;
     encounter = parkedEncounter;
     parkedEncounter = null;
     storeEncounter(encounter);
@@ -148,6 +154,8 @@
 
   function beginEncounter(source: Partial<Encounter> = {}) {
     if (!appState) return false;
+    answeredProposals = new Set();
+    restoredParked = false;
     encounter = {
       anchor: source.anchor ?? appState.lastEvent,
       startedAt: source.startedAt ?? Math.floor(Date.now() / 1000),
@@ -176,6 +184,7 @@
 
   function leaveEncounter() {
     if (!encounter || pending || appState?.health.turnInFlight) return;
+    answeredProposals = new Set();
     encounter = null;
     parkedEncounter = null;
     storeEncounter(null);
@@ -187,6 +196,7 @@
     text: string,
     options: {
       approvals?: number[];
+    denials?: number[];
       focus?: number | null;
       restore?: boolean;
       message?: boolean;
@@ -210,6 +220,7 @@
       const result = await sendTurn(text, {
         focus: turnFocus,
         approvals: options.approvals ?? [],
+        denials: options.denials ?? [],
         gesture: options.gesture,
       });
       await refreshState({ quiet: true });
@@ -240,8 +251,18 @@
   }
 
   function approveProposal(id: number) {
+    answeredProposals = new Set([...answeredProposals, id]);
     void transmit("", {
       approvals: [id],
+      restore: false,
+      message: false,
+    });
+  }
+
+  function denyProposal(id: number) {
+    answeredProposals = new Set([...answeredProposals, id]);
+    void transmit("", {
+      denials: [id],
       restore: false,
       message: false,
     });
@@ -311,6 +332,7 @@
 
   onMount(() => {
     parkedEncounter = readParkedEncounter();
+    restoredParked = parkedEncounter != null;
     void refreshState().then(() => {
       if (!encounter && !busy) void gesture("return");
     });
@@ -328,11 +350,12 @@
   });
 
   $effect(() => {
-    if (!appState || !parkedEncounter || encounter) return;
+    if (!appState || !parkedEncounter || encounter || !restoredParked) return;
     const source = sourceLoop(appState, parkedEncounter);
     if (!source) {
       parkedEncounter = null;
       storeEncounter(null);
+      restoredParked = false;
     }
   });
 
@@ -417,7 +440,11 @@
           <TalkView
             mode={encounter ? "encounter" : "ambient"}
             {loops}
-            {actions}
+            actions={actions.filter(
+              (action) =>
+                action.kind !== "decision" ||
+                !answeredProposals.has(action.proposal.id),
+            )}
             messages={encounterMessages}
             presence={presenceMessage}
             tasks={appState.tasks}
@@ -429,6 +456,7 @@
             onOpenLoop={openLoop}
             onSend={(text) => void transmit(text)}
             onApprove={approveProposal}
+            onDeny={denyProposal}
             onInspectTask={inspectTask}
             onBye={leaveEncounter}
           />

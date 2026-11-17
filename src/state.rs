@@ -62,6 +62,9 @@ pub struct State {
     proposals: Vec<OpenProposal>,
     /// `(turn, proposal)` pairs the host approved.
     approvals: Vec<(u64, u64)>,
+    /// Proposals the user declined; the fact lives in the journal, the fold
+    /// only needs the ids.
+    denials: Vec<u64>,
     /// The highest task id this log has allocated, decodable or not.
     last_task_id: TaskId,
 }
@@ -274,17 +277,27 @@ impl State {
                 created_at: proposal.at,
                 turn: proposal.turn,
                 approved: approved.contains(&proposal.id),
+                denied: self.denials.contains(&proposal.id),
             })
             .collect()
     }
 
     /// A proposal may only name an active identity fact of its own kind: a
-    /// correction withdraws its target, a goal or commitment replaces it.
+    /// correction withdraws its target, a goal or commitment replaces it. A
+    /// correction may also withdraw a still-pending proposal.
     #[must_use]
     pub fn valid_proposal_target(&self, kind: ProposalKind, target_id: Option<u64>) -> bool {
         let Some(target_id) = target_id else {
             return kind != ProposalKind::Correction;
         };
+        if kind == ProposalKind::Correction
+            && self
+                .proposals
+                .iter()
+                .any(|proposal| proposal.id == target_id)
+        {
+            return true;
+        }
         !self.closed.contains(&target_id)
             && self.events.iter().any(|event| {
                 event.id == target_id
@@ -317,7 +330,13 @@ impl State {
                 .filter(|event| {
                     matches!(
                         event.kind,
-                        Kind::User | Kind::Eja | Kind::Returned | Kind::Departed | Kind::Alone
+                        Kind::User
+                            | Kind::Eja
+                            | Kind::Returned
+                            | Kind::Departed
+                            | Kind::Alone
+                            | Kind::Approval
+                            | Kind::Denial
                     )
                 })
                 .filter(|event| event.turn < history_before)
@@ -391,6 +410,11 @@ impl State {
             Kind::Approval => {
                 if let Some(id) = proposal_of(event) {
                     self.approvals.push((event.turn, id));
+                }
+            }
+            Kind::Denial => {
+                if let Some(id) = proposal_of(event) {
+                    self.denials.push(id);
                 }
             }
             Kind::TaskOpened => self.opened(event),

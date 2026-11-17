@@ -95,6 +95,8 @@ struct TurnRequest {
     #[serde(default)]
     approvals: Vec<u64>,
     #[serde(default)]
+    denials: Vec<u64>,
+    #[serde(default)]
     gesture: Option<String>,
 }
 
@@ -209,7 +211,8 @@ pub fn serve(options: Options) -> eja::Result<()> {
                 let pulse = pulse_host.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let _reset = TurnFlag(&pulse.turn_in_flight);
-                    let _ = execute_turn(&pulse, "", None, Vec::new(), Some(Kind::Alone));
+                    let _ =
+                        execute_turn(&pulse, "", None, Vec::new(), Vec::new(), Some(Kind::Alone));
                 })
                 .await;
             }
@@ -592,6 +595,7 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
     let turn: TurnRequest = serde_json::from_value(body)?;
     let text = turn.text.trim();
     let approvals: Vec<u64> = turn.approvals.into_iter().filter(|id| *id > 0).collect();
+    let denials: Vec<u64> = turn.denials.into_iter().filter(|id| *id > 0).collect();
     let gesture = match turn.gesture.as_deref() {
         None | Some("") => None,
         Some("return") => Some(Kind::Returned),
@@ -599,14 +603,17 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
         Some("alone") => Some(Kind::Alone),
         Some(_) => return Err(ApiError::bad("unknown gesture")),
     };
-    if text.is_empty() && approvals.is_empty() && gesture.is_none() {
+    if text.is_empty() && approvals.is_empty() && denials.is_empty() && gesture.is_none() {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
-            message: "a turn needs text, an approval or a situation".to_owned(),
+            message: "a turn needs text, an approval, a denial or a situation".to_owned(),
         });
     }
     if gesture.is_some() && !approvals.is_empty() {
         return Err(ApiError::bad("a situation carries no approvals"));
+    }
+    if gesture.is_some() && !denials.is_empty() {
+        return Err(ApiError::bad("a situation carries no denials"));
     }
     if text.chars().count() > MAX_TEXT {
         return Err(ApiError {
@@ -630,6 +637,7 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
             &text,
             turn.focus.filter(|id| *id > 0),
             approvals,
+            denials,
             gesture,
         )
     })
@@ -648,6 +656,7 @@ fn execute_turn(
     text: &str,
     focus: Option<u64>,
     approvals: Vec<u64>,
+    denials: Vec<u64>,
     gesture: Option<Kind>,
 ) -> ApiResult<String> {
     let effective = host.settings.effective_current()?;
@@ -737,6 +746,7 @@ fn execute_turn(
     let store = Store::new(&host.state_dir)?;
     let mut options = TurnOptions {
         approvals,
+        denials,
         focus,
         gesture,
         cancelled: host.cancelled.clone(),

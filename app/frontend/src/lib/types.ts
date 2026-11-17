@@ -69,6 +69,7 @@ export interface Proposal {
   text: string;
   at: number;
   turn: number;
+  denied: boolean;
 }
 
 export interface IdentityEntry {

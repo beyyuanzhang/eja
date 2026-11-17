@@ -70,6 +70,7 @@ export function sendTurn(
   options: {
     focus?: number | null;
     approvals?: number[];
+    denials?: number[];
     gesture?: "return" | "leave" | "alone";
   } = {},
 ): Promise<TurnResponse> {
@@ -80,6 +81,7 @@ export function sendTurn(
       text,
       focus: options.focus ?? null,
       approvals: options.approvals ?? [],
+      denials: options.denials ?? [],
       ...(options.gesture ? { gesture: options.gesture } : {}),
     }),
   });

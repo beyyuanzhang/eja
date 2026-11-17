@@ -403,6 +403,29 @@ fn presence_decides_whether_a_reply_reaches_the_user() {
     let returned = situation(Kind::Returned);
     let departed = situation(Kind::Departed);
     let alone = situation(Kind::Alone);
+    let proposed = turn_at(
+        &store,
+        "propose something",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "a fact".to_string(),
+        }])],
+    );
+    let proposal_id = proposed.context().proposals[0].id;
+    let denied = eja::turn_at_with_options(
+        &store,
+        "",
+        &Script::new(vec![decision(vec![])]),
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            denials: vec![proposal_id],
+            ..Default::default()
+        },
+    )
+    .expect("denial turn");
     turn_at(&store, "hello", vec![decision(vec![])]);
     let state = State::load(&store).expect("state");
     let rendered = eja::adapters::render_context(&state.project("", None, eja::now_utc()));
@@ -411,6 +434,7 @@ fn presence_decides_whether_a_reply_reaches_the_user() {
         ("returned", &returned, "[eja]"),
         ("departed", &departed, "[monologue]"),
         ("alone", &alone, "[monologue]"),
+        ("denial", &denied, "[eja]"),
     ] {
         let id = outcome
             .context()
@@ -428,4 +452,101 @@ fn presence_decides_whether_a_reply_reaches_the_user() {
             "{label} reply should render {expected}: {line}"
         );
     }
+}
+
+#[test]
+fn a_turn_that_asks_delivers_no_reply() {
+    let fixture = Fixture::new("question-first");
+    let store = fixture.store();
+    let outcome = turn_at(
+        &store,
+        "call me river",
+        vec![
+            decision(vec![Action::Propose {
+                kind: ProposalKind::Commitment,
+                target_id: None,
+                text: "the user is river".to_string(),
+            }]),
+            Decision {
+                reply: String::new(),
+                actions: vec![],
+                refused: vec![],
+            },
+        ],
+    );
+    assert!(
+        outcome.reply.is_empty(),
+        "the question goes first: {}",
+        outcome.reply
+    );
+    let events = store.events().expect("events");
+    assert!(events
+        .iter()
+        .any(|event| event.kind == Kind::Eja && event.text.is_empty()));
+}
+
+#[test]
+fn a_denial_is_a_fact_and_the_question_stays_open() {
+    let fixture = Fixture::new("denial-fact");
+    let store = fixture.store();
+    let proposed = turn_at(
+        &store,
+        "call me mars",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "the user is mars".to_string(),
+        }])],
+    );
+    let proposal_id = proposed.context().proposals[0].id;
+
+    let denied = eja::turn_at_with_options(
+        &store,
+        "",
+        &Script::new(vec![decision(vec![])]),
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            denials: vec![proposal_id],
+            ..Default::default()
+        },
+    )
+    .expect("denial turn");
+    assert!(!denied.reply.is_empty(), "eja speaks to the user's answer");
+    assert!(denied
+        .context()
+        .proposals
+        .iter()
+        .any(|proposal| { proposal.id == proposal_id && proposal.denied && !proposal.approved }));
+    assert!(State::load(&store).expect("state").commitments().is_empty());
+    let events = store.events().expect("events");
+    assert!(events.iter().any(|event| event.kind == Kind::Denial));
+
+    let withdrawn = turn_at(
+        &store,
+        "then never mind",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Correction,
+            target_id: Some(proposal_id),
+            text: "the user declined the name".to_string(),
+        }])],
+    );
+    let correction_id = withdrawn
+        .context()
+        .proposals
+        .iter()
+        .find(|proposal| proposal.id != proposal_id)
+        .expect("correction proposal")
+        .id;
+    let confirmed = approved(
+        &store,
+        "",
+        vec![decision(vec![Action::Confirm {
+            proposal_id: correction_id,
+        }])],
+        vec![correction_id],
+    );
+    assert!(confirmed.context().proposals.is_empty());
+    assert!(State::load(&store).expect("state").commitments().is_empty());
 }

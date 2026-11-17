@@ -62,6 +62,28 @@ export function messagesSince(messages: Message[], encounter: Encounter): Messag
   return messages.filter((message) => message.id > encounter.anchor);
 }
 
+// An encounter shows the exchange, not eja's inner voice: an eja message
+// belongs to the conversation only when the user spoke in its turn.
+export function spokenSince(
+  messages: Message[],
+  events: JournalEvent[],
+  encounter: Encounter,
+): Message[] {
+  const userTurns = new Set(
+    events
+      .filter(
+        (event) =>
+          event.kind === "user" ||
+          event.kind === "approval" ||
+          event.kind === "denial",
+      )
+      .map((event) => event.turn),
+  );
+  return messagesSince(messages, encounter).filter(
+    (message) => message.role === "user" || userTurns.has(message.turn),
+  );
+}
+
 // The return screen's voice is eja's own reply to the latest return: spoken
 // only if eja chose to speak on that turn. A later departure or alone turn
 // means the user left; the voice rests until the next return.
