@@ -6,7 +6,6 @@
   import SettingsDrawer from "./lib/SettingsDrawer.svelte";
   import TalkView from "./lib/TalkView.svelte";
   import TaskSheet from "./lib/TaskSheet.svelte";
-  import UnfoldView from "./lib/UnfoldView.svelte";
   import {
     fetchRaw,
     fetchSettings,
@@ -34,11 +33,9 @@
     RawRecord,
     SettingsView,
     Task,
-    ViewName,
   } from "./lib/types";
 
   let appState = $state<AppState | null>(null);
-  let view = $state<ViewName>("talk");
   let initialLoading = $state(true);
   let fatal = $state("");
   let pending = $state(false);
@@ -79,14 +76,6 @@
       : (appState?.tasks.find((task) => task.id === selectedTaskId) ?? null),
   );
   const pollDelay = $derived(pending || appState?.health.turnInFlight ? 2000 : 5000);
-
-  const statusTone = $derived.by(() => {
-    if (!appState) return "open";
-    if (pending || appState.health.turnInFlight) return "running";
-    if (encounter ? actions.length > 0 : loops.length > 0) return "waiting";
-    if (!appState.health.model) return "waiting";
-    return "done";
-  });
 
   function showToast(message: string, error = false) {
     if (toastTimer) clearTimeout(toastTimer);
@@ -164,7 +153,6 @@
     };
     parkedEncounter = null;
     storeEncounter(encounter);
-    setView("talk");
     return true;
   }
 
@@ -172,7 +160,6 @@
     if (!appState) return;
     if (parkedEncounter && parkedMatches(loop, parkedEncounter)) {
       resumeParked();
-      setView("talk");
       return;
     }
     if (loop.kind === "decision") {
@@ -188,7 +175,6 @@
     encounter = null;
     parkedEncounter = null;
     storeEncounter(null);
-    setView("talk");
     void gesture("leave");
   }
 
@@ -196,7 +182,7 @@
     text: string,
     options: {
       approvals?: number[];
-    denials?: number[];
+      denials?: number[];
       focus?: number | null;
       restore?: boolean;
       message?: boolean;
@@ -244,10 +230,6 @@
   async function gesture(kind: "return" | "leave" | "alone") {
     if (!appState || pending || appState.health.turnInFlight) return;
     await transmit("", { gesture: kind, restore: false, message: false, focus: null });
-  }
-
-  function setView(next: ViewName) {
-    view = next;
   }
 
   function approveProposal(id: number) {
@@ -371,42 +353,6 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="app-shell">
-  <header class="topbar">
-    <div class="brand-side">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true"><i></i></span>
-        <span class="wordmark">eja</span>
-      </div>
-    </div>
-
-    <nav class="view-switch" aria-label="视图">
-      <button
-        type="button"
-        class:active={view === "talk"}
-        aria-current={view === "talk" ? "page" : undefined}
-        title="交流"
-        onclick={() => setView("talk")}
-      >
-        <span>talk</span>
-      </button>
-      <button
-        type="button"
-        class:active={view === "unfold"}
-        aria-current={view === "unfold" ? "page" : undefined}
-        title="展开工作"
-        onclick={() => setView("unfold")}
-      >
-        <span>unfold</span>
-      </button>
-    </nav>
-
-    <div class="top-tools">
-      <span class="ambient-status" aria-hidden="true">
-        <i class="status-dot {statusTone}"></i>
-      </span>
-    </div>
-  </header>
-
   {#if appState?.health.journalError}
     <div class="journal-warning" role="alert">
       <AlertCircle size={13} />
@@ -435,45 +381,28 @@
         </div>
       </div>
     {:else if appState}
-      <div class="view-stage">
-        <div class="view-pane" class:active={view === "talk"} aria-hidden={view !== "talk"}>
-          <TalkView
-            mode={encounter ? "encounter" : "ambient"}
-            {loops}
-            actions={actions.filter(
-              (action) =>
-                action.kind !== "decision" ||
-                !answeredProposals.has(action.proposal.id),
-            )}
-            messages={encounterMessages}
-            presence={presenceMessage}
-            tasks={appState.tasks}
-            health={appState.health}
-            {pending}
-            {optimistic}
-            visible={view === "talk"}
-            seed={composerSeed}
-            onOpenLoop={openLoop}
-            onSend={(text) => void transmit(text)}
-            onApprove={approveProposal}
-            onDeny={denyProposal}
-            onInspectTask={inspectTask}
-            onBye={leaveEncounter}
-          />
-        </div>
-
-        <div class="view-pane" class:active={view === "unfold"} aria-hidden={view !== "unfold"}>
-          <UnfoldView
-            tasks={appState.tasks}
-            relations={appState.relations}
-            counts={{ running: appState.counts.running, waiting: appState.counts.waiting }}
-            now={appState.now}
-            visible={view === "unfold"}
-            selectedTask={selectedTaskId}
-            onSelect={openTask}
-          />
-        </div>
-      </div>
+      <TalkView
+        mode={encounter ? "encounter" : "ambient"}
+        {loops}
+        actions={actions.filter(
+          (action) =>
+            action.kind !== "decision" ||
+            !answeredProposals.has(action.proposal.id),
+        )}
+        messages={encounterMessages}
+        presence={presenceMessage}
+        tasks={appState.tasks}
+        health={appState.health}
+        {pending}
+        {optimistic}
+        seed={composerSeed}
+        onOpenLoop={openLoop}
+        onSend={(text) => void transmit(text)}
+        onApprove={approveProposal}
+        onDeny={denyProposal}
+        onInspectTask={inspectTask}
+        onBye={leaveEncounter}
+      />
     {/if}
   </main>
 
@@ -535,128 +464,6 @@
     overflow: hidden;
   }
 
-  .topbar {
-    position: relative;
-    z-index: 30;
-    display: grid;
-    min-height: 62px;
-    flex: 0 0 auto;
-    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-    align-items: center;
-    padding: 0 17px 0 20px;
-    border-bottom: 1px solid var(--line);
-    background: color-mix(in srgb, var(--paper) 86%, transparent);
-    backdrop-filter: blur(20px) saturate(1.1);
-    -webkit-backdrop-filter: blur(20px) saturate(1.1);
-  }
-
-  .brand-side {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-  }
-
-  .brand {
-    display: inline-flex;
-    height: 38px;
-    align-items: center;
-    gap: 10px;
-    border-radius: 10px;
-    color: var(--ink);
-  }
-
-  .brand-mark {
-    display: grid;
-    width: 18px;
-    height: 18px;
-    place-items: center;
-    border: 1px solid rgba(36, 35, 31, 0.14);
-    border-radius: 50%;
-    background: rgba(255, 254, 250, 0.64);
-  }
-
-  .brand-mark i {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: var(--accent);
-    box-shadow: 0 0 0 3px rgba(189, 96, 66, 0.07);
-  }
-
-  .wordmark {
-    padding-top: 1px;
-    font-family: var(--serif);
-    font-size: 21px;
-    font-weight: 470;
-    letter-spacing: -0.035em;
-    line-height: 1;
-  }
-
-  .view-switch {
-    display: inline-flex;
-    height: 36px;
-    align-items: center;
-    gap: 2px;
-    padding: 3px;
-    border: 1px solid rgba(36, 35, 31, 0.075);
-    border-radius: 999px;
-    background: rgba(230, 227, 218, 0.46);
-    box-shadow: 0 1px 1px rgba(255, 255, 255, 0.7) inset;
-  }
-
-  .view-switch button {
-    position: relative;
-    display: inline-flex;
-    height: 28px;
-    align-items: center;
-    justify-content: center;
-    padding: 0 15px;
-    border-radius: 999px;
-    color: var(--muted);
-    font-size: 10.5px;
-    font-weight: 540;
-    letter-spacing: 0.025em;
-    transition:
-      color 180ms ease,
-      background 180ms ease,
-      box-shadow 180ms ease;
-  }
-
-  .view-switch button:hover {
-    color: var(--ink-soft);
-  }
-
-  .view-switch button.active {
-    background: rgba(255, 254, 250, 0.96);
-    color: var(--ink);
-    box-shadow:
-      0 1px 2px rgba(36, 35, 31, 0.08),
-      0 5px 14px rgba(36, 35, 31, 0.045);
-  }
-
-  .top-tools {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 5px;
-  }
-
-  .ambient-status {
-    display: inline-flex;
-    width: 30px;
-    height: 30px;
-    align-items: center;
-    justify-content: center;
-    border-radius: 999px;
-  }
-
-  .ambient-status .status-dot {
-    width: 6px;
-    height: 6px;
-    flex-basis: 6px;
-  }
-
   .journal-warning {
     position: relative;
     z-index: 28;
@@ -687,35 +494,6 @@
     position: relative;
     flex: 1;
     min-height: 0;
-  }
-
-  .view-stage,
-  .view-pane {
-    position: absolute;
-    inset: 0;
-    min-height: 0;
-  }
-
-  .view-pane {
-    visibility: hidden;
-    opacity: 0;
-    pointer-events: none;
-    transform: translateY(5px);
-    transition:
-      opacity 200ms ease,
-      transform 260ms cubic-bezier(0.2, 0.7, 0.2, 1),
-      visibility 0s linear 260ms;
-  }
-
-  .view-pane.active {
-    visibility: visible;
-    opacity: 1;
-    pointer-events: auto;
-    transform: translateY(0);
-    transition:
-      opacity 220ms ease,
-      transform 300ms cubic-bezier(0.2, 0.7, 0.2, 1),
-      visibility 0s;
   }
 
   .loading-stage,
@@ -896,35 +674,6 @@
   }
 
   @media (max-width: 760px) {
-    .topbar {
-      min-height: 56px;
-      grid-template-columns: 50px minmax(0, 1fr) 44px;
-      padding: 0 10px;
-    }
-
-    .brand {
-      gap: 4px;
-    }
-
-    .brand-mark {
-      width: 16px;
-      height: 16px;
-    }
-
-    .wordmark {
-      display: inline;
-      font-size: 18px;
-    }
-
-    .view-switch {
-      justify-self: center;
-    }
-
-    .view-switch button {
-      min-width: 70px;
-      padding: 0 13px;
-    }
-
     .settings-trigger {
       bottom: max(12px, env(safe-area-inset-bottom));
       left: 12px;

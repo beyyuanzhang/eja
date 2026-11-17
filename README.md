@@ -68,10 +68,9 @@ Constitution:
 ## App
 
 `app/` is an independently served Svelte 5 + TypeScript + Vite interface for
-continuous conversation with EJA. It has one attention surface and two views over
-the same journal: **talk** is either the return screen of open loops or one
-active encounter, and **unfold** shows the task lanes, timing, dependencies and
-evidence. There is no new-chat or session control.
+continuous conversation with EJA. It has one surface, **talk**: either the
+return screen of open loops or one active encounter. There is no new-chat or
+session control.
 
 The HTTP runtime is part of the `eja` executable; the frontend is not embedded:
 

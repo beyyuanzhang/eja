@@ -23,7 +23,6 @@
     health: Health;
     pending: boolean;
     optimistic: OptimisticMessage | null;
-    visible: boolean;
     seed: ComposerSeed | null;
     onOpenLoop: (loop: OpenLoop) => void;
     onSend: (text: string) => void;
@@ -43,7 +42,6 @@
     health,
     pending,
     optimistic,
-    visible,
     seed,
     onOpenLoop,
     onSend,
@@ -122,7 +120,7 @@
   });
 
   $effect(() => {
-    if (!seed || !textarea || !visible) return;
+    if (!seed || !textarea) return;
     draft = seed.text;
     void tick().then(() => {
       resizeComposer();

@@ -35,12 +35,6 @@ export function relative(seconds: number): string {
   return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
 }
 
-export function axisTime(seconds: number, span: number): string {
-  const date = new Date(seconds * 1000);
-  if (span > 86_400) return `${date.getMonth() + 1}/${date.getDate()} ${clock(seconds)}`;
-  return clock(seconds);
-}
-
 export function duration(seconds: number): string {
   const value = Math.max(0, Math.round(seconds));
   if (value < 60) return `${value}s`;
@@ -53,14 +47,6 @@ export function duration(seconds: number): string {
   const days = Math.floor(value / 86_400);
   const hours = Math.floor((value % 86_400) / 3600);
   return `${days}d${hours ? ` ${hours}h` : ""}`;
-}
-
-export function taskEnd(task: Task, now: number): number {
-  if (task.closed_at) return task.closed_at;
-  if (task.status === "running") return now;
-  if (task.reported_at) return task.reported_at;
-  if (task.assigned_at) return task.assigned_at + 60;
-  return task.created_at + 60;
 }
 
 export interface StatusPresentation {
@@ -93,12 +79,6 @@ export function pretty(value: unknown): string {
   } catch {
     return String(value);
   }
-}
-
-export function niceStep(span: number): number {
-  const target = span / 7;
-  const steps = [60, 120, 300, 600, 900, 1800, 3600, 7200, 14_400, 21_600, 43_200, 86_400, 172_800];
-  return steps.find((step) => step >= target) ?? steps[steps.length - 1];
 }
 
 export function leadTask<T extends Task>(tasks: T[]): T | null {

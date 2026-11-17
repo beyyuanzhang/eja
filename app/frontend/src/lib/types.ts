@@ -1,4 +1,3 @@
-export type ViewName = "talk" | "unfold";
 export type MessageRole = "user" | "eja";
 export type TaskStatus = "open" | "running" | "waiting" | "done" | "failed";
 export type TaskKind = "aja" | "group";
