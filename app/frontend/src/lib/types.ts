@@ -50,16 +50,9 @@ export interface Task {
   reported_at: number | null;
   closed_at: number | null;
   close: TaskClose | null;
-  assignment: unknown;
   run: TaskRun;
   event_ids: number[];
   children: number[];
-}
-
-export interface Relation {
-  from: number;
-  to: number;
-  kind: string;
 }
 
 export interface Proposal {
@@ -69,22 +62,6 @@ export interface Proposal {
   text: string;
   at: number;
   turn: number;
-}
-
-export interface IdentityEntry {
-  id: number;
-  text: string;
-  at: number;
-  closes?: number | null;
-  proposal_id?: number | null;
-}
-
-export interface Identity {
-  goals: IdentityEntry[];
-  commitments: IdentityEntry[];
-  corrections: IdentityEntry[];
-  decisions: IdentityEntry[];
-  relationships: IdentityEntry[];
 }
 
 export interface Health {
@@ -98,31 +75,11 @@ export interface Health {
   turnInFlight: boolean;
 }
 
-export interface StateCounts {
-  tasks: number;
-  open: number;
-  running: number;
-  waiting: number;
-  done: number;
-  failed: number;
-  messages: number;
-}
-
 export interface AppState {
-  now: number;
-  stateDir: string;
-  projectDir: string;
   events: JournalEvent[];
   messages: Message[];
   tasks: Task[];
-  workspaces: { name: string; root: string }[];
-  relations: Relation[];
   proposals: Proposal[];
-  identity: Identity;
-  currentGoal: IdentityEntry | null;
-  refused: IdentityEntry[];
-  counts: StateCounts;
-  lastTurn: number;
   lastEvent: number;
   health: Health;
 }
@@ -257,7 +214,6 @@ export interface ComposerSeed {
 
 export interface Encounter {
   anchor: number;
-  startedAt: number;
   taskId: number | null;
   proposalId: number | null;
 }

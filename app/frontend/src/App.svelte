@@ -15,7 +15,7 @@
     sendTurn,
   } from "./lib/api";
   import {
-    ambientLoops,
+    coreLoops,
     encounterLoops,
     parkedMatches,
     presenceVoice,
@@ -32,7 +32,6 @@
     OptimisticMessage,
     RawRecord,
     SettingsView,
-    Task,
   } from "./lib/types";
 
   let appState = $state<AppState | null>(null);
@@ -61,7 +60,7 @@
     if (!appState || encounter) return null;
     return presenceVoice(appState.messages, appState.events);
   });
-  const loops = $derived(appState ? ambientLoops(appState, busy) : []);
+  const loops = $derived(appState ? coreLoops(appState, busy) : []);
   const actions = $derived(
     appState && encounter ? encounterLoops(appState, encounter, busy) : [],
   );
@@ -147,7 +146,6 @@
     restoredParked = false;
     encounter = {
       anchor: source.anchor ?? appState.lastEvent,
-      startedAt: source.startedAt ?? Math.floor(Date.now() / 1000),
       taskId: source.taskId ?? null,
       proposalId: source.proposalId ?? null,
     };
@@ -252,10 +250,6 @@
 
   function openTask(id: number) {
     selectedTaskId = id;
-  }
-
-  function inspectTask(task: Task) {
-    selectedTaskId = task.id;
   }
 
   async function openRaw(address: string) {
@@ -400,7 +394,7 @@
         onSend={(text) => void transmit(text)}
         onApprove={approveProposal}
         onDeny={denyProposal}
-        onInspectTask={inspectTask}
+        onInspectTask={(task) => openTask(task.id)}
         onBye={leaveEncounter}
       />
     {/if}

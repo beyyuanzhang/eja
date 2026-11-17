@@ -14,6 +14,7 @@
     X,
   } from "lucide-svelte";
   import { fade, fly } from "svelte/transition";
+  import { untrack } from "svelte";
   import ConnectorSettings from "./ConnectorSettings.svelte";
   import ModelSettings from "./ModelSettings.svelte";
   import NumberField from "./NumberField.svelte";
@@ -59,6 +60,7 @@
   let saved = $state(false);
   let dirty = $state(false);
   let copiedPath = $state("");
+  let hydrated = false;
 
   const sections = [
     { id: "model" as const, label: "模型", Icon: Cpu },
@@ -209,7 +211,14 @@
   }
 
   $effect(() => {
-    hydrate(settings);
+    const current = settings;
+    if (!open || !current) {
+      hydrated = false;
+      return;
+    }
+    if (hydrated) return;
+    hydrated = true;
+    untrack(() => hydrate(current));
   });
 </script>
 

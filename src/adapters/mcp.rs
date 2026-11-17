@@ -609,7 +609,10 @@ impl HostTools {
             private: &self.private,
             control,
         };
-        FileTools.call(&context, tool, arguments)
+        // The resolved path is the answer: re-resolving the caller's relative
+        // name against the first matching root could address another grant.
+        let resolved = json!({"path": full.to_string_lossy()});
+        FileTools.call(&context, tool, &resolved)
     }
 
     /// The built-in workspace file tools are a grant the host may switch off;
@@ -664,6 +667,9 @@ impl Capabilities for HostTools {
     fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
         let control = parent.child(Duration::from_secs(60));
         if tool == "read_file" || tool == "list_dir" {
+            if !self.workspace_tools {
+                return Err("the workspace file tools are switched off".into());
+            }
             return self.read(tool, arguments, &control);
         }
         if tool == "write_file" || tool == "edit_file" {
@@ -684,7 +690,7 @@ impl Capabilities for HostTools {
 
     /// A witness is one declared host capability. The request names the tool; the
     /// host decides whether that name may answer it, and reading a file can have
-    /// no effect, so the host's own read tools are always allowed.
+    /// no effect, so the host's own read tools answer while the grant is on.
     fn witness(&self, request: &Value, control: &Control) -> Result<Value> {
         let tool = request["tool"]
             .as_str()
@@ -697,6 +703,9 @@ impl Capabilities for HostTools {
         let control = control.child(Duration::from_secs(120));
         control.check()?;
         if tool == "read_file" || tool == "list_dir" {
+            if !self.workspace_tools {
+                return Err("the workspace file tools are switched off".into());
+            }
             return self.read(tool, &arguments, &control);
         }
         let context = ToolContext {

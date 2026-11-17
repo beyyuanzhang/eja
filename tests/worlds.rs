@@ -632,4 +632,12 @@ fn each_granted_git_root_reconciles_into_its_own_project() {
     );
     worlds.release(&first);
     worlds.release(&second);
+    assert!(
+        !first.root.exists(),
+        "release after settle removes the worktree of the owning backend"
+    );
+    assert!(
+        !second.root.exists(),
+        "release after settle removes the worktree of the owning backend"
+    );
 }

@@ -216,9 +216,6 @@
           <small>每句话都能落回原件</small>
         </div>
         <div class="addresses">
-          <button class="chip" type="button" onclick={() => onRaw(`log:task:${task.id}`)}>
-            log:task:{task.id}
-          </button>
           {#each events as id}
             <button class="chip" type="button" onclick={() => onRaw(`log:event:${id}`)}>
               event:{id}

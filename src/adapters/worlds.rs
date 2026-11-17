@@ -14,7 +14,7 @@ use std::{
 };
 
 /// A project larger than this is reported as truncated instead of scanned.
-const ENTRIES: usize = 20_000;
+pub const ENTRIES: usize = 20_000;
 /// Names shown per change class before the rest are counted.
 const NAMES: usize = 6;
 /// Releasing a world is cleanup, and it runs after the run's own budget may have
@@ -312,6 +312,7 @@ impl Worlds for Shared {
 /// each other, and the result is a ref the host may reconcile explicitly.
 pub struct Worktrees {
     project: PathBuf,
+    granted: PathBuf,
     root: PathBuf,
     private: PathBuf,
     open: Open,
@@ -384,10 +385,16 @@ impl Worktrees {
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             project: PathBuf::from(top),
+            granted: project,
             root,
             private: private.into(),
             open: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A grant inside this git project belongs to it; a foreign root does not.
+    fn owns(&self, root: Option<&Path>) -> bool {
+        root.is_none_or(|root| root.starts_with(&self.project) || root == self.granted)
     }
 
     /// One branch per (state directory, task). Two instances that share a
@@ -411,7 +418,7 @@ impl Worktrees {
 
 impl Worlds for Worktrees {
     fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World> {
-        if root.is_some_and(|root| root != self.project.as_path()) {
+        if !self.owns(root) {
             return Err("an isolated world belongs to its own git project".into());
         }
         let root = self.root.join(task.to_string());
@@ -475,7 +482,7 @@ impl Worlds for Worktrees {
     }
 
     fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value> {
-        if root.is_some_and(|root| root != self.project.as_path()) {
+        if !self.owns(root) {
             return Err("an isolated world belongs to its own git project".into());
         }
         let branch = self.branch(task);
@@ -571,12 +578,9 @@ impl Worlds for WorkspaceWorlds {
 
     fn settle(&self, world: &World, control: &Control) -> Result<Value> {
         let backend = self.reserved(world);
-        let account = backend.settle(world, control);
-        self.held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&world.task);
-        account
+        // The reservation stays held through release: settle alone must not
+        // hand the world back to a root lookup that no longer knows it.
+        backend.settle(world, control)
     }
 
     fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value> {

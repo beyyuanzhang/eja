@@ -1,5 +1,5 @@
 //! Host tools. Connectors implement this same boundary; ajas never load plugins.
-use super::Control;
+use super::{cut_chars, worlds::ENTRIES, Control};
 use crate::{aja::FRAME_LIMIT, Result};
 use serde_json::{json, Value};
 use std::{
@@ -8,6 +8,58 @@ use std::{
     path::{Component, Path, PathBuf},
     time::Duration,
 };
+
+/// A search pattern is an argument, not output: it is echoed only up to the
+/// room left for the results, so a huge pattern cannot overflow the frame.
+const PATTERN_CAP: usize = 1024;
+
+/// The frame bounds the serialized result, not the raw text: escaping grows
+/// it, so a view is measured as JSON and halved until it fits.
+fn fit_frame(view: Value) -> Result<Value> {
+    let mut view = view;
+    loop {
+        if crate::measure::value(&view) < FRAME_LIMIT {
+            return Ok(view);
+        }
+        if !shrink(&mut view) {
+            return Err("tool output does not fit the frame".into());
+        }
+        if let Value::Object(map) = &mut view {
+            map.insert("truncated".to_owned(), Value::Bool(true));
+        }
+    }
+}
+
+/// Halve the largest string in the view; with none left, drop array entries.
+fn shrink(value: &mut Value) -> bool {
+    match value {
+        Value::String(text) if !text.is_empty() => {
+            *text = cut_chars(text, text.len() / 2).to_owned();
+            true
+        }
+        Value::Array(items) => {
+            let largest = items
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, item)| crate::measure::value(item))
+                .map(|(index, _)| index);
+            largest.is_some_and(|index| {
+                if !shrink(&mut items[index]) {
+                    items.remove(index);
+                }
+                true
+            })
+        }
+        Value::Object(map) => {
+            let largest = map
+                .iter()
+                .max_by_key(|(_, item)| crate::measure::value(item))
+                .map(|(key, _)| key.clone());
+            largest.is_some_and(|key| shrink(map.get_mut(&key).expect("key just listed")))
+        }
+        _ => false,
+    }
+}
 
 pub struct ToolContext<'a> {
     pub aja_id: u64,
@@ -87,13 +139,14 @@ pub fn granted_path(roots: &[PathBuf], name: &str) -> Result<PathBuf> {
         return Err("absolute paths must stay inside a granted workspace".into());
     }
     // A relative name is tried in each root; a root that merely lacks the file
-    // does not end the search, but a traversal or symlink refusal does.
+    // or refuses it (traversal, symlink) does not end the search: the name may
+    // still address a clean file in a later grant.
     let mut missing = false;
     for root in roots {
         match relative_file(root, name) {
             Ok(full) if full.exists() => return Ok(full),
             Ok(_) => missing = true,
-            Err(error) => return Err(error),
+            Err(_) => {}
         }
     }
     if missing {
@@ -221,7 +274,8 @@ fn walk(root: &Path, private: &Path, control: &Control) -> Result<(Vec<PathBuf>,
             continue;
         };
         for entry in entries.flatten() {
-            if control.check().is_err() || files.len() >= 20_000 {
+            control.check()?;
+            if files.len() >= ENTRIES {
                 truncated = true;
                 break;
             }
@@ -318,6 +372,7 @@ fn search_root(ctx: &ToolContext<'_>, args: &Value) -> Result<PathBuf> {
 
 fn glob(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
     let pattern = args["pattern"].as_str().ok_or("missing pattern")?;
+    let shown = cut_chars(pattern, PATTERN_CAP);
     let root = search_root(ctx, args)?;
     let (files, mut truncated) = walk(&root, ctx.private, ctx.control)?;
     let mut matched: Vec<(String, i64)> = Vec::new();
@@ -325,7 +380,7 @@ fn glob(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
         let Ok(relative) = file.strip_prefix(ctx.project) else {
             continue;
         };
-        let name = relative.to_string_lossy().replace('\\', "/");
+        let name = relative.to_string_lossy().into_owned();
         if !glob_matches(pattern, &name) {
             continue;
         }
@@ -349,13 +404,14 @@ fn glob(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
         }
         kept.push(name.clone());
     }
-    Ok(
-        json!({"pattern":pattern,"matches":kept,"showing":kept.len(),"total":total,"truncated":truncated}),
+    fit_frame(
+        json!({"pattern":shown,"matches":kept,"showing":kept.len(),"total":total,"truncated":truncated}),
     )
 }
 
 fn grep(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
     let pattern = args["pattern"].as_str().ok_or("missing pattern")?;
+    let shown = cut_chars(pattern, PATTERN_CAP);
     let regex =
         regex_lite::Regex::new(pattern).map_err(|error| format!("invalid pattern: {error}"))?;
     let include = args["include"].as_str().filter(|glob| !glob.is_empty());
@@ -369,7 +425,7 @@ fn grep(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
         let Ok(relative) = file.strip_prefix(ctx.project) else {
             continue;
         };
-        let name = relative.to_string_lossy().replace('\\', "/");
+        let name = relative.to_string_lossy().into_owned();
         if include.is_some_and(|glob| !glob_matches(glob, &name)) {
             continue;
         }
@@ -397,7 +453,9 @@ fn grep(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
             matches.push(entry);
         }
     }
-    Ok(json!({"pattern":pattern,"matches":matches,"showing":matches.len(),"truncated":truncated}))
+    fit_frame(
+        json!({"pattern":shown,"matches":matches,"showing":matches.len(),"truncated":truncated}),
+    )
 }
 
 fn shell(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
@@ -414,6 +472,13 @@ fn shell(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
         .arg("-c")
         .arg(command)
         .current_dir(ctx.project)
+        .env_remove("LNA_API_KEY")
+        .env_remove("JIYUAN_API_KEY")
+        .env_remove("OPENAI_API_KEY")
         .stdin(std::process::Stdio::null());
-    super::process::shell_output(&mut process, &control, FRAME_LIMIT)
+    fit_frame(super::process::shell_output(
+        &mut process,
+        &control,
+        FRAME_LIMIT / 8,
+    )?)
 }

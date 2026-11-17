@@ -136,7 +136,9 @@ impl Store {
         })
     }
 
-    pub(crate) fn lock_turn(&self) -> Result<fs::File> {
+    /// The journal lease for one turn: held by whoever is about to think, so a
+    /// second thinker (or a heartbeat about to spend a turn) stands down.
+    pub fn lock_turn(&self) -> Result<fs::File> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -223,6 +225,11 @@ impl Store {
 #[must_use]
 pub fn now_utc() -> DateTime<Utc> {
     Utc::now()
+}
+
+/// A read-only look at the journal: no repair, no cursor, no writer claim.
+pub fn read_journal(root: impl AsRef<Path>) -> Result<Vec<Event>> {
+    read_events(&root.as_ref().join("log.jsonl"))
 }
 
 #[must_use]

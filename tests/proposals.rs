@@ -455,6 +455,56 @@ fn presence_decides_whether_a_reply_reaches_the_user() {
 }
 
 #[test]
+fn a_correction_in_an_absent_turn_stays_monologue() {
+    let fixture = Fixture::new("correction-monologue");
+    let store = fixture.store();
+    let proposed = turn_at(
+        &store,
+        "remember this",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "a fact".to_string(),
+        }])],
+    );
+    let question_id = proposed.context().proposals[0].id;
+    let alone = eja::turn_at_with_options(
+        &store,
+        "",
+        &Script::new(vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Correction,
+            target_id: Some(question_id),
+            text: "withdrawn while alone".to_string(),
+        }])]),
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            gesture: Some(Kind::Alone),
+            ..Default::default()
+        },
+    )
+    .expect("alone turn");
+    let state = State::load(&store).expect("state");
+    let rendered = eja::adapters::render_context(&state.project("", None, eja::now_utc()));
+    let id = alone
+        .context()
+        .history
+        .iter()
+        .find(|event| event.kind == Kind::Eja)
+        .map(|event| event.id)
+        .expect("reply event");
+    let line = rendered
+        .lines()
+        .find(|line| line.contains(&format!("#{id} ")))
+        .unwrap_or_default();
+    assert!(
+        line.contains("[monologue]"),
+        "the host's own approval is not the user's presence: {line}"
+    );
+}
+
+#[test]
 fn a_turn_that_asks_delivers_no_reply() {
     let fixture = Fixture::new("question-first");
     let store = fixture.store();

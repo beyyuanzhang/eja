@@ -98,7 +98,7 @@ export function friendlyError(message: string): string {
   if (/a turn is already running/i.test(message)) {
     return "它还在处理上一件事。";
   }
-  if (/needs text, an approval or a situation/i.test(message)) {
+  if (/needs text, an approval, a denial or a situation/i.test(message)) {
     return "还没有写下要交代的事。";
   }
   if (/text is longer|request body too large/i.test(message)) {

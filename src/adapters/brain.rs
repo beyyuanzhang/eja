@@ -516,6 +516,13 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                             other.kind,
                             Kind::User | Kind::Returned | Kind::Approval | Kind::Denial
                         )
+                        && (other.kind != Kind::Approval
+                            || other
+                                .data
+                                .as_ref()
+                                .and_then(|data| data.get("source"))
+                                .and_then(serde_json::Value::as_str)
+                                != Some("eja"))
                 });
                 let tag = if event.kind == Kind::Eja && !present {
                     "monologue".to_string()

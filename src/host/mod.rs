@@ -6,7 +6,7 @@ pub use settings::SettingsStore;
 
 use self::{
     settings::{connector_config, RoleConfig, StoredConnector, StoredSettings},
-    util::{clip, now_seconds, safe_file, ApiError, ApiResult},
+    util::{clip, safe_file, ApiError, ApiResult},
 };
 use axum::{
     body::to_bytes,
@@ -195,10 +195,7 @@ pub fn serve(options: Options) -> eja::Result<()> {
                 if !effective.model_ready() {
                     continue;
                 }
-                let Ok(store) = Store::new(&pulse_host.state_dir) else {
-                    continue;
-                };
-                let Ok(events) = store.events() else {
+                let Ok(events) = eja::read_journal(&pulse_host.state_dir) else {
                     continue;
                 };
                 let Some(last) = events.last() else {
@@ -208,6 +205,26 @@ pub fn serve(options: Options) -> eja::Result<()> {
                     continue;
                 }
                 if pulse_host.turn_in_flight.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                // The quiet window is re-checked under the turn lock: a user
+                // turn may have landed between the read above and this claim.
+                let Ok(store) = Store::new(&pulse_host.state_dir) else {
+                    pulse_host.turn_in_flight.store(false, Ordering::SeqCst);
+                    continue;
+                };
+                let Ok(_lease) = store.lock_turn() else {
+                    pulse_host.turn_in_flight.store(false, Ordering::SeqCst);
+                    continue;
+                };
+                let quiet = store.events().ok().and_then(|events| {
+                    events.last().map(|last| {
+                        last.kind != Kind::Alone
+                            && eja::now_utc().timestamp() - last.at >= PULSE.quiet
+                    })
+                });
+                if quiet != Some(true) {
+                    pulse_host.turn_in_flight.store(false, Ordering::SeqCst);
                     continue;
                 }
                 let pulse = pulse_host.clone();
@@ -268,15 +285,7 @@ fn state_json(host: &Host) -> Value {
         torn: journal.torn,
         turn_in_flight: host.turn_in_flight.load(Ordering::SeqCst),
     };
-    let grant = host.settings.grant(&effective.settings);
-    state::state_json(
-        &journal,
-        now_seconds(),
-        &host.state_dir,
-        &host.project_dir,
-        &grant,
-        &health,
-    )
+    state::state_json(&journal, &health)
 }
 
 async fn get_settings(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
@@ -780,9 +789,7 @@ pub fn build_worlds(
 ) -> Arc<dyn Worlds> {
     let mut roots: BTreeMap<PathBuf, Arc<dyn Worlds>> = BTreeMap::new();
     for (index, (_, root)) in grant.iter().enumerate() {
-        let path = PathBuf::from(root)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(root));
+        let path = normalize_root(root);
         if roots.contains_key(&path) {
             continue;
         }
@@ -802,10 +809,18 @@ pub fn build_worlds(
         roots.insert(path, backend);
     }
     let default = roots
-        .get(project)
+        .get(&normalize_root(&project.display().to_string()))
         .cloned()
         .unwrap_or_else(|| Arc::new(Shared::new(project.to_path_buf(), state_dir.to_path_buf())));
     Arc::new(eja::adapters::WorkspaceWorlds::new(default, roots))
+}
+
+/// Grant keys are real paths: a granted root reached through a symlink is the
+/// same world as the resolved one, never a second backend beside it.
+fn normalize_root(root: &str) -> PathBuf {
+    PathBuf::from(root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(root))
 }
 
 async fn get_raw(

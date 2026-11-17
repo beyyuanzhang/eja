@@ -26,7 +26,6 @@ export function readParkedEncounter(): Encounter | null {
     const value = JSON.parse(raw) as Partial<Encounter>;
     if (
       !Number.isInteger(value.anchor) ||
-      !Number.isInteger(value.startedAt) ||
       !(
         value.taskId == null ||
         (Number.isInteger(value.taskId) && Number(value.taskId) > 0)
@@ -40,7 +39,6 @@ export function readParkedEncounter(): Encounter | null {
     }
     return {
       anchor: Number(value.anchor),
-      startedAt: Number(value.startedAt),
       taskId: value.taskId == null ? null : Number(value.taskId),
       proposalId: value.proposalId == null ? null : Number(value.proposalId),
     };
@@ -185,13 +183,6 @@ export function coreLoops(
 function loopMatchesEncounter(loop: OpenLoop, encounter: Encounter): boolean {
   if (loop.kind === "decision") return encounter.proposalId === loop.proposal.id;
   return encounter.taskId === loop.task.id;
-}
-
-export function ambientLoops(
-  state: AppState,
-  busy = state.health.turnInFlight,
-): OpenLoop[] {
-  return coreLoops(state, busy);
 }
 
 export function encounterLoops(

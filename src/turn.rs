@@ -158,7 +158,14 @@ fn recover_state(store: &Store, state: &mut State, turn: u64, at: i64) -> Result
 
 /// Record the host's approval of one proposal, as the turn's own fact. The
 /// journal stays the authority: a later read sees the approval like any other.
-fn approve(store: &Store, state: &mut State, proposal_id: u64, turn: u64, at: i64) -> Result<()> {
+fn approve(
+    store: &Store,
+    state: &mut State,
+    proposal_id: u64,
+    turn: u64,
+    at: i64,
+    source: &str,
+) -> Result<()> {
     commit(
         store,
         state,
@@ -168,7 +175,7 @@ fn approve(store: &Store, state: &mut State, proposal_id: u64, turn: u64, at: i6
         turn,
         EventMeta::data(
             at,
-            serde_json::json!({"proposal_id": proposal_id, "source": "host"}),
+            serde_json::json!({"proposal_id": proposal_id, "source": source}),
         ),
     )
 }
@@ -200,7 +207,7 @@ fn propose(
     // approval in the same turn, so the withdrawal can be confirmed without a
     // question ever reaching the user.
     if kind == ProposalKind::Correction {
-        approve(store, state, state.last_id(), turn, at)?;
+        approve(store, state, state.last_id(), turn, at, "eja")?;
     }
     Ok(None)
 }
@@ -1200,7 +1207,7 @@ pub fn turn_at_with_options<'i>(
     // An approval is a fact, not a caller's flag: it is recorded once, with the
     // turn it authorizes, and every later read comes from the journal.
     for proposal_id in &options.approvals {
-        approve(store, &mut state, *proposal_id, turn_no, at)?;
+        approve(store, &mut state, *proposal_id, turn_no, at, "user")?;
     }
     // A denial is the user's answer, recorded like an approval: the proposal
     // stays pending until EJA itself withdraws or re-asks.

@@ -327,7 +327,7 @@ fn a_shell_command_dies_with_its_run() {
             .contains("timed out"),
         "{shell}"
     );
-    assert!(model.pids.lock().unwrap().len() >= 1);
+    assert!(!model.pids.lock().unwrap().is_empty());
     assert_reaped(&model.pids.lock().unwrap());
 }
 

@@ -61,10 +61,11 @@
     if (presence) displayedPresence = presence;
   });
 
-  const visibleMessages = $derived(
-    messages.filter((message) => message.text.trim().length > 0).slice(-6),
+  const spokenMessages = $derived(
+    messages.filter((message) => message.text.trim().length > 0),
   );
-  const hiddenCount = $derived(Math.max(0, messages.length - visibleMessages.length));
+  const visibleMessages = $derived(spokenMessages.slice(-6));
+  const hiddenCount = $derived(Math.max(0, spokenMessages.length - visibleMessages.length));
   const canSend = $derived(draft.trim().length > 0 && !pending);
   const background = $derived(
     tasks.filter(
@@ -165,13 +166,8 @@
               </button>
             {/each}
           </div>
-          {#if background.length}
-            <p class="background-line">
-              <i class="status-dot running"></i>
-              {#if lead?.title}<span>{lead.title}</span>{/if}
-            </p>
-          {/if}
-        {:else if background.length}
+        {/if}
+        {#if background.length}
           <p class="background-line">
             <i class="status-dot running"></i>
             {#if lead?.title}<span>{lead.title}</span>{/if}

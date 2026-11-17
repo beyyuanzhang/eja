@@ -240,7 +240,10 @@ fn run() -> Result<()> {
         }
         Command::Context => {
             let state = State::load(&store)?;
-            let context = state.project("", options.focus, eja::now_utc());
+            let settings = host::SettingsStore::new(std::env::current_dir()?, dir);
+            let stored = settings.read().map_err(|error| error.to_string())?;
+            let grant = settings.grant(&stored);
+            let context = state.project_with_workspaces("", options.focus, eja::now_utc(), &grant);
             println!("{}", adapters::render_context(&context));
             println!(
                 "[{} tasks | focus #{}]",
@@ -256,8 +259,13 @@ fn run() -> Result<()> {
             }
         }
         Command::Tools => {
+            let settings = host::SettingsStore::new(std::env::current_dir()?, dir.clone());
+            let stored = settings.read().map_err(|error| error.to_string())?;
+            let grant = settings.grant(&stored);
             let tools =
-                HostTools::new(config.as_deref(), &std::env::current_dir()?, &dir, &startup)?;
+                HostTools::new(config.as_deref(), &std::env::current_dir()?, &dir, &startup)?
+                    .with_workspace_tools(stored.connectors.workspace_tools)
+                    .with_roots(grant.iter().map(|(_, root)| PathBuf::from(root)).collect());
             let assignment = Assignment {
                 task_id: options.focus.unwrap_or(0),
                 objective: String::new(),

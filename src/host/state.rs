@@ -4,8 +4,8 @@
 //! log, and this module only reads the raw lines (tolerating a torn tail) and
 //! renders that one state as the API's JSON. Semantics live in the core.
 
-use eja::{Event, Kind, RelationKind, State, Task, TaskStatus};
-use serde_json::{json, Map, Value};
+use eja::{Event, Kind, RelationKind, State, Task};
+use serde_json::{json, Value};
 use std::{fs, path::Path};
 
 pub struct Journal {
@@ -97,22 +97,6 @@ impl serde::Serialize for Health {
     }
 }
 
-fn field(data: Option<&Value>, name: &str) -> Value {
-    data.and_then(|data| data.get(name))
-        .cloned()
-        .unwrap_or(Value::Null)
-}
-
-fn entry(event: &Event) -> Value {
-    json!({
-        "id": event.id,
-        "text": event.text,
-        "at": event.at,
-        "closes": event.closes,
-        "proposal_id": field(event.data.as_ref(), "proposal_id"),
-    })
-}
-
 fn children_of(state: &State, id: u64) -> Vec<u64> {
     state
         .relations()
@@ -138,7 +122,6 @@ fn task_json(state: &State, task: &Task) -> Value {
         "reported_at": task.reported_at,
         "closed_at": task.closed_at,
         "close": task.close,
-        "assignment": task.assignment,
         "run": {
             "digest": run.and_then(|run| run.digest.clone()),
             "evidence": run.and_then(|run| run.evidence.clone()).unwrap_or(Value::Null),
@@ -152,19 +135,8 @@ fn task_json(state: &State, task: &Task) -> Value {
     })
 }
 
-fn is_closed(state: &State, id: u64) -> bool {
-    state.events().iter().any(|event| event.closes == Some(id))
-}
-
 /// The API state: one core fold, serialized. Nothing here re-derives meaning.
-pub fn state_json(
-    journal: &Journal,
-    now: i64,
-    state_dir: &Path,
-    project_dir: &Path,
-    workspaces: &[(String, String)],
-    health: &Health,
-) -> Value {
+pub fn state_json(journal: &Journal, health: &Health) -> Value {
     let state = State::fold(journal.events.clone());
     let events: Vec<Value> = journal
         .events
@@ -191,30 +163,6 @@ pub fn state_json(
         .iter()
         .map(|task| task_json(&state, task))
         .collect();
-    let count = |status: TaskStatus| {
-        state
-            .tasks()
-            .iter()
-            .filter(|task| task.status == status)
-            .count()
-    };
-    let mut identity = Map::new();
-    let mut put = |name: &str, kind: Kind, keep_closed: bool| {
-        let mut entries: Vec<Value> = state
-            .events()
-            .iter()
-            .filter(|event| event.kind == kind)
-            .filter(|event| keep_closed || !is_closed(&state, event.id))
-            .map(entry)
-            .collect();
-        entries.reverse();
-        identity.insert(name.to_owned(), Value::Array(entries));
-    };
-    put("goals", Kind::Goal, false);
-    put("commitments", Kind::Commitment, false);
-    put("corrections", Kind::Correction, true);
-    put("decisions", Kind::RecordDecision, true);
-    put("relationships", Kind::Relationship, true);
     let proposals: Vec<Value> = state
         .proposals()
         .iter()
@@ -229,45 +177,11 @@ pub fn state_json(
             })
         })
         .collect();
-    let refused: Vec<Value> = state
-        .events()
-        .iter()
-        .filter(|event| event.kind == Kind::Refused)
-        .map(|event| {
-            json!({
-                "id": event.id,
-                "text": event.text,
-                "at": event.at,
-                "scope": event.scope,
-            })
-        })
-        .collect();
     json!({
-        "now": now,
-        "stateDir": state_dir.display().to_string(),
-        "projectDir": project_dir.display().to_string(),
-        "workspaces": workspaces
-            .iter()
-            .map(|(name, root)| json!({"name": name, "root": root}))
-            .collect::<Vec<_>>(),
         "events": events,
         "messages": messages,
         "tasks": tasks,
-        "relations": state.relations(),
         "proposals": proposals,
-        "identity": Value::Object(identity),
-        "currentGoal": state.goal().map_or(Value::Null, entry),
-        "refused": refused,
-        "counts": {
-            "tasks": state.tasks().len(),
-            "open": count(TaskStatus::Open),
-            "running": count(TaskStatus::Running),
-            "waiting": count(TaskStatus::Waiting),
-            "done": count(TaskStatus::Done),
-            "failed": count(TaskStatus::Failed),
-            "messages": messages.len(),
-        },
-        "lastTurn": state.turn(),
         "lastEvent": state.last_id(),
         "health": health,
     })
@@ -298,7 +212,6 @@ mod tests {
     use super::{journal_task, state_json, Health, Journal};
     use eja::{Event, Kind};
     use serde_json::{json, Value};
-    use std::path::Path;
 
     fn event(id: u64, turn: u64, scope: &str, kind: Kind, text: &str, data: Value) -> Event {
         Event {
@@ -399,19 +312,10 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(
-            &journal,
-            1_700_000_100,
-            Path::new("/state"),
-            Path::new("/project"),
-            &[("default".to_owned(), "/project".to_owned())],
-            &health(),
-        );
+        let state = state_json(&journal, &health());
 
         assert_eq!(state["messages"].as_array().unwrap().len(), 2);
         assert_eq!(state["events"].as_array().unwrap().len(), 9);
-        assert_eq!(state["counts"]["done"], 1);
-        assert_eq!(state["counts"]["tasks"], 2);
         assert_eq!(state["lastEvent"], 9);
         assert_eq!(state["tasks"][0]["children"], json!([2]));
         assert_eq!(state["tasks"][1]["status"], "done");
@@ -422,7 +326,6 @@ mod tests {
         );
         assert_eq!(state["tasks"][1]["close"]["accepted"], true);
         assert_eq!(state["tasks"][1]["event_ids"], json!([3, 5, 6, 7, 8]));
-        assert_eq!(state["relations"][0]["kind"], "part_of");
 
         let raw = journal_task(&journal, 2).expect("task");
         assert_eq!(raw["task"]["title"], "build");
