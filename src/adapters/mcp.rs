@@ -22,6 +22,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -479,6 +480,9 @@ impl ToolGateway for McpTools {
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         self.tools.values().map(|t| t.definition.clone()).collect()
     }
+    fn owns(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         ctx.control.check()?;
         let tool = self.tools.get(name).ok_or("MCP tool not granted")?;
@@ -556,12 +560,21 @@ impl Drop for McpTools {
 
 /// The application's one tool entry point. Shared MCP servers outlive ajas.
 pub struct HostTools {
-    mcp: Option<McpTools>,
+    groups: Vec<Group>,
+    mcp: Option<Arc<McpTools>>,
     project: PathBuf,
     private: PathBuf,
-    workspace_tools: bool,
     roots: Vec<PathBuf>,
 }
+
+/// One connector: a name, a grant, and a gateway. The assembly knows nothing
+/// about what is inside a group; adding a tool or a protocol adds a group.
+struct Group {
+    builtin: bool,
+    enabled: bool,
+    gateway: Box<dyn ToolGateway>,
+}
+
 impl HostTools {
     pub fn new(
         config: Option<&Path>,
@@ -569,13 +582,26 @@ impl HostTools {
         private: &Path,
         control: &Control,
     ) -> Result<Self> {
+        let mut groups = vec![Group {
+            builtin: true,
+            enabled: true,
+            gateway: Box::new(FileTools),
+        }];
+        let mcp = config
+            .map(|path| McpTools::load(path, project, control).map(Arc::new))
+            .transpose()?;
+        if let Some(mcp) = &mcp {
+            groups.push(Group {
+                builtin: false,
+                enabled: true,
+                gateway: Box::new(mcp.clone()),
+            });
+        }
         Ok(Self {
-            mcp: config
-                .map(|p| McpTools::load(p, project, control))
-                .transpose()?,
+            groups,
+            mcp,
             project: project.canonicalize()?,
             private: private.canonicalize()?,
-            workspace_tools: true,
             roots: Vec::new(),
         })
     }
@@ -586,6 +612,13 @@ impl HostTools {
     pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.roots = roots;
         self
+    }
+
+    fn workspace_enabled(&self) -> bool {
+        self.groups
+            .iter()
+            .find(|group| group.builtin)
+            .is_some_and(|group| group.enabled)
     }
 
     fn read(&self, tool: &str, arguments: &Value, control: &Control) -> Result<Value> {
@@ -618,46 +651,43 @@ impl HostTools {
     /// The built-in workspace file tools are a grant the host may switch off;
     /// connectors are unaffected.
     #[must_use]
-    pub const fn with_workspace_tools(mut self, enabled: bool) -> Self {
-        self.workspace_tools = enabled;
+    pub fn with_workspace_tools(mut self, enabled: bool) -> Self {
+        if let Some(group) = self.groups.iter_mut().find(|group| group.builtin) {
+            group.enabled = enabled;
+        }
         self
     }
 }
 impl ToolGateway for HostTools {
-    /// A aja works its granted workspace through the built-in file tools, and
-    /// reaches anything beyond it only through the host's declared connectors.
-    /// The file tools resolve every path inside the run's world and refuse the
-    /// host's private state, so the grant cannot widen the workspace.
+    /// The registry concatenates its enabled groups; a name is routed to the
+    /// group that declares it. No tool name is known here.
     fn definitions(&self, assignment: &Assignment) -> Vec<Value> {
-        let mut definitions = if self.workspace_tools {
-            FileTools.definitions(assignment)
-        } else {
-            Vec::new()
-        };
-        definitions.extend(
-            self.mcp
-                .as_ref()
-                .map_or_else(Vec::new, |mcp| mcp.definitions(assignment)),
-        );
-        definitions
+        self.groups
+            .iter()
+            .filter(|group| group.enabled)
+            .flat_map(|group| group.gateway.definitions(assignment))
+            .collect()
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
-        if matches!(
-            name,
-            "read_file" | "list_dir" | "edit_file" | "write_file" | "glob" | "grep" | "shell"
-        ) {
-            if !self.workspace_tools {
+        for group in &self.groups {
+            if !group.gateway.owns(name) {
+                continue;
+            }
+            if !group.enabled {
                 return Err("the workspace file tools are switched off".into());
             }
-            return FileTools.call(ctx, name, args);
+            return group.gateway.call(ctx, name, args);
         }
-        if !name.starts_with("mcp__") {
-            return Err(format!("{name} is not a declared connector tool").into());
-        }
-        self.mcp
-            .as_ref()
-            .ok_or("MCP is not configured")?
-            .call(ctx, name, args)
+        Err(format!("{name} is not a declared connector tool").into())
+    }
+    fn observes(&self, name: &str) -> bool {
+        self.groups
+            .iter()
+            .filter(|group| group.enabled)
+            .any(|group| group.gateway.owns(name) && group.gateway.observes(name))
+    }
+    fn owns(&self, name: &str) -> bool {
+        self.groups.iter().any(|group| group.gateway.owns(name))
     }
 }
 
@@ -666,14 +696,14 @@ impl Capabilities for HostTools {
     /// the granted workspaces, connector tools only when declared read-only.
     fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
         let control = parent.child(Duration::from_secs(60));
-        if tool == "read_file" || tool == "list_dir" {
-            if !self.workspace_tools {
+        if FileTools.owns(tool) {
+            if !self.workspace_enabled() {
                 return Err("the workspace file tools are switched off".into());
             }
+            if !FileTools.observes(tool) {
+                return Err("EJA only observes; edits belong to ajas".into());
+            }
             return self.read(tool, arguments, &control);
-        }
-        if tool == "write_file" || tool == "edit_file" {
-            return Err("EJA only observes; edits belong to ajas".into());
         }
         let context = ToolContext {
             aja_id: 0,
@@ -702,9 +732,12 @@ impl Capabilities for HostTools {
             .unwrap_or_else(|| json!({}));
         let control = control.child(Duration::from_secs(120));
         control.check()?;
-        if tool == "read_file" || tool == "list_dir" {
-            if !self.workspace_tools {
+        if FileTools.owns(tool) {
+            if !self.workspace_enabled() {
                 return Err("the workspace file tools are switched off".into());
+            }
+            if !FileTools.observes(tool) {
+                return Err("EJA only observes; edits belong to ajas".into());
             }
             return self.read(tool, &arguments, &control);
         }

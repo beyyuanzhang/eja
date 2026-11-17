@@ -216,3 +216,54 @@ fn the_host_reads_every_granted_workspace_and_nothing_else() {
         "traversal outside the grants is refused"
     );
 }
+
+#[test]
+fn the_workspace_grant_switches_off_every_entry() {
+    use eja::adapters::{HostTools, ToolGateway};
+    let fixture = State::new("observe-switch");
+    let project = fixture.path().join("project");
+    let private = fixture.path().join("state");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(&private).expect("private");
+    std::fs::write(project.join("note.txt"), "hello").expect("write");
+    let host = HostTools::new(None, &project, &private, &control())
+        .expect("tools")
+        .with_workspace_tools(false);
+    assert!(host
+        .definitions(&eja::Assignment {
+            task_id: 1,
+            objective: String::new(),
+            workspace: String::new(),
+            acceptance: String::new(),
+            input: String::new(),
+            resume: None,
+            issued_at: 0,
+        })
+        .is_empty());
+    let context = eja::adapters::ToolContext {
+        aja_id: 1,
+        project: &project,
+        private: &private,
+        control: &control(),
+    };
+    assert!(host
+        .call(
+            &context,
+            "read_file",
+            &serde_json::json!({"path":"note.txt"})
+        )
+        .is_err());
+    assert!(Capabilities::observe(
+        &host,
+        "read_file",
+        &serde_json::json!({"path":"note.txt"}),
+        &control()
+    )
+    .is_err());
+    assert!(Capabilities::witness(
+        &host,
+        &serde_json::json!({"tool":"read_file","arguments":{"path":"note.txt"}}),
+        &control()
+    )
+    .is_err());
+}

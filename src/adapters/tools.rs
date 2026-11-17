@@ -74,6 +74,44 @@ pub trait ToolGateway: Send + Sync {
     fn definitions(&self, assignment: &crate::Assignment) -> Vec<Value>;
     /// Trusted host implementations must honor control and bound their output/resources.
     fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value>;
+    /// Whether the host itself may call this tool to look at the world. An
+    /// effect is never an observation; connectors declare their own read-only
+    /// tools instead.
+    fn observes(&self, _name: &str) -> bool {
+        false
+    }
+    /// Whether this gateway declares the name: the registry routes by it.
+    fn owns(&self, name: &str) -> bool;
+}
+
+/// The reserved name of the built-in workspace group.
+pub const WORKSPACE_GROUP: &str = "workspace";
+
+/// The built-in group's tools, in presentation order. Definitions, routing and
+/// the settings view all derive from this one list.
+pub const WORKSPACE_TOOLS: [&str; 7] = [
+    "read_file",
+    "list_dir",
+    "edit_file",
+    "write_file",
+    "glob",
+    "grep",
+    "shell",
+];
+
+impl<T: ToolGateway + ?Sized> ToolGateway for std::sync::Arc<T> {
+    fn definitions(&self, assignment: &crate::Assignment) -> Vec<Value> {
+        (**self).definitions(assignment)
+    }
+    fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value> {
+        (**self).call(context, name, arguments)
+    }
+    fn observes(&self, name: &str) -> bool {
+        (**self).observes(name)
+    }
+    fn owns(&self, name: &str) -> bool {
+        (**self).owns(name)
+    }
 }
 
 /// No absolute paths, parent traversal, or symlinks in a aja's file capabilities.
@@ -157,17 +195,55 @@ pub fn granted_path(roots: &[PathBuf], name: &str) -> Result<PathBuf> {
 
 pub struct FileTools;
 
+/// One tool's declaration, from the group's single name list.
+fn workspace_definition(name: &str) -> Value {
+    let (description, properties, required) = match name {
+        "read_file" => (
+            "Read a UTF-8 file from the workspace. Large files are truncated.",
+            json!({"path":{"type":"string"}}),
+            json!(["path"]),
+        ),
+        "list_dir" => (
+            "List one directory level of the workspace: names, kind and size. Bounded by the output frame, reporting how many entries were kept.",
+            json!({"path":{"type":"string"}}),
+            json!(["path"]),
+        ),
+        "edit_file" => (
+            "Replace one exact occurrence in a workspace file. Fails unless the find text occurs exactly once, so an edit is always unambiguous.",
+            json!({"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}}),
+            json!(["path","find","replace"]),
+        ),
+        "write_file" => (
+            "Write UTF-8 content into the workspace.",
+            json!({"path":{"type":"string"},"text":{"type":"string"}}),
+            json!(["path","text"]),
+        ),
+        "glob" => (
+            "Find workspace files by glob pattern (*, ?, **), newest first. Skips .git, the host's private state and symlinks. Bounded: reports how many matches were kept.",
+            json!({"pattern":{"type":"string"},"path":{"type":"string","description":"directory to search from; defaults to the workspace root"}}),
+            json!(["pattern"]),
+        ),
+        "grep" => (
+            "Search workspace file contents with a regular expression. Returns file:line: text matches, bounded by the output frame. Skips .git, the host's private state, symlinks and oversized files.",
+            json!({"pattern":{"type":"string"},"path":{"type":"string","description":"directory to search from; defaults to the workspace root"},"include":{"type":"string","description":"optional glob the file path must match, e.g. *.rs"}}),
+            json!(["pattern"]),
+        ),
+        "shell" => (
+            "Run one shell command in the workspace (sh -c). Returns exit_code, bounded stdout/stderr and whether the run's budget ended it. A non-zero exit is an answer to read, not a tool failure. The command inherits the run's deadline and cancellation; its whole process group is killed when the run stops.",
+            json!({"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"optional per-command deadline, capped by the run's remaining budget"}}),
+            json!(["command"]),
+        ),
+        _ => unreachable!("the workspace name list is the definition list"),
+    };
+    json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}})
+}
+
 impl ToolGateway for FileTools {
     fn definitions(&self, _: &crate::Assignment) -> Vec<Value> {
-        vec![
-            json!({"type":"function","function":{"name":"read_file","description":"Read a UTF-8 file from the workspace. Large files are truncated.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"list_dir","description":"List one directory level of the workspace: names, kind and size. Bounded by the output frame, reporting how many entries were kept.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"edit_file","description":"Replace one exact occurrence in a workspace file. Fails unless the find text occurs exactly once, so an edit is always unambiguous.","parameters":{"type":"object","properties":{"path":{"type":"string"},"find":{"type":"string"},"replace":{"type":"string"}},"required":["path","find","replace"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"write_file","description":"Write UTF-8 content into the workspace.","parameters":{"type":"object","properties":{"path":{"type":"string"},"text":{"type":"string"}},"required":["path","text"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"glob","description":"Find workspace files by glob pattern (*, ?, **), newest first. Skips .git, the host's private state and symlinks. Bounded: reports how many matches were kept.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"directory to search from; defaults to the workspace root"}},"required":["pattern"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"grep","description":"Search workspace file contents with a regular expression. Returns file:line: text matches, bounded by the output frame. Skips .git, the host's private state, symlinks and oversized files.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","description":"directory to search from; defaults to the workspace root"},"include":{"type":"string","description":"optional glob the file path must match, e.g. *.rs"}},"required":["pattern"],"additionalProperties":false}}}),
-            json!({"type":"function","function":{"name":"shell","description":"Run one shell command in the workspace (sh -c). Returns exit_code, bounded stdout/stderr and whether the run's budget ended it. A non-zero exit is an answer to read, not a tool failure. The command inherits the run's deadline and cancellation; its whole process group is killed when the run stops.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"optional per-command deadline, capped by the run's remaining budget"}},"required":["command"],"additionalProperties":false}}}),
-        ]
+        WORKSPACE_TOOLS
+            .iter()
+            .map(|name| workspace_definition(name))
+            .collect()
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         ctx.control.check()?;
@@ -259,6 +335,12 @@ impl ToolGateway for FileTools {
             _ => return Err("tool not allowed".into()),
         };
         Ok(value)
+    }
+    fn observes(&self, name: &str) -> bool {
+        matches!(name, "read_file" | "list_dir")
+    }
+    fn owns(&self, name: &str) -> bool {
+        WORKSPACE_TOOLS.contains(&name)
     }
 }
 

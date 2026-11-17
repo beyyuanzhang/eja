@@ -335,6 +335,9 @@ fn a_shell_command_dies_with_its_run() {
 /// the world rather than the aja's own account.
 struct Effects;
 impl ToolGateway for Effects {
+    fn owns(&self, name: &str) -> bool {
+        name == "effect"
+    }
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         vec![
             json!({"type":"function","function":{"name":"effect","description":"apply one effect","parameters":{"type":"object","properties":{"kind":{"type":"string"},"path":{"type":"string"}},"required":["kind","path"]}}}),
@@ -415,6 +418,9 @@ fn the_aja_leaves_a_fossil_of_the_world_it_ended_in() {
 /// A gateway that answers with something far larger than a aja should carry.
 struct Big;
 impl ToolGateway for Big {
+    fn owns(&self, name: &str) -> bool {
+        name == "big"
+    }
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         vec![
             json!({"type":"function","function":{"name":"big","description":"a big result","parameters":{"type":"object","properties":{}}}}),
@@ -505,6 +511,9 @@ fn a_continuation_starts_from_the_predecessor_record() {
 
 struct Policy;
 impl ToolGateway for Policy {
+    fn owns(&self, name: &str) -> bool {
+        FileTools.owns(name)
+    }
     fn definitions(&self, a: &Assignment) -> Vec<Value> {
         FileTools
             .definitions(a)
@@ -1139,6 +1148,9 @@ fn live_and_replayed_results_share_one_view_and_large_records_still_resume() {
 
 struct Passage;
 impl ToolGateway for Passage {
+    fn owns(&self, name: &str) -> bool {
+        name == "big"
+    }
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         Big.definitions(&assignment(1))
     }

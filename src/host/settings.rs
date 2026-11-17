@@ -765,7 +765,7 @@ fn normalize_connectors(
     }
     if values
         .iter()
-        .any(|value| value.name.trim() == BUILTIN_WORKSPACE)
+        .any(|value| value.name.trim() == eja::adapters::WORKSPACE_GROUP)
     {
         return Err(ApiError::bad("workspace 是内置连接器，不能另建同名连接器"));
     }
@@ -1046,7 +1046,7 @@ fn public_connector(connector: &StoredConnector) -> ConnectorView {
 /// switchable, with nothing to edit and nothing to delete.
 fn builtin_workspace_view(enabled: bool) -> ConnectorView {
     ConnectorView {
-        name: BUILTIN_WORKSPACE.to_owned(),
+        name: eja::adapters::WORKSPACE_GROUP.to_owned(),
         mode: "command",
         builtin: true,
         command: String::new(),
@@ -1059,9 +1059,6 @@ fn builtin_workspace_view(enabled: bool) -> ConnectorView {
         timeout_ms: 0,
     }
 }
-
-/// The reserved name of the built-in workspace file tools.
-pub const BUILTIN_WORKSPACE: &str = "workspace";
 
 fn public_key_values(values: &BTreeMap<String, String>) -> Vec<KeyValueView> {
     values

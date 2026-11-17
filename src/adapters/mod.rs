@@ -20,7 +20,10 @@ pub use model::{Control, Model, OpenAiModel};
 pub use native::{NativeWorker, INTERRUPTED};
 pub use ports::{Capabilities, Ports, RecordReader};
 pub use records::RecordFiles;
-pub use tools::{granted_path, workspace_path, FileTools, ToolContext, ToolGateway};
+pub use tools::{
+    granted_path, workspace_path, FileTools, ToolContext, ToolGateway, WORKSPACE_GROUP,
+    WORKSPACE_TOOLS,
+};
 pub use worlds::{Shared, WorkspaceWorlds, Worktrees, World, Worlds};
 
 use crate::Kind;
