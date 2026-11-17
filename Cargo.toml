@@ -18,6 +18,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros", "process", "io-util", "signal"] }
 rmcp = { version = "3.9", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest"] }
 libc = "0.2"
+regex-lite = "0.1"
 
 # The lint policy this crate holds itself to. Pedantic and nursery are on, and
 # the two that do not fit this codebase are named here rather than silently

@@ -639,7 +639,10 @@ impl ToolGateway for HostTools {
         definitions
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
-        if matches!(name, "read_file" | "list_dir" | "edit_file" | "write_file") {
+        if matches!(
+            name,
+            "read_file" | "list_dir" | "edit_file" | "write_file" | "glob" | "grep" | "shell"
+        ) {
             if !self.workspace_tools {
                 return Err("the workspace file tools are switched off".into());
             }

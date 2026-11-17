@@ -227,6 +227,110 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     assert_eq!(manifest_of(&f, 1), before);
 }
 
+#[test]
+fn shell_glob_and_grep_work_inside_the_world() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = workspace("shell-tools");
+    std::fs::create_dir_all(f.path().join("src")).unwrap();
+    std::fs::write(
+        f.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    std::fs::write(f.path().join("notes.md"), "remember the shell\n").unwrap();
+    let model = Arc::new(Script::new(vec![
+        calls(vec![
+            call(
+                "shell",
+                json!({"command":"printf ran > shell.txt && pwd && exit 3"}),
+            ),
+            call("glob", json!({"pattern":"**/*.rs"})),
+            call("grep", json!({"pattern":"pub fn","include":"*.rs"})),
+        ]),
+        final_message(&["shell.txt"]),
+    ]));
+    let w = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
+    let digest = w.execute(&assignment(1), &control());
+    assert!(digest.contains("ended: message"), "{digest}");
+    assert_eq!(
+        std::fs::read_to_string(f.path().join("shell.txt")).unwrap(),
+        "ran"
+    );
+    let seen = model.seen.lock().unwrap();
+    let tool = |id: &str| -> Value {
+        let content = seen[1].iter().find(|m| m["tool_call_id"] == id).unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let view: Value = serde_json::from_str(&content).unwrap();
+        view["result"].clone()
+    };
+    let shell = tool("call_shell");
+    assert_eq!(
+        shell["exit_code"], 3,
+        "a non-zero exit is an answer: {shell}"
+    );
+    let cwd = f.path().canonicalize().unwrap();
+    assert!(shell["stdout"]
+        .as_str()
+        .unwrap()
+        .contains(&cwd.display().to_string()));
+    assert_eq!(shell["ended"], Value::Null);
+    let glob = tool("call_glob");
+    assert_eq!(glob["matches"], json!(["src/lib.rs"]), "{glob}");
+    let grep = tool("call_grep");
+    assert!(
+        grep["matches"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("src/lib.rs:1:"),
+        "{grep}"
+    );
+}
+
+#[test]
+fn a_shell_command_dies_with_its_run() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = workspace("shell-deadline");
+    let model = Arc::new(Script::new(vec![
+        calls(vec![call(
+            "shell",
+            json!({"command":"sleep 30","timeout_ms":300}),
+        )]),
+        final_message(&[]),
+    ]));
+    let w = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
+    let started = Instant::now();
+    let digest = w.execute(&assignment(1), &control());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the deadline killed the sleep"
+    );
+    assert!(digest.contains("ended: message"), "{digest}");
+    let seen = model.seen.lock().unwrap();
+    let content = seen[1]
+        .iter()
+        .find(|m| m["tool_call_id"] == "call_shell")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let shell: Value = serde_json::from_str(&content).unwrap();
+    assert!(
+        shell["result"]["ended"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"),
+        "{shell}"
+    );
+    assert!(model.pids.lock().unwrap().len() >= 1);
+    assert_reaped(&model.pids.lock().unwrap());
+}
+
 /// Effects that reach past the work area, so the digest can be checked against
 /// the world rather than the aja's own account.
 struct Effects;
@@ -799,7 +903,7 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
     assert!(digest.contains("ended: message"), "{digest}");
     let seen = server.join().unwrap();
     assert_eq!(seen[0]["messages"][1]["content"], "aja 1 work");
-    assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(seen[0]["tools"].as_array().unwrap().len(), 8);
     assert!(seen[1]["messages"]
         .as_array()
         .unwrap()

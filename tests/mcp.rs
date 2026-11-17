@@ -134,6 +134,9 @@ fn stdio_discovery_grants_results_and_owned_process_group() {
             "list_dir",
             "edit_file",
             "write_file",
+            "glob",
+            "grep",
+            "shell",
             "mcp__fixture__a_b",
             "mcp__fixture__echo",
             "mcp__fixture__fail"
