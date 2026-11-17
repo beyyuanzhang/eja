@@ -2,7 +2,7 @@
 
 One runtime, any number of frontends. A view talks to `eja serve` over HTTP and
 renders what the runtime derives; it never recomputes interaction semantics.
-`app/frontend` and `app/macos` are two views over this one contract.
+`app/macos` is the native view over this contract.
 
 All responses are JSON. An error is `{ "error": "..." }` with a 4xx/5xx status.
 

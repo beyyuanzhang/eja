@@ -67,27 +67,21 @@ Constitution:
 
 ## App
 
-`app/` is an independently served Svelte 5 + TypeScript + Vite interface for
-continuous conversation with EJA. It has one surface, **talk**: either the
-return screen of open loops or one active encounter. There is no new-chat or
-session control.
+`app/macos` is the native SwiftUI interface for continuous conversation with
+EJA. It has one surface, **talk**: either the return screen of open loops or one
+active encounter. There is no new-chat or session control. Build it with
+`app/macos/build.sh` and open `app/macos/dist/Eja.app`.
 
-The HTTP runtime is part of the `eja` executable; the frontend is not embedded:
+The HTTP runtime is part of the `eja` executable and stays separate from the
+app:
 
 ```sh
 cargo run -- serve --dir .eja --project .
-npm --prefix app/frontend run build
-npm --prefix app/frontend run preview
 ```
 
-Open <http://127.0.0.1:4173>. That is the only app address. The runtime's
-<http://127.0.0.1:8787> endpoint is internal API transport, not a second app.
+The runtime's <http://127.0.0.1:8787> endpoint is API transport, not a second app.
 Any number of separately hosted frontends may use the same runtime. See
-[app/README.md](app/README.md).
-
-`app/macos` is a native SwiftUI frontend over the same HTTP contract. Build it
-with `app/macos/build.sh` and open `app/macos/dist/Eja.app`; the runtime stays
-separate.
+[app/README.md](app/README.md) and [docs/APP-API.md](docs/APP-API.md).
 
 ## Facts and views
 

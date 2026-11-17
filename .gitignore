@@ -4,4 +4,3 @@ __pycache__/
 .agents/
 .archify/
 app/settings.json
-app/frontend/node_modules/
