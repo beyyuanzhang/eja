@@ -14,9 +14,9 @@ use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -347,7 +347,7 @@ impl ToolGateway for Effects {
         let path = args["path"].as_str().unwrap_or_default();
         match args["kind"].as_str().unwrap_or_default() {
             "project" => {
-                let target = c.project.join(path);
+                let target = c.workspace()?.join(path);
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -355,7 +355,7 @@ impl ToolGateway for Effects {
                 Ok(json!({"ok": true}))
             }
             "drop" => {
-                std::fs::remove_file(c.project.join(path))?;
+                std::fs::remove_file(c.workspace()?.join(path))?;
                 Ok(json!({"ok": true}))
             }
             other => Err(format!("unknown effect {other}").into()),
@@ -1012,6 +1012,133 @@ fn oversized_start_is_rejected_without_leaving_a_process() {
     assert_eq!(worker.active_count(), 0);
     assert!(worker_pids().is_empty());
     assert_eq!(manifest_of(&f, 1)["frozen"], true);
+}
+
+struct TestRuntime(Child);
+impl Drop for TestRuntime {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn post_detached_turn(mut command: Command) -> String {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _runtime = TestRuntime(
+        command
+            .args(["--port", &port.to_string()])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {
+            break stream;
+        }
+        assert!(Instant::now() < deadline, "runtime did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let body = r#"{"text":"run the MCP fixture"}"#;
+    write!(
+        stream,
+        "POST /api/turn HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    response
+}
+
+#[test]
+fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
+    use eja::adapters::{RecordFiles, RecordReader};
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for via_http in [false, true] {
+        let fixture = workspace("connector-only");
+        let state = fixture.path().join(".eja");
+        let old_worktree = state.join("worlds/1");
+        std::fs::create_dir_all(&old_worktree).unwrap();
+        std::fs::write(old_worktree.join("existing.txt"), "old worktree").unwrap();
+        let peer = fixture.path().join("peer");
+        let empty_path = fixture.path().join("bin");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::create_dir_all(&empty_path).unwrap();
+        std::fs::write(state.join("mcp.json"), json!({"mcpServers":{"fixture":{
+            "command":"/usr/bin/python3",
+            "args":[PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_server.py"), peer, "stdio"],
+            "tools":["echo"]
+        }}}).to_string()).unwrap();
+
+        let (url, server) = serve(vec![
+            json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":json!({"actions":[
+                {"op":"open_task","title":"connector only","request":"use the echo tool","acceptance":"it returned","run":true}
+            ]}).to_string()}}]}),
+            json!({"choices":[{"finish_reason":"tool_calls","message":calls(vec![
+                call("mcp__fixture__echo", json!({"text":"fixture-returned"}))
+            ])}]}),
+            json!({"choices":[{"finish_reason":"stop","message":final_message(&[])}]}),
+            json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":json!({"reply":"Accepted the echo.","actions":[
+                {"op":"close_task","task_id":1,"accepted":true}
+            ]}).to_string()}}]}),
+        ]);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_eja"));
+        command
+            .current_dir(fixture.path())
+            .env("PATH", &empty_path)
+            .env("LNA_BASE_URL", url)
+            .env("LNA_API_KEY", "test-key")
+            .env("LNA_MODEL", "test-model");
+        if via_http {
+            command.arg("serve");
+        }
+        command.args(["--no-project", "--dir", state.to_str().unwrap()]);
+        let reply = if via_http {
+            post_detached_turn(command)
+        } else {
+            let output = command
+                .args(["turn", "run the MCP fixture"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert!(reply.contains("Accepted the echo."), "{reply}");
+        let requests = server.join().unwrap();
+        let names: Vec<_> = requests[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["mcp__fixture__echo", "eja_read_record"]);
+        let reopened = eja::State::load(&eja::Store::new(&state).unwrap()).unwrap();
+        let task = reopened.task(1).unwrap();
+        assert_eq!(task.status, eja::TaskStatus::Done);
+        assert!(task.workspace.is_empty());
+        let manifest = manifest_of(&fixture, 1);
+        assert_eq!(manifest["frozen"], true);
+        assert!(manifest["checkpoint"].is_null() && manifest["checkpoint_error"].is_null());
+        let record = RecordFiles::with_checkpoints(state.join("ajas"), state.join("checkpoints"))
+            .slice("1/context.jsonl", &eja::Selector::Whole, &control())
+            .unwrap();
+        assert!(record["text"]
+            .as_str()
+            .unwrap()
+            .contains("fixture-returned"));
+        assert!(!state.join("checkpoints").exists());
+        assert!(old_worktree.join("existing.txt").is_file());
+    }
 }
 
 #[test]

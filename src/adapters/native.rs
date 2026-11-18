@@ -187,12 +187,12 @@ pub struct NativeWorker {
     model: Arc<dyn Model>,
     tools: Arc<dyn ToolGateway>,
     limits: Limits,
-    /// The shadow repository that keeps one commit per aja: the fossils. It owns
-    /// the private state path too, so the worker holds no layout of its own.
-    records: super::records::Checkpoints,
+    /// The optional shadow repository that keeps one commit per aja. A host
+    /// without Git evidence leaves this absent; the transcript manifest remains.
+    records: Option<super::records::Checkpoints>,
     /// Where each run may change things. Isolation is the host's decision, and
     /// the backend refuses a world that already has an owner.
-    worlds: Arc<dyn Worlds>,
+    worlds: Option<Arc<dyn Worlds>>,
     active: Mutex<Vec<ActiveRun>>,
 }
 
@@ -204,35 +204,52 @@ impl NativeWorker {
         model: Arc<dyn Model>,
         tools: Arc<dyn ToolGateway>,
     ) -> Result<Self> {
+        let project = project.into();
+        Self::for_workspace(binary, root, Some(&project), model, tools)
+    }
+
+    /// Build a worker with the host's optional workspace.
+    pub fn for_workspace(
+        binary: impl Into<PathBuf>,
+        root: impl Into<PathBuf>,
+        project: Option<&Path>,
+        model: Arc<dyn Model>,
+        tools: Arc<dyn ToolGateway>,
+    ) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
-        let project = project.into().canonicalize()?;
-        let state = root
-            .parent()
-            .ok_or("aja root has no state directory")?
-            .to_path_buf();
-        if project.starts_with(&state) {
+        let project = project.map(Path::canonicalize).transpose()?;
+        let state = root.parent().ok_or("aja root has no state directory")?;
+        if project
+            .as_ref()
+            .is_some_and(|project| project.starts_with(state))
+        {
             return Err(
                 "the private state directory must not contain the project workspace".into(),
             );
         }
-        let checkpoints = state.join("checkpoints");
+        let records = project.as_ref().map(|_| {
+            super::records::Checkpoints::new(state.join("checkpoints"), state.to_path_buf())
+        });
+        let worlds = project
+            .map(|project| Arc::new(Shared::new(project, state.to_path_buf())) as Arc<dyn Worlds>);
         Ok(Self {
             binary: binary.into().canonicalize()?,
             root,
             model,
             tools,
             limits: Limits::default(),
-            records: super::records::Checkpoints::new(checkpoints, state.clone()),
-            worlds: Arc::new(Shared::new(project, state)),
+            records,
+            worlds,
             active: Mutex::new(Vec::new()),
         })
     }
-    /// The worlds this host provides. Without one, every run shares the project.
+
+    /// Replace the constructor's default world backend.
     #[must_use]
     pub fn with_worlds(mut self, worlds: Arc<dyn Worlds>) -> Self {
-        self.worlds = worlds;
+        self.worlds = Some(worlds);
         self
     }
     pub fn with_limits(mut self, limits: Limits) -> Result<Self> {
@@ -266,7 +283,7 @@ impl NativeWorker {
         control: &Control,
         log: &mut ContextLog,
         counts: &mut std::collections::BTreeMap<String, usize>,
-        world: &World,
+        workspace: Option<&Path>,
     ) -> Result<(String, String)> {
         let mut definitions = self.tools.definitions(assignment);
         definitions.push(super::records::definition());
@@ -286,10 +303,10 @@ impl NativeWorker {
             context_bytes: self.limits.context_bytes,
             messages,
         };
-        let mut process = Process::start(&self.binary, &world.root, &start)?;
+        let mut process = Process::start(&self.binary, workspace.unwrap_or(&self.root), &start)?;
         let context = ToolContext {
             aja_id: assignment.task_id,
-            project: &world.root,
+            workspace,
             private: self.root.parent().ok_or("missing state root")?,
             control,
         };
@@ -398,16 +415,23 @@ impl NativeWorker {
             world,
             world_line,
         } = run;
-        // The record store freezes the world; the worker only hands it the run.
-        let (checkpoint, checkpoint_error) = match self.records.freeze(
-            assignment.task_id,
-            assignment.issued_at,
-            &world.root,
-            control,
-        ) {
-            Ok(commit) => (Some(commit), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
+        // The record store freezes the world only when this host assembled Git
+        // evidence. The transcript/manifest record is independent of it.
+        let (checkpoint, checkpoint_error) =
+            self.records
+                .as_ref()
+                .zip(world)
+                .map_or((None, None), |(records, world)| {
+                    match records.freeze(
+                        assignment.task_id,
+                        assignment.issued_at,
+                        &world.root,
+                        control,
+                    ) {
+                        Ok(commit) => (Some(commit), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    }
+                });
         let context = aja.join("context.jsonl");
         if let Ok(file) = fs::OpenOptions::new().write(true).open(&context) {
             file.sync_all()?;
@@ -441,7 +465,7 @@ impl NativeWorker {
         let manifest = super::records::Manifest {
             assignment: assignment.clone(),
             digest: digest.clone(),
-            world: world.label.clone(),
+            world: world.map_or_else(|| "none".to_owned(), |world| world.label.clone()),
             checkpoint,
             checkpoint_error,
             context: "context.jsonl".to_string(),
@@ -468,7 +492,7 @@ struct Seal<'a> {
     aja: &'a Path,
     assignment: &'a Assignment,
     outcome: Outcome<'a>,
-    world: &'a World,
+    world: Option<&'a World>,
     world_line: String,
 }
 
@@ -491,12 +515,20 @@ impl Worker for NativeWorker {
         // it is the only place that decides how many runs may exist at once.
         let root = (!assignment.workspace.is_empty())
             .then_some(std::path::Path::new(assignment.workspace.as_str()));
-        let world = match self.worlds.reserve(assignment.task_id, root, &control) {
-            Ok(world) => Held {
-                worlds: &*self.worlds,
-                world,
-            },
-            Err(error) => return format!("0 steps, 0 tool calls, ended: error\nno world: {error}"),
+        let held_world = if let Some(worlds) = &self.worlds {
+            match worlds.reserve(assignment.task_id, root, &control) {
+                Ok(world) => Some(Held {
+                    worlds: worlds.as_ref(),
+                    world,
+                }),
+                Err(error) => {
+                    return format!("0 steps, 0 tool calls, ended: error\nno world: {error}")
+                }
+            }
+        } else if root.is_some() {
+            return "0 steps, 0 tool calls, ended: error\nno world: this deployment grants no workspace".into();
+        } else {
+            None
         };
         {
             let mut active = self
@@ -517,7 +549,7 @@ impl Worker for NativeWorker {
             active: &self.active,
             id: assignment.task_id,
         };
-        let world = &world.world;
+        let world = held_world.as_ref().map(|held| &held.world);
         let mut counts = std::collections::BTreeMap::new();
         let mut log = match ContextLog::create(&aja) {
             Ok(log) => log,
@@ -527,8 +559,13 @@ impl Worker for NativeWorker {
                 )
             }
         };
-        let result: Result<(String, String)> =
-            self.run(assignment, &control, &mut log, &mut counts, world);
+        let result = self.run(
+            assignment,
+            &control,
+            &mut log,
+            &mut counts,
+            world.map(|world| world.root.as_path()),
+        );
         let steps = log.assistants;
         // The world's account is measured before the run is revoked: an expired
         // deadline makes it honest ("unobserved"), not optimistic.
@@ -549,23 +586,23 @@ impl Worker for NativeWorker {
         drop(log);
         // The account is the host's: measured against the reservation, and made
         // durable before the aja is sealed.
-        let account = self
-            .worlds
-            .settle(world, &parent.child(Duration::from_secs(60)));
-        let world_line = match &account {
-            Ok(value) => {
-                let mut line = format!(
-                    "world: {}: {}",
-                    world.label,
-                    value["change"].as_str().unwrap_or("unreported")
-                );
-                if let Some(commit) = value["commit"].as_str() {
-                    let _ = write!(line, " at {commit}");
+        let world_line = held_world.as_ref().map_or_else(
+            || "world: none: no workspace".into(),
+            |held| match held
+                .worlds
+                .settle(&held.world, &parent.child(Duration::from_secs(60)))
+            {
+                Ok(value) => {
+                    let change = value["change"].as_str().unwrap_or("unreported");
+                    let mut line = format!("world: {}: {change}", held.world.label);
+                    if let Some(commit) = value["commit"].as_str() {
+                        let _ = write!(line, " at {commit}");
+                    }
+                    line
                 }
-                line
-            }
-            Err(error) => format!("world: {}: account unavailable ({error})", world.label),
-        };
+                Err(error) => format!("world: {}: account unavailable ({error})", held.world.label),
+            },
+        );
         self.seal(
             Seal {
                 aja: &aja,

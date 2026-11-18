@@ -1,7 +1,7 @@
 //! Host surface: one read over the three authorities, and the capabilities a
 //! host may add on top of it.
 use super::Worlds;
-use crate::{Address, Authority, Control, Event, Host, Result, Selector, TaskId};
+use crate::{Address, Authority, Control, Event, Host, Result, Selector, TaskId, WorkspaceGrant};
 use serde_json::Value;
 
 pub trait RecordReader {
@@ -31,6 +31,18 @@ pub struct Ports<'a> {
 }
 
 impl Host for Ports<'_> {
+    fn workspace_available(&self, workspace: &str, available: &[WorkspaceGrant]) -> bool {
+        if workspace.is_empty() {
+            return true;
+        }
+        let Ok(target) = std::fs::canonicalize(workspace) else {
+            return false;
+        };
+        available
+            .iter()
+            .any(|grant| std::fs::canonicalize(&grant.root).is_ok_and(|root| root == target))
+    }
+
     fn look(
         &self,
         target: &str,

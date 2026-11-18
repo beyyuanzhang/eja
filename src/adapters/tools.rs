@@ -63,11 +63,33 @@ fn shrink(value: &mut Value) -> bool {
 
 pub struct ToolContext<'a> {
     pub aja_id: u64,
-    /// The one workspace: the project. There is no second place to write.
-    pub project: &'a Path,
+    /// The workspace this run may touch. A host may assemble connectors without
+    /// one; a local file tool then has nothing to resolve against.
+    pub workspace: Option<&'a Path>,
     /// The host's own state, which no aja may read or write.
     pub private: &'a Path,
     pub control: &'a Control,
+}
+
+impl ToolContext<'_> {
+    pub fn workspace(&self) -> Result<&Path> {
+        self.workspace
+            .ok_or_else(|| "this host assembled no workspace".into())
+    }
+
+    // A reserved worktree can live beneath the state directory. Protect private
+    // state inside a granted workspace while the workspace resolver keeps an
+    // isolated run within its own root.
+    fn private_in_workspace(&self) -> Option<&Path> {
+        self.workspace
+            .filter(|workspace| self.private.starts_with(workspace))
+            .map(|_| self.private)
+    }
+
+    fn is_private(&self, path: &Path) -> bool {
+        self.private_in_workspace()
+            .is_some_and(|private| path.starts_with(private))
+    }
 }
 
 pub trait ToolGateway: Send + Sync {
@@ -79,6 +101,9 @@ pub trait ToolGateway: Send + Sync {
     /// tools instead.
     fn observes(&self, _name: &str) -> bool {
         false
+    }
+    fn witnesses(&self, name: &str) -> bool {
+        self.observes(name)
     }
     /// Whether this gateway declares the name: the registry routes by it.
     fn owns(&self, name: &str) -> bool;
@@ -108,6 +133,9 @@ impl<T: ToolGateway + ?Sized> ToolGateway for std::sync::Arc<T> {
     }
     fn observes(&self, name: &str) -> bool {
         (**self).observes(name)
+    }
+    fn witnesses(&self, name: &str) -> bool {
+        (**self).witnesses(name)
     }
     fn owns(&self, name: &str) -> bool {
         (**self).owns(name)
@@ -247,11 +275,12 @@ impl ToolGateway for FileTools {
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         ctx.control.check()?;
+        let workspace = ctx.workspace()?;
         let value = match name {
             "read_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let full = workspace_path(ctx.project, path)?;
-                if full.starts_with(ctx.private) {
+                let full = workspace_path(workspace, path)?;
+                if ctx.is_private(&full) {
                     return Err("the host's private state is not readable".into());
                 }
                 let file = fs::File::open(full)?;
@@ -262,8 +291,8 @@ impl ToolGateway for FileTools {
             }
             "list_dir" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
-                let full = workspace_path(ctx.project, path)?;
-                if full.starts_with(ctx.private) {
+                let full = workspace_path(workspace, path)?;
+                if ctx.is_private(&full) {
                     return Err("the host's private state is not readable".into());
                 }
                 let mut entries = Vec::new();
@@ -293,8 +322,8 @@ impl ToolGateway for FileTools {
                 let path = args["path"].as_str().ok_or("missing path")?;
                 let find = args["find"].as_str().ok_or("missing find")?;
                 let replace = args["replace"].as_str().ok_or("missing replace")?;
-                let full = workspace_path(ctx.project, path)?;
-                if full.starts_with(ctx.private) {
+                let full = workspace_path(workspace, path)?;
+                if ctx.is_private(&full) {
                     return Err("the host's private state is not writable".into());
                 }
                 if fs::metadata(&full)?.len() > FRAME_LIMIT as u64 {
@@ -319,8 +348,8 @@ impl ToolGateway for FileTools {
             "write_file" => {
                 let path = args["path"].as_str().ok_or("missing path")?;
                 let text = args["text"].as_str().ok_or("missing text")?;
-                let full = workspace_path(ctx.project, path)?;
-                if full.starts_with(ctx.private) {
+                let full = workspace_path(workspace, path)?;
+                if ctx.is_private(&full) {
                     return Err("the host's private state is not writable".into());
                 }
                 if let Some(parent) = full.parent() {
@@ -346,7 +375,7 @@ impl ToolGateway for FileTools {
 
 /// Every regular file under one root, skipping the host's private state, `.git`
 /// and symlinks. The walk is bounded by the run's control and the entry cap.
-fn walk(root: &Path, private: &Path, control: &Control) -> Result<(Vec<PathBuf>, bool)> {
+fn walk(root: &Path, private: Option<&Path>, control: &Control) -> Result<(Vec<PathBuf>, bool)> {
     let mut files = Vec::new();
     let mut truncated = false;
     let mut pending = vec![root.to_path_buf()];
@@ -362,7 +391,7 @@ fn walk(root: &Path, private: &Path, control: &Control) -> Result<(Vec<PathBuf>,
                 break;
             }
             let path = entry.path();
-            if path.starts_with(private) {
+            if private.is_some_and(|private| path.starts_with(private)) {
                 continue;
             }
             let Ok(metadata) = path.symlink_metadata() else {
@@ -442,8 +471,8 @@ fn glob_walk(segments: &[&str], parts: &[&str]) -> bool {
 
 fn search_root(ctx: &ToolContext<'_>, args: &Value) -> Result<PathBuf> {
     let path = args["path"].as_str().unwrap_or(".");
-    let full = workspace_path(ctx.project, path)?;
-    if full.starts_with(ctx.private) {
+    let full = workspace_path(ctx.workspace()?, path)?;
+    if ctx.is_private(&full) {
         return Err("the host's private state is not searchable".into());
     }
     if !full.is_dir() {
@@ -456,10 +485,11 @@ fn glob(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
     let pattern = args["pattern"].as_str().ok_or("missing pattern")?;
     let shown = cut_chars(pattern, PATTERN_CAP);
     let root = search_root(ctx, args)?;
-    let (files, mut truncated) = walk(&root, ctx.private, ctx.control)?;
+    let workspace = ctx.workspace()?;
+    let (files, mut truncated) = walk(&root, ctx.private_in_workspace(), ctx.control)?;
     let mut matched: Vec<(String, i64)> = Vec::new();
     for file in files {
-        let Ok(relative) = file.strip_prefix(ctx.project) else {
+        let Ok(relative) = file.strip_prefix(workspace) else {
             continue;
         };
         let name = relative.to_string_lossy().into_owned();
@@ -498,13 +528,14 @@ fn grep(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
         regex_lite::Regex::new(pattern).map_err(|error| format!("invalid pattern: {error}"))?;
     let include = args["include"].as_str().filter(|glob| !glob.is_empty());
     let root = search_root(ctx, args)?;
-    let (files, mut truncated) = walk(&root, ctx.private, ctx.control)?;
+    let workspace = ctx.workspace()?;
+    let (files, mut truncated) = walk(&root, ctx.private_in_workspace(), ctx.control)?;
     let mut matches = Vec::new();
     let mut budget = crate::measure::Budget::new(FRAME_LIMIT);
     budget.admit(256);
     'files: for file in files {
         ctx.control.check()?;
-        let Ok(relative) = file.strip_prefix(ctx.project) else {
+        let Ok(relative) = file.strip_prefix(workspace) else {
             continue;
         };
         let name = relative.to_string_lossy().into_owned();
@@ -553,7 +584,7 @@ fn shell(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
     process
         .arg("-c")
         .arg(command)
-        .current_dir(ctx.project)
+        .current_dir(ctx.workspace()?)
         .env_remove("LNA_API_KEY")
         .env_remove("JIYUAN_API_KEY")
         .env_remove("OPENAI_API_KEY")

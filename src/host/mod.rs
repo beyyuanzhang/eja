@@ -73,7 +73,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[derive(Debug, Clone)]
 pub struct Options {
     pub state_dir: PathBuf,
-    pub project_dir: PathBuf,
+    pub project_dir: Option<PathBuf>,
     pub host: String,
     pub port: u16,
     pub allowed_origins: Vec<String>,
@@ -81,7 +81,7 @@ pub struct Options {
 
 pub struct Host {
     state_dir: PathBuf,
-    project_dir: PathBuf,
+    project_dir: Option<PathBuf>,
     settings: SettingsStore,
     allowed_origins: Vec<String>,
     turn_in_flight: AtomicBool,
@@ -129,15 +129,19 @@ pub fn serve(options: Options) -> eja::Result<()> {
     }
     let project_dir = options
         .project_dir
-        .canonicalize()
-        .map_err(|error| format!("project directory is unavailable: {error}"))?;
-    if !project_dir.is_dir() {
-        return Err(format!(
-            "project directory does not exist: {}",
-            project_dir.display()
-        )
-        .into());
-    }
+        .map(|path| {
+            let path = path
+                .canonicalize()
+                .map_err(|error| format!("project directory is unavailable: {error}"))?;
+            if !path.is_dir() {
+                return Err(format!(
+                    "project directory does not exist: {}",
+                    path.display()
+                ));
+            }
+            Ok(path)
+        })
+        .transpose()?;
     std::fs::create_dir_all(&options.state_dir)?;
     let state_dir = options.state_dir.canonicalize()?;
     let ignore = state_dir.join(".gitignore");
@@ -176,7 +180,12 @@ pub fn serve(options: Options) -> eja::Result<()> {
         let local = listener.local_addr()?;
         println!("eja app  http://{local}");
         println!("  state   {}", host.state_dir.display());
-        println!("  project {}", host.project_dir.display());
+        println!(
+            "  project {}",
+            host.project_dir
+                .as_ref()
+                .map_or_else(|| "(none)".to_owned(), |path| path.display().to_string())
+        );
         println!(
             "  eja     {}",
             effective
@@ -522,10 +531,11 @@ async fn test_connector(State(host): State<Arc<Host>>, request: Request) -> ApiR
     };
     let project = host.project_dir.clone();
     let state_dir = host.state_dir.clone();
-    let result =
-        tokio::task::spawn_blocking(move || probe_connector(&connector, &project, &state_dir))
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        probe_connector(&connector, project.as_deref(), &state_dir)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(Json(match result {
         Ok((tools, stderr)) => json!({
             "ok": true,
@@ -544,7 +554,7 @@ async fn test_connector(State(host): State<Arc<Host>>, request: Request) -> ApiR
 
 fn probe_connector(
     connector: &StoredConnector,
-    project: &Path,
+    project: Option<&Path>,
     state_dir: &Path,
 ) -> std::result::Result<(Vec<Value>, String), String> {
     std::fs::create_dir_all(state_dir).map_err(|error| error.to_string())?;
@@ -568,7 +578,7 @@ fn probe_connector(
         Arc::new(AtomicBool::new(false)),
     );
     let result = (|| {
-        let tools = HostTools::new(Some(&config), project, state_dir, &control)
+        let tools = HostTools::with_workspace(Some(&config), project, state_dir, &control)
             .map_err(|error| sanitize(&error.to_string(), connector))?;
         let definitions = tools.definitions(&Assignment {
             task_id: 0,
@@ -755,16 +765,15 @@ fn execute_turn(
     let startup = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
     let config = effective.mcp_path.as_deref().filter(|path| path.is_file());
     let grant = host.settings.grant(&effective.settings);
-    let tools = Arc::new(
-        HostTools::new(config, &host.project_dir, &host.state_dir, &startup)?
-            .with_workspace_tools(effective.workspace_tools)
-            .with_roots(
-                grant
-                    .iter()
-                    .map(|workspace| PathBuf::from(&workspace.root))
-                    .collect(),
-            ),
-    );
+    let assembled = assemble_capabilities(
+        host.project_dir.as_deref(),
+        &host.state_dir,
+        config,
+        &grant,
+        effective.workspace_tools,
+        effective.limits.slots,
+        &startup,
+    )?;
     let ajas = host.state_dir.join("ajas");
     let mut aja_limits = eja::aja::Limits::default();
     if effective.limits.aja_steps > 0 {
@@ -773,27 +782,13 @@ fn execute_turn(
     if effective.limits.aja_timeout_ms > 0 {
         aja_limits.timeout_ms = effective.limits.aja_timeout_ms;
     }
-    let worlds = build_worlds(
-        &host.project_dir,
-        &host.state_dir,
-        &grant,
-        effective.limits.slots,
-        &startup,
-    );
-    let worker = NativeWorker::new(
-        std::env::current_exe()?,
-        &ajas,
-        host.project_dir.clone(),
-        Arc::new(model),
-        tools.clone() as Arc<dyn ToolGateway>,
-    )?
-    .with_limits(aja_limits)?
-    .with_worlds(worlds.clone());
-    let records = RecordFiles::with_checkpoints(ajas, host.state_dir.join("checkpoints"));
+    let worker = assembled.worker(&ajas, model, aja_limits)?;
+    // Reading a historical checkpoint is independent of creating new ones.
+    let records = RecordFiles::with_checkpoints(&ajas, host.state_dir.join("checkpoints"));
     let ports = Ports {
         aja: Some(&records),
-        capabilities: Some(&*tools),
-        worlds: Some(worlds.as_ref()),
+        capabilities: Some(&*assembled.tools),
+        worlds: assembled.worlds.as_deref(),
     };
     let store = Store::new(&host.state_dir)?;
     let mut options = TurnOptions {
@@ -823,6 +818,69 @@ fn execute_turn(
     Ok(outcome.reply)
 }
 
+/// One deployment's assembled optional capabilities.
+pub struct Assembled {
+    pub tools: Arc<HostTools>,
+    pub worlds: Option<Arc<dyn Worlds>>,
+    workspace: Option<PathBuf>,
+}
+
+impl Assembled {
+    pub fn worker(
+        &self,
+        ajas: &Path,
+        model: OpenAiModel,
+        limits: eja::aja::Limits,
+    ) -> eja::Result<NativeWorker> {
+        let worker = NativeWorker::for_workspace(
+            std::env::current_exe()?,
+            ajas,
+            self.workspace.as_deref(),
+            Arc::new(model),
+            self.tools.clone() as Arc<dyn ToolGateway>,
+        )?
+        .with_limits(limits)?;
+        Ok(if let Some(worlds) = &self.worlds {
+            worker.with_worlds(worlds.clone())
+        } else {
+            worker
+        })
+    }
+}
+
+/// Assemble local tools, connectors, worlds and Git evidence from the host's
+/// grants. With no workspace and no grant this is connector-only: no file tools,
+/// no project cwd, and no checkpoint repository.
+pub fn assemble_capabilities(
+    project: Option<&Path>,
+    state_dir: &Path,
+    config: Option<&Path>,
+    grant: &[eja::WorkspaceGrant],
+    workspace_tools: bool,
+    slots: usize,
+    startup: &Control,
+) -> eja::Result<Assembled> {
+    let workspace = project
+        .map(Path::to_path_buf)
+        .or_else(|| grant.first().map(|grant| PathBuf::from(&grant.root)));
+    let tools = Arc::new(
+        HostTools::with_workspace(config, workspace.as_deref(), state_dir, startup)?
+            .with_workspace_tools(workspace_tools)
+            .with_roots(
+                grant
+                    .iter()
+                    .map(|workspace| PathBuf::from(&workspace.root))
+                    .collect(),
+            ),
+    );
+    let worlds = build_worlds(state_dir, grant, slots, startup);
+    Ok(Assembled {
+        tools,
+        worlds,
+        workspace,
+    })
+}
+
 fn header_pairs(role: &RoleConfig) -> Vec<(String, String)> {
     role.headers
         .iter()
@@ -834,13 +892,13 @@ fn header_pairs(role: &RoleConfig) -> Vec<(String, String)> {
 /// worktrees and any other root shares itself; with one slot every root is
 /// shared. The default root is the first grant, so a task that names nothing
 /// works where the host was started.
-pub fn build_worlds(
-    project: &Path,
+fn build_worlds(
     state_dir: &Path,
     grant: &[eja::WorkspaceGrant],
     slots: usize,
     startup: &Control,
-) -> Arc<dyn Worlds> {
+) -> Option<Arc<dyn Worlds>> {
+    let first_root = normalize_root(&grant.first()?.root);
     let mut roots: BTreeMap<PathBuf, Arc<dyn Worlds>> = BTreeMap::new();
     for (index, grant) in grant.iter().enumerate() {
         let path = normalize_root(&grant.root);
@@ -862,11 +920,10 @@ pub fn build_worlds(
         };
         roots.insert(path, backend);
     }
-    let default = roots
-        .get(&normalize_root(&project.display().to_string()))
-        .cloned()
-        .unwrap_or_else(|| Arc::new(Shared::new(project.to_path_buf(), state_dir.to_path_buf())));
-    Arc::new(eja::adapters::WorkspaceWorlds::new(default, roots))
+    let default = roots.get(&first_root)?.clone();
+    Some(Arc::new(eja::adapters::WorkspaceWorlds::new(
+        default, roots,
+    )))
 }
 
 /// Grant keys are real paths: a granted root reached through a symlink is the

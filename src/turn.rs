@@ -377,41 +377,6 @@ fn open_task(ctx: &ActionCtx<'_>, state: &mut State, input: &TaskOpen<'_>) -> Re
     Ok(id)
 }
 
-/// Resolve the workspace ID a task names against the available workspaces. An
-/// omitted ID is the default (the first root); an unknown ID is refused.
-fn resolve_workspace<'a>(
-    options: &'a TurnOptions,
-    id: Option<&str>,
-) -> std::result::Result<&'a str, String> {
-    let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) else {
-        return Ok(options
-            .workspaces
-            .first()
-            .map_or("", |grant| grant.root.as_str()));
-    };
-    options
-        .workspaces
-        .iter()
-        .find(|grant| grant.id == id)
-        .map(|grant| grant.root.as_str())
-        .ok_or_else(|| format!("open_task refused: no available workspace id {id}"))
-}
-
-/// A task may only execute in a root available now. An empty workspace is the
-/// host's default and is not re-resolved from task text.
-fn workspace_is_available(options: &TurnOptions, workspace: &str) -> bool {
-    if workspace.is_empty() {
-        return true;
-    }
-    let Ok(target) = std::fs::canonicalize(workspace) else {
-        return false;
-    };
-    options
-        .workspaces
-        .iter()
-        .any(|grant| std::fs::canonicalize(&grant.root).is_ok_and(|granted| granted == target))
-}
-
 fn link_tasks(
     store: &Store,
     state: &mut State,
@@ -542,7 +507,10 @@ fn reserve_dispatch(
             "dispatch refused: a group is not an execution aja".into()
         ));
     }
-    if !workspace_is_available(ctx.options, &task.workspace) {
+    if !ctx
+        .host
+        .workspace_available(&task.workspace, &ctx.options.workspaces)
+    {
         return Ok(Err(
             "dispatch refused: task workspace is not available".into()
         ));
@@ -749,7 +717,10 @@ fn reconcile(
             "reconcile refused: task {task_id} has no run to reconcile"
         )));
     }
-    if !workspace_is_available(ctx.options, &task.workspace) {
+    if !ctx
+        .host
+        .workspace_available(&task.workspace, &ctx.options.workspaces)
+    {
         return Ok(Err(
             "reconcile refused: task workspace is not available".into()
         ));
@@ -941,7 +912,11 @@ fn apply_actions(
                 evidence,
                 run,
             } => {
-                let workspace = match resolve_workspace(ctx.options, workspace.as_deref()) {
+                let workspace = match ctx
+                    .host
+                    .resolve_workspace(workspace.as_deref(), &ctx.options.workspaces)
+                    .map_err(|error| error.to_string())
+                {
                     Ok(root) => root,
                     Err(note) => {
                         let told = refuse(ctx.store, state, ctx, &note)?;
@@ -958,7 +933,7 @@ fn apply_actions(
                         request,
                         origin: ctx.input,
                         acceptance,
-                        workspace,
+                        workspace: &workspace,
                         evidence: evidence.clone(),
                     },
                 )?;

@@ -152,7 +152,7 @@ fn list_dir_reads_the_project_and_reports_what_it_hid() {
     let control = control();
     let ctx = ToolContext {
         aja_id: 1,
-        project: &project,
+        workspace: Some(&project),
         private: &private,
         control: &control,
     };
@@ -179,7 +179,7 @@ fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
     let control = control();
     let ctx = ToolContext {
         aja_id: 1,
-        project: &work,
+        workspace: Some(&work),
         private: &private,
         control: &control,
     };
@@ -214,6 +214,47 @@ fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
         Err(error) => error.to_string(),
     };
     assert!(ambiguous.contains("found 2"), "{ambiguous}");
+}
+
+#[test]
+fn file_tools_reach_the_reserved_worktree_but_not_its_private_parent() {
+    use eja::adapters::{FileTools, ToolContext, ToolGateway};
+    use serde_json::json;
+
+    let fixture = State::new("isolated-file-tools");
+    let private = fixture.path().join("state");
+    let worktree = private.join("worlds/0/1");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let journal = private.join("log.jsonl");
+    std::fs::write(&journal, "host facts").unwrap();
+    let tool_control = control();
+    let tools = ToolContext {
+        aja_id: 1,
+        workspace: Some(&worktree),
+        private: &private,
+        control: &tool_control,
+    };
+    FileTools
+        .call(
+            &tools,
+            "write_file",
+            &json!({"path":"out.txt","text":"output"}),
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("out.txt")).unwrap(),
+        "output"
+    );
+    let found = FileTools
+        .call(&tools, "glob", &json!({"pattern":"*.txt"}))
+        .unwrap();
+    assert_eq!(found["matches"], json!(["out.txt"]));
+    assert!(FileTools
+        .call(&tools, "read_file", &json!({"path":journal}))
+        .is_err());
+    assert!(FileTools
+        .call(&tools, "read_file", &json!({"path":"../../../log.jsonl"}))
+        .is_err());
 }
 
 #[test]
@@ -295,7 +336,7 @@ fn world_and_frozen_text_reads_share_encoding_bounds_and_cancellation() {
     let private = state.path().join(".eja");
     let context = ToolContext {
         aja_id: 1,
-        project: state.path(),
+        workspace: Some(state.path()),
         private: &private,
         control: &control,
     };

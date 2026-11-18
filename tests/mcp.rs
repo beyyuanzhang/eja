@@ -59,7 +59,7 @@ impl Fixture {
     ) -> Result<Value> {
         let ctx = ToolContext {
             aja_id: 123,
-            project: self.root(),
+            workspace: Some(self.root()),
             private: self.root(),
             control,
         };

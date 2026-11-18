@@ -22,7 +22,6 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -189,6 +188,10 @@ impl McpTools {
 
     /// Explicit host config only; no home/project auto-discovery or shell expansion.
     pub fn load(path: &Path, project: &Path, parent: &Control) -> Result<Self> {
+        Self::load_with_workspace(path, Some(project), parent)
+    }
+
+    fn load_with_workspace(path: &Path, project: Option<&Path>, parent: &Control) -> Result<Self> {
         parent.check()?;
         let mut bytes = Vec::new();
         fs::File::open(path)?
@@ -241,11 +244,15 @@ impl McpTools {
                     if !config.headers.is_empty() {
                         return Err("stdio MCP cannot have HTTP headers".into());
                     }
+                    let config_dir = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
                     let cwd = config.cwd.as_ref().map_or_else(
-                        || project.to_path_buf(),
+                        || project.map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf),
                         |p| {
                             if p.is_relative() {
-                                path.parent().unwrap_or_else(|| Path::new(".")).join(p)
+                                config_dir.join(p)
                             } else {
                                 p.clone()
                             }
@@ -483,6 +490,12 @@ impl ToolGateway for McpTools {
     fn owns(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
+    fn observes(&self, name: &str) -> bool {
+        self.is_read_only(name)
+    }
+    fn witnesses(&self, name: &str) -> bool {
+        self.is_witness(name)
+    }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
         ctx.control.check()?;
         let tool = self.tools.get(name).ok_or("MCP tool not granted")?;
@@ -561,8 +574,7 @@ impl Drop for McpTools {
 /// The application's one tool entry point. Shared MCP servers outlive ajas.
 pub struct HostTools {
     groups: Vec<Group>,
-    mcp: Option<Arc<McpTools>>,
-    project: PathBuf,
+    workspace: Option<PathBuf>,
     private: PathBuf,
     roots: Vec<PathBuf>,
 }
@@ -582,25 +594,35 @@ impl HostTools {
         private: &Path,
         control: &Control,
     ) -> Result<Self> {
-        let mut groups = vec![Group {
-            builtin: true,
-            enabled: true,
-            gateway: Box::new(FileTools),
-        }];
-        let mcp = config
-            .map(|path| McpTools::load(path, project, control).map(Arc::new))
-            .transpose()?;
-        if let Some(mcp) = &mcp {
+        Self::with_workspace(config, Some(project), private, control)
+    }
+
+    pub fn with_workspace(
+        config: Option<&Path>,
+        workspace: Option<&Path>,
+        private: &Path,
+        control: &Control,
+    ) -> Result<Self> {
+        let workspace = workspace.map(Path::canonicalize).transpose()?;
+        let mut groups = Vec::new();
+        if workspace.is_some() {
+            groups.push(Group {
+                builtin: true,
+                enabled: true,
+                gateway: Box::new(FileTools),
+            });
+        }
+        if let Some(path) = config {
+            let gateway = McpTools::load_with_workspace(path, workspace.as_deref(), control)?;
             groups.push(Group {
                 builtin: false,
                 enabled: true,
-                gateway: Box::new(mcp.clone()),
+                gateway: Box::new(gateway),
             });
         }
         Ok(Self {
             groups,
-            mcp,
-            project: project.canonicalize()?,
+            workspace,
             private: private.canonicalize()?,
             roots: Vec::new(),
         })
@@ -614,38 +636,66 @@ impl HostTools {
         self
     }
 
-    fn workspace_enabled(&self) -> bool {
-        self.groups
+    fn enabled_group(&self, tool: &str) -> Result<&Group> {
+        let group = self
+            .groups
             .iter()
-            .find(|group| group.builtin)
-            .is_some_and(|group| group.enabled)
+            .find(|group| group.gateway.owns(tool))
+            .ok_or_else(|| format!("{tool} is not a declared connector tool"))?;
+        if !group.enabled {
+            return Err("the workspace file tools are switched off".into());
+        }
+        Ok(group)
     }
 
-    fn read(&self, tool: &str, arguments: &Value, control: &Control) -> Result<Value> {
-        let path = arguments["path"].as_str().ok_or("missing path")?;
-        let roots: Vec<PathBuf> = if self.roots.is_empty() {
-            vec![self.project.clone()]
+    fn inspect(
+        &self,
+        tool: &str,
+        arguments: &Value,
+        control: &Control,
+        witness: bool,
+    ) -> Result<Value> {
+        let group = self.enabled_group(tool)?;
+        let allowed = if witness {
+            group.gateway.witnesses(tool)
         } else {
-            self.roots.clone()
+            group.gateway.observes(tool)
         };
-        let full = super::granted_path(&roots, path)?;
-        if full.starts_with(&self.private) {
-            return Err("the host's private state is not readable".into());
+        if !allowed {
+            return Err(if group.builtin {
+                "EJA only observes; edits belong to ajas".into()
+            } else if witness {
+                format!("{tool} is not a declared witness").into()
+            } else {
+                "EJA may only observe read-only connector tools".into()
+            });
         }
-        let root = roots
-            .iter()
-            .find(|root| full.starts_with(root))
-            .ok_or("path is outside every granted workspace")?;
-        let context = ToolContext {
+        let mut context = ToolContext {
             aja_id: 0,
-            project: root,
+            workspace: self.workspace.as_deref(),
             private: &self.private,
             control,
         };
-        // The resolved path is the answer: re-resolving the caller's relative
-        // name against the first matching root could address another grant.
-        let resolved = json!({"path": full.to_string_lossy()});
-        FileTools.call(&context, tool, &resolved)
+        if group.builtin {
+            let roots = if self.roots.is_empty() {
+                self.workspace.as_slice()
+            } else {
+                &self.roots
+            };
+            let path = arguments["path"].as_str().ok_or("missing path")?;
+            let full = super::granted_path(roots, path)?;
+            if full.starts_with(&self.private) {
+                return Err("the host's private state is not readable".into());
+            }
+            context.workspace = roots
+                .iter()
+                .find(|root| full.starts_with(root))
+                .map(PathBuf::as_path);
+            return group
+                .gateway
+                .call(&context, tool, &json!({"path": full.to_string_lossy()}));
+        }
+        group.gateway.call(&context, tool, arguments)
     }
 
     /// The built-in workspace file tools are a grant the host may switch off;
@@ -669,22 +719,11 @@ impl ToolGateway for HostTools {
             .collect()
     }
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
-        for group in &self.groups {
-            if !group.gateway.owns(name) {
-                continue;
-            }
-            if !group.enabled {
-                return Err("the workspace file tools are switched off".into());
-            }
-            return group.gateway.call(ctx, name, args);
-        }
-        Err(format!("{name} is not a declared connector tool").into())
+        self.enabled_group(name)?.gateway.call(ctx, name, args)
     }
     fn observes(&self, name: &str) -> bool {
-        self.groups
-            .iter()
-            .filter(|group| group.enabled)
-            .any(|group| group.gateway.owns(name) && group.gateway.observes(name))
+        self.enabled_group(name)
+            .is_ok_and(|group| group.gateway.observes(name))
     }
     fn owns(&self, name: &str) -> bool {
         self.groups.iter().any(|group| group.gateway.owns(name))
@@ -692,65 +731,27 @@ impl ToolGateway for HostTools {
 }
 
 impl Capabilities for HostTools {
-    /// EJA may look at the world; it may never act. Files are readable only from
-    /// the granted workspaces, connector tools only when declared read-only.
     fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
-        let control = parent.child(Duration::from_secs(60));
-        if FileTools.owns(tool) {
-            if !self.workspace_enabled() {
-                return Err("the workspace file tools are switched off".into());
-            }
-            if !FileTools.observes(tool) {
-                return Err("EJA only observes; edits belong to ajas".into());
-            }
-            return self.read(tool, arguments, &control);
-        }
-        let context = ToolContext {
-            aja_id: 0,
-            project: &self.project,
-            private: &self.private,
-            control: &control,
-        };
-        let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
-        if !mcp.is_read_only(tool) {
-            return Err("EJA may only observe read-only connector tools".into());
-        }
-        mcp.call(&context, tool, arguments)
+        self.inspect(
+            tool,
+            arguments,
+            &parent.child(Duration::from_secs(60)),
+            false,
+        )
     }
 
-    /// A witness is one declared host capability. The request names the tool; the
-    /// host decides whether that name may answer it, and reading a file can have
-    /// no effect, so the host's own read tools answer while the grant is on.
     fn witness(&self, request: &Value, control: &Control) -> Result<Value> {
         let tool = request["tool"]
             .as_str()
             .filter(|name| !name.is_empty())
             .ok_or("a witness names one host tool")?;
-        let arguments = request
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let control = control.child(Duration::from_secs(120));
-        control.check()?;
-        if FileTools.owns(tool) {
-            if !self.workspace_enabled() {
-                return Err("the workspace file tools are switched off".into());
-            }
-            if !FileTools.observes(tool) {
-                return Err("EJA only observes; edits belong to ajas".into());
-            }
-            return self.read(tool, &arguments, &control);
-        }
-        let context = ToolContext {
-            aja_id: 0,
-            project: &self.project,
-            private: &self.private,
-            control: &control,
-        };
-        let mcp = self.mcp.as_ref().ok_or("MCP is not configured")?;
-        if !mcp.is_witness(tool) {
-            return Err(format!("{tool} is not a declared witness").into());
-        }
-        mcp.call(&context, tool, &arguments)
+        let empty = json!({});
+        let arguments = request.get("arguments").unwrap_or(&empty);
+        self.inspect(
+            tool,
+            arguments,
+            &control.child(Duration::from_secs(120)),
+            true,
+        )
     }
 }

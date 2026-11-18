@@ -1,14 +1,12 @@
 use eja::{
-    adapters::{
-        self, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolGateway,
-    },
+    adapters::{self, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolGateway},
     turn_at_with_options, Assignment, Result, State, Store, Task, TaskStatus, TurnEnd, TurnOptions,
 };
-use std::{collections::VecDeque, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{collections::VecDeque, path::PathBuf, process::ExitCode};
 
 mod host;
 
-const USAGE: &str = "usage: eja --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET | serve [--dir DIR] [--project DIR] [--host HOST] [--port PORT] [--allow-origin ORIGIN]";
+const USAGE: &str = "usage: eja [--no-project] --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET | serve [--no-project] [--dir DIR] [--project DIR] [--host HOST] [--port PORT] [--allow-origin ORIGIN]";
 
 enum Command {
     Turn(String),
@@ -20,14 +18,24 @@ enum Command {
     Audit(u64),
 }
 
-fn parse(args: Vec<String>) -> Result<(PathBuf, Option<PathBuf>, TurnOptions, Command)> {
+struct Invocation {
+    dir: PathBuf,
+    config: Option<PathBuf>,
+    options: TurnOptions,
+    command: Command,
+    no_project: bool,
+}
+
+fn parse(args: Vec<String>) -> Result<Invocation> {
     let mut args: VecDeque<_> = args.into();
     let mut dir = PathBuf::from(".eja");
     let mut config = None;
+    let mut no_project = false;
     let mut options = TurnOptions::default();
     let mut words = Vec::new();
     while let Some(arg) = args.pop_front() {
         match arg.as_str() {
+            "--no-project" => no_project = true,
             "--dir" | "--task" | "--mcp-config" | "--confirm" => {
                 let value = args
                     .pop_front()
@@ -71,7 +79,13 @@ fn parse(args: Vec<String>) -> Result<(PathBuf, Option<PathBuf>, TurnOptions, Co
         },
         _ => return Err(USAGE.into()),
     };
-    Ok((dir, config, options, command))
+    Ok(Invocation {
+        dir,
+        config,
+        options,
+        command,
+        no_project,
+    })
 }
 
 fn env<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
@@ -117,7 +131,7 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("{USAGE}\n\n  turn      one interaction: project, decide, act, record\n  show X    context, log, tasks, tools, task:ID, aja:ID, audit:ID\n  serve     start the HTTP runtime for one or more frontends");
+        println!("{USAGE}\n\n  --no-project  assemble no default workspace\n  turn          one interaction: project, decide, act, record\n  show X        context, log, tasks, tools, task:ID, aja:ID, audit:ID\n  serve         start the HTTP runtime for one or more frontends");
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "serve") {
@@ -127,7 +141,13 @@ fn run() -> Result<()> {
     if args.as_slice() == ["--aja-worker"] {
         return eja::aja::worker_main();
     }
-    let (dir, config, mut options, command) = parse(args)?;
+    let Invocation {
+        dir,
+        config,
+        mut options,
+        command,
+        no_project,
+    } = parse(args)?;
     // A directory written before the aja rename keeps its executions under
     // nodes/. This version reads the ajas/ layout and does not migrate, so it
     // says so instead of reading the journal as a project with no executions.
@@ -165,7 +185,7 @@ fn run() -> Result<()> {
             let brain = OpenAiBrain::from_env()?
                 .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?;
             let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
-            let project = std::env::current_dir()?;
+            let project = (!no_project).then(std::env::current_dir).transpose()?;
             // The CLI shares the runtime's grant: the same settings file names
             // the same workspaces, so a task opened here resolves like one
             // opened over HTTP.
@@ -173,37 +193,25 @@ fn run() -> Result<()> {
             let stored = settings.read().unwrap_or_default();
             let grant = settings.grant(&stored);
             options.workspaces.clone_from(&grant);
-            let tools = Arc::new(
-                HostTools::new(config.as_deref(), &project, &dir, &startup)?
-                    .with_workspace_tools(stored.connectors.workspace_tools)
-                    .with_roots(
-                        grant
-                            .iter()
-                            .map(|workspace| PathBuf::from(&workspace.root))
-                            .collect(),
-                    ),
-            );
+            let assembled = host::assemble_capabilities(
+                project.as_deref(),
+                &dir,
+                config.as_deref(),
+                &grant,
+                stored.connectors.workspace_tools,
+                limits.slots,
+                &startup,
+            )?;
             let ajas = dir.join("ajas");
             let mut aja_limits = eja::aja::Limits::default();
             aja_limits.steps = Some(env("EJA_AJA_STEPS", eja::aja::DEFAULT_STEPS)?);
             aja_limits.timeout_ms = env("EJA_AJA_TIMEOUT_MS", aja_limits.timeout_ms)?;
-            // Parallel slots need isolated worlds. Without one the host runs a
-            // single shared world, so only one execution may hold it.
-            let worlds = host::build_worlds(&project, &dir, &grant, limits.slots, &startup);
-            let worker = NativeWorker::new(
-                std::env::current_exe()?,
-                &ajas,
-                project,
-                Arc::new(model),
-                tools.clone() as Arc<dyn ToolGateway>,
-            )?
-            .with_limits(aja_limits)?
-            .with_worlds(worlds.clone());
-            let records = RecordFiles::with_checkpoints(ajas, dir.join("checkpoints"));
+            let worker = assembled.worker(&ajas, model, aja_limits)?;
+            let records = RecordFiles::with_checkpoints(&ajas, dir.join("checkpoints"));
             let ports = Ports {
                 aja: Some(&records),
-                capabilities: Some(&*tools),
-                worlds: Some(worlds.as_ref()),
+                capabilities: Some(&*assembled.tools),
+                worlds: assembled.worlds.as_deref(),
             };
             let outcome = turn_at_with_options(
                 &store,
@@ -245,7 +253,8 @@ fn run() -> Result<()> {
         }
         Command::Context => {
             let state = State::load(&store)?;
-            let settings = host::SettingsStore::new(std::env::current_dir()?, dir);
+            let project = (!no_project).then(std::env::current_dir).transpose()?;
+            let settings = host::SettingsStore::new(project, dir);
             let stored = settings.read().map_err(|error| error.to_string())?;
             let grant = settings.grant(&stored);
             let context = state.project_with_workspaces("", options.focus, eja::now_utc(), &grant);
@@ -264,18 +273,19 @@ fn run() -> Result<()> {
             }
         }
         Command::Tools => {
-            let settings = host::SettingsStore::new(std::env::current_dir()?, dir.clone());
+            let project = (!no_project).then(std::env::current_dir).transpose()?;
+            let settings = host::SettingsStore::new(project.clone(), dir.clone());
             let stored = settings.read().map_err(|error| error.to_string())?;
             let grant = settings.grant(&stored);
-            let tools =
-                HostTools::new(config.as_deref(), &std::env::current_dir()?, &dir, &startup)?
-                    .with_workspace_tools(stored.connectors.workspace_tools)
-                    .with_roots(
-                        grant
-                            .iter()
-                            .map(|workspace| PathBuf::from(&workspace.root))
-                            .collect(),
-                    );
+            let assembled = host::assemble_capabilities(
+                project.as_deref(),
+                &dir,
+                config.as_deref(),
+                &grant,
+                stored.connectors.workspace_tools,
+                1,
+                &startup,
+            )?;
             let assignment = Assignment {
                 task_id: options.focus.unwrap_or(0),
                 objective: String::new(),
@@ -287,7 +297,7 @@ fn run() -> Result<()> {
             };
             println!(
                 "{}",
-                serde_json::to_string_pretty(&tools.definitions(&assignment))?
+                serde_json::to_string_pretty(&assembled.tools.definitions(&assignment))?
             );
         }
         Command::Aja(id) => {
@@ -373,19 +383,24 @@ fn run() -> Result<()> {
 
 fn serve(args: &[String]) -> Result<()> {
     let mut dir = PathBuf::from(".eja");
-    let mut project = std::env::current_dir()?;
+    let mut project = Some(std::env::current_dir()?);
     let mut host = "127.0.0.1".to_owned();
     let mut port = 8787;
     let mut allowed_origins = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
+        if arg == "--no-project" {
+            project = None;
+            index += 1;
+            continue;
+        }
         let value = args
             .get(index + 1)
             .ok_or_else(|| format!("{arg} requires a value"))?;
         match arg.as_str() {
             "--dir" => dir = PathBuf::from(value),
-            "--project" => project = PathBuf::from(value),
+            "--project" => project = Some(PathBuf::from(value)),
             "--host" => host.clone_from(value),
             "--allow-origin" => {
                 allowed_origins.extend(
@@ -405,11 +420,15 @@ fn serve(args: &[String]) -> Result<()> {
         }
         index += 2;
     }
-    if !project.is_absolute() {
-        project = std::env::current_dir()?.join(project);
+    if let Some(project) = project.as_mut().filter(|project| !project.is_absolute()) {
+        *project = std::env::current_dir()?.join(&*project);
     }
     if !dir.is_absolute() {
-        dir = project.join(dir);
+        let base = match &project {
+            Some(project) => project.clone(),
+            None => std::env::current_dir()?,
+        };
+        dir = base.join(dir);
     }
     host::serve(host::Options {
         state_dir: dir,

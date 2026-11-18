@@ -635,6 +635,32 @@ impl<'a> Observation<'a> {
 /// Every method inherits host control. A host that declares no worlds and no
 /// acceptance evidence is still a complete host; the defaults say so.
 pub trait Host {
+    /// Resolve the workspace a task names. The host owns both the id table and
+    /// the directories those ids refer to; the core only stores the answer.
+    ///
+    /// An omitted id selects the first grant, or no workspace when the host
+    /// supplied none. An explicit id must name a grant.
+    fn resolve_workspace(&self, id: Option<&str>, available: &[WorkspaceGrant]) -> Result<String> {
+        let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) else {
+            return Ok(available
+                .first()
+                .map_or_else(String::new, |grant| grant.root.clone()));
+        };
+        available
+            .iter()
+            .find(|grant| grant.id == id)
+            .map(|grant| grant.root.clone())
+            .ok_or_else(|| format!("open_task refused: no available workspace id {id}").into())
+    }
+
+    /// Whether a task's already-fixed root is still one the host grants.
+    ///
+    /// The root is deliberately checked as stored, never re-resolved from the
+    /// task's old workspace id. An empty root is a task with no workspace.
+    fn workspace_available(&self, workspace: &str, available: &[WorkspaceGrant]) -> bool {
+        workspace.is_empty() || available.iter().any(|grant| grant.root == workspace)
+    }
+
     /// One read. A target that parses as an address resolves through that
     /// authority; any other target is a host read tool name.
     fn look(

@@ -232,7 +232,7 @@ pub fn fresh_messages(assignment: &Assignment, limits: &Limits) -> Vec<Value> {
             )
         },
     );
-    let system = format!("You are one AJA: a single bounded execution of the work assigned below. Complete it with the supplied tools. Your workspace is the current project; inherited messages describe earlier observations, not a restored world. {budget} Acceptance is the contract. Stop once it holds and report what you did. Tool results carry record addresses; use eja_read_record to read omitted passages. Never claim a failed tool succeeded.");
+    let system = format!("You are one AJA: a single bounded execution of the work assigned below. Complete it with the supplied tools. Use only the execution environment and tools provided for this run. Inherited messages describe earlier observations. {budget} Acceptance is the contract. Stop once it holds and report what you did. Tool results carry record addresses; use eja_read_record to read omitted passages. Never claim a failed tool succeeded.");
     let mut brief = assignment.objective.clone();
     if !assignment.input.trim().is_empty() && assignment.input.trim() != brief.trim() {
         brief.push_str("\n\nTask as given:\n");

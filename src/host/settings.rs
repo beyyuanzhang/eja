@@ -295,6 +295,7 @@ pub struct Effective {
     pub mcp_path: Option<PathBuf>,
     pub limits: Limits,
     pub workspace_tools: bool,
+    pub project: bool,
 }
 
 impl Effective {
@@ -304,7 +305,7 @@ impl Effective {
     }
 
     pub fn mcp_ready(&self) -> bool {
-        self.workspace_tools
+        (self.project && self.workspace_tools)
             || (self.mcp_path.as_ref().is_some_and(|path| path.is_file())
                 && self.connectors.servers.iter().any(|server| server.enabled))
     }
@@ -313,17 +314,15 @@ impl Effective {
 #[derive(Clone)]
 pub struct SettingsStore {
     path: PathBuf,
-    legacy: PathBuf,
-    project: PathBuf,
+    project: Option<PathBuf>,
     dir: PathBuf,
     write_lock: Arc<Mutex<()>>,
 }
 
 impl SettingsStore {
-    pub fn new(project: PathBuf, dir: PathBuf) -> Self {
+    pub fn new(project: Option<PathBuf>, dir: PathBuf) -> Self {
         Self {
             path: dir.join("app-settings.json"),
-            legacy: project.join("app").join("settings.json"),
             project,
             dir,
             write_lock: Arc::new(Mutex::new(())),
@@ -331,9 +330,16 @@ impl SettingsStore {
     }
 
     pub fn read(&self) -> ApiResult<StoredSettings> {
-        if !self.path.is_file() && self.legacy.is_file() {
-            let bytes = fs::read(&self.legacy)?;
-            write_private_bytes(&self.path, &bytes)?;
+        if !self.path.is_file() {
+            if let Some(legacy) = self
+                .project
+                .as_ref()
+                .map(|project| project.join("app/settings.json"))
+                .filter(|path| path.is_file())
+            {
+                let bytes = fs::read(legacy)?;
+                write_private_bytes(&self.path, &bytes)?;
+            }
         }
         if !self.path.is_file() {
             return Ok(StoredSettings {
@@ -397,7 +403,8 @@ impl SettingsStore {
             .connectors
             .workspace_tools
             .unwrap_or(current.connectors.workspace_tools);
-        let workspaces = normalize_workspaces(input.workspaces, &self.project, &self.dir)?;
+        let workspaces =
+            normalize_workspaces(input.workspaces, self.project.as_deref(), &self.dir)?;
         let next = StoredSettings {
             providers,
             roles,
@@ -496,6 +503,7 @@ impl SettingsStore {
             mcp_path,
             limits,
             workspace_tools,
+            project: self.project.is_some(),
         }
     }
 
@@ -522,7 +530,10 @@ impl SettingsStore {
             runtime_path: env::current_exe()
                 .map_or_else(|_| "eja".to_owned(), |path| path.display().to_string()),
             state_dir: self.dir.display().to_string(),
-            project_dir: self.project.display().to_string(),
+            project_dir: self
+                .project
+                .as_ref()
+                .map_or_else(String::new, |path| path.display().to_string()),
         }
     }
 
@@ -533,17 +544,25 @@ impl SettingsStore {
     /// The directories EJA may use. Registration is the durable availability
     /// decision; a missing directory is not offered and cannot be selected.
     pub fn grant(&self, settings: &StoredSettings) -> Vec<WorkspaceGrant> {
-        let root = self.project.display().to_string();
-        let mut grants = vec![WorkspaceGrant {
-            id: workspace_id(&root),
-            label: "default".to_owned(),
-            root,
-        }];
+        let mut grants = Vec::new();
+        if let Some(project) = &self.project {
+            let root = project.display().to_string();
+            grants.push(WorkspaceGrant {
+                id: workspace_id(&root),
+                label: "default".to_owned(),
+                root,
+            });
+        }
         for (label, root) in &settings.workspaces {
             let Ok(path) = Path::new(root).canonicalize() else {
                 continue;
             };
-            if !path.is_dir() || path == self.project {
+            if !path.is_dir()
+                || self
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| path == *project)
+            {
                 continue;
             }
             let root = path.display().to_string();
@@ -588,7 +607,7 @@ impl SettingsStore {
             .map(str::trim)
             .filter(|path| !path.is_empty())
         {
-            return Some(self.project.join(path));
+            return Some(self.project.as_ref().unwrap_or(&self.dir).join(path));
         }
         let local = self.dir.join("mcp.json");
         local.is_file().then_some(local)
@@ -738,7 +757,7 @@ fn workspace_id(root: &str) -> String {
 
 fn normalize_workspaces(
     input: BTreeMap<String, String>,
-    project: &Path,
+    project: Option<&Path>,
     dir: &Path,
 ) -> ApiResult<BTreeMap<String, String>> {
     if input.len() > 16 {
@@ -765,11 +784,11 @@ fn normalize_workspaces(
         if path.starts_with(dir) || dir.starts_with(&path) {
             return Err(ApiError::bad(format!("工作区 {name} 不能与状态目录重叠")));
         }
-        if path
-            == project
+        if project.is_some_and(|project| {
+            path == project
                 .canonicalize()
                 .unwrap_or_else(|_| project.to_path_buf())
-        {
+        }) {
             return Err(ApiError::bad(format!(
                 "工作区 {name} 就是默认工作区，无需另加"
             )));
@@ -1308,7 +1327,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let store = SettingsStore::new(project, state.clone());
+        let store = SettingsStore::new(Some(project), state.clone());
         let settings = store.read().unwrap();
         assert_eq!(settings.providers[0].api_key, "secret-key-value");
         assert!(state.join("app-settings.json").is_file());
@@ -1353,7 +1372,7 @@ mod tests {
     #[test]
     fn a_fresh_state_gets_safe_defaults() {
         let root = root();
-        let store = SettingsStore::new(root.join("project"), root.join(".eja"));
+        let store = SettingsStore::new(Some(root.join("project")), root.join(".eja"));
         let settings: StoredSettings = store.read().unwrap();
         assert_eq!(settings.limits.slots, 1);
         assert!(settings.providers.is_empty());
@@ -1365,7 +1384,7 @@ mod tests {
         let root = root();
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let store = SettingsStore::new(project, root.join(".eja"));
+        let store = SettingsStore::new(Some(project), root.join(".eja"));
         let effective = store.effective_current().unwrap();
         assert!(effective.workspace_tools, "on by default");
         let view = store.view(&effective);
@@ -1406,7 +1425,7 @@ mod tests {
         let extra = root.join("extra");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&extra).unwrap();
-        let store = SettingsStore::new(project.clone(), root.join(".eja"));
+        let store = SettingsStore::new(Some(project.clone()), root.join(".eja"));
         let mut settings = StoredSettings::default();
         settings
             .workspaces

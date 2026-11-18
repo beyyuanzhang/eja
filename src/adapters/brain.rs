@@ -95,7 +95,7 @@ WORKSPACES lists the workspace ids the host grants, default first. The id is the
 stable target; the label is only a display name. open_task may carry \
 \"workspace\":\"<id>\" to fix where its runs write, and omits it for the default. \
 The id is resolved once, when the task opens; the task then states its root. \
-An omitted workspace uses the first one. Use another only when the request \
+If WORKSPACES has grants, an omitted workspace uses the first one; otherwise the task has no workspace. Use another only when the request \
 clearly identifies it, and never move an already-open task to a different root. \
 When the user's meaning is not unique and the difference matters, do not guess. \
 You may answer with choices: [{label, value}, ...]. The label is shown to the user; \

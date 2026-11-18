@@ -243,7 +243,7 @@ fn the_workspace_grant_switches_off_every_entry() {
         .is_empty());
     let context = eja::adapters::ToolContext {
         aja_id: 1,
-        project: &project,
+        workspace: Some(&project),
         private: &private,
         control: &control(),
     };

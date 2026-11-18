@@ -79,6 +79,14 @@ app:
 cargo run -- serve --dir .eja --project .
 ```
 
+With no configured workspaces, the same executable can run with its configured
+connectors alone. It records each execution without creating a Git checkpoint:
+
+```sh
+cargo run -- --no-project --dir .eja --mcp-config .eja/mcp.json turn "..."
+cargo run -- serve --no-project --dir .eja
+```
+
 The runtime's <http://127.0.0.1:8787> endpoint is API transport, not a second app.
 Any number of separately hosted frontends may use the same runtime. See
 [app/README.md](app/README.md) and [docs/APP-API.md](docs/APP-API.md).
@@ -96,11 +104,13 @@ Any number of separately hosted frontends may use the same runtime. See
 - Working contexts are bounded views. Live tool results and replayed tool results
   use the same view function. Every tool result has a `{aja, entry}` address;
   `eja_read_record` reads a bounded passage from this aja or its ancestry.
-- A checkpoint captures Git-visible workspace files. It is evidence about the
-  world at that time; a continuation inherits observations, not a restored world.
-  Missing checkpoints are reported in both manifest and digest. The record store
-  owns that repository and its one hermetic git invocation, so a project's hooks,
-  signing settings and global configuration never reach a run.
+- A checkpoint captures Git-visible workspace files when the coding capability
+  is assembled. It is evidence about the world at that time; a continuation
+  inherits observations, not a restored world. Missing checkpoints are reported
+  in both manifest and digest. The record store owns that repository and its one
+  hermetic git invocation, so a project's hooks, signing settings and global
+  configuration never reach a run. A run without a workspace still writes its
+  context and manifest; `checkpoint` is null and no Git process is started.
 - An approval is its own event, recorded by the host for one turn. Confirmation
   reads that event, so a caller's flag never becomes a second authority.
 - A task may declare **evidence** at open: what the host must observe before the
@@ -319,12 +329,13 @@ Host resource configuration: `EJA_TURN_DECISIONS`, `EJA_TURN_ACTIONS`,
 `EJA_TURN_DISPATCHES`, `EJA_AJA_SLOTS`, `EJA_TURN_TIMEOUT_MS`, `EJA_AJA_STEPS`,
 `EJA_AJA_TIMEOUT_MS`, `EJA_CONTEXT_BYTES`. Limits must be positive.
 `EJA_AJA_SLOTS` is the number of runs that may share a turn. With one slot the
-host runs one shared world. Above one it needs a git project with at least one
-commit, because each run gets its own worktree and branch (`<dir>/worlds/<id>`)
-and is reconciled only when asked. A worktree world starts at `HEAD`: uncommitted
-project changes stay in the project and are reported by the run's own account.
-The runtime project is the default workspace. Every existing extra directory
-saved in settings is also available; a missing directory is not offered.
+uses a shared world when a workspace is granted. With multiple slots, a
+workspace with a Git commit can give runs their own worktrees and branches,
+reconciled only when asked. A deployment without a workspace allocates no world. A worktree world starts
+at `HEAD`: uncommitted project changes stay in the project and are reported by
+the run's own account. The runtime project is the default workspace.
+`--no-project` removes that default. Every existing extra directory saved in
+settings is still available; a missing directory is not offered.
 Registration is the durable availability decision. When a task opens, it names
 one available workspace id; that root is fixed for the task and never silently
 moves to another directory.
