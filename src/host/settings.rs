@@ -295,7 +295,6 @@ pub struct Effective {
     pub mcp_path: Option<PathBuf>,
     pub limits: Limits,
     pub workspace_tools: bool,
-    pub project: bool,
 }
 
 impl Effective {
@@ -305,9 +304,8 @@ impl Effective {
     }
 
     pub fn mcp_ready(&self) -> bool {
-        (self.project && self.workspace_tools)
-            || (self.mcp_path.as_ref().is_some_and(|path| path.is_file())
-                && self.connectors.servers.iter().any(|server| server.enabled))
+        self.mcp_path.as_ref().is_some_and(|path| path.is_file())
+            && self.connectors.servers.iter().any(|server| server.enabled)
     }
 }
 
@@ -503,7 +501,6 @@ impl SettingsStore {
             mcp_path,
             limits,
             workspace_tools,
-            project: self.project.is_some(),
         }
     }
 

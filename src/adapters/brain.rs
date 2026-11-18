@@ -821,6 +821,7 @@ const DECIDE_TIMEOUT: Duration = Duration::from_secs(180);
 pub struct OpenAiBrain {
     model: OpenAiModel,
     context_budget: usize,
+    managed_plugins: bool,
 }
 
 impl OpenAiBrain {
@@ -839,6 +840,7 @@ impl OpenAiBrain {
         Self {
             model: OpenAiModel::new(base, key, model),
             context_budget: DEFAULT_CONTEXT_BYTES,
+            managed_plugins: false,
         }
     }
     #[must_use]
@@ -853,12 +855,23 @@ impl OpenAiBrain {
         self.context_budget = budget;
         Ok(self)
     }
+
+    #[must_use]
+    pub const fn with_managed_plugins(mut self, enabled: bool) -> Self {
+        self.managed_plugins = enabled;
+        self
+    }
 }
 
 impl Brain for OpenAiBrain {
     fn decide(&self, context: &EjaContext, parent: &Control) -> Decision {
+        let system = if self.managed_plugins {
+            std::borrow::Cow::Owned(format!("{SYSTEM_PROMPT}\nThe host grants AJAs managed plugin tools. An AJA may stage a Python MCP plugin, test it on sample input, and activate it for subsequent turns. Activate only when the task calls for a new or improved capability. It may list or roll back installed versions."))
+        } else {
+            std::borrow::Cow::Borrowed(SYSTEM_PROMPT)
+        };
         let messages = vec![
-            json!({"role":"system","content":SYSTEM_PROMPT}),
+            json!({"role":"system","content":system}),
             json!({"role":"user","content":render_context_within(context, self.context_budget)}),
         ];
         let control = parent.child(DECIDE_TIMEOUT);

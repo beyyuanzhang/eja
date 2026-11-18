@@ -93,7 +93,7 @@ fn expand(value: &str) -> Result<String> {
     Ok(result)
 }
 
-fn alias(server: &str, tool: &str) -> String {
+fn alias(prefix: &str, server: &str, tool: &str) -> String {
     let normalized: String = tool
         .chars()
         .map(|c| {
@@ -104,7 +104,7 @@ fn alias(server: &str, tool: &str) -> String {
             }
         })
         .collect();
-    let name = format!("mcp__{server}__{normalized}");
+    let name = format!("{prefix}__{server}__{normalized}");
     if name.len() <= 64 {
         return name;
     }
@@ -201,6 +201,58 @@ impl McpTools {
             return Err("MCP config exceeds limit".into());
         }
         let config: Config = serde_json::from_slice(&bytes)?;
+        let config_dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Self::load_config(config, config_dir, project, "mcp", parent)
+    }
+
+    /// Connect a host-prepared, isolated process. Managed plugins receive no
+    /// inherited environment and are exposed only to AJA execution.
+    pub fn load_managed(
+        name: &str,
+        launcher: &str,
+        args: Vec<String>,
+        cwd: &Path,
+        parent: &Control,
+    ) -> Result<Self> {
+        let server = ServerConfig {
+            command: Some(launcher.into()),
+            url: None,
+            args,
+            env: BTreeMap::new(),
+            cwd: None,
+            headers: BTreeMap::new(),
+            tools: None,
+            read_only: vec![],
+            witness: vec![],
+            enabled: true,
+            timeout_ms: 5_000,
+        };
+        Self::load_config(
+            Config {
+                servers: BTreeMap::from([(name.to_owned(), server)]),
+            },
+            cwd,
+            None,
+            "plugin",
+            parent,
+        )
+    }
+
+    #[must_use]
+    pub fn managed_tool_name(name: &str, tool: &str) -> String {
+        alias("plugin", name, tool)
+    }
+
+    fn load_config(
+        config: Config,
+        config_dir: &Path,
+        project: Option<&Path>,
+        prefix: &str,
+        parent: &Control,
+    ) -> Result<Self> {
         if config.servers.len() > 32 {
             return Err("MCP config exceeds 32 servers".into());
         }
@@ -244,10 +296,6 @@ impl McpTools {
                     if !config.headers.is_empty() {
                         return Err("stdio MCP cannot have HTTP headers".into());
                     }
-                    let config_dir = path
-                        .parent()
-                        .filter(|parent| !parent.as_os_str().is_empty())
-                        .unwrap_or_else(|| Path::new("."));
                     let cwd = config.cwd.as_ref().map_or_else(
                         || project.map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf),
                         |p| {
@@ -266,10 +314,16 @@ impl McpTools {
                         .kill_on_drop(true)
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
-                        .stderr(Stdio::inherit());
-                    for key in ["PATH", "HOME", "TMPDIR", "TMP", "LANG", "SYSTEMROOT"] {
-                        if let Some(value) = std::env::var_os(key) {
-                            command.env(key, value);
+                        .stderr(if prefix == "plugin" {
+                            Stdio::null()
+                        } else {
+                            Stdio::inherit()
+                        });
+                    if prefix == "mcp" {
+                        for key in ["PATH", "HOME", "TMPDIR", "TMP", "LANG", "SYSTEMROOT"] {
+                            if let Some(value) = std::env::var_os(key) {
+                                command.env(key, value);
+                            }
                         }
                     }
                     for (key, value) in &config.env {
@@ -429,7 +483,7 @@ impl McpTools {
                 {
                     continue;
                 }
-                let public = alias(&name, &tool.name);
+                let public = alias(prefix, &name, &tool.name);
                 let definition = json!({
                     "type": "function",
                     "function": {
@@ -450,15 +504,16 @@ impl McpTools {
                                 .witness
                                 .iter()
                                 .any(|witness| witness == tool.name.as_ref()),
-                            read_only: config
-                                .read_only
-                                .iter()
-                                .any(|name| name == tool.name.as_ref())
-                                || tool
-                                    .annotations
-                                    .as_ref()
-                                    .and_then(|annotations| annotations.read_only_hint)
-                                    .unwrap_or(false),
+                            read_only: prefix == "mcp"
+                                && (config
+                                    .read_only
+                                    .iter()
+                                    .any(|name| name == tool.name.as_ref())
+                                    || tool
+                                        .annotations
+                                        .as_ref()
+                                        .and_then(|annotations| annotations.read_only_hint)
+                                        .unwrap_or(false)),
                         },
                     )
                     .is_some()
@@ -701,11 +756,25 @@ impl HostTools {
     /// The built-in workspace file tools are a grant the host may switch off;
     /// connectors are unaffected.
     #[must_use]
-    pub fn with_workspace_tools(mut self, enabled: bool) -> Self {
+    pub fn with_workspace_tools(self, enabled: bool) -> Self {
+        self.with_local_tools(enabled, enabled)
+    }
+
+    #[must_use]
+    pub fn with_local_tools(mut self, files: bool, shell: bool) -> Self {
         if let Some(group) = self.groups.iter_mut().find(|group| group.builtin) {
-            group.enabled = enabled;
+            group.enabled = files || shell;
+            group.gateway = Box::new(super::tools::LocalTools { files, shell });
         }
         self
+    }
+
+    pub fn register(&mut self, gateway: Box<dyn ToolGateway>) {
+        self.groups.push(Group {
+            builtin: false,
+            enabled: true,
+            gateway,
+        });
     }
 }
 impl ToolGateway for HostTools {

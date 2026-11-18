@@ -87,6 +87,41 @@ cargo run -- --no-project --dir .eja --mcp-config .eja/mcp.json turn "..."
 cargo run -- serve --no-project --dir .eja
 ```
 
+`EJA_CAPABILITIES` selects what either entry point assembles. The default is
+`workspace,files,shell,git,mcp`. `workspace` grants configured directories,
+`files` adds file tools, `shell` adds the terminal, `git` enables new checkpoints
+and isolated Git worktrees, and `mcp` loads configured connectors. File and shell
+tools need a workspace. The existing workspace-tools setting still switches both
+off. Previously frozen Git evidence can still be read by address.
+
+For file editing without shell or Git:
+
+```sh
+EJA_CAPABILITIES=workspace,files cargo run -- serve --dir .eja --project .
+```
+
+### Managed plugins
+
+Select `plugins` to let AJAs stage their own Python stdio MCP servers, test a tool
+on sample input, and activate a tested version for future turns. The same tools
+also list current and previous activations and roll back a version. Active plugin tools
+appear automatically as `plugin__NAME__TOOL` and the run record identifies their
+version. A turn keeps the version it started with. If the newly selected version
+fails to start, the runtime tries the previous one and reports the startup error.
+
+```sh
+EJA_CAPABILITIES=mcp,plugins cargo run -- serve --dir .eja
+```
+
+The managed registry lives under `<dir>/plugins`. A managed server receives its
+versioned source and the arguments to its tool calls. Its process receives no
+workspace, host credentials, or network grant. macOS uses the system sandbox and
+Python from the Command Line Tools or Xcode. Linux needs `/usr/bin/bwrap`, user
+namespaces, and `/usr/bin/python3`. Plugin execution fails if that isolation is
+unavailable. The HTTP runtime restricts managed plugin administration to a local
+listener. Explicitly configured shell and MCP capabilities keep their own trust
+boundaries.
+
 The runtime's <http://127.0.0.1:8787> endpoint is API transport, not a second app.
 Any number of separately hosted frontends may use the same runtime. See
 [app/README.md](app/README.md) and [docs/APP-API.md](docs/APP-API.md).
@@ -329,7 +364,7 @@ Host resource configuration: `EJA_TURN_DECISIONS`, `EJA_TURN_ACTIONS`,
 `EJA_TURN_DISPATCHES`, `EJA_AJA_SLOTS`, `EJA_TURN_TIMEOUT_MS`, `EJA_AJA_STEPS`,
 `EJA_AJA_TIMEOUT_MS`, `EJA_CONTEXT_BYTES`. Limits must be positive.
 `EJA_AJA_SLOTS` is the number of runs that may share a turn. With one slot the
-uses a shared world when a workspace is granted. With multiple slots, a
+host uses a shared world when a workspace is granted. With multiple slots, a
 workspace with a Git commit can give runs their own worktrees and branches,
 reconciled only when asked. A deployment without a workspace allocates no world. A worktree world starts
 at `HEAD`: uncommitted project changes stay in the project and are reported by

@@ -6,6 +6,8 @@ use std::{collections::VecDeque, path::PathBuf, process::ExitCode};
 
 mod host;
 
+use host::Capability;
+
 const USAGE: &str = "usage: eja [--no-project] --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET | serve [--no-project] [--dir DIR] [--project DIR] [--host HOST] [--port PORT] [--allow-origin ORIGIN]";
 
 enum Command {
@@ -141,6 +143,7 @@ fn run() -> Result<()> {
     if args.as_slice() == ["--aja-worker"] {
         return eja::aja::worker_main();
     }
+    let capabilities = host::EnabledCapabilities::from_env()?;
     let Invocation {
         dir,
         config,
@@ -183,22 +186,25 @@ fn run() -> Result<()> {
             limits.slots = env("EJA_AJA_SLOTS", limits.slots)?;
             limits.validate()?;
             let brain = OpenAiBrain::from_env()?
-                .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?;
+                .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?
+                .with_managed_plugins(capabilities.has(Capability::Plugins));
             let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
-            let project = (!no_project).then(std::env::current_dir).transpose()?;
+            let project = (capabilities.has(Capability::Workspace) && !no_project)
+                .then(std::env::current_dir)
+                .transpose()?;
             // The CLI shares the runtime's grant: the same settings file names
             // the same workspaces, so a task opened here resolves like one
             // opened over HTTP.
             let settings = host::SettingsStore::new(project.clone(), dir.clone());
             let stored = settings.read().unwrap_or_default();
-            let grant = settings.grant(&stored);
+            let grant = capabilities.grants(&settings, &stored);
             options.workspaces.clone_from(&grant);
             let assembled = host::assemble_capabilities(
                 project.as_deref(),
                 &dir,
                 config.as_deref(),
                 &grant,
-                stored.connectors.workspace_tools,
+                capabilities.with_workspace_tools(stored.connectors.workspace_tools),
                 limits.slots,
                 &startup,
             )?;
@@ -253,10 +259,12 @@ fn run() -> Result<()> {
         }
         Command::Context => {
             let state = State::load(&store)?;
-            let project = (!no_project).then(std::env::current_dir).transpose()?;
+            let project = (capabilities.has(Capability::Workspace) && !no_project)
+                .then(std::env::current_dir)
+                .transpose()?;
             let settings = host::SettingsStore::new(project, dir);
             let stored = settings.read().map_err(|error| error.to_string())?;
-            let grant = settings.grant(&stored);
+            let grant = capabilities.grants(&settings, &stored);
             let context = state.project_with_workspaces("", options.focus, eja::now_utc(), &grant);
             println!("{}", adapters::render_context(&context));
             println!(
@@ -273,16 +281,18 @@ fn run() -> Result<()> {
             }
         }
         Command::Tools => {
-            let project = (!no_project).then(std::env::current_dir).transpose()?;
+            let project = (capabilities.has(Capability::Workspace) && !no_project)
+                .then(std::env::current_dir)
+                .transpose()?;
             let settings = host::SettingsStore::new(project.clone(), dir.clone());
             let stored = settings.read().map_err(|error| error.to_string())?;
-            let grant = settings.grant(&stored);
+            let grant = capabilities.grants(&settings, &stored);
             let assembled = host::assemble_capabilities(
                 project.as_deref(),
                 &dir,
                 config.as_deref(),
                 &grant,
-                stored.connectors.workspace_tools,
+                capabilities.with_workspace_tools(stored.connectors.workspace_tools),
                 1,
                 &startup,
             )?;
@@ -382,6 +392,7 @@ fn run() -> Result<()> {
 }
 
 fn serve(args: &[String]) -> Result<()> {
+    let capabilities = host::EnabledCapabilities::from_env()?;
     let mut dir = PathBuf::from(".eja");
     let mut project = Some(std::env::current_dir()?);
     let mut host = "127.0.0.1".to_owned();
@@ -436,6 +447,7 @@ fn serve(args: &[String]) -> Result<()> {
         host,
         port,
         allowed_origins,
+        capabilities,
     })
 }
 

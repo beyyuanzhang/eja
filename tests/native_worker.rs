@@ -1142,6 +1142,78 @@ fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
 }
 
 #[test]
+fn a_workspace_can_write_files_without_shell_or_git() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = workspace("workspace-without-git");
+    let bin = fixture.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let marker = fixture.path().join("git-invoked");
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\nprintf 'called' > \"$TEST_GIT_MARKER\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let (url, server) = serve(vec![
+        json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":json!({"actions":[
+            {"op":"open_task","title":"local file","request":"write local.txt","acceptance":"file written","run":true}
+        ]}).to_string()}}]}),
+        json!({"choices":[{"finish_reason":"tool_calls","message":calls(vec![
+            call("write_file", json!({"path":"local.txt","text":"local result"}))
+        ])}]}),
+        json!({"choices":[{"finish_reason":"stop","message":final_message(&[])}]}),
+        json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"reply\":\"recorded\"}"}}]}),
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_eja"))
+        .current_dir(fixture.path())
+        .env("PATH", bin)
+        .env("TEST_GIT_MARKER", &marker)
+        .env("EJA_CAPABILITIES", "workspace,files")
+        .env("EJA_AJA_SLOTS", "2")
+        .env("LNA_BASE_URL", url)
+        .env("LNA_API_KEY", "test-key")
+        .env("LNA_MODEL", "test-model")
+        .args(["--dir", ".eja", "turn", "write a local file"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("recorded"),
+        "{output:?}"
+    );
+    let requests = server.join().unwrap();
+    let tools = requests[1]["tools"].as_array().unwrap();
+    assert!(tools
+        .iter()
+        .any(|tool| tool["function"]["name"] == "write_file"));
+    assert!(tools.iter().all(|tool| tool["function"]["name"] != "shell"));
+    assert_eq!(
+        std::fs::read_to_string(fixture.path().join("local.txt")).unwrap(),
+        "local result"
+    );
+    assert!(!marker.exists());
+    let manifest = manifest_of(&fixture, 1);
+    assert!(manifest["checkpoint"].is_null() && manifest["checkpoint_error"].is_null());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_eja"))
+        .current_dir(fixture.path())
+        .env("EJA_CAPABILITIES", "workspace,shell")
+        .args(["--dir", ".eja", "show", "tools"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let tools: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "shell");
+}
+
+#[test]
 fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
     let _lock = LOCK
         .lock()

@@ -1,3 +1,5 @@
+mod plugin_sandbox;
+mod plugins;
 mod settings;
 mod state;
 mod util;
@@ -77,6 +79,70 @@ pub struct Options {
     pub host: String,
     pub port: u16,
     pub allowed_origins: Vec<String>,
+    pub capabilities: EnabledCapabilities,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Capability {
+    Workspace,
+    Files,
+    Shell,
+    Git,
+    Mcp,
+    Plugins,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EnabledCapabilities([bool; 6]);
+
+impl EnabledCapabilities {
+    pub fn from_env() -> eja::Result<Self> {
+        let configured = match std::env::var("EJA_CAPABILITIES") {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => "workspace,files,shell,git,mcp".into(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut enabled = Self([false; 6]);
+        for item in configured
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            let capability = match item {
+                "workspace" => Capability::Workspace,
+                "files" => Capability::Files,
+                "shell" => Capability::Shell,
+                "git" => Capability::Git,
+                "mcp" => Capability::Mcp,
+                "plugins" => Capability::Plugins,
+                _ => return Err(format!("unknown EJA_CAPABILITIES entry {item}").into()),
+            };
+            enabled.0[capability as usize] = true;
+        }
+        Ok(enabled)
+    }
+
+    pub const fn has(self, capability: Capability) -> bool {
+        self.0[capability as usize]
+    }
+
+    pub fn grants(
+        self,
+        settings: &SettingsStore,
+        stored: &StoredSettings,
+    ) -> Vec<eja::WorkspaceGrant> {
+        if self.has(Capability::Workspace) {
+            settings.grant(stored)
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub const fn with_workspace_tools(mut self, enabled: bool) -> Self {
+        self.0[Capability::Files as usize] &= enabled;
+        self.0[Capability::Shell as usize] &= enabled;
+        self
+    }
 }
 
 pub struct Host {
@@ -84,6 +150,7 @@ pub struct Host {
     project_dir: Option<PathBuf>,
     settings: SettingsStore,
     allowed_origins: Vec<String>,
+    capabilities: EnabledCapabilities,
     turn_in_flight: AtomicBool,
     cancelled: Arc<AtomicBool>,
 }
@@ -127,8 +194,18 @@ pub fn serve(options: Options) -> eja::Result<()> {
     if options.port == 0 {
         return Err("--port must be between 1 and 65535".into());
     }
+    if options.capabilities.has(Capability::Plugins)
+        && !(options.host == "localhost"
+            || options
+                .host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback()))
+    {
+        return Err("managed plugin administration requires a local runtime address".into());
+    }
     let project_dir = options
         .project_dir
+        .filter(|_| options.capabilities.has(Capability::Workspace))
         .map(|path| {
             let path = path
                 .canonicalize()
@@ -169,6 +246,7 @@ pub fn serve(options: Options) -> eja::Result<()> {
         project_dir,
         settings,
         allowed_origins: options.allowed_origins,
+        capabilities: options.capabilities,
         turn_in_flight: AtomicBool::new(false),
         cancelled: cancelled.clone(),
     });
@@ -307,6 +385,14 @@ fn state_json(host: &Host, busy: bool, encounter: Option<state::Encounter>) -> V
         .settings
         .effective_current()
         .unwrap_or_else(|_| host.settings.effective(StoredSettings::default()));
+    let capabilities = host
+        .capabilities
+        .with_workspace_tools(effective.workspace_tools);
+    let workspace_tools = (capabilities.has(Capability::Files)
+        || capabilities.has(Capability::Shell))
+        && !capabilities
+            .grants(&host.settings, &effective.settings)
+            .is_empty();
     let health = state::Health {
         model: effective.model_ready(),
         model_name: effective
@@ -315,7 +401,7 @@ fn state_json(host: &Host, busy: bool, encounter: Option<state::Encounter>) -> V
             .as_ref()
             .map_or_else(String::new, |role| role.model.clone()),
         state: host.state_dir.is_dir(),
-        mcp: effective.mcp_ready(),
+        mcp: workspace_tools || (capabilities.has(Capability::Mcp) && effective.mcp_ready()),
         journal: if journal.error.is_some() {
             "error"
         } else {
@@ -755,7 +841,8 @@ fn execute_turn(
         eja_role.api_key.as_str(),
         eja_role.model.as_str(),
     )
-    .with_headers(header_pairs(eja_role));
+    .with_headers(header_pairs(eja_role))
+    .with_managed_plugins(host.capabilities.has(Capability::Plugins));
     let model = OpenAiModel::new(
         aja_role.base_url.as_str(),
         aja_role.api_key.as_str(),
@@ -764,13 +851,16 @@ fn execute_turn(
     .with_headers(header_pairs(aja_role));
     let startup = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
     let config = effective.mcp_path.as_deref().filter(|path| path.is_file());
-    let grant = host.settings.grant(&effective.settings);
+    let grant = host
+        .capabilities
+        .grants(&host.settings, &effective.settings);
     let assembled = assemble_capabilities(
         host.project_dir.as_deref(),
         &host.state_dir,
         config,
         &grant,
-        effective.workspace_tools,
+        host.capabilities
+            .with_workspace_tools(effective.workspace_tools),
         effective.limits.slots,
         &startup,
     )?;
@@ -823,6 +913,7 @@ pub struct Assembled {
     pub tools: Arc<HostTools>,
     pub worlds: Option<Arc<dyn Worlds>>,
     workspace: Option<PathBuf>,
+    git: bool,
 }
 
 impl Assembled {
@@ -832,7 +923,7 @@ impl Assembled {
         model: OpenAiModel,
         limits: eja::aja::Limits,
     ) -> eja::Result<NativeWorker> {
-        let worker = NativeWorker::for_workspace(
+        let mut worker = NativeWorker::for_workspace(
             std::env::current_exe()?,
             ajas,
             self.workspace.as_deref(),
@@ -840,6 +931,9 @@ impl Assembled {
             self.tools.clone() as Arc<dyn ToolGateway>,
         )?
         .with_limits(limits)?;
+        if !self.git {
+            worker = worker.without_checkpoints();
+        }
         Ok(if let Some(worlds) = &self.worlds {
             worker.with_worlds(worlds.clone())
         } else {
@@ -856,28 +950,44 @@ pub fn assemble_capabilities(
     state_dir: &Path,
     config: Option<&Path>,
     grant: &[eja::WorkspaceGrant],
-    workspace_tools: bool,
+    capabilities: EnabledCapabilities,
     slots: usize,
     startup: &Control,
 ) -> eja::Result<Assembled> {
     let workspace = project
         .map(Path::to_path_buf)
         .or_else(|| grant.first().map(|grant| PathBuf::from(&grant.root)));
-    let tools = Arc::new(
-        HostTools::with_workspace(config, workspace.as_deref(), state_dir, startup)?
-            .with_workspace_tools(workspace_tools)
-            .with_roots(
-                grant
-                    .iter()
-                    .map(|workspace| PathBuf::from(&workspace.root))
-                    .collect(),
-            ),
+    let mut tools = HostTools::with_workspace(
+        config.filter(|_| capabilities.has(Capability::Mcp)),
+        workspace.as_deref(),
+        state_dir,
+        startup,
+    )?
+    .with_local_tools(
+        capabilities.has(Capability::Files),
+        capabilities.has(Capability::Shell),
+    )
+    .with_roots(
+        grant
+            .iter()
+            .map(|workspace| PathBuf::from(&workspace.root))
+            .collect(),
     );
-    let worlds = build_worlds(state_dir, grant, slots, startup);
+    if capabilities.has(Capability::Plugins) {
+        plugins::register(&mut tools, state_dir, startup)?;
+    }
+    let worlds = build_worlds(
+        state_dir,
+        grant,
+        slots,
+        capabilities.has(Capability::Git),
+        startup,
+    );
     Ok(Assembled {
-        tools,
+        tools: Arc::new(tools),
         worlds,
         workspace,
+        git: capabilities.has(Capability::Git),
     })
 }
 
@@ -896,6 +1006,7 @@ fn build_worlds(
     state_dir: &Path,
     grant: &[eja::WorkspaceGrant],
     slots: usize,
+    git: bool,
     startup: &Control,
 ) -> Option<Arc<dyn Worlds>> {
     let first_root = normalize_root(&grant.first()?.root);
@@ -905,7 +1016,7 @@ fn build_worlds(
         if roots.contains_key(&path) {
             continue;
         }
-        let backend: Arc<dyn Worlds> = if slots > 1 {
+        let backend: Arc<dyn Worlds> = if slots > 1 && git {
             match Worktrees::new(
                 &path,
                 state_dir.join("worlds").join(index.to_string()),
@@ -979,7 +1090,8 @@ async fn get_raw(
         })));
     }
     if let Some(relative) = address.strip_prefix("world:") {
-        let grant = host.settings.grant(
+        let grant = host.capabilities.grants(
+            &host.settings,
             &host
                 .settings
                 .effective_current()
@@ -1025,6 +1137,22 @@ async fn cors(State(host): State<Arc<Host>>, request: Request, next: Next) -> Re
             local_origin(origin) || host.allowed_origins.iter().any(|item| item == origin)
         })
         .map(ToOwned::to_owned);
+    if host.capabilities.has(Capability::Plugins) && request.method() == Method::POST {
+        let allowed_origin = origin.is_some() || !request.headers().contains_key(header::ORIGIN);
+        let json = request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+            });
+        if !allowed_origin || !json {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
     if request.method() == Method::OPTIONS {
         if origin.is_none() && request.headers().contains_key(header::ORIGIN) {
             return StatusCode::FORBIDDEN.into_response();

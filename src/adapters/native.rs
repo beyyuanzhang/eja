@@ -257,6 +257,12 @@ impl NativeWorker {
         self.limits = limits;
         Ok(self)
     }
+
+    #[must_use]
+    pub fn without_checkpoints(mut self) -> Self {
+        self.records = None;
+        self
+    }
     pub fn cancel(&self, aja_id: u64) -> bool {
         let active = self
             .active

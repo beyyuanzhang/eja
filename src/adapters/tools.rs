@@ -223,6 +223,40 @@ pub fn granted_path(roots: &[PathBuf], name: &str) -> Result<PathBuf> {
 
 pub struct FileTools;
 
+pub(super) struct LocalTools {
+    pub files: bool,
+    pub shell: bool,
+}
+
+impl ToolGateway for LocalTools {
+    fn definitions(&self, _: &crate::Assignment) -> Vec<Value> {
+        WORKSPACE_TOOLS
+            .iter()
+            .filter(|name| self.owns(name))
+            .map(|name| workspace_definition(name))
+            .collect()
+    }
+
+    fn call(&self, ctx: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value> {
+        if !self.owns(name) {
+            return Err("local tool is disabled".into());
+        }
+        FileTools.call(ctx, name, arguments)
+    }
+
+    fn observes(&self, name: &str) -> bool {
+        self.files && FileTools.observes(name)
+    }
+
+    fn owns(&self, name: &str) -> bool {
+        if name == "shell" {
+            self.shell
+        } else {
+            self.files && FileTools.owns(name)
+        }
+    }
+}
+
 /// One tool's declaration, from the group's single name list.
 fn workspace_definition(name: &str) -> Value {
     let (description, properties, required) = match name {
