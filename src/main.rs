@@ -6,9 +6,7 @@ use std::{collections::VecDeque, path::PathBuf, process::ExitCode};
 
 mod host;
 
-use host::Capability;
-
-const USAGE: &str = "usage: eja [--no-project] --dir DIR [--task ID] [--mcp-config FILE] [--confirm ID] turn [text...] | show TARGET | serve [--no-project] [--dir DIR] [--project DIR] [--host HOST] [--port PORT] [--allow-origin ORIGIN]";
+const USAGE: &str = "usage: eja [--no-project] --dir DIR [--task ID] [--confirm ID] turn [text...] | show TARGET | serve [--no-project] [--dir DIR] [--project DIR] [--host HOST] [--port PORT] [--allow-origin ORIGIN]";
 
 enum Command {
     Turn(String),
@@ -22,7 +20,6 @@ enum Command {
 
 struct Invocation {
     dir: PathBuf,
-    config: Option<PathBuf>,
     options: TurnOptions,
     command: Command,
     no_project: bool,
@@ -31,29 +28,26 @@ struct Invocation {
 fn parse(args: Vec<String>) -> Result<Invocation> {
     let mut args: VecDeque<_> = args.into();
     let mut dir = PathBuf::from(".eja");
-    let mut config = None;
     let mut no_project = false;
     let mut options = TurnOptions::default();
     let mut words = Vec::new();
     while let Some(arg) = args.pop_front() {
         match arg.as_str() {
             "--no-project" => no_project = true,
-            "--dir" | "--task" | "--mcp-config" | "--confirm" => {
+            "--dir" | "--task" | "--confirm" => {
                 let value = args
                     .pop_front()
                     .ok_or_else(|| format!("{arg} requires a value"))?;
-                match arg.as_str() {
-                    "--dir" => dir = value.into(),
-                    "--mcp-config" => config = Some(PathBuf::from(value)),
-                    _ => {
-                        let id = value
-                            .parse()
-                            .map_err(|_| format!("invalid id for {arg}: {value}"))?;
-                        if arg == "--task" {
-                            options.focus = Some(id);
-                        } else {
-                            options.approvals.push(id);
-                        }
+                if arg == "--dir" {
+                    dir = value.into();
+                } else {
+                    let id = value
+                        .parse()
+                        .map_err(|_| format!("invalid id for {arg}: {value}"))?;
+                    if arg == "--task" {
+                        options.focus = Some(id);
+                    } else {
+                        options.approvals.push(id);
                     }
                 }
             }
@@ -83,7 +77,6 @@ fn parse(args: Vec<String>) -> Result<Invocation> {
     };
     Ok(Invocation {
         dir,
-        config,
         options,
         command,
         no_project,
@@ -149,24 +142,12 @@ fn run() -> Result<()> {
     if args.as_slice() == ["--aja-worker"] {
         return eja::aja::worker_main();
     }
-    let capabilities = host::EnabledCapabilities::from_env()?;
     let Invocation {
         dir,
-        config,
         mut options,
         command,
         no_project,
     } = parse(args)?;
-    // A directory written before the aja rename keeps its executions under
-    // nodes/. This version reads the ajas/ layout and does not migrate, so it
-    // says so instead of reading the journal as a project with no executions.
-    if dir.join("nodes").exists() && !dir.join("ajas").exists() {
-        return Err(format!(
-            "{} records executions under nodes/, which this version does not read; there is no migration",
-            dir.display()
-        )
-        .into());
-    }
     let store = Store::new(&dir)?;
     // The host's private state is not part of the environment it observes: keep it
     // out of any commit, including a Git worktree environment's.
@@ -184,30 +165,57 @@ fn run() -> Result<()> {
             limits.decisions = env("EJA_TURN_DECISIONS", limits.decisions)?;
             limits.actions = env("EJA_TURN_ACTIONS", limits.actions)?;
             limits.dispatches = env("EJA_TURN_DISPATCHES", limits.dispatches)?;
-            limits.timeout_ms = env("EJA_TURN_TIMEOUT_MS", limits.timeout_ms)?;
-            limits.slots = env("EJA_AJA_SLOTS", limits.slots)?;
             limits.validate()?;
-            let project = (capabilities.has(Capability::Workspace) && !no_project)
-                .then(std::env::current_dir)
-                .transpose()?;
+            let project = (!no_project).then(std::env::current_dir).transpose()?;
             // The CLI shares the runtime's grant: the same settings file names
             // the same workspaces, so a task opened here resolves like one
             // opened over HTTP.
             let settings = host::SettingsStore::new(project, dir.clone());
-            let composed = host::compose(&settings, capabilities, config.as_deref(), &startup)?;
+            let composed = host::compose(&settings, &startup)?;
             report_capability_diagnostics(&composed.diagnostics);
             options.limits.slots = composed.effective.limits.slots.max(1);
             if composed.effective.limits.turn_timeout_ms > 0 {
                 options.limits.timeout_ms = composed.effective.limits.turn_timeout_ms;
             }
-            let grant = capabilities.grants(&settings, &composed.effective.settings);
+            let grant = composed
+                .effective
+                .capabilities
+                .grants(&settings, &composed.effective.settings);
             options.workspaces.clone_from(&grant);
-            let mut brain = OpenAiBrain::from_env()?
-                .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?;
+            let eja_role = composed
+                .effective
+                .roles
+                .eja
+                .as_ref()
+                .filter(|role| role.configured())
+                .ok_or("settings need an EJA provider and model")?;
+            let aja_role = composed
+                .effective
+                .roles
+                .aja
+                .as_ref()
+                .filter(|role| role.configured())
+                .ok_or("settings need an AJA provider and model")?;
+            let mut brain =
+                OpenAiBrain::new(&eja_role.base_url, &eja_role.api_key, &eja_role.model)
+                    .with_headers(
+                        eja_role
+                            .headers
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value.clone()))
+                            .collect(),
+                    );
             if let Some(description) = &composed.capability_description {
                 brain = brain.with_capability_description(description);
             }
-            let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
+            let model = OpenAiModel::new(&aja_role.base_url, &aja_role.api_key, &aja_role.model)
+                .with_headers(
+                    aja_role
+                        .headers
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                );
             let ajas = dir.join("ajas");
             let mut aja_limits = eja::aja::Limits::default();
             if composed.effective.limits.aja_steps > 0 {
@@ -263,12 +271,12 @@ fn run() -> Result<()> {
         }
         Command::Context => {
             let state = State::load(&store)?;
-            let project = (capabilities.has(Capability::Workspace) && !no_project)
-                .then(std::env::current_dir)
-                .transpose()?;
+            let project = (!no_project).then(std::env::current_dir).transpose()?;
             let settings = host::SettingsStore::new(project, dir);
-            let stored = settings.read().map_err(|error| error.to_string())?;
-            let grant = capabilities.grants(&settings, &stored);
+            let effective = settings.effective_current()?;
+            let grant = effective
+                .capabilities
+                .grants(&settings, &effective.settings);
             let context = state.project_with_workspaces("", options.focus, eja::now_utc(), &grant);
             println!("{}", adapters::render_context(&context));
             println!(
@@ -285,11 +293,9 @@ fn run() -> Result<()> {
             }
         }
         Command::Tools => {
-            let project = (capabilities.has(Capability::Workspace) && !no_project)
-                .then(std::env::current_dir)
-                .transpose()?;
+            let project = (!no_project).then(std::env::current_dir).transpose()?;
             let settings = host::SettingsStore::new(project, dir);
-            let composed = host::compose(&settings, capabilities, config.as_deref(), &startup)?;
+            let composed = host::compose(&settings, &startup)?;
             report_capability_diagnostics(&composed.diagnostics);
             let assignment = Assignment {
                 task_id: options.focus.unwrap_or(0),
@@ -387,7 +393,6 @@ fn run() -> Result<()> {
 }
 
 fn serve(args: &[String]) -> Result<()> {
-    let capabilities = host::EnabledCapabilities::from_env()?;
     let mut dir = PathBuf::from(".eja");
     let mut project = Some(std::env::current_dir()?);
     let mut host = "127.0.0.1".to_owned();
@@ -442,7 +447,6 @@ fn serve(args: &[String]) -> Result<()> {
         host,
         port,
         allowed_origins,
-        capabilities,
     })
 }
 

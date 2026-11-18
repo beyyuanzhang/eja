@@ -79,6 +79,56 @@ fn manifest_of(state: &State, id: u64) -> Value {
     .unwrap()
 }
 
+fn current_manifest(assignment: &Value) -> Value {
+    json!({
+        "format": "eja.aja",
+        "version": 1,
+        "assignment": assignment,
+        "digest": "",
+        "environment": null,
+        "checkpoint": null,
+        "checkpoint_error": null
+    })
+}
+
+fn configure_cli(
+    state: &State,
+    base_url: &str,
+    capabilities: &Value,
+    connectors: &Value,
+    slots: usize,
+) {
+    let dir = state.path().join(".eja");
+    eja::Store::new(&dir).expect("state");
+    std::fs::write(
+        dir.join("app-settings.json"),
+        serde_json::to_vec_pretty(&json!({
+            "providers": [{
+                "id": "test",
+                "name": "Test",
+                "baseUrl": base_url,
+                "apiKey": "test-key",
+                "models": ["test-model"]
+            }],
+            "roles": {
+                "eja": {"providerId": "test", "model": "test-model"},
+                "aja": {"providerId": "test", "model": "test-model"}
+            },
+            "connectors": {"servers": connectors},
+            "capabilities": capabilities,
+            "limits": {
+                "slots": slots,
+                "turnTimeoutMs": 0,
+                "ajaSteps": 0,
+                "ajaTimeoutMs": 0
+            },
+            "workspaces": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 fn assignment(id: u64) -> Assignment {
     Assignment {
         task_id: id,
@@ -221,8 +271,8 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
         "the aja writes the workspace itself"
     );
     assert!(manifest_of(&f, 1)["checkpoint"].as_str().is_some());
-    assert_eq!(manifest_of(&f, 1)["frozen"], true);
-    assert_eq!(manifest_of(&f, 1)["context"], "context.jsonl");
+    assert_eq!(manifest_of(&f, 1)["format"], "eja.aja");
+    assert_eq!(manifest_of(&f, 1)["version"], 1);
     assert!(
         std::fs::metadata(f.path().join(".eja/ajas/1/aja.json"))
             .unwrap()
@@ -324,19 +374,19 @@ fn a_worktree_run_persists_the_environment_and_stable_artifact_it_settled() {
     assert!(digest.contains("ended: message"), "{digest}");
     assert!(!fixture.path().join("out.txt").exists());
     let manifest = manifest_of(&fixture, 1);
-    assert_eq!(manifest["environment_kind"], "worktree", "{manifest}");
+    assert_eq!(manifest["environment"]["provider"], "git", "{manifest}");
     assert_eq!(
-        manifest["environment_root"],
+        manifest["environment"]["root"],
         fixture.path().canonicalize().unwrap().display().to_string()
     );
     assert!(
-        manifest["environment_branch"]
+        manifest["environment"]["state"]["branch"]
             .as_str()
             .is_some_and(|branch| branch.starts_with("eja/aja-1-")),
         "{manifest}"
     );
     assert!(
-        manifest["environment_commit"]
+        manifest["environment"]["state"]["commit"]
             .as_str()
             .is_some_and(|commit| commit.len() == 40 || commit.len() == 64),
         "{manifest}"
@@ -711,7 +761,7 @@ fn traversal_private_state_and_symlinks_are_not_file_capabilities() {
         "{digest}"
     );
     assert!(!f.path().join("escape.txt").exists());
-    assert_eq!(manifest_of(&f, 1)["frozen"], true);
+    assert_eq!(manifest_of(&f, 1)["version"], 1);
     let seen = model.seen.lock().unwrap();
     let results = seen[1]
         .iter()
@@ -765,7 +815,7 @@ fn step_context_and_output_limits_stop_the_aja_and_preserve_partial_work() {
     assert!(r.contains("ended: budget"), "{r}");
     assert!(r.contains("context budget"), "{r}");
     assert_eq!(w.active_count(), 0);
-    assert_eq!(manifest_of(&f, 2)["frozen"], true);
+    assert_eq!(manifest_of(&f, 2)["version"], 1);
     // A protocol breach is an error, not a budget the aja spent.
     let oversized = Arc::new(Script::new(vec![json!({
         "role": "assistant",
@@ -784,7 +834,7 @@ fn step_context_and_output_limits_stop_the_aja_and_preserve_partial_work() {
     assert!(r.contains("ended: error"), "{r}");
     assert!(r.contains("output limit"), "{r}");
     assert_eq!(w.active_count(), 0);
-    assert_eq!(manifest_of(&f, 3)["frozen"], true);
+    assert_eq!(manifest_of(&f, 3)["version"], 1);
     // A plain-text final message is a claim, not a schema breach.
     let plain = Arc::new(Script::new(vec![
         json!({"role":"assistant","content":"not a digest"}),
@@ -857,7 +907,7 @@ fn timeout_cancellation_and_busy_slot_release_all_aja_resources() {
             "{r}"
         );
         assert_eq!(w.active_count(), 0);
-        assert_eq!(manifest_of(&f, 1)["frozen"], true);
+        assert_eq!(manifest_of(&f, 1)["version"], 1);
         assert_reaped(&pids);
     }
 }
@@ -1138,7 +1188,7 @@ fn oversized_start_is_rejected_without_leaving_a_process() {
     assert!(digest.contains("context budget"), "{digest}");
     assert_eq!(worker.active_count(), 0);
     assert!(worker_pids().is_empty());
-    assert_eq!(manifest_of(&f, 1)["frozen"], true);
+    assert_eq!(manifest_of(&f, 1)["version"], 1);
 }
 
 struct TestRuntime(Child);
@@ -1194,18 +1244,10 @@ fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
     for via_http in [false, true] {
         let fixture = workspace("connector-only");
         let state = fixture.path().join(".eja");
-        let old_worktree = state.join("environments/1");
-        std::fs::create_dir_all(&old_worktree).unwrap();
-        std::fs::write(old_worktree.join("existing.txt"), "old worktree").unwrap();
         let peer = fixture.path().join("peer");
         let empty_path = fixture.path().join("bin");
         std::fs::create_dir_all(&peer).unwrap();
         std::fs::create_dir_all(&empty_path).unwrap();
-        std::fs::write(state.join("mcp.json"), json!({"mcpServers":{"fixture":{
-            "command":"/usr/bin/python3",
-            "args":[PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_server.py"), peer, "stdio"],
-            "tools":["echo"]
-        }}}).to_string()).unwrap();
 
         let (url, server) = serve(vec![
             json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":json!({"actions":[
@@ -1219,13 +1261,33 @@ fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
                 {"op":"close_task","task_id":1,"accepted":true}
             ]}).to_string()}}]}),
         ]);
+        configure_cli(
+            &fixture,
+            &url,
+            &json!({
+                "workspace": false,
+                "files": false,
+                "shell": false,
+                "git": false,
+                "mcp": true,
+                "plugins": false
+            }),
+            &json!([{
+                "name": "fixture",
+                "command": "/usr/bin/python3",
+                "args": [
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_server.py"),
+                    peer,
+                    "stdio"
+                ],
+                "tools": ["echo"],
+                "enabled": true,
+                "timeoutMs": 2000
+            }]),
+            1,
+        );
         let mut command = Command::new(env!("CARGO_BIN_EXE_eja"));
-        command
-            .current_dir(fixture.path())
-            .env("PATH", &empty_path)
-            .env("LNA_BASE_URL", url)
-            .env("LNA_API_KEY", "test-key")
-            .env("LNA_MODEL", "test-model");
+        command.current_dir(fixture.path()).env("PATH", &empty_path);
         if via_http {
             command.arg("serve");
         }
@@ -1254,7 +1316,8 @@ fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
         assert_eq!(task.status, eja::TaskStatus::Done);
         assert!(task.workspace.is_empty());
         let manifest = manifest_of(&fixture, 1);
-        assert_eq!(manifest["frozen"], true);
+        assert_eq!(manifest["format"], "eja.aja");
+        assert_eq!(manifest["version"], 1);
         assert!(manifest["checkpoint"].is_null() && manifest["checkpoint_error"].is_null());
         let record = RecordFiles::with_checkpoints(state.join("ajas"), state.join("checkpoints"))
             .slice("1/context.jsonl", &eja::Selector::Whole, &control())
@@ -1264,7 +1327,6 @@ fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
             .unwrap()
             .contains("fixture-returned"));
         assert!(!state.join("checkpoints").exists());
-        assert!(old_worktree.join("existing.txt").is_file());
     }
 }
 
@@ -1297,15 +1359,24 @@ fn a_workspace_can_write_files_without_shell_or_git() {
         json!({"choices":[{"finish_reason":"stop","message":final_message(&[])}]}),
         json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"reply\":\"recorded\"}"}}]}),
     ]);
+    configure_cli(
+        &fixture,
+        &url,
+        &json!({
+            "workspace": true,
+            "files": true,
+            "shell": false,
+            "git": false,
+            "mcp": false,
+            "plugins": false
+        }),
+        &json!([]),
+        2,
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
         .current_dir(fixture.path())
         .env("PATH", bin)
         .env("TEST_GIT_MARKER", &marker)
-        .env("EJA_CAPABILITIES", "workspace,files")
-        .env("EJA_AJA_SLOTS", "2")
-        .env("LNA_BASE_URL", url)
-        .env("LNA_API_KEY", "test-key")
-        .env("LNA_MODEL", "test-model")
         .args(["--dir", ".eja", "turn", "write a local file"])
         .output()
         .unwrap();
@@ -1328,9 +1399,22 @@ fn a_workspace_can_write_files_without_shell_or_git() {
     let manifest = manifest_of(&fixture, 1);
     assert!(manifest["checkpoint"].is_null() && manifest["checkpoint_error"].is_null());
 
+    configure_cli(
+        &fixture,
+        &url,
+        &json!({
+            "workspace": true,
+            "files": false,
+            "shell": true,
+            "git": false,
+            "mcp": false,
+            "plugins": false
+        }),
+        &json!([]),
+        2,
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
         .current_dir(fixture.path())
-        .env("EJA_CAPABILITIES", "workspace,shell")
         .args(["--dir", ".eja", "show", "tools"])
         .output()
         .unwrap();
@@ -1346,13 +1430,9 @@ fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let f = workspace("cli");
+    eja::Store::new(f.path().join(".eja")).unwrap();
     let fixture = f.path().join(".eja/fixture");
     std::fs::create_dir_all(&fixture).unwrap();
-    std::fs::write(f.path().join(".eja/mcp.json"), json!({"mcpServers":{"files":{
-        "command":"/usr/bin/python3",
-        "args":[PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_server.py"),fixture,"files"],
-        "tools":["write_file"]
-    }}}).to_string()).unwrap();
     let decision = |reply: &str, actions: Value| json!({"role":"assistant","content":json!({"reply":reply,"actions":actions}).to_string()});
     let response = |reason: &str, message: Value| json!({"choices":[{"finish_reason":reason,"message":message}]});
     let (url, server) = serve(vec![
@@ -1386,11 +1466,33 @@ fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
             ),
         ),
     ]);
+    configure_cli(
+        &f,
+        &url,
+        &json!({
+            "workspace": true,
+            "files": false,
+            "shell": false,
+            "git": true,
+            "mcp": true,
+            "plugins": false
+        }),
+        &json!([{
+            "name": "files",
+            "command": "/usr/bin/python3",
+            "args": [
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_server.py"),
+                fixture,
+                "files"
+            ],
+            "tools": ["write_file"],
+            "enabled": true,
+            "timeoutMs": 2000
+        }]),
+        1,
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
         .current_dir(f.path())
-        .env("LNA_BASE_URL", url)
-        .env("LNA_API_KEY", "test-key")
-        .env("LNA_MODEL", "test-model")
         .args(["--dir", ".eja", "turn", "broad original user request"])
         .output()
         .unwrap();
@@ -1410,7 +1512,7 @@ fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
         .as_str()
         .unwrap()
         .contains("build"));
-    assert_eq!(manifest_of(&f, 1)["frozen"], true);
+    assert_eq!(manifest_of(&f, 1)["version"], 1);
     let log = std::fs::read_to_string(f.path().join(".eja/log.jsonl")).unwrap();
     let events: Vec<Value> = log
         .lines()
@@ -1616,7 +1718,7 @@ fn a_continuation_keeps_the_complete_prefix_of_an_interrupted_call_group() {
     .unwrap();
     std::fs::write(
         aja.join("aja.json"),
-        json!({"assignment":assignment(1),"frozen":true}).to_string(),
+        current_manifest(&json!(assignment(1))).to_string(),
     )
     .unwrap();
     let model = Arc::new(Script::new(vec![final_message(&[])]));
@@ -1656,7 +1758,7 @@ fn a_turn_deadline_cannot_be_extended_by_a_ajas_own_timeout() {
     assert!(digest.contains("ended: budget"), "{digest}");
     assert!(digest.contains("timed out"));
     assert_eq!(w.active_count(), 0);
-    assert_eq!(manifest_of(&f, 1)["frozen"], true);
+    assert_eq!(manifest_of(&f, 1)["version"], 1);
     assert!(manifest_of(&f, 1)["checkpoint_error"]
         .as_str()
         .unwrap()
@@ -1777,31 +1879,15 @@ fn malformed_custom_model_messages_are_recorded_as_errors_and_not_replayed() {
 }
 
 #[test]
-fn cli_show_cannot_enter_turn_and_invalid_context_budget_is_explicit() {
+fn cli_show_cannot_enter_turn() {
     let f = workspace("cli-show");
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
         .args(["--dir", f.path().to_str().unwrap(), "show", "turn"])
-        .env("LNA_BASE_URL", "http://127.0.0.1:1")
-        .env("LNA_API_KEY", "test")
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown show target"));
     assert!(!f.path().join("log.jsonl").exists());
-    let output = Command::new(env!("CARGO_BIN_EXE_eja"))
-        .current_dir(f.path())
-        .args(["--dir", ".eja", "turn", "hi"])
-        .env("LNA_BASE_URL", "http://127.0.0.1:1")
-        .env("LNA_API_KEY", "test")
-        .env("EJA_CONTEXT_BYTES", "0")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("EJA_CONTEXT_BYTES"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[test]
@@ -1828,7 +1914,7 @@ fn empty_tool_lists_are_final_messages_and_a_missing_record_start_is_an_error() 
     std::fs::create_dir_all(&damaged).unwrap();
     std::fs::write(
         damaged.join("aja.json"),
-        json!({"frozen":true,"assignment":assignment(3)}).to_string(),
+        current_manifest(&json!(assignment(3))).to_string(),
     )
     .unwrap();
     std::fs::write(damaged.join("context.jsonl"), "").unwrap();
@@ -1842,7 +1928,7 @@ fn empty_tool_lists_are_final_messages_and_a_missing_record_start_is_an_error() 
 }
 
 #[test]
-fn a_continuation_refuses_a_predecessor_that_never_froze() {
+fn a_continuation_refuses_a_record_without_the_current_format() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1851,7 +1937,6 @@ fn a_continuation_refuses_a_predecessor_that_never_froze() {
     std::fs::create_dir_all(&aja).unwrap();
     let start = json!({"kind":"start","view_version":1,"messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":"old brief"}]});
     std::fs::write(aja.join("context.jsonl"), format!("{start}\n")).unwrap();
-    // No `frozen`: the host never sealed this record, so it is not evidence.
     std::fs::write(
         aja.join("aja.json"),
         json!({"assignment":assignment(1)}).to_string(),
@@ -1863,41 +1948,37 @@ fn a_continuation_refuses_a_predecessor_that_never_froze() {
     next.resume = Some(1);
     let digest = w.execute(&next, &control());
     assert!(
-        digest.contains("ended: error") && digest.contains("not frozen"),
+        digest.contains("ended: error") && digest.contains("missing field `format`"),
         "{digest}"
     );
 }
 
 #[test]
-fn a_legacy_start_entry_is_its_own_ancestry_root() {
+fn a_start_without_the_current_view_version_is_refused() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let f = workspace("legacy");
+    let f = workspace("unsupported-start");
     let aja = f.path().join(".eja/ajas/1");
     std::fs::create_dir_all(&aja).unwrap();
-    // A record written before view_version 1 already holds its whole starting view.
-    let start = json!({"kind":"start","messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":"legacy brief"}]});
+    let start = json!({"kind":"start","messages":[{"role":"system","content":"You are AJA"},{"role":"user","content":"old brief"}]});
     std::fs::write(aja.join("context.jsonl"), format!("{start}\n")).unwrap();
     let mut parent = assignment(1);
     parent.resume = Some(1);
     std::fs::write(
         aja.join("aja.json"),
-        json!({"assignment":parent,"frozen":true}).to_string(),
+        current_manifest(&json!(parent)).to_string(),
     )
     .unwrap();
     let model = Arc::new(Script::new(vec![final_message(&[])]));
-    let w = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
+    let w = worker_for(&f, model, Arc::new(FileTools), Limits::default());
     let mut next = assignment(2);
     next.resume = Some(1);
     let digest = w.execute(&next, &control());
-    assert!(digest.contains("ended: message"), "{digest}");
-    let seen = model.seen.lock().unwrap();
-    // The legacy record is where the chain stops: it is replayed once, and it does
-    // not send the reader looking for an ancestor it never named.
-    assert!(seen[0]
-        .iter()
-        .any(|message| message["content"] == "legacy brief"));
+    assert!(
+        digest.contains("ended: error") && digest.contains("no valid start entry"),
+        "{digest}"
+    );
 }
 
 #[test]
@@ -1916,7 +1997,7 @@ fn a_record_ancestry_cycle_is_refused() {
         parent.resume = Some(if id == 1 { 2 } else { 1 });
         std::fs::write(
             aja.join("aja.json"),
-            json!({"assignment":parent,"frozen":true}).to_string(),
+            current_manifest(&json!(parent)).to_string(),
         )
         .unwrap();
     }

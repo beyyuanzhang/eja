@@ -99,17 +99,6 @@ fn addresses_are_one_scheme_and_plain_targets_are_host_tools() {
     assert!(eja::Address::parse("record:3/4").is_some());
     assert!(eja::Address::parse("record:3/report.md").is_some());
     assert!(eja::Address::parse("environment:README.md").is_some());
-    assert!(eja::Address::parse("world:README.md").is_some());
-    assert_eq!(
-        eja::Address::parse("world:README.md")
-            .expect("legacy address")
-            .to_string(),
-        "environment:README.md"
-    );
-    let legacy: eja::Address =
-        serde_json::from_value(serde_json::json!({"authority":"world","id":"README.md"}))
-            .expect("legacy serialized authority");
-    assert_eq!(legacy.to_string(), "environment:README.md");
     assert!(eja::Address::parse("history").is_none());
     assert!(eja::Address::parse("read_file").is_none());
     assert!(eja::Address::parse("log:").is_none());

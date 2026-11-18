@@ -772,9 +772,7 @@ pub enum Authority {
     Log,
     /// One entry or file of a frozen execution record.
     Record,
-    /// A path in an execution environment the host grants. The serialized
-    /// `world` spelling remains accepted for events written before this name.
-    #[serde(alias = "world")]
+    /// A path in an execution environment the host grants.
     Environment,
 }
 
@@ -782,8 +780,7 @@ pub enum Authority {
 /// one are read the same way.
 ///
 /// The examples are `log:event:12`, `record:3/report.md`, and
-/// `environment:src/out.txt`. The former `world:` spelling remains an input
-/// alias for records and callers written before the terminology changed.
+/// `environment:src/out.txt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Address {
     pub authority: Authority,
@@ -800,7 +797,7 @@ impl Address {
         let authority = match scheme {
             "log" => Authority::Log,
             "record" => Authority::Record,
-            "environment" | "world" => Authority::Environment,
+            "environment" => Authority::Environment,
             _ => return None,
         };
         Some(Self {

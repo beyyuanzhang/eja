@@ -3,6 +3,7 @@ use super::{cut_chars, environments::ENTRIES, Capabilities, Control};
 use crate::{aja::FRAME_LIMIT, Result};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -528,14 +529,46 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new(private: impl Into<PathBuf>, providers: Vec<Box<dyn ToolProvider>>) -> Result<Self> {
-        Ok(Self {
-            providers,
+        let mut registry = Self {
+            providers: Vec::new(),
             private: private.into().canonicalize()?,
-        })
+        };
+        for provider in providers {
+            registry.register(provider)?;
+        }
+        Ok(registry)
     }
 
-    pub fn register(&mut self, provider: Box<dyn ToolProvider>) {
+    pub fn register(&mut self, provider: Box<dyn ToolProvider>) -> Result<()> {
+        let assignment = crate::Assignment {
+            task_id: 0,
+            objective: String::new(),
+            workspace: String::new(),
+            acceptance: String::new(),
+            input: String::new(),
+            resume: None,
+            issued_at: 0,
+        };
+        let mut names = self
+            .providers
+            .iter()
+            .flat_map(|provider| provider.definitions(&assignment))
+            .filter_map(|definition| {
+                definition["function"]["name"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        for definition in provider.definitions(&assignment) {
+            let name = definition["function"]["name"]
+                .as_str()
+                .ok_or("host tool definition has no name")?;
+            if !names.insert(name.to_owned()) {
+                return Err(format!("host tool name is declared twice: {name}").into());
+            }
+        }
         self.providers.push(provider);
+        Ok(())
     }
 
     fn provider(&self, tool: &str) -> Result<&dyn ToolProvider> {

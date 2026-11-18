@@ -1,9 +1,9 @@
 # Native AJA protocol
 
 The same executable runs in private `--aja-worker` mode. It starts with an empty
-process environment in the execution environment the host reserved for this run:
-the project itself for a shared environment, a Git worktree when slots are
-isolated. The host owns model credentials, MCP
+process environment in the environment provider record reserved for this run:
+the project itself for a shared environment, or an isolated environment such as
+a Git worktree when slots are isolated. The host owns model credentials, MCP
 connections, tool grants and all external effects. The aja only runs framed IPC.
 
 ## Startup
@@ -41,27 +41,26 @@ line each, and the oldest fold into one address range. Nothing is deleted from
 the record. Every step line names the record entry it came from, and the fold line
 names the range of those entries, so a folded step is read back with
 `eja_read_record {aja, entry}` — the record half of the same address space that
-`log:` and `environment:` name from the host side. The old `world:` prefix is
-accepted as an input alias.
+`log:` and `environment:` name from the host side.
 A contract that cannot fit even at that scale ends with budget. Incomplete
 provider responses and invalid tool messages end with error.
 
 ## Frozen record
 
-`context.jsonl` contains a v1 start entry, this run's assistant/tool entries and
-finish. Start stores only fresh messages. The frozen assignment.resume is its parent address. A
-continuation does not copy ancestor payloads. Replaying legacy records that
-already contain inherited start messages treats them as ancestry roots.
+`context.jsonl` contains a `view_version: 1` start entry, this run's
+assistant/tool entries and finish. Start stores only fresh messages. The frozen
+`assignment.resume` is its parent address. A continuation does not copy ancestor
+payloads.
 
 Replaying a predecessor folds its transcript against the same budget, but only
 when the working set outgrows it: measuring the whole transcript once per record
 entry would cost the square of a long record for no new information.
 
 `aja.json` is published by atomic rename after process cleanup and transcript
-sync. It contains assignment, digest, optional checkpoint, checkpoint_error,
-context file/size and frozen:true. Frozen files become read-only. Checkpointing
-captures the Git-visible files of that environment; whole/range/match read the same
-commit.
+sync. It uses the `eja.aja` format, version 1, and contains the assignment,
+digest, optional provider-owned environment record, checkpoint and
+`checkpoint_error`. Frozen files become read-only. Checkpointing captures the
+Git-visible files of that environment; whole/range/match read the same commit.
 Checkpoint failure remains visible and does not discard the execution record.
 
 A record is evidence, not acceptance. EJA's later close_task event is the verdict.
@@ -80,6 +79,6 @@ resources belong to the host. Ordinary filesystem permissions and child processe
 are application boundaries, not an OS security sandbox.
 
 MCP connections belong to the command/application, and are shared across the
-ajas of one host. Cancelling a request asks the server to stop; it cannot undo remote effects.
-Legacy host/admin adapters must satisfy the same bounded-output and Control
+ajas of one host. Cancelling a request asks the server to stop; it cannot undo
+remote effects. Every adapter must satisfy the same bounded-output and Control
 contracts to participate in finite execution.

@@ -6,46 +6,65 @@ aja retains no aja-owned MCP client, server or thread.
 
 ## Configuration
 
-The CLI loads `<dir>/mcp.json` when present, or the exact `--mcp-config FILE` path.
-It does not search personal or other project configuration directories. No config
-grants no external connector tools. Each native aja still has its host-bound
-read-only record passage tool. A configured server that fails to initialize or
-list its granted tools is reported and omitted. Healthy servers from the same
-configuration remain available. An unreadable or invalid connector configuration
-is also reported as a capability warning and cannot disable unrelated local or
-managed capabilities.
+Connectors live in `<state>/app-settings.json`, in the same file as providers,
+roles, workspaces and capability switches. There is no separate MCP file and no
+MCP command-line configuration path. No configured server grants no external
+connector tools. Each native aja still has its host-bound read-only record passage
+tool. A configured server that fails to initialize or list its granted tools is
+reported and omitted. Healthy servers remain available.
 
 ```json
 {
-  "mcpServers": {
-    "local": {
-      "command": "/absolute/path/to/server",
-      "args": ["--stdio"],
-      "env": {"SERVICE_TOKEN": "${MY_SERVICE_TOKEN}"},
-      "tools": ["search", "fetch"],
-      "timeout_ms": 30000
-    },
-    "remote": {
-      "url": "https://your-service.example/mcp",
-      "headers": {"Authorization": "Bearer ${MY_SERVICE_TOKEN}"},
-      "tools": ["search"]
-    }
+  "capabilities": {
+    "workspace": true,
+    "files": true,
+    "shell": true,
+    "git": true,
+    "mcp": true,
+    "plugins": false
+  },
+  "connectors": {
+    "servers": [
+      {
+        "name": "local",
+        "command": "/absolute/path/to/server",
+        "args": ["--stdio"],
+        "env": {"SERVICE_TOKEN": "${MY_SERVICE_TOKEN}"},
+        "tools": ["search", "fetch"],
+        "enabled": true,
+        "timeoutMs": 30000
+      },
+      {
+        "name": "remote",
+        "url": "https://your-service.example/mcp",
+        "headers": {"Authorization": "Bearer ${MY_SERVICE_TOKEN}"},
+        "tools": ["search"],
+        "enabled": true,
+        "timeoutMs": 30000
+      }
+    ]
   }
 }
 ```
 
+The surrounding file also needs `providers`, `roles`, `limits` and
+`workspaces`. The app writes the complete shape. Set `capabilities.mcp` to
+`false` to remove every connector tool while leaving the stored definitions
+intact.
+
 Each server specifies exactly one `command` or `url`. Unknown fields are errors.
-Names are 1–24 ASCII letters, digits, underscores or hyphens. Optional `enabled: false`
-skips a server. `tools` lists exact remote names: omitted grants the startup
-catalog, `[]` grants none; a missing configured tool is an error. The catalog is
-fixed for the host lifetime, so reconnect/restart is required for catalog changes.
+Names are 1–24 ASCII letters, digits, underscores or hyphens. Optional
+`enabled: false` skips a server. `tools` lists exact remote names: omitted grants
+the startup catalog, `[]` grants none; a missing configured tool is an error. The
+catalog is fixed for the host lifetime, so restart the runtime after changing it.
 
 Stdio programs run directly, without a shell. The default working directory is
-the project; optional `cwd` is absolute or relative to the config file. Only
-`PATH`, `HOME`, `TMPDIR`, `TMP`, `LANG`, `SYSTEMROOT` and explicit `env` are passed.
-Only `env` values and HTTP header values expand `${VARIABLE}`; missing variables
-are errors. Arguments and commands are literal. Server stderr is inherited by the host;
-stdout must contain MCP JSON lines only.
+the project, or the state directory when no project is configured. Optional `cwd`
+is absolute or relative to that default. Only `PATH`, `HOME`, `TMPDIR`, `TMP`,
+`LANG`, `SYSTEMROOT` and explicit `env` are passed. Only `env` values and HTTP
+header values expand `${VARIABLE}`; missing variables are errors. Arguments and
+commands are literal. Server stderr is inherited by the host; stdout must contain
+MCP JSON lines only.
 
 HTTP uses Streamable HTTP, accepts JSON and SSE responses, and supports configured
 headers. Protocol/session headers belong to the SDK. URL credentials and
@@ -53,7 +72,7 @@ redirects are rejected. This implementation does not perform interactive OAuth.
 
 ```bash
 eja --dir .eja show tools
-eja --dir .eja --mcp-config /path/to/mcp.json turn "use the connector"
+eja --dir .eja turn "use the connector"
 ```
 
 Tool names become `mcp__<server>__<tool>`; unsupported characters become `_`.
@@ -81,7 +100,7 @@ resource browser or prompt registry.
   servers. Its remaining time does not become a later tool call's timeout.
 - Results retain MCP `content`, `structuredContent` and `isError`; remote resource
   references stay data and are not automatically fetched or made local artifacts.
-- `read_only` lists server tool names the host declares safe for EJA to observe.
+- `readOnly` lists server tool names the host declares safe for EJA to observe.
   EJA can also observe any tool the server itself annotated `readOnlyHint`. The
   host is the authority here: declare only tools that cannot change state, because
   EJA will call them on its own.
@@ -98,11 +117,17 @@ resource browser or prompt registry.
 A server tool may answer an acceptance witness only when its server declares it:
 
 ```json
-{ "mcpServers": { "checks": { "command": "...", "witness": ["run_checks"] } } }
+{
+  "name": "checks",
+  "command": "/absolute/path/to/server",
+  "witness": ["run_checks"],
+  "enabled": true,
+  "timeoutMs": 30000
+}
 ```
 
 The declaration is checked against the server catalog at load time, like
-`read_only`. A witness is an effect-capable host act, so it is the host's
+`readOnly`. A witness is an effect-capable host act, so it is the host's
 declaration, never the model's request, that decides which tools may answer; the
 file read tools are always allowed because they cannot have effects. A witness
 call runs under its own 120-second child deadline.
@@ -116,5 +141,5 @@ not constrain a separate MCP server's internal code. MCP cancellation is a
 request to the server; it cannot guarantee rollback or termination of remote
 work, and a deliberately detached process requires its own lifecycle management.
 
-The current CLI host lives for one command. A future long-running app can retain
-the same `ToolRegistry` for its application lifetime without changing AJA.
+The long-running HTTP runtime retains the same `ToolRegistry` for its lifetime,
+so every aja sees one catalog and connection owner.

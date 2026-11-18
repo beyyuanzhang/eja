@@ -1,9 +1,12 @@
 //! Durable append-only journal and its rebuildable write cursor.
 use crate::{Event, EventMeta, Kind, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Deserialize;
+use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{BufRead, BufReader, Write},
+    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -29,6 +32,52 @@ struct Cursor {
 const LOCK_WAIT_MS: u32 = 100;
 /// How long one wait for the log lock sleeps before looking again.
 const LOCK_POLL: Duration = Duration::from_millis(1);
+const STATE_FILE: &str = "state.json";
+const STATE_VERSION: u64 = 1;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateMarker {
+    format: String,
+    version: u64,
+}
+
+/// Open the one state format this runtime understands. A directory with any
+/// existing content and no marker is not this format, so it is never interpreted
+/// as a journal or upgraded in place.
+fn prepare_state(root: &Path) -> Result<()> {
+    fs::create_dir_all(root)?;
+    let marker = root.join(STATE_FILE);
+    if marker.exists() {
+        let value: StateMarker = serde_json::from_slice(&fs::read(&marker)?)?;
+        if value.format != "eja" || value.version != STATE_VERSION {
+            return Err(format!(
+                "{} uses an unsupported EJA state format; create a new state directory",
+                root.display()
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    if fs::read_dir(root)?.next().is_some() {
+        return Err(format!(
+            "{} is not an initialized EJA state directory; create a new state directory",
+            root.display()
+        )
+        .into());
+    }
+    let temp = root.join(".state.json.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    serde_json::to_writer(&mut file, &json!({"format":"eja","version":STATE_VERSION}))?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(temp, marker)?;
+    Ok(())
+}
 
 /// The log lock guards one append, not the journal: ownership for a turn is the
 /// separate `turn.lock`. A concurrent thread that spawns a child can briefly
@@ -96,7 +145,7 @@ fn read_events(path: &Path) -> Result<Vec<Event>> {
 
 impl Store {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
-        fs::create_dir_all(root.as_ref())?;
+        prepare_state(root.as_ref())?;
         let log_path = root.as_ref().to_path_buf().join("log.jsonl");
         let file = OpenOptions::new()
             .create(true)

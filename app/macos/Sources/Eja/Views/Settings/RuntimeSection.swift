@@ -49,33 +49,6 @@ struct RuntimeSection: View {
                     pathRow("state", value: model.view?.stateDir ?? "")
                     SettingsRule()
                     pathRow("project", value: model.view?.projectDir ?? "")
-                    if let configPath = model.view?.connectors.configPath, !configPath.isEmpty {
-                        SettingsRule()
-                        pathRow("mcp", value: configPath)
-                    }
-                    if let view = model.view,
-                       !view.connectors.managed || !(view.connectors.error ?? "").isEmpty {
-                        SettingsRule()
-                    }
-                    if let view = model.view {
-                        if !view.connectors.managed {
-                            Text("连接器尚未托管：保存一次设置后由应用接管。")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Theme.amber)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 11)
-                        }
-                        if let error = view.connectors.error, !error.isEmpty {
-                            Label(error, systemImage: "exclamationmark.triangle")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Theme.danger)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 16)
-                                .padding(.bottom, 11)
-                                .textSelection(.enabled)
-                        }
-                    }
                 }
             }
         }

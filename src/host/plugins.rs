@@ -305,7 +305,7 @@ pub(super) fn register(
                 name: name.clone(),
                 version,
                 provider,
-            }));
+            }))?;
         } else {
             diagnostics.push(format!(
                 "managed plugin {name} is unavailable: {}",
@@ -314,7 +314,7 @@ pub(super) fn register(
         }
         manager.loaded.insert(name, status);
     }
-    tools.register(Box::new(manager));
+    tools.register(Box::new(manager))?;
     Ok(Registration { diagnostics })
 }
 

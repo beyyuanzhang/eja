@@ -3,8 +3,8 @@
 mod support;
 
 use eja::adapters::{
-    EnvironmentKind, EnvironmentLease, EnvironmentProvider, EnvironmentRecord, GitWorktrees, Ports,
-    RecordReader, SharedEnvironment, WorkspaceEnvironments,
+    EnvironmentProvider, EnvironmentRecord, GitWorktrees, Ports, RecordReader, SharedEnvironment,
+    WorkspaceEnvironments,
 };
 use eja::{
     turn_at_with_options, Action, Assignment, Control, Kind, Selector, TurnOptions, Worker,
@@ -21,33 +21,6 @@ use std::{
     path::{Path, PathBuf},
 };
 use support::{control, Done, Script, State};
-
-#[derive(Default)]
-struct ReconcileProbe {
-    calls: AtomicUsize,
-}
-
-impl EnvironmentProvider for ReconcileProbe {
-    fn reserve(&self, _: u64, _: Option<&Path>, _: &Control) -> eja::Result<EnvironmentLease> {
-        Err("probe does not reserve environments".into())
-    }
-
-    fn settle(&self, _: &EnvironmentLease, _: &Control) -> eja::Result<Value> {
-        Err("probe does not settle environments".into())
-    }
-
-    fn reconcile(
-        &self,
-        _: Option<&Path>,
-        _: &EnvironmentRecord,
-        _: &Control,
-    ) -> eja::Result<Value> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({"merged": true}))
-    }
-
-    fn release(&self, _: &EnvironmentLease) {}
-}
 
 /// Records how many runs were alive at once. A run waits for a sibling so a
 /// serial host is reported as serial instead of being hidden by timing.
@@ -93,11 +66,11 @@ impl RecordReader for SharedRecord {
     }
 
     fn environment(&self, _: u64) -> eja::Result<Option<EnvironmentRecord>> {
-        Ok(Some(EnvironmentRecord {
-            kind: EnvironmentKind::Shared,
-            root: self.root.clone(),
-            ..EnvironmentRecord::default()
-        }))
+        Ok(Some(EnvironmentRecord::new(
+            "shared",
+            Path::new(&self.root),
+            json!({}),
+        )))
     }
 }
 
@@ -267,8 +240,8 @@ fn a_conflicting_environment_is_reported_and_never_merged_silently() {
     let environment = environments.reserve(2, None, &control).expect("reserve");
     std::fs::write(environment.root.join("base.txt"), "from the run\n").unwrap();
     let settled = environments.settle(&environment, &control).expect("settle");
-    let mut record = environment.record.clone();
-    record.commit = settled["commit"].as_str().map(ToOwned::to_owned);
+    let record: EnvironmentRecord = serde_json::from_value(settled["environment_record"].clone())
+        .expect("recorded environment");
     // The shared environment moved on in the meantime.
     std::fs::write(project.join("base.txt"), "from the host\n").unwrap();
     git(&project, &["add", "-A"]);
@@ -294,29 +267,22 @@ fn a_conflicting_environment_is_reported_and_never_merged_silently() {
 }
 
 #[test]
-fn a_recorded_shared_run_never_enters_the_current_isolated_backend() {
+fn a_recorded_shared_run_reconciles_through_the_shared_provider() {
     let state = State::new("recorded-shared");
     let project = tree(&state);
-    let probe = Arc::new(ReconcileProbe::default());
-    let current: Arc<dyn EnvironmentProvider> = probe.clone();
+    let current: Arc<dyn EnvironmentProvider> = Arc::new(SharedEnvironment::new(
+        project.clone(),
+        state.path().join(".eja"),
+    ));
     let environments = WorkspaceEnvironments::new(
         current.clone(),
         BTreeMap::from([(project.clone(), current)]),
     );
-    let record = EnvironmentRecord {
-        kind: EnvironmentKind::Shared,
-        root: project.display().to_string(),
-        ..EnvironmentRecord::default()
-    };
+    let record = EnvironmentRecord::new("shared", &project, json!({}));
     let outcome = environments
         .reconcile(Some(&project), &record, &control())
         .expect("a shared run needs no current backend work");
     assert_eq!(outcome["merged"], json!(true), "{outcome}");
-    assert_eq!(
-        probe.calls.load(Ordering::SeqCst),
-        0,
-        "today's isolated default must not process a run recorded as shared"
-    );
 }
 
 #[test]
@@ -329,17 +295,12 @@ fn a_recorded_worktree_without_a_git_service_is_refused_without_touching_the_pro
     ));
     let environments =
         WorkspaceEnvironments::new(shared.clone(), BTreeMap::from([(project.clone(), shared)]));
-    let record = EnvironmentRecord {
-        kind: EnvironmentKind::Worktree,
-        root: project.display().to_string(),
-        branch: Some("eja/aja-8-deadbeef".into()),
-        commit: None,
-    };
+    let record = EnvironmentRecord::new("git", &project, json!({"branch": "eja/aja-8-deadbeef"}));
     let error = environments
         .reconcile(Some(&project), &record, &control())
         .expect_err("absent Git history cannot land a worktree");
     assert!(
-        error.to_string().contains("no Git environment provider"),
+        error.to_string().contains("no git environment provider"),
         "{error}"
     );
     assert_eq!(
@@ -368,7 +329,7 @@ fn a_recorded_worktree_merges_its_stable_commit_when_history_is_available() {
     let settled = backend.settle(&environment, &control).expect("settle");
     let record: EnvironmentRecord = serde_json::from_value(settled["environment_record"].clone())
         .expect("recorded environment");
-    assert!(record.commit.is_some(), "{settled}");
+    assert!(record.state["commit"].is_string(), "{settled}");
     backend.release(&environment);
 
     let shared: Arc<dyn EnvironmentProvider> = Arc::new(SharedEnvironment::new(
@@ -390,46 +351,6 @@ fn a_recorded_worktree_merges_its_stable_commit_when_history_is_available() {
 }
 
 #[test]
-fn a_bare_legacy_worktree_uses_the_only_available_history() {
-    let state = State::new("recorded-legacy-worktree");
-    let project = project_with_one_commit(&state);
-    let control = control();
-    let backend = Arc::new(
-        GitWorktrees::new(
-            &project,
-            state.path().join(".eja/environments"),
-            state.path().join(".eja"),
-            &control,
-        )
-        .expect("worktrees"),
-    );
-    let environment = backend.reserve(11, None, &control).expect("reserve");
-    std::fs::write(environment.root.join("legacy.txt"), "legacy result\n").unwrap();
-    let settled = backend.settle(&environment, &control).expect("settle");
-    let mut record: EnvironmentRecord =
-        serde_json::from_value(settled["environment_record"].clone())
-            .expect("recorded environment");
-    record.root.clear();
-    backend.release(&environment);
-
-    let shared: Arc<dyn EnvironmentProvider> = Arc::new(SharedEnvironment::new(
-        project.clone(),
-        state.path().join(".eja"),
-    ));
-    let history: Arc<dyn EnvironmentProvider> = backend;
-    let environments = WorkspaceEnvironments::new(shared, BTreeMap::new())
-        .with_history(BTreeMap::from([(project.clone(), history)]));
-    let outcome = environments
-        .reconcile(None, &record, &control)
-        .expect("an unambiguous legacy record still reconciles");
-    assert_eq!(outcome["merged"], json!(true), "{outcome}");
-    assert_eq!(
-        std::fs::read_to_string(project.join("legacy.txt")).unwrap(),
-        "legacy result\n"
-    );
-}
-
-#[test]
 fn a_recorded_environment_for_another_workspace_is_refused() {
     let state = State::new("recorded-wrong-root");
     let project = tree(&state);
@@ -440,12 +361,7 @@ fn a_recorded_environment_for_another_workspace_is_refused() {
     ));
     let environments =
         WorkspaceEnvironments::new(shared.clone(), BTreeMap::from([(project.clone(), shared)]));
-    let record = EnvironmentRecord {
-        kind: EnvironmentKind::Worktree,
-        root: other.display().to_string(),
-        branch: Some("eja/aja-10-deadbeef".into()),
-        commit: None,
-    };
+    let record = EnvironmentRecord::new("git", &other, json!({"branch": "eja/aja-10-deadbeef"}));
     let error = environments
         .reconcile(Some(&project), &record, &control())
         .expect_err("a task keeps its originally assigned workspace");
@@ -503,9 +419,9 @@ fn a_shared_environment_needs_no_merge() {
 #[test]
 fn reconciling_a_run_is_one_recorded_observation() {
     let state = State::new("reconcile");
+    let store = state.store();
     let project = state.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let store = state.store();
     let environments = SharedEnvironment::new(project.clone(), state.path().join(".eja"));
     let record = SharedRecord {
         root: project.display().to_string(),
@@ -926,10 +842,12 @@ fn each_granted_git_root_reconciles_into_its_own_project() {
     std::fs::write(second.root.join("out.txt"), "beta\n").unwrap();
     let first_account = environments.settle(&first, &control).expect("settle alpha");
     let second_account = environments.settle(&second, &control).expect("settle beta");
-    let mut first_record = first.record.clone();
-    first_record.commit = first_account["commit"].as_str().map(ToOwned::to_owned);
-    let mut second_record = second.record.clone();
-    second_record.commit = second_account["commit"].as_str().map(ToOwned::to_owned);
+    let first_record: EnvironmentRecord =
+        serde_json::from_value(first_account["environment_record"].clone())
+            .expect("alpha environment record");
+    let second_record: EnvironmentRecord =
+        serde_json::from_value(second_account["environment_record"].clone())
+            .expect("beta environment record");
     let merged = environments
         .reconcile(Some(&projects[0]), &first_record, &control)
         .expect("reconcile alpha");

@@ -19,7 +19,7 @@ final class SettingsModel {
     var providers: [ProviderDraft] = []
     var roles: RoleBindings = .empty
     var connectors: [ConnectorDraft] = []
-    var workspaceTools = true
+    var capabilities: CapabilitySettings = .defaults
     var limits: Limits = .fallback
     var workspaces: [WorkspaceDraft] = []
     var view: SettingsView?
@@ -47,7 +47,8 @@ final class SettingsModel {
         let body = SettingsSaveBody(
             providers: providers,
             roles: roles,
-            connectors: ConnectorSaveBody(servers: connectors, workspaceTools: workspaceTools),
+            connectors: ConnectorSaveBody(servers: connectors),
+            capabilities: capabilities,
             limits: limits,
             workspaces: workspaceMap()
         )
@@ -104,8 +105,8 @@ final class SettingsModel {
         self.view = view
         providers = view.providers.map(ProviderDraft.init(view:))
         roles = view.roles
-        workspaceTools = view.connectors.servers.first(where: { $0.builtin })?.enabled ?? true
-        connectors = view.connectors.servers.filter { !$0.builtin }.map(ConnectorDraft.init(view:))
+        capabilities = view.capabilities
+        connectors = view.connectors.servers.map(ConnectorDraft.init(view:))
         limits = view.limits
         workspaces = view.workspaces.keys.sorted().map { name in
             WorkspaceDraft(name: name, path: view.workspaces[name] ?? "")
@@ -127,7 +128,8 @@ final class SettingsModel {
 
     private func reconcile(with saved: SettingsView) {
         view = saved
-        workspaceTools = saved.connectors.servers.first(where: { $0.builtin })?.enabled ?? workspaceTools
+        capabilities = saved.capabilities
+        limits = saved.limits
         let returnedProviders = Dictionary(uniqueKeysWithValues: saved.providers.map { ($0.id, $0) })
         for index in providers.indices {
             guard let returned = returnedProviders[providers[index].id] else { continue }
@@ -139,7 +141,7 @@ final class SettingsModel {
             }
             providers[index].headers = syncRows(providers[index].headers, with: returned.headers)
         }
-        let returnedConnectors = Dictionary(uniqueKeysWithValues: saved.connectors.servers.filter { !$0.builtin }.map { ($0.name, $0) })
+        let returnedConnectors = Dictionary(uniqueKeysWithValues: saved.connectors.servers.map { ($0.name, $0) })
         for index in connectors.indices {
             let name = connectors[index].name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard let returned = returnedConnectors[name] else { continue }

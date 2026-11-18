@@ -1,7 +1,7 @@
 use super::{
     plugins,
-    settings::{Effective, RoleConfig, StoredSettings},
-    Capability, EnabledCapabilities, SettingsStore,
+    settings::{connector_config, Effective, RoleConfig},
+    Capability, SettingsStore,
 };
 use eja::adapters::{
     Checkpoints, Control, EnvironmentProvider, GitWorktrees, McpTools, NativeWorker, OpenAiModel,
@@ -49,49 +49,12 @@ impl ComposedHost {
 
 /// Read one deployment's settings and construct the capabilities shared by CLI
 /// and HTTP turns. Optional providers report failures in `diagnostics`.
-pub fn compose(
-    settings: &SettingsStore,
-    capabilities: EnabledCapabilities,
-    explicit_mcp_path: Option<&Path>,
-    startup: &Control,
-) -> eja::Result<ComposedHost> {
+pub fn compose(settings: &SettingsStore, startup: &Control) -> eja::Result<ComposedHost> {
     let mut diagnostics = Vec::new();
-    if let Err(error) = settings.prepare() {
-        diagnostics.push(format!(
-            "connector configuration could not be prepared: {error}"
-        ));
-    }
-    let effective = match settings.effective_current() {
-        Ok(effective) => effective,
-        Err(error) => {
-            diagnostics.push(format!(
-                "settings could not be read; using environment configuration: {error}"
-            ));
-            settings.effective(StoredSettings::default())
-        }
-    };
-    if let Some(error) = &effective.connectors.error {
-        diagnostics.push(format!("connector configuration is invalid: {error}"));
-    }
+    let effective = settings.effective_current()?;
+    let capabilities = effective.capabilities;
 
     let grant = capabilities.grants(settings, &effective.settings);
-    let config = if capabilities.has(Capability::Mcp) {
-        explicit_mcp_path.or(effective.mcp_path.as_deref())
-    } else {
-        None
-    };
-    if capabilities.has(Capability::Mcp)
-        && config.is_none()
-        && effective
-            .connectors
-            .servers
-            .iter()
-            .any(|server| server.enabled)
-    {
-        diagnostics.push(
-            "connectors are enabled but no connector configuration path is available".to_owned(),
-        );
-    }
 
     let private = settings.state_dir().canonicalize()?;
     let workspace = settings
@@ -102,7 +65,6 @@ pub fn compose(
         .iter()
         .map(|grant| PathBuf::from(&grant.root))
         .collect::<Vec<_>>();
-    let capabilities = capabilities.with_workspace_tools(effective.workspace_tools);
 
     let mut providers: Vec<Box<dyn ToolProvider>> = Vec::new();
     if let Some(workspace) = &workspace {
@@ -116,18 +78,23 @@ pub fn compose(
             )));
         }
     }
-    if capabilities.has(Capability::Mcp) {
-        if let Some(path) = config {
-            match McpTools::load_available(path, workspace.as_deref(), startup) {
-                Ok((provider, errors)) => {
-                    diagnostics.extend(errors);
-                    providers.push(Box::new(provider));
-                }
-                Err(error) => diagnostics.push(format!(
-                    "connector tools are unavailable from {}: {error}",
-                    path.display()
-                )),
+    if capabilities.has(Capability::Mcp) && !effective.connectors.is_empty() {
+        let servers = effective
+            .connectors
+            .iter()
+            .map(|connector| (connector.name.clone(), connector_config(connector)))
+            .collect();
+        match McpTools::load_available_values(
+            servers,
+            workspace.as_deref().unwrap_or(&private),
+            workspace.as_deref(),
+            startup,
+        ) {
+            Ok((provider, errors)) => {
+                diagnostics.extend(errors);
+                providers.push(Box::new(provider));
             }
+            Err(error) => diagnostics.push(format!("connector tools are unavailable: {error}")),
         }
     }
 
@@ -300,6 +267,27 @@ mod tests {
             .collect()
     }
 
+    fn configure(settings: &SettingsStore, capabilities: &serde_json::Value) {
+        settings
+            .write(json!({
+                "providers": [],
+                "roles": {
+                    "eja": {"providerId": "", "model": ""},
+                    "aja": {"providerId": "", "model": ""}
+                },
+                "connectors": {"servers": []},
+                "capabilities": capabilities,
+                "limits": {
+                    "slots": 1,
+                    "turnTimeoutMs": 0,
+                    "ajaSteps": 0,
+                    "ajaTimeoutMs": 0
+                },
+                "workspaces": {}
+            }))
+            .expect("settings");
+    }
+
     #[test]
     fn broken_optional_capabilities_are_diagnostics_not_lost_local_tools() {
         let root = Temp::new("optional");
@@ -310,26 +298,24 @@ mod tests {
         fs::write(project.join("note.txt"), "local work still runs").unwrap();
         fs::write(state.join("plugins"), "not a directory").unwrap();
 
-        let settings = SettingsStore::new(Some(project), state.clone());
-        let control = Control::new(Duration::from_secs(30), Arc::default());
-        let composed = compose(
+        let settings = SettingsStore::new(Some(project), state);
+        configure(
             &settings,
-            EnabledCapabilities([true, true, false, false, true, true]),
-            Some(&state.join("missing-mcp.json")),
-            &control,
-        )
-        .expect("optional failures do not fail composition");
+            &json!({
+                "workspace": true,
+                "files": true,
+                "shell": false,
+                "git": false,
+                "mcp": true,
+                "plugins": true
+            }),
+        );
+        let control = Control::new(Duration::from_secs(30), Arc::default());
+        let composed =
+            compose(&settings, &control).expect("optional failures do not fail composition");
 
         let names = definition_names(&composed.tools);
         assert!(names.iter().any(|name| name == "read_file"), "{names:?}");
-        assert!(
-            composed
-                .diagnostics
-                .iter()
-                .any(|error| error.contains("connector tools are unavailable")),
-            "{:?}",
-            composed.diagnostics
-        );
         assert!(
             composed
                 .diagnostics
@@ -361,14 +347,19 @@ mod tests {
         .unwrap();
 
         let settings = SettingsStore::new(None, state);
-        let control = Control::new(Duration::from_secs(30), Arc::default());
-        let composed = compose(
+        configure(
             &settings,
-            EnabledCapabilities([false, false, false, false, false, true]),
-            None,
-            &control,
-        )
-        .expect("plugin startup failure is optional");
+            &json!({
+                "workspace": false,
+                "files": false,
+                "shell": false,
+                "git": false,
+                "mcp": false,
+                "plugins": true
+            }),
+        );
+        let control = Control::new(Duration::from_secs(30), Arc::default());
+        let composed = compose(&settings, &control).expect("plugin startup failure is optional");
         let names = definition_names(&composed.tools);
         assert!(
             names.iter().any(|name| name == "eja_plugin_list"),

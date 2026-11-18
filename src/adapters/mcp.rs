@@ -199,6 +199,17 @@ impl McpTools {
         Self::load_policy(path, project, parent, true)
     }
 
+    /// Connect connectors already parsed by the host. This is the runtime path:
+    /// there is no second connector file between settings and execution.
+    pub fn load_available_values(
+        servers: BTreeMap<String, Value>,
+        base: &Path,
+        project: Option<&Path>,
+        parent: &Control,
+    ) -> Result<(Self, Vec<String>)> {
+        Self::load_config(Config { servers }, base, project, "mcp", parent, true)
+    }
+
     fn load_policy(
         path: &Path,
         project: Option<&Path>,

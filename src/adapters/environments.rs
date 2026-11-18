@@ -180,42 +180,43 @@ fn snapshot(root: &Path, skip: &Path, control: &Control) -> (Inventory, bool) {
     (state, truncated)
 }
 
-/// One environment reserved for one execution: where it may write.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnvironmentKind {
-    /// A record written before the kind was stated.
-    #[default]
-    Unknown,
-    Shared,
-    Worktree,
-}
-
-/// The durable part of a reserved environment: what kind it was, the
-/// granted root it belonged to, and the ref that holds the run's result.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The durable part of a reserved environment. The provider owns `state`; the
+/// common layer never interprets Git refs or any other provider-specific data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentRecord {
-    #[serde(default)]
-    pub kind: EnvironmentKind,
+    pub provider: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit: Option<String>,
+    #[serde(default = "empty_state")]
+    pub state: Value,
+}
+
+fn empty_state() -> Value {
+    json!({})
+}
+
+impl Default for EnvironmentRecord {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            root: String::new(),
+            state: empty_state(),
+        }
+    }
 }
 
 impl EnvironmentRecord {
     #[must_use]
-    pub fn of(kind: EnvironmentKind, root: &Path) -> Self {
+    pub fn new(provider: &str, root: &Path, state: Value) -> Self {
         Self {
-            kind,
+            provider: provider.to_owned(),
             root: root
                 .canonicalize()
                 .unwrap_or_else(|_| root.to_path_buf())
                 .display()
                 .to_string(),
-            ..Self::default()
+            state,
         }
     }
 }
@@ -231,6 +232,8 @@ pub struct EnvironmentLease {
 
 /// Reserve, settle, reconcile and release the environment one execution may change.
 pub trait EnvironmentProvider: Send + Sync {
+    /// The stable name recorded in a run's environment record.
+    fn provider_name(&self) -> &'static str;
     /// `root` names the granted workspace this run works in; `None` is the
     /// host's default. A backend that owns several roots isolates them apart.
     fn reserve(
@@ -324,6 +327,10 @@ impl SharedEnvironment {
 }
 
 impl EnvironmentProvider for SharedEnvironment {
+    fn provider_name(&self) -> &'static str {
+        "shared"
+    }
+
     fn reserve(
         &self,
         task: u64,
@@ -366,7 +373,7 @@ impl EnvironmentProvider for SharedEnvironment {
             task,
             label: "shared".to_string(),
             root: root.clone(),
-            record: EnvironmentRecord::of(EnvironmentKind::Shared, &root),
+            record: EnvironmentRecord::new("shared", &root, json!({})),
         })
     }
 
@@ -393,21 +400,18 @@ impl EnvironmentProvider for SharedEnvironment {
             )
             .into());
         }
-        match record.kind {
-            EnvironmentKind::Shared => Ok(json!({
-                "environment": "shared",
-                "merged": true,
-                "detail": "the run happened in the shared environment"
-            })),
-            EnvironmentKind::Worktree => Err(
-                "reconcile refused: the run used an isolated Git worktree, but this runtime has no Git environment provider to merge its recorded branch"
-                    .into(),
-            ),
-            EnvironmentKind::Unknown => Err(
-                "reconcile refused: the run record does not identify the environment provider it used"
-                    .into(),
-            ),
+        if record.provider != "shared" {
+            return Err(format!(
+                "reconcile refused: the run used the {} provider, not shared",
+                record.provider
+            )
+            .into());
         }
+        Ok(json!({
+            "environment": "shared",
+            "merged": true,
+            "detail": "the run happened in the shared environment"
+        }))
     }
 
     fn release(&self, environment: &EnvironmentLease) {
@@ -528,6 +532,10 @@ impl GitWorktrees {
 }
 
 impl EnvironmentProvider for GitWorktrees {
+    fn provider_name(&self) -> &'static str {
+        "git"
+    }
+
     fn reserve(
         &self,
         task: u64,
@@ -571,12 +579,7 @@ impl EnvironmentProvider for GitWorktrees {
             task,
             label: format!("worktree {branch} at {}", &head[..head.len().min(12)]),
             root,
-            record: EnvironmentRecord {
-                kind: EnvironmentKind::Worktree,
-                root: self.granted.display().to_string(),
-                branch: Some(branch),
-                commit: None,
-            },
+            record: EnvironmentRecord::new("git", &self.granted, json!({"branch": branch})),
         })
     }
 
@@ -597,14 +600,13 @@ impl EnvironmentProvider for GitWorktrees {
         )?;
         let commit = git(&environment.root, &["rev-parse", "HEAD"], control)?;
         let mut record = environment.record.clone();
-        record.commit = Some(commit.clone());
+        record.state["commit"] = json!(commit);
         Ok(json!({
             "environment": environment.label,
             "change": delta.line(),
             "commit": commit,
-            "kind": record.kind,
+            "provider": record.provider,
             "root": record.root,
-            "branch": record.branch,
             "environment_record": record,
         }))
     }
@@ -629,23 +631,29 @@ impl EnvironmentProvider for GitWorktrees {
             )
             .into());
         }
-        match record.kind {
-            EnvironmentKind::Shared => Ok(json!({
+        match record.provider.as_str() {
+            "shared" => Ok(json!({
                 "environment": "shared",
                 "merged": true,
                 "detail": "the run happened in the shared environment"
             })),
-            EnvironmentKind::Worktree => {
+            "git" => {
                 let branch = record
-                    .branch
-                    .as_deref()
+                    .state
+                    .get("branch")
+                    .and_then(Value::as_str)
                     .ok_or("reconcile refused: the isolated run record names no branch artifact")?;
-                merge_branch(&self.project, branch, record.commit.as_deref(), control)
+                merge_branch(
+                    &self.project,
+                    branch,
+                    record.state["commit"].as_str(),
+                    control,
+                )
             }
-            EnvironmentKind::Unknown => Err(
-                "reconcile refused: the run record does not identify the environment provider it used"
-                    .into(),
-            ),
+            other => Err(format!(
+                "reconcile refused: this runtime cannot reconcile an environment from provider {other}"
+            )
+            .into()),
         }
     }
 
@@ -770,6 +778,10 @@ impl WorkspaceEnvironments {
 }
 
 impl EnvironmentProvider for WorkspaceEnvironments {
+    fn provider_name(&self) -> &'static str {
+        "workspace"
+    }
+
     fn reserve(
         &self,
         task: u64,
@@ -810,38 +822,35 @@ impl EnvironmentProvider for WorkspaceEnvironments {
                 .into());
             }
         }
-        match record.kind {
-            EnvironmentKind::Shared => Ok(json!({
-                "environment": "shared",
-                "merged": true,
-                "detail": "the run happened in the shared environment"
-            })),
-            EnvironmentKind::Worktree => {
-                let key = recorded_root.or(task_root).or_else(|| {
-                    if self.history.len() == 1 {
-                        self.history.keys().next().cloned()
-                    } else {
-                        None
-                    }
-                }).ok_or(
-                    "reconcile refused: the run record does not bind its isolated environment to a workspace",
-                )?;
-                self.history.get(&key).map_or_else(
-                    || {
-                        Err(format!(
-                            "reconcile refused: no Git environment provider is configured for {}; the run's recorded branch cannot be merged",
-                            key.display()
-                        )
-                        .into())
-                    },
-                    |backend| backend.reconcile(root, record, control),
-                )
+        let key = recorded_root.or(task_root).or_else(|| {
+            if self.history.len() == 1 {
+                self.history.keys().next().cloned()
+            } else if self.roots.len() == 1 {
+                self.roots.keys().next().cloned()
+            } else {
+                None
             }
-            EnvironmentKind::Unknown => Err(
-                "reconcile refused: the run record does not identify the environment provider it used"
-                    .into(),
-            ),
+        });
+        let direct = key
+            .as_ref()
+            .and_then(|key| self.history.get(key).or_else(|| self.roots.get(key)));
+        let backend = direct
+            .filter(|backend| backend.provider_name() == record.provider)
+            .or_else(|| {
+                self.history
+                    .values()
+                    .chain(self.roots.values())
+                    .find(|backend| backend.provider_name() == record.provider)
+            })
+            .unwrap_or(&self.default);
+        if backend.provider_name() != record.provider {
+            return Err(format!(
+                "reconcile refused: no {} environment provider is configured",
+                record.provider
+            )
+            .into());
         }
+        backend.reconcile(root, record, control)
     }
 
     fn release(&self, environment: &EnvironmentLease) {

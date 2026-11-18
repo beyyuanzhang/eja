@@ -84,17 +84,6 @@ fn an_unknown_show_target_is_refused_with_the_usage_line() {
 }
 
 #[test]
-fn a_directory_written_before_the_rename_is_refused_not_read() {
-    let _lock = serial();
-    let fixture = State::new("cli-legacy");
-    std::fs::create_dir_all(fixture.path().join("nodes")).expect("legacy dir");
-    let (ok, text) = run(fixture.path(), &["show", "log"]);
-    assert!(!ok, "a legacy directory must not be read: {text}");
-    assert!(text.contains("nodes/"), "{text}");
-    assert!(text.contains("no migration"), "{text}");
-}
-
-#[test]
 fn a_confirm_flag_reaches_the_turn_instead_of_being_ignored() {
     let _lock = serial();
     let fixture = State::new("cli-confirm");

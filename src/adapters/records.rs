@@ -5,7 +5,7 @@
 //! the host's `record:` address — resolves the same paths and reads the same
 //! manifest through this module, so a record has one shape and one owner.
 
-use super::{EnvironmentKind, EnvironmentRecord, RecordReader};
+use super::{EnvironmentRecord, RecordReader};
 use crate::{fold, Assignment, Control, Result, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -84,58 +84,27 @@ impl Checkpoints {
 
 /// One frozen run, as written by the worker and read back by everything else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
+    pub(crate) format: String,
+    pub(crate) version: u64,
     /// The activation contract this run was given.
     pub(crate) assignment: Assignment,
     /// The host's account of what the run left behind.
     #[serde(default)]
     pub(crate) digest: String,
-    /// Where it ran. Older records call this field `world`.
-    #[serde(default, alias = "world")]
-    pub(crate) environment: String,
+    /// The provider's complete environment record, when the run had one.
+    #[serde(default)]
+    pub(crate) environment: Option<EnvironmentRecord>,
     /// The commit a `record:` file is read from, when one was taken.
     #[serde(default)]
     pub(crate) checkpoint: Option<String>,
     #[serde(default)]
     pub(crate) checkpoint_error: Option<String>,
-    /// The environment that measured this run. `world_*` remains accepted for
-    /// records written before the environment terminology was introduced.
-    #[serde(default, alias = "world_kind", skip_serializing_if = "Option::is_none")]
-    pub(crate) environment_kind: Option<String>,
-    #[serde(
-        default,
-        alias = "world_root",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub(crate) environment_root: String,
-    #[serde(
-        default,
-        alias = "world_branch",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) environment_branch: Option<String>,
-    #[serde(
-        default,
-        alias = "world_commit",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) environment_commit: Option<String>,
-    /// The transcript's file name in this aja's directory. The protocol fixes it;
-    /// it is recorded so a record states its own layout for a reader that only
-    /// has the file.
-    #[serde(default = "default_context")]
-    pub(crate) context: String,
-    #[serde(default)]
-    pub(crate) context_bytes: usize,
-    /// Absent in records written before the field existed: an unfrozen record is
-    /// never replayed, and the default says so.
-    #[serde(default)]
-    pub(crate) frozen: bool,
 }
 
-fn default_context() -> String {
-    "context.jsonl".to_string()
-}
+const FORMAT: &str = "eja.aja";
+const VERSION: u64 = 1;
 
 impl Manifest {
     fn path(root: &Path, aja: u64) -> Result<PathBuf> {
@@ -143,34 +112,14 @@ impl Manifest {
     }
 
     pub(crate) fn read(root: &Path, aja: u64) -> Result<Self> {
-        Ok(serde_json::from_slice(&fs::read(Self::path(root, aja)?)?)?)
-    }
-
-    fn environment(&self) -> EnvironmentRecord {
-        let old_worktree = self.environment.strip_prefix("worktree ");
-        let kind = match self.environment_kind.as_deref() {
-            Some("shared") => EnvironmentKind::Shared,
-            Some("worktree") => EnvironmentKind::Worktree,
-            None if self.environment == "shared" => EnvironmentKind::Shared,
-            None if old_worktree.is_some() => EnvironmentKind::Worktree,
-            Some(_) | None => EnvironmentKind::Unknown,
-        };
-        let branch = self.environment_branch.clone().or_else(|| {
-            old_worktree
-                .and_then(|rest| rest.split_once(" at "))
-                .map(|(branch, _)| branch.to_owned())
-        });
-        let root = if self.environment_root.is_empty() {
-            self.assignment.workspace.clone()
-        } else {
-            self.environment_root.clone()
-        };
-        EnvironmentRecord {
-            kind,
-            root,
-            branch,
-            commit: self.environment_commit.clone(),
+        let manifest: Self = serde_json::from_slice(&fs::read(Self::path(root, aja)?)?)?;
+        if manifest.format != FORMAT || manifest.version != VERSION {
+            return Err(format!(
+                "aja {aja} uses an unsupported record format; expected {FORMAT} version {VERSION}"
+            )
+            .into());
         }
+        Ok(manifest)
     }
 }
 
@@ -303,7 +252,7 @@ impl Drop for Source {
 impl RecordReader for RecordFiles {
     fn environment(&self, aja: u64) -> Result<Option<EnvironmentRecord>> {
         match Manifest::read(&self.root, aja) {
-            Ok(manifest) => Ok(Some(manifest.environment())),
+            Ok(manifest) => Ok(manifest.environment),
             Err(error)
                 if error
                     .downcast_ref::<io::Error>()
@@ -447,6 +396,7 @@ fn start(root: &Path, aja: u64, control: &Control) -> Result<Value> {
         .ok_or("record has no start entry")??;
     let entry: Value = serde_json::from_str(&line)?;
     if entry["kind"] != "start"
+        || entry["view_version"].as_u64() != Some(1)
         || entry["messages"]
             .as_array()
             .is_none_or(std::vec::Vec::is_empty)
@@ -456,8 +406,7 @@ fn start(root: &Path, aja: u64, control: &Control) -> Result<Value> {
     Ok(entry)
 }
 
-/// New records store only a parent address and this run's start messages. Legacy
-/// records already contain their whole starting view and form an ancestry root.
+/// A record stores one parent address and this run's starting view.
 pub fn lineage(root: &Path, predecessor: Option<u64>, control: &Control) -> Result<Vec<u64>> {
     let mut chain = Vec::new();
     let mut next = predecessor;
@@ -468,16 +417,9 @@ pub fn lineage(root: &Path, predecessor: Option<u64>, control: &Control) -> Resu
             return Err("record ancestry cycle".into());
         }
         let manifest = Manifest::read(root, aja)?;
-        if !manifest.frozen {
-            return Err("predecessor record is not frozen".into());
-        }
         chain.push(aja);
-        let initial = start(root, aja, control)?;
-        next = if initial["view_version"] == 1 {
-            manifest.assignment.resume
-        } else {
-            None
-        };
+        start(root, aja, control)?;
+        next = manifest.assignment.resume;
     }
     Ok(chain)
 }
@@ -499,12 +441,12 @@ pub fn replay(root: &Path, chain: &[u64], budget: usize, control: &Control) -> R
             let entry: Value = serde_json::from_str(&line?)?;
             match entry["kind"].as_str() {
                 Some("start") => {
+                    if entry["view_version"].as_u64() != Some(1) {
+                        return Err("record start has an unsupported view version".into());
+                    }
                     let fresh = entry["messages"]
                         .as_array()
                         .ok_or("record start has no messages")?;
-                    if entry["view_version"] != 1 {
-                        messages.clear();
-                    }
                     messages.retain(|message: &Value| message["role"] != "system");
                     for message in fresh.iter().rev() {
                         if message["role"] == "system" {
@@ -632,8 +574,10 @@ mod tests {
         Control::new(Duration::from_secs(30), std::sync::Arc::default())
     }
 
-    fn manifest(environment: &str) -> Manifest {
+    fn manifest() -> Manifest {
         Manifest {
+            format: FORMAT.to_owned(),
+            version: VERSION,
             assignment: Assignment {
                 task_id: 3,
                 objective: String::new(),
@@ -644,73 +588,28 @@ mod tests {
                 issued_at: 1,
             },
             digest: String::new(),
-            environment: environment.into(),
-            environment_kind: None,
-            environment_root: String::new(),
-            environment_branch: None,
-            environment_commit: None,
+            environment: Some(EnvironmentRecord::new(
+                "git",
+                Path::new("/recorded/project"),
+                json!({
+                    "branch": "eja/aja-3-deadbeef",
+                    "commit": "a".repeat(40),
+                }),
+            )),
             checkpoint: None,
             checkpoint_error: None,
-            context: default_context(),
-            context_bytes: 0,
-            frozen: true,
         }
     }
 
     #[test]
-    fn existing_records_infer_their_environment_and_new_records_read_what_was_frozen() {
-        let shared = manifest("shared").environment();
-        assert_eq!(shared.kind, EnvironmentKind::Shared);
-        assert_eq!(shared.root, "/workspace/project");
-
-        let old_worktree = manifest("worktree eja/aja-3-deadbeef at abcdef123456").environment();
-        assert_eq!(old_worktree.kind, EnvironmentKind::Worktree);
-        assert_eq!(old_worktree.branch.as_deref(), Some("eja/aja-3-deadbeef"));
-        assert_eq!(old_worktree.root, "/workspace/project");
-
-        assert_eq!(
-            manifest("none").environment().kind,
-            EnvironmentKind::Unknown
-        );
-
-        let mut recorded = manifest("worktree eja/aja-3-deadbeef at abcdef123456");
-        let commit = "a".repeat(40);
-        recorded.environment_kind = Some("worktree".into());
-        recorded.environment_root = "/recorded/project".into();
-        recorded.environment_branch = Some("eja/aja-3-deadbeef".into());
-        recorded.environment_commit = Some(commit.clone());
-        let record = recorded.environment();
+    fn a_manifest_round_trips_the_environment_owned_by_its_provider() {
+        let value = serde_json::to_value(manifest()).expect("manifest value");
+        let decoded: Manifest = serde_json::from_value(value).expect("manifest");
+        let record = decoded.environment.expect("environment record");
+        assert_eq!(record.provider, "git");
         assert_eq!(record.root, "/recorded/project");
-        assert_eq!(record.commit.as_deref(), Some(commit.as_str()));
-    }
-
-    #[test]
-    fn legacy_manifest_field_names_decode_into_the_environment_record() {
-        let mut old = manifest("worktree eja/aja-3-deadbeef at abcdef123456");
-        old.environment_kind = Some("worktree".into());
-        old.environment_root = "/recorded/project".into();
-        old.environment_branch = Some("eja/aja-3-deadbeef".into());
-        old.environment_commit = Some("a".repeat(40));
-        let mut value = serde_json::to_value(old).expect("manifest value");
-        let fields = value.as_object_mut().expect("manifest object");
-        let environment = fields.remove("environment").expect("environment");
-        fields.insert("world".into(), environment);
-        for (current, legacy) in [
-            ("environment_kind", "world_kind"),
-            ("environment_root", "world_root"),
-            ("environment_branch", "world_branch"),
-            ("environment_commit", "world_commit"),
-        ] {
-            let value = fields.remove(current).expect(current);
-            fields.insert(legacy.into(), value);
-        }
-
-        let decoded: Manifest = serde_json::from_value(value).expect("legacy manifest");
-        let record = decoded.environment();
-        assert_eq!(record.kind, EnvironmentKind::Worktree);
-        assert_eq!(record.root, "/recorded/project");
-        assert_eq!(record.branch.as_deref(), Some("eja/aja-3-deadbeef"));
-        assert_eq!(record.commit.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(record.state["branch"].as_str(), Some("eja/aja-3-deadbeef"));
+        assert_eq!(record.state["commit"].as_str().map(str::len), Some(40));
     }
 
     #[test]

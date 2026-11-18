@@ -79,43 +79,57 @@ app:
 cargo run -- serve --dir .eja --project .
 ```
 
-With no configured workspaces, the same executable can run with its configured
-connectors alone. It records each execution without creating a Git checkpoint:
+The same executable can run with connectors alone. Configure that in
+`<dir>/app-settings.json`, then start a turn:
 
 ```sh
-cargo run -- --no-project --dir .eja --mcp-config .eja/mcp.json turn "..."
+cargo run -- --no-project --dir .eja turn "..."
 cargo run -- serve --no-project --dir .eja
 ```
 
-`EJA_CAPABILITIES` selects what either entry point assembles. The default is
-`workspace,files,shell,git,mcp`. `workspace` grants configured directories,
-`files` adds file tools, `shell` adds the terminal, `git` enables new checkpoints
-and isolated Git worktrees, and `mcp` loads configured connectors. File and shell
-tools need a workspace. The existing workspace-tools setting still switches both
-off. Previously frozen Git evidence can still be read by address.
-Optional connector and managed-plugin startup failures are reported as capability
-warnings. A failed provider is omitted, while unrelated providers, local tools and
-ordinary turns remain usable. The runtime exposes the latest warnings as
-`health.capabilityErrors`.
+There is one settings file and one capability switchboard. The defaults are
+workspace, files, shell, Git and MCP on, and plugins off:
 
-For file editing without shell or Git:
-
-```sh
-EJA_CAPABILITIES=workspace,files cargo run -- serve --dir .eja --project .
+```json
+{
+  "providers": [],
+  "roles": {},
+  "connectors": {"servers": []},
+  "capabilities": {
+    "workspace": true,
+    "files": true,
+    "shell": true,
+    "git": true,
+    "mcp": true,
+    "plugins": false
+  },
+  "limits": {
+    "slots": 1,
+    "turnTimeoutMs": 0,
+    "ajaSteps": 0,
+    "ajaTimeoutMs": 0
+  },
+  "workspaces": {}
+}
 ```
+
+File and shell tools need a workspace. Turning off a capability removes its
+provider from the runtime. Optional connector and plugin startup failures are
+reported as capability warnings. A failed provider is omitted while unrelated
+providers and ordinary turns remain usable. The runtime exposes the latest
+warnings as `health.capabilityErrors`.
 
 ### Managed plugins
 
-Select `plugins` to let AJAs stage their own Python stdio MCP servers, test a tool
-on sample input, and activate a tested version for future turns. The same tools
-also list current and previous activations and roll back a version. Active plugin tools
-appear automatically as `plugin__NAME__TOOL` and the run record identifies their
-version. A turn keeps the version it started with. If the newly selected version
-fails to start, the runtime tries the previous one and reports the startup error.
+Set `capabilities.plugins` to `true` to let AJAs stage their own Python stdio MCP
+servers, test a tool on sample input, and activate a tested version for future
+turns. The same tools also list current and previous activations and roll back a
+version. Active plugin tools appear automatically as `plugin__NAME__TOOL` and
+the run record identifies their version. A turn keeps the version it started
+with. If the newly selected version fails to start, the runtime tries the
+previous one and reports the startup error.
 
-```sh
-EJA_CAPABILITIES=mcp,plugins cargo run -- serve --dir .eja
-```
+Plugins are available only when both `mcp` and `plugins` are enabled.
 
 The managed registry lives under `<dir>/plugins`. A managed server receives its
 versioned source and the arguments to its tool calls. Its process receives no
@@ -137,9 +151,9 @@ Any number of separately hosted frontends may use the same runtime. See
 - `<dir>/ajas/<id>/context.jsonl` records that aja's own start messages,
   assistant messages and full tool results. A continuation stores its parent
   address, rather than copying the parent's payload into its record.
-- `aja.json` is one typed manifest: the assignment, the digest, and the optional
-  checkpoint address a `record:` file is read from. The digest is an index into
-  evidence, not a verdict.
+- `aja.json` uses the explicit `eja.aja` version 1 format. It stores the
+  assignment, digest, optional provider-owned environment record, and optional
+  checkpoint address. The digest is an index into evidence, not a verdict.
 - Working contexts are bounded views. Live tool results and replayed tool results
   use the same view function. Every tool result has a `{aja, entry}` address;
   `eja_read_record` reads a bounded passage from this aja or its ancestry.
@@ -158,8 +172,7 @@ Any number of separately hosted frontends may use the same runtime. See
   so a witness that never answers cannot strand a task in the index.
 - One address space covers every fact a view can read: `log:<target>`,
   `record:<aja>/<path>`, `environment:<path>`. Any other target is a host read
-  tool. A folded region and a live one are read the same way. Input beginning
-  with the former `world:` prefix is normalized to `environment:`.
+  tool. A folded region and a live one are read the same way.
 - An observation says what it is — `look`, `witness` or `reconcile` — and its
   target then names the subject. Its kind is a typed field, not a reserved text,
   so a host tool may be named `witness` without becoming acceptance evidence.
@@ -315,43 +328,16 @@ becomes waiting for judgment, and continuation uses a new id. Frozen records
 retain the complete safe prefix of an interrupted tool-call group. Damaged or
 missing predecessor records are explicit errors, never a silent fresh start.
 
-## Compatibility
+## State format
 
-0.14 gives each fact one owner: a projection borrows the fold instead of copying
-it, one record module owns the manifest, the path resolver, the reader and the
-shadow repository that freezes a run, a task that executes carries its run facts
-in one type a group does not have, and the three bounded address spaces admit and
-stop through one budget helper. A committed observation this version cannot decode
-is counted in the evidence section rather than dropped. 0.13 logs stay readable:
-a task without a run is a group, and an unreadable observation is a count.
-
-0.13 makes the fold a value: a turn reads the journal once and pushes every event
-it commits into the same `State`, so one derivation serves validation and the
-projection. Evidence is that fold's output instead of a second copy a caller
-supplies, an observation carries a typed kind instead of a reserved target string,
-and every folded region names the address that reads it. The environment provider is the
-only concurrency guard, a refused environment costs no aja id, and the record keeps its
-frozen transcript when it is replayed. 0.12 logs stay readable: new fields default
-to absent.
-
-0.12 turns approvals into events, moves acceptance evidence into the task's own
-contract, adds a slot budget with isolated environments and environment reconciliation, and
-replaces the look source taxonomy with one address space. Older logs stay
-readable: new fields default to absent, and a proposal without an Approval event
-simply stays pending. A state directory that predates the `ajas/` layout (it has
-`nodes/`) is refused by name; there is no migration.
-
-0.11 renames the execution record from `nodes/` to `ajas/` and the environment
-verbs `EJA_NODE_*` to `EJA_AJA_*`.
+An initialized state directory contains `state.json` with
+`{"format":"eja","version":1}`. A non-empty directory without that marker, or
+with another format or version, is refused. The runtime does not rewrite or
+upgrade an existing directory.
 
 ## Run
 
 ```bash
-export LNA_BASE_URL=https://your-provider/v1
-export LNA_API_KEY=...
-export LNA_MODEL=...
-# Optional aja endpoint/model: EJA_AJA_BASE_URL, EJA_AJA_API_KEY, EJA_AJA_MODEL
-
 cargo run -- --dir /tmp/eja turn "draft a release checklist"
 cargo run -- --dir /tmp/eja show tasks
 cargo run -- --dir /tmp/eja show task:1
@@ -361,19 +347,22 @@ cargo run -- --dir /tmp/eja show context
 cargo run -- --dir /tmp/eja --confirm 12 turn "apply the approved proposal"
 ```
 
-Configure connectors in `<dir>/mcp.json`, or pass `--mcp-config FILE`.
-`eja --dir DIR show tools` lists connector grants without model credentials.
+Configure providers, roles, connectors, capabilities and workspaces in
+`<dir>/app-settings.json`. The macOS app writes the same file.
+`eja --dir DIR show tools` lists active tool grants without printing credentials.
 Without connectors, a aja has its record reader and can produce a reply; it
 has no filesystem-write or external-effect capability. See [MCP setup](docs/MCP.md)
 and the [native protocol](docs/AJA-PROTOCOL.md).
 
-Host resource configuration: `EJA_TURN_DECISIONS`, `EJA_TURN_ACTIONS`,
-`EJA_TURN_DISPATCHES`, `EJA_AJA_SLOTS`, `EJA_TURN_TIMEOUT_MS`, `EJA_AJA_STEPS`,
-`EJA_AJA_TIMEOUT_MS`, `EJA_CONTEXT_BYTES`. Limits must be positive.
-`EJA_AJA_SLOTS` is the number of runs that may share a turn. With one slot the
-host uses a shared environment when a workspace is granted. With multiple slots, a
-workspace with a Git commit can give runs their own worktrees and branches,
-reconciled only when asked. A deployment without a workspace allocates no environment. A Git worktree starts
+The `limits` object sets slots, turn timeout, AJA steps and AJA timeout. The turn
+decision/action/dispatch limits and context-byte budget remain available as
+`EJA_TURN_DECISIONS`, `EJA_TURN_ACTIONS`, `EJA_TURN_DISPATCHES` and
+`EJA_CONTEXT_BYTES`.
+
+With one slot the host uses a shared environment when a workspace is granted.
+With multiple slots, a workspace with a Git commit can give runs their own Git
+worktrees and branches, reconciled only when asked. A deployment without a
+workspace allocates no environment. A Git worktree starts
 at `HEAD`: uncommitted project changes stay in the project and are reported by
 the run's own account. The runtime project is the default workspace.
 `--no-project` removes that default. Every existing extra directory saved in
@@ -381,10 +370,10 @@ settings is still available; a missing directory is not offered.
 Registration is the durable availability decision. When a task opens, it names
 one available workspace id; that root is fixed for the task and never silently
 moves to another directory.
-Each new run records its environment kind, granted root, branch and settled commit.
-Reconciliation follows that evidence rather than the capabilities enabled at
-restart. If the required backend is unavailable, or an old record cannot name an
-unambiguous workspace, reconciliation refuses and records the reason.
+Each new run records its environment provider, granted root and provider-owned
+state. Git state contains the branch and settled commit. Reconciliation selects
+the provider named by that record. If the required provider is unavailable,
+reconciliation refuses and records the reason.
 `--task ID` selects initial focus. `show audit:ID` follows explicit containment
 and continuation edges; matching input text never invents a job relationship.
 
@@ -425,8 +414,8 @@ An ordinary child process is not an OS security sandbox. Cancellation cannot
 undo remote side effects. The kernel guarantees bounded host execution under
 these port contracts; it cannot prove a model will solve an arbitrary objective.
 Identity and task state can be replayed; environment effects are never replayed by
-folding the log. Legacy records/logs remain readable; past invalid relationships
-are not retroactively authorized, and dispatch refuses ambiguous ancestry.
+folding the log. Past invalid relationships are not retroactively authorized, and
+dispatch refuses ambiguous ancestry.
 
 Historical, pre-0.11 model measurements are kept separately in
 [benchmark history](docs/BENCHMARKS.md); they are not measurements of this revision.

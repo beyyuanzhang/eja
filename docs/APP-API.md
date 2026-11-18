@@ -80,10 +80,11 @@ Response: `{ "ok": true, "reply": "..." }`, or `{ "ok": false, "error": "..." }`
 
 ## GET /api/settings, POST /api/settings
 
-The settings view is the connector list's projection: the built-in `workspace`
-row is first, `builtin: true`, switchable and not deletable. Saving takes
-providers, roles, non-builtin connectors, limits and workspaces; see
-`src/host/settings.rs` for the exact shape. A save returns the new view.
+The settings view contains providers, role bindings, connectors, the six
+capability switches, limits, workspaces and the runtime paths. Saving accepts the
+same shape, with write-only provider and connector secrets. Connector policy
+fields such as `tools`, `readOnly` and `witness` are returned and must be sent
+back unchanged when a client edits a connector. A save returns the new view.
 
 ## GET /api/raw
 

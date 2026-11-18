@@ -158,7 +158,8 @@ index and aja id form a stable address.
 Reconstruction follows immutable parent manifests, rejects cycles/missing
 records, and folds entries oldest to newest through the same renderer. An unfinished tool group contributes its complete earlier prefix, not an
 invalid provider message sequence. Its partial raw effects remain in the record.
-Old records whose start already contains inherited history are ancestry roots.
+Every record read requires the current `eja.aja` format, version 1, and a v1
+start entry.
 
 `eja_read_record` may read this aja or its explicit ancestors, never arbitrary
 host state. Live model messages use the current system contract even when old
@@ -190,10 +191,11 @@ transcript or manufacture an acceptance.
 
 ## Composition
 
-`host::compose` is the single assembly root for CLI and HTTP. It returns one
-`ComposedHost` containing the selected tool registry, environment provider,
-record-store services and capability diagnostics. The turn then exposes only the
-matching interfaces through `Ports`.
+`host::compose` is the single assembly root for CLI and HTTP. It reads
+`app-settings.json`, assembles the selected tool registry and environment
+provider, and returns one `ComposedHost` with record-store services and
+capability diagnostics. The turn then exposes only the matching interfaces
+through `Ports`.
 
 Tools and environments have different contracts because they answer different
 questions. `ToolProvider` declares callable actions and their names.
@@ -203,18 +205,18 @@ protocol, path rules, grants and output bound.
 
 `EnvironmentProvider` owns the lifecycle of a mutable execution environment. It
 reserves exclusive access, measures changes at settlement, reconciles a recorded
-result and releases the lease. Shared directories and Git worktrees implement the
-same lifecycle contract. A future container or remote database environment can
-implement it without adding a new kernel action.
+result and releases the lease. Shared directories and injected Git worktrees
+implement the same lifecycle contract. A future container or remote database
+environment can implement it without adding a new kernel action.
 
 `ExecutionServices` is a constructor bundle passed to `NativeWorker`. It groups
 the selected workspace, checkpoint store and environment provider so one worker
 can execute a run. It has no dispatch protocol and adds no kernel authority.
 
-Git appears in two adapter roles. `Checkpoints` freezes Git-visible evidence for
-records. `GitWorktrees` supplies isolated execution environments and durable
-branches. The kernel sees neither role directly and contains no repository
-topology.
+Git appears in two external adapter roles. `Checkpoints` freezes Git-visible
+evidence for records. `GitWorktrees` supplies isolated execution environments and
+durable branches. The kernel sees neither role directly and contains no
+repository topology.
 
 ## Port contracts
 
@@ -289,7 +291,7 @@ subject anything it did not already know.
 Stall detection is not a convergence proof. The strict execution bound comes from
 the host budgets; solving a natural-language objective remains model-dependent.
 
-## Ownership and compatibility
+## Ownership
 
 Core modules are `domain`, `store`, `state`, `turn`, the shared `control`
 and the one renderer `fold`. `state` is the fold itself: `S = fold(L)` is a
@@ -300,7 +302,9 @@ for trusted host/admin code, including fixture construction. The journal-wide
 Unix turn lease is the sole turn exclusion guard. Append locking and stale-cursor
 checks protect the rebuildable cursor; they do not implement a distributed scheduler.
 
-Existing serialized ajas default to kind `aja`; grouping is never guessed
-from text or old containment usage. Legacy confirmation events still resolve
-legacy proposals. A legacy ambiguous continuation is refused at dispatch. Prior
-historical facts are not rewritten to claim they met rules introduced later.
+An initialized state directory contains `state.json` with
+`{"format":"eja","version":1}`. A non-empty directory without this marker, or
+with another format or version, is refused. Execution manifests use
+`{"format":"eja.aja","version":1}`. The runtime does not rewrite, upgrade or
+fall back to an earlier layout. Prior historical facts are not rewritten to
+claim they met rules introduced later.

@@ -6,25 +6,19 @@ struct ConnectorSection: View {
 
     var body: some View {
         SettingsPage {
-            if let error = model.view?.connectors.error, !error.isEmpty {
-                SettingsGroup("连接器") {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(Theme.danger)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
-                        .textSelection(.enabled)
-                }
-            }
-
-            SettingsGroup("内置") {
-                SettingsRow("workspace") {
-                    Toggle("", isOn: $model.workspaceTools)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                        .tint(Theme.accent)
-                        .onChange(of: model.workspaceTools) { _, _ in model.markDirty() }
+            SettingsGroup("能力") {
+                VStack(spacing: 0) {
+                    capabilityRow("工作区", note: "允许任务使用文件夹", value: $model.capabilities.workspace)
+                    SettingsRule()
+                    capabilityRow("文件", note: "读取、写入和搜索文件", value: $model.capabilities.files)
+                    SettingsRule()
+                    capabilityRow("Shell", note: "运行终端命令", value: $model.capabilities.shell)
+                    SettingsRule()
+                    capabilityRow("Git", note: "建立隔离环境并合并结果", value: $model.capabilities.git)
+                    SettingsRule()
+                    capabilityRow("MCP", note: "使用下方连接器", value: $model.capabilities.mcp)
+                    SettingsRule()
+                    capabilityRow("插件", note: "允许 EJA 安装和更新插件", value: $model.capabilities.plugins)
                 }
             }
 
@@ -56,6 +50,21 @@ struct ConnectorSection: View {
                     }
                 }
             }
+        }
+    }
+
+    private func capabilityRow(
+        _ title: String,
+        note: String,
+        value: Binding<Bool>
+    ) -> some View {
+        SettingsRow(title, note: note) {
+            Toggle("", isOn: value)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(Theme.accent)
+                .onChange(of: value.wrappedValue) { _, _ in model.markDirty() }
         }
     }
 

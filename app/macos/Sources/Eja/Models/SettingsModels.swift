@@ -4,6 +4,7 @@ struct SettingsView: Codable, Sendable {
     var providers: [ProviderView]
     var roles: RoleBindings
     var connectors: ConnectorsView
+    var capabilities: CapabilitySettings
     var limits: Limits
     var workspaces: [String: String]
     var runtimePath: String
@@ -45,15 +46,11 @@ struct RoleBinding: Codable, Sendable {
 
 struct ConnectorsView: Codable, Sendable {
     var servers: [ConnectorView]
-    var managed: Bool
-    var configPath: String
-    var error: String?
 }
 
 struct ConnectorView: Codable, Sendable {
     var name: String
     var mode: String
-    var builtin: Bool
     var command: String
     var url: String
     var args: [String]
@@ -62,6 +59,27 @@ struct ConnectorView: Codable, Sendable {
     var headers: [KeyValueView]
     var enabled: Bool
     var timeoutMs: Int
+    var tools: [String]
+    var readOnly: [String]
+    var witness: [String]
+}
+
+struct CapabilitySettings: Codable, Sendable, Equatable {
+    var workspace: Bool
+    var files: Bool
+    var shell: Bool
+    var git: Bool
+    var mcp: Bool
+    var plugins: Bool
+
+    static let defaults = CapabilitySettings(
+        workspace: true,
+        files: true,
+        shell: true,
+        git: true,
+        mcp: true,
+        plugins: false
+    )
 }
 
 struct Limits: Codable, Sendable {
@@ -162,6 +180,9 @@ struct ConnectorDraft: Encodable, Sendable, Identifiable {
     var headers: [KeyValueDraft]
     var enabled: Bool
     var timeoutMs: Int
+    var tools: [String]
+    var readOnly: [String]
+    var witness: [String]
 
     init(view: ConnectorView) {
         name = view.name
@@ -174,6 +195,9 @@ struct ConnectorDraft: Encodable, Sendable, Identifiable {
         headers = view.headers.map(KeyValueDraft.init(view:))
         enabled = view.enabled
         timeoutMs = view.timeoutMs
+        tools = view.tools
+        readOnly = view.readOnly
+        witness = view.witness
     }
 
     init() {
@@ -187,10 +211,14 @@ struct ConnectorDraft: Encodable, Sendable, Identifiable {
         headers = []
         enabled = true
         timeoutMs = 30_000
+        tools = []
+        readOnly = []
+        witness = []
     }
 
     enum CodingKeys: String, CodingKey {
         case name, mode, command, url, args, cwd, env, headers, enabled, timeoutMs
+        case tools, readOnly, witness
     }
 }
 
@@ -198,13 +226,13 @@ struct SettingsSaveBody: Encodable, Sendable {
     var providers: [ProviderDraft]
     var roles: RoleBindings
     var connectors: ConnectorSaveBody
+    var capabilities: CapabilitySettings
     var limits: Limits
     var workspaces: [String: String]
 }
 
 struct ConnectorSaveBody: Encodable, Sendable {
     var servers: [ConnectorDraft]
-    var workspaceTools: Bool
 }
 
 struct DiscoverBody: Encodable, Sendable {

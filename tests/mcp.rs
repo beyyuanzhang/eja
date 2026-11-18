@@ -8,7 +8,7 @@ use eja::{
         ToolContext, ToolProvider, ToolRegistry, WorkspaceTools,
     },
     aja::Limits,
-    Assignment, Result, Worker,
+    Assignment, Result, Store, Worker,
 };
 use serde_json::{json, Value};
 use std::{
@@ -550,7 +550,8 @@ fn native_ajas_share_one_host_connection_and_freeze_independently() {
         let manifest: Value =
             serde_json::from_slice(&fs::read(root.join(format!("{id}/aja.json"))).unwrap())
                 .unwrap();
-        assert_eq!(manifest["frozen"], true);
+        assert_eq!(manifest["format"], "eja.aja");
+        assert_eq!(manifest["version"], 1);
         assert!(alive(pid));
     }
     assert_eq!(
@@ -572,12 +573,49 @@ fn native_ajas_share_one_host_connection_and_freeze_independently() {
 }
 
 #[test]
-fn cli_catalog_uses_owned_default_config_and_reports_an_explicit_missing_path() {
+fn cli_catalog_uses_the_connectors_in_app_settings() {
     let _lock = serial();
     let f = Fixture::new();
-    let path = f.config(&json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
+    let state = f.root().join(".eja");
+    Store::new(&state).unwrap();
+    fs::write(
+        state.join("app-settings.json"),
+        serde_json::to_vec_pretty(&json!({
+            "providers": [],
+            "roles": {
+                "eja": {"providerId": "", "model": ""},
+                "aja": {"providerId": "", "model": ""}
+            },
+            "connectors": {
+                "servers": [{
+                    "name": "fixture",
+                    "command": "/usr/bin/python3",
+                    "args": [script(), f.dir("stdio"), "stdio"],
+                    "enabled": true,
+                    "timeoutMs": 2000
+                }]
+            },
+            "capabilities": {
+                "workspace": true,
+                "files": true,
+                "shell": true,
+                "git": true,
+                "mcp": true,
+                "plugins": false
+            },
+            "limits": {
+                "slots": 1,
+                "turnTimeoutMs": 0,
+                "ajaSteps": 0,
+                "ajaTimeoutMs": 0
+            },
+            "workspaces": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_eja"))
-        .args(["--dir", f.root().to_str().unwrap(), "show", "tools"])
+        .args(["--dir", state.to_str().unwrap(), "show", "tools"])
         .output()
         .unwrap();
     assert!(
@@ -591,35 +629,6 @@ fn cli_catalog_uses_owned_default_config_and_reports_an_explicit_missing_path() 
         .unwrap()
         .iter()
         .any(|t| t["function"]["name"] == "mcp__fixture__echo"));
-    assert!(!alive(f.pid("fixture", "pid")));
-    fs::remove_file(path).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_eja"))
-        .args([
-            "--dir",
-            f.root().to_str().unwrap(),
-            "--mcp-config",
-            f.root().join("missing").to_str().unwrap(),
-            "show",
-            "tools",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("connector tools are unavailable"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(value
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|tool| tool["function"]["name"] == "read_file"));
 }
 
 #[test]

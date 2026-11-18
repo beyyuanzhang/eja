@@ -114,7 +114,11 @@ fn closed_loop_dispatches_reports_and_accepts() {
     names.sort();
     assert_eq!(
         names,
-        vec!["log.jsonl".to_string(), "log.turn.lock".to_string()]
+        vec![
+            "log.jsonl".to_string(),
+            "log.turn.lock".to_string(),
+            "state.json".to_string()
+        ]
     );
     assert_eq!(
         std::fs::metadata(fixture.path().join("log.turn.lock"))

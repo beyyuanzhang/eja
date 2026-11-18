@@ -24,6 +24,8 @@ impl fmt::Display for ApiError {
     }
 }
 
+impl std::error::Error for ApiError {}
+
 impl ApiError {
     pub fn bad(message: impl Into<String>) -> Self {
         Self {

@@ -26,7 +26,7 @@ use eja::{
     adapters::{Control, McpTools, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolProvider},
     turn_at_with_options, Assignment, ChoiceSelection, Kind, Store, TurnOptions,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -79,7 +79,6 @@ pub struct Options {
     pub host: String,
     pub port: u16,
     pub allowed_origins: Vec<String>,
-    pub capabilities: EnabledCapabilities,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,38 +91,28 @@ pub enum Capability {
     Plugins,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct EnabledCapabilities([bool; 6]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // Six independent switches are the contract.
+pub struct EnabledCapabilities {
+    pub workspace: bool,
+    pub files: bool,
+    pub shell: bool,
+    pub git: bool,
+    pub mcp: bool,
+    pub plugins: bool,
+}
 
 impl EnabledCapabilities {
-    pub fn from_env() -> eja::Result<Self> {
-        let configured = match std::env::var("EJA_CAPABILITIES") {
-            Ok(value) => value,
-            Err(std::env::VarError::NotPresent) => "workspace,files,shell,git,mcp".into(),
-            Err(error) => return Err(error.into()),
-        };
-        let mut enabled = Self([false; 6]);
-        for item in configured
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-        {
-            let capability = match item {
-                "workspace" => Capability::Workspace,
-                "files" => Capability::Files,
-                "shell" => Capability::Shell,
-                "git" => Capability::Git,
-                "mcp" => Capability::Mcp,
-                "plugins" => Capability::Plugins,
-                _ => return Err(format!("unknown EJA_CAPABILITIES entry {item}").into()),
-            };
-            enabled.0[capability as usize] = true;
-        }
-        Ok(enabled)
-    }
-
     pub const fn has(self, capability: Capability) -> bool {
-        self.0[capability as usize]
+        match capability {
+            Capability::Workspace => self.workspace,
+            Capability::Files => self.files,
+            Capability::Shell => self.shell,
+            Capability::Git => self.git,
+            Capability::Mcp => self.mcp,
+            Capability::Plugins => self.plugins,
+        }
     }
 
     pub fn grants(
@@ -137,11 +126,18 @@ impl EnabledCapabilities {
             Vec::new()
         }
     }
+}
 
-    pub const fn with_workspace_tools(mut self, enabled: bool) -> Self {
-        self.0[Capability::Files as usize] &= enabled;
-        self.0[Capability::Shell as usize] &= enabled;
-        self
+impl Default for EnabledCapabilities {
+    fn default() -> Self {
+        Self {
+            workspace: true,
+            files: true,
+            shell: true,
+            git: true,
+            mcp: true,
+            plugins: false,
+        }
     }
 }
 
@@ -150,7 +146,7 @@ pub struct Host {
     project_dir: Option<PathBuf>,
     settings: SettingsStore,
     allowed_origins: Vec<String>,
-    capabilities: EnabledCapabilities,
+    local: bool,
     turn_in_flight: AtomicBool,
     cancelled: Arc<AtomicBool>,
     /// The most recent optional-capability failures. They are diagnostics, not
@@ -197,18 +193,13 @@ pub fn serve(options: Options) -> eja::Result<()> {
     if options.port == 0 {
         return Err("--port must be between 1 and 65535".into());
     }
-    if options.capabilities.has(Capability::Plugins)
-        && !(options.host == "localhost"
-            || options
-                .host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback()))
-    {
-        return Err("managed plugin administration requires a local runtime address".into());
-    }
+    let local = options.host == "localhost"
+        || options
+            .host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
     let project_dir = options
         .project_dir
-        .filter(|_| options.capabilities.has(Capability::Workspace))
         .map(|path| {
             let path = path
                 .canonicalize()
@@ -224,38 +215,26 @@ pub fn serve(options: Options) -> eja::Result<()> {
         .transpose()?;
     std::fs::create_dir_all(&options.state_dir)?;
     let state_dir = options.state_dir.canonicalize()?;
+    Store::new(&state_dir)?;
     let ignore = state_dir.join(".gitignore");
     if !ignore.exists() {
         std::fs::write(ignore, "*\n")?;
     }
-    if state_dir.join("nodes").exists() && !state_dir.join("ajas").exists() {
-        return Err(format!(
-            "{} records executions under nodes/, which this version does not read; there is no migration",
-            state_dir.display()
-        )
-        .into());
-    }
-    Store::new(&state_dir)?;
     let settings = SettingsStore::new(project_dir.clone(), state_dir.clone());
-    let mut startup_diagnostics = Vec::new();
-    if let Err(error) = settings.prepare() {
-        startup_diagnostics.push(format!(
-            "connector configuration could not be prepared: {error}"
-        ));
+    let effective = settings.effective_current()?;
+    if effective.capabilities.plugins && !local {
+        return Err("plugin administration requires a local runtime address".into());
     }
-    let effective = settings
-        .effective_current()
-        .unwrap_or_else(|_| settings.effective(StoredSettings::default()));
     let cancelled = Arc::new(AtomicBool::new(false));
     let host = Arc::new(Host {
         state_dir,
         project_dir,
         settings,
         allowed_origins: options.allowed_origins,
-        capabilities: options.capabilities,
+        local,
         turn_in_flight: AtomicBool::new(false),
         cancelled: cancelled.clone(),
-        diagnostics: Mutex::new(startup_diagnostics),
+        diagnostics: Mutex::new(Vec::new()),
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -383,18 +362,13 @@ async fn get_state(
         proposal: query.proposal_id,
     });
     let busy = !matches!(query.busy.as_str(), "" | "0" | "false");
-    Ok(Json(state_json(&host, busy, encounter)))
+    Ok(Json(state_json(&host, busy, encounter)?))
 }
 
-fn state_json(host: &Host, busy: bool, encounter: Option<state::Encounter>) -> Value {
+fn state_json(host: &Host, busy: bool, encounter: Option<state::Encounter>) -> ApiResult<Value> {
     let journal = state::Journal::read(&host.state_dir);
-    let effective = host
-        .settings
-        .effective_current()
-        .unwrap_or_else(|_| host.settings.effective(StoredSettings::default()));
-    let capabilities = host
-        .capabilities
-        .with_workspace_tools(effective.workspace_tools);
+    let effective = host.settings.effective_current()?;
+    let capabilities = effective.capabilities;
     let workspace_tools = (capabilities.has(Capability::Files)
         || capabilities.has(Capability::Shell))
         && !capabilities
@@ -423,12 +397,12 @@ fn state_json(host: &Host, busy: bool, encounter: Option<state::Encounter>) -> V
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone(),
     };
-    state::state_json(
+    Ok(state::state_json(
         &journal,
         &health,
         busy || host.turn_in_flight.load(Ordering::SeqCst),
         encounter,
-    )
+    ))
 }
 
 async fn get_settings(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
@@ -438,6 +412,17 @@ async fn get_settings(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
 
 async fn save_settings(State(host): State<Arc<Host>>, request: Request) -> ApiResult<Json<Value>> {
     let body = read_json(request).await?;
+    if !host.local
+        && body
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("plugins"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        return Err(ApiError::bad(
+            "plugin administration requires a local runtime address",
+        ));
+    }
     host.settings.write(body)?;
     let effective = host.settings.effective_current()?;
     Ok(Json(serde_json::to_value(host.settings.view(&effective))?))
@@ -830,7 +815,7 @@ fn execute_turn(
     selection: Option<ChoiceSelection>,
 ) -> ApiResult<String> {
     let startup = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
-    let composed = compose(&host.settings, host.capabilities, None, &startup)?;
+    let composed = compose(&host.settings, &startup)?;
     {
         let mut current = host
             .diagnostics
@@ -875,7 +860,7 @@ fn execute_turn(
         aja_role.model.as_str(),
     )
     .with_headers(compose::header_pairs(aja_role));
-    let grant = host
+    let grant = effective
         .capabilities
         .grants(&host.settings, &effective.settings);
     let ajas = host.state_dir.join("ajas");
@@ -966,18 +951,11 @@ async fn get_raw(
             "truncated": truncated,
         })));
     }
-    if let Some(relative) = address
-        .strip_prefix("environment:")
-        .or_else(|| address.strip_prefix("world:"))
-    {
-        let grant = host.capabilities.grants(
-            &host.settings,
-            &host
-                .settings
-                .effective_current()
-                .unwrap_or_else(|_| host.settings.effective(StoredSettings::default()))
-                .settings,
-        );
+    if let Some(relative) = address.strip_prefix("environment:") {
+        let effective = host.settings.effective_current()?;
+        let grant = effective
+            .capabilities
+            .grants(&host.settings, &effective.settings);
         let mut found = None;
         for workspace in &grant {
             if let Ok(view) = safe_file(Path::new(&workspace.root), relative, MAX_RAW) {
@@ -1000,8 +978,8 @@ async fn get_raw(
     ))
 }
 
-async fn get_health(State(host): State<Arc<Host>>) -> Json<Value> {
-    Json(state_json(&host, false, None)["health"].clone())
+async fn get_health(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
+    Ok(Json(state_json(&host, false, None)?["health"].clone()))
 }
 
 async fn api_not_found() -> Response {
@@ -1017,7 +995,11 @@ async fn cors(State(host): State<Arc<Host>>, request: Request, next: Next) -> Re
             local_origin(origin) || host.allowed_origins.iter().any(|item| item == origin)
         })
         .map(ToOwned::to_owned);
-    if host.capabilities.has(Capability::Plugins) && request.method() == Method::POST {
+    let plugins = host
+        .settings
+        .effective_current()
+        .is_ok_and(|effective| effective.capabilities.has(Capability::Plugins));
+    if plugins && request.method() == Method::POST {
         let allowed_origin = origin.is_some() || !request.headers().contains_key(header::ORIGIN);
         let json = request
             .headers()

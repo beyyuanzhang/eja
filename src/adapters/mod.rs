@@ -16,8 +16,8 @@ pub use brain::{
     parse_decision, render_context, render_context_within, OpenAiBrain, SYSTEM_PROMPT,
 };
 pub use environments::{
-    EnvironmentKind, EnvironmentLease, EnvironmentProvider, EnvironmentRecord, GitWorktrees,
-    SharedEnvironment, WorkspaceEnvironments,
+    EnvironmentLease, EnvironmentProvider, EnvironmentRecord, GitWorktrees, SharedEnvironment,
+    WorkspaceEnvironments,
 };
 pub use mcp::McpTools;
 pub use model::{Control, Model, OpenAiModel};

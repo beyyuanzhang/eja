@@ -1,6 +1,9 @@
-use super::util::{
-    is_local_provider, normalize_base_url, provider_name, unique_strings, write_private_bytes,
-    write_private_json, ApiError, ApiResult,
+use super::{
+    util::{
+        is_local_provider, normalize_base_url, provider_name, unique_strings, write_private_json,
+        ApiError, ApiResult,
+    },
+    EnabledCapabilities,
 };
 use eja::WorkspaceGrant;
 use serde::{Deserialize, Serialize};
@@ -13,7 +16,7 @@ use std::{
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Provider {
     pub id: String,
     pub name: String,
@@ -27,7 +30,7 @@ pub struct Provider {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Role {
     #[serde(default)]
     pub provider_id: String,
@@ -36,6 +39,7 @@ pub struct Role {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Roles {
     #[serde(default)]
     pub eja: Role,
@@ -43,13 +47,24 @@ pub struct Roles {
     pub aja: Role,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Limits {
     pub slots: usize,
     pub turn_timeout_ms: u64,
     pub aja_steps: usize,
     pub aja_timeout_ms: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            slots: 1,
+            turn_timeout_ms: 0,
+            aja_steps: 0,
+            aja_timeout_ms: 0,
+        }
+    }
 }
 
 impl Limits {
@@ -64,6 +79,7 @@ impl Limits {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredConnector {
     pub name: String,
     #[serde(default)]
@@ -80,8 +96,14 @@ pub struct StoredConnector {
     pub headers: BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default = "default_timeout", rename = "timeout_ms")]
+    #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub read_only: Vec<String>,
+    #[serde(default)]
+    pub witness: Vec<String>,
 }
 
 const fn default_true() -> bool {
@@ -93,20 +115,14 @@ const fn default_timeout() -> u64 {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectorSettings {
     #[serde(default)]
     pub servers: Vec<StoredConnector>,
-    #[serde(default)]
-    pub managed: bool,
-    /// The built-in workspace file tools: always granted, switchable, never
-    /// deletable. They are not a connector process, so they live beside the
-    /// server list rather than inside it.
-    #[serde(default = "default_true")]
-    pub workspace_tools: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredSettings {
     #[serde(default)]
     pub providers: Vec<Provider>,
@@ -114,7 +130,7 @@ pub struct StoredSettings {
     pub roles: Roles,
     #[serde(default)]
     pub connectors: ConnectorSettings,
-    #[serde(default)]
+    pub capabilities: EnabledCapabilities,
     pub limits: Limits,
     /// Extra directories the user has made available to EJA. A task fixes one
     /// of these roots when it opens.
@@ -123,7 +139,7 @@ pub struct StoredSettings {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderInput {
     #[serde(default)]
     id: String,
@@ -142,6 +158,7 @@ struct ProviderInput {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeyValueInput {
     #[serde(default)]
     key: String,
@@ -152,7 +169,7 @@ struct KeyValueInput {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConnectorInput {
     #[serde(default)]
     name: String,
@@ -174,9 +191,16 @@ struct ConnectorInput {
     enabled: bool,
     #[serde(default = "default_timeout")]
     timeout_ms: u64,
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
+    read_only: Vec<String>,
+    #[serde(default)]
+    witness: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SaveInput {
     #[serde(default)]
     providers: Vec<ProviderInput>,
@@ -184,19 +208,17 @@ struct SaveInput {
     roles: Roles,
     #[serde(default)]
     connectors: ConnectorSaveInput,
-    #[serde(default)]
+    capabilities: EnabledCapabilities,
     limits: Limits,
     #[serde(default)]
     workspaces: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ConnectorSaveInput {
     #[serde(default)]
     servers: Vec<ConnectorInput>,
-    #[serde(default)]
-    workspace_tools: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,7 +248,6 @@ pub struct ProviderView {
 pub struct ConnectorView {
     pub name: String,
     pub mode: &'static str,
-    pub builtin: bool,
     pub command: String,
     pub url: String,
     pub args: Vec<String>,
@@ -235,15 +256,15 @@ pub struct ConnectorView {
     pub headers: Vec<KeyValueView>,
     pub enabled: bool,
     pub timeout_ms: u64,
+    pub tools: Vec<String>,
+    pub read_only: Vec<String>,
+    pub witness: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectorsView {
     pub servers: Vec<ConnectorView>,
-    pub managed: bool,
-    pub config_path: String,
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,6 +273,7 @@ pub struct SettingsView {
     pub providers: Vec<ProviderView>,
     pub roles: Roles,
     pub connectors: ConnectorsView,
+    pub capabilities: EnabledCapabilities,
     pub limits: Limits,
     pub workspaces: BTreeMap<String, String>,
     pub runtime_path: String,
@@ -280,21 +302,12 @@ pub struct EffectiveRoles {
 }
 
 #[derive(Debug, Clone)]
-pub struct ActiveConnectors {
-    pub servers: Vec<StoredConnector>,
-    pub managed: bool,
-    pub error: Option<String>,
-    pub workspace_tools: bool,
-}
-
-#[derive(Debug, Clone)]
 pub struct Effective {
     pub settings: StoredSettings,
-    pub connectors: ActiveConnectors,
+    pub connectors: Vec<StoredConnector>,
     pub roles: EffectiveRoles,
-    pub mcp_path: Option<PathBuf>,
+    pub capabilities: EnabledCapabilities,
     pub limits: Limits,
-    pub workspace_tools: bool,
 }
 
 impl Effective {
@@ -304,8 +317,7 @@ impl Effective {
     }
 
     pub fn mcp_ready(&self) -> bool {
-        self.mcp_path.as_ref().is_some_and(|path| path.is_file())
-            && self.connectors.servers.iter().any(|server| server.enabled)
+        self.capabilities.mcp && self.connectors.iter().any(|server| server.enabled)
     }
 }
 
@@ -329,61 +341,9 @@ impl SettingsStore {
 
     pub fn read(&self) -> ApiResult<StoredSettings> {
         if !self.path.is_file() {
-            if let Some(legacy) = self
-                .project
-                .as_ref()
-                .map(|project| project.join("app/settings.json"))
-                .filter(|path| path.is_file())
-            {
-                let bytes = fs::read(legacy)?;
-                write_private_bytes(&self.path, &bytes)?;
-            }
+            return Ok(StoredSettings::default());
         }
-        if !self.path.is_file() {
-            return Ok(StoredSettings {
-                limits: Limits {
-                    slots: 1,
-                    ..Limits::default()
-                },
-                connectors: ConnectorSettings {
-                    workspace_tools: true,
-                    ..ConnectorSettings::default()
-                },
-                ..StoredSettings::default()
-            });
-        }
-        let raw: Value = serde_json::from_slice(&fs::read(&self.path)?)?;
-        let mut settings: StoredSettings = serde_json::from_value(raw.clone()).unwrap_or_default();
-        if settings.providers.is_empty() {
-            if let Some(provider) = legacy_provider(&raw) {
-                let primary = provider.models.first().cloned().unwrap_or_default();
-                let aja = provider.models.get(1).cloned().unwrap_or_default();
-                if settings.roles.eja.provider_id.is_empty() && settings.roles.eja.model.is_empty()
-                {
-                    settings.roles.eja = Role {
-                        provider_id: provider.id.clone(),
-                        model: primary,
-                    };
-                }
-                if settings.roles.aja.provider_id.is_empty() && settings.roles.aja.model.is_empty()
-                {
-                    settings.roles.aja = Role {
-                        provider_id: provider.id.clone(),
-                        model: aja,
-                    };
-                }
-                settings.providers = vec![provider];
-            }
-        }
-        settings.limits = if settings.limits.slots == 0 {
-            Limits {
-                slots: 1,
-                ..settings.limits
-            }
-        } else {
-            settings.limits
-        };
-        Ok(settings)
+        Ok(serde_json::from_slice(&fs::read(&self.path)?)?)
     }
 
     pub fn project_dir(&self) -> Option<&Path> {
@@ -404,11 +364,7 @@ impl SettingsStore {
         let providers = normalize_providers(input.providers, &current.providers)?;
         let roles = normalize_roles(input.roles, &providers)?;
         let connectors =
-            normalize_connectors(input.connectors.servers, &self.active(&current).servers)?;
-        let workspace_tools = input
-            .connectors
-            .workspace_tools
-            .unwrap_or(current.connectors.workspace_tools);
+            normalize_connectors(input.connectors.servers, &current.connectors.servers)?;
         let workspaces =
             normalize_workspaces(input.workspaces, self.project.as_deref(), &self.dir)?;
         let next = StoredSettings {
@@ -416,99 +372,28 @@ impl SettingsStore {
             roles,
             connectors: ConnectorSettings {
                 servers: connectors,
-                managed: true,
-                workspace_tools,
             },
+            capabilities: input.capabilities,
             limits: input.limits.sane(),
             workspaces,
         };
         let raw = serde_json::to_value(&next)?;
         write_private_json(&self.path, &raw)?;
-        self.write_managed_mcp(&next.connectors.servers)?;
         Ok(next)
     }
 
-    pub fn prepare(&self) -> ApiResult<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| ApiError::internal("settings write lock is unavailable"))?;
-        let settings = self.read()?;
-        if settings.connectors.managed {
-            self.write_managed_mcp(&settings.connectors.servers)?;
-        }
-        Ok(())
-    }
-
-    pub fn active(&self, settings: &StoredSettings) -> ActiveConnectors {
-        if settings.connectors.managed {
-            return ActiveConnectors {
-                servers: settings.connectors.servers.clone(),
-                managed: true,
-                error: None,
-                workspace_tools: settings.connectors.workspace_tools,
-            };
-        }
-        let Some(path) = self.legacy_mcp_path() else {
-            return ActiveConnectors {
-                servers: settings.connectors.servers.clone(),
-                managed: false,
-                error: None,
-                workspace_tools: settings.connectors.workspace_tools,
-            };
-        };
-        match read_legacy_mcp(&path) {
-            Ok(servers) => ActiveConnectors {
-                servers: if settings.connectors.servers.is_empty() {
-                    servers
-                } else {
-                    settings.connectors.servers.clone()
-                },
-                managed: false,
-                error: None,
-                workspace_tools: settings.connectors.workspace_tools,
-            },
-            Err(error) => ActiveConnectors {
-                servers: settings.connectors.servers.clone(),
-                managed: false,
-                error: Some(format!("{}: {error}", path.display())),
-                workspace_tools: settings.connectors.workspace_tools,
-            },
-        }
-    }
-
-    pub fn effective(&self, settings: StoredSettings) -> Effective {
-        let connectors = self.active(&settings);
-        let workspace_tools = connectors.workspace_tools;
-        let eja = configured_role(&settings, "eja").or_else(|| environment_role(false));
-        let aja = configured_role(&settings, "aja")
-            .or_else(|| environment_role(true))
-            .or_else(|| eja.clone());
-        let mcp_path = if connectors.managed {
-            Some(self.managed_mcp_path())
-        } else {
-            self.legacy_mcp_path().filter(|path| path.exists())
-        };
-        let mut limits = settings.limits.clone().sane();
-        if let Some(value) = env_number("EJA_AJA_SLOTS").filter(|value| *value > 0) {
-            limits.slots = value.min(8) as usize;
-        }
-        if let Some(value) = env_number("EJA_TURN_TIMEOUT_MS") {
-            limits.turn_timeout_ms = value.min(7_200_000);
-        }
-        if let Some(value) = env_number("EJA_AJA_STEPS").filter(|value| *value > 0) {
-            limits.aja_steps = value.min(200) as usize;
-        }
-        if let Some(value) = env_number("EJA_AJA_TIMEOUT_MS").filter(|value| *value > 0) {
-            limits.aja_timeout_ms = value.min(14_400_000);
-        }
+    pub fn effective(settings: StoredSettings) -> Effective {
+        let connectors = settings.connectors.servers.clone();
+        let eja = configured_role(&settings, "eja");
+        let aja = configured_role(&settings, "aja").or_else(|| eja.clone());
+        let limits = settings.limits.clone().sane();
+        let capabilities = settings.capabilities;
         Effective {
             settings,
             connectors,
             roles: EffectiveRoles { eja, aja },
-            mcp_path,
+            capabilities,
             limits,
-            workspace_tools,
         }
     }
 
@@ -518,18 +403,9 @@ impl SettingsStore {
             providers: settings.providers.iter().map(public_provider).collect(),
             roles: settings.roles.clone(),
             connectors: ConnectorsView {
-                servers: std::iter::once(builtin_workspace_view(
-                    effective.connectors.workspace_tools,
-                ))
-                .chain(effective.connectors.servers.iter().map(public_connector))
-                .collect(),
-                managed: effective.connectors.managed,
-                config_path: effective
-                    .mcp_path
-                    .as_ref()
-                    .map_or_else(String::new, |path| path.display().to_string()),
-                error: effective.connectors.error.clone(),
+                servers: effective.connectors.iter().map(public_connector).collect(),
             },
+            capabilities: effective.capabilities,
             limits: settings.limits.clone(),
             workspaces: settings.workspaces.clone(),
             runtime_path: env::current_exe()
@@ -543,7 +419,7 @@ impl SettingsStore {
     }
 
     pub fn effective_current(&self) -> ApiResult<Effective> {
-        Ok(self.effective(self.read()?))
+        Ok(Self::effective(self.read()?))
     }
 
     /// The directories EJA may use. Registration is the durable availability
@@ -585,84 +461,16 @@ impl SettingsStore {
 
     pub fn connector_for_test(&self, body: &Value) -> ApiResult<StoredConnector> {
         let current = self.read()?;
-        let active = self.active(&current);
         let incoming = body.get("connector").unwrap_or(body);
         let name = incoming.get("name").and_then(Value::as_str).unwrap_or("");
-        let previous = active
+        let previous = current
+            .connectors
             .servers
             .iter()
             .find(|connector| connector.name == name);
         let input: ConnectorInput = serde_json::from_value(incoming.clone())?;
         normalize_connector(input, previous)
     }
-
-    pub fn managed_mcp_path(&self) -> PathBuf {
-        self.dir.join("app-mcp.json")
-    }
-
-    fn legacy_mcp_path(&self) -> Option<PathBuf> {
-        let raw: Value = fs::read(&self.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_else(|| json!({}));
-        if let Some(path) = raw
-            .get("connectors")
-            .and_then(|connectors| connectors.get("mcpConfig"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        {
-            return Some(self.project.as_ref().unwrap_or(&self.dir).join(path));
-        }
-        let local = self.dir.join("mcp.json");
-        local.is_file().then_some(local)
-    }
-
-    fn write_managed_mcp(&self, connectors: &[StoredConnector]) -> ApiResult<()> {
-        let mut servers = serde_json::Map::new();
-        for connector in connectors {
-            servers.insert(connector.name.clone(), connector_config(connector));
-        }
-        write_private_json(&self.managed_mcp_path(), &json!({ "mcpServers": servers }))
-    }
-}
-
-fn legacy_provider(raw: &Value) -> Option<Provider> {
-    let model = raw.get("model")?;
-    let base_url = model
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    let api_key = model
-        .get("apiKey")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let primary = model
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    let aja = model
-        .get("ajaModel")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    if base_url.is_empty() && api_key.is_empty() && primary.is_empty() && aja.is_empty() {
-        return None;
-    }
-    Some(Provider {
-        id: "default".to_owned(),
-        name: provider_name(&base_url, "Provider"),
-        base_url,
-        api_key,
-        models: unique_strings(Some(&vec![primary, aja])),
-        headers: BTreeMap::new(),
-    })
 }
 
 fn normalize_providers(
@@ -816,12 +624,6 @@ fn normalize_connectors(
     if values.len() > 32 {
         return Err(ApiError::bad("最多可以配置 32 个连接器"));
     }
-    if values
-        .iter()
-        .any(|value| value.name.trim() == eja::adapters::WORKSPACE_GROUP)
-    {
-        return Err(ApiError::bad("workspace 是内置连接器，不能另建同名连接器"));
-    }
     let prior: BTreeMap<_, _> = previous
         .iter()
         .map(|connector| (connector.name.clone(), connector))
@@ -918,6 +720,9 @@ fn normalize_connector(
         headers,
         enabled: value.enabled,
         timeout_ms: value.timeout_ms.clamp(1, 300_000),
+        tools: unique_strings(Some(&value.tools)),
+        read_only: unique_strings(Some(&value.read_only)),
+        witness: unique_strings(Some(&value.witness)),
     })
 }
 
@@ -999,70 +804,6 @@ fn configured_role(settings: &StoredSettings, name: &str) -> Option<RoleConfig> 
     })
 }
 
-fn environment_role(aja: bool) -> Option<RoleConfig> {
-    let base_url = if aja {
-        env_value(&["EJA_AJA_BASE_URL"])
-    } else {
-        String::new()
-    };
-    let api_key = if aja {
-        env_value(&["EJA_AJA_API_KEY"])
-    } else {
-        String::new()
-    };
-    let model = if aja {
-        env_value(&["EJA_AJA_MODEL"])
-    } else {
-        String::new()
-    };
-    let base_url = if base_url.is_empty() {
-        env_value(&["LNA_BASE_URL", "OPENAI_BASE_URL", "JIYUAN_BASE_URL"])
-    } else {
-        base_url
-    };
-    let api_key = if api_key.is_empty() {
-        env_value(&["LNA_API_KEY", "OPENAI_API_KEY", "JIYUAN_API_KEY"])
-    } else {
-        api_key
-    };
-    let model = if model.is_empty() {
-        env_value(&["LNA_MODEL", "OPENAI_MODEL", "JIYUAN_MODEL"])
-    } else {
-        model
-    };
-    if base_url.is_empty() && api_key.is_empty() && model.is_empty() {
-        return None;
-    }
-    Some(RoleConfig {
-        base_url,
-        api_key,
-        model,
-        headers: env_headers(if aja {
-            "EJA_AJA_HEADERS"
-        } else {
-            "LNA_HEADERS"
-        }),
-    })
-}
-
-fn env_value(names: &[&str]) -> String {
-    names
-        .iter()
-        .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
-        .unwrap_or_default()
-}
-
-fn env_number(name: &str) -> Option<u64> {
-    env::var(name).ok().and_then(|value| value.parse().ok())
-}
-
-fn env_headers(name: &str) -> BTreeMap<String, String> {
-    env::var(name)
-        .ok()
-        .and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_default()
-}
-
 fn public_provider(provider: &Provider) -> ProviderView {
     ProviderView {
         id: provider.id.clone(),
@@ -1083,7 +824,6 @@ fn public_connector(connector: &StoredConnector) -> ConnectorView {
         } else {
             "url"
         },
-        builtin: false,
         command: connector.command.clone().unwrap_or_default(),
         url: connector.url.clone().unwrap_or_default(),
         args: connector.args.clone(),
@@ -1092,24 +832,9 @@ fn public_connector(connector: &StoredConnector) -> ConnectorView {
         headers: public_key_values(&connector.headers),
         enabled: connector.enabled,
         timeout_ms: connector.timeout_ms,
-    }
-}
-
-/// The built-in workspace connector as the settings list shows it: one row,
-/// switchable, with nothing to edit and nothing to delete.
-fn builtin_workspace_view(enabled: bool) -> ConnectorView {
-    ConnectorView {
-        name: eja::adapters::WORKSPACE_GROUP.to_owned(),
-        mode: "command",
-        builtin: true,
-        command: String::new(),
-        url: String::new(),
-        args: Vec::new(),
-        cwd: String::new(),
-        env: Vec::new(),
-        headers: Vec::new(),
-        enabled,
-        timeout_ms: 0,
+        tools: connector.tools.clone(),
+        read_only: connector.read_only.clone(),
+        witness: connector.witness.clone(),
     }
 }
 
@@ -1174,70 +899,16 @@ pub fn connector_config(connector: &StoredConnector) -> Value {
     }
     config.insert("enabled".to_owned(), json!(connector.enabled));
     config.insert("timeout_ms".to_owned(), json!(connector.timeout_ms));
-    Value::Object(config)
-}
-
-fn read_legacy_mcp(path: &Path) -> ApiResult<Vec<StoredConnector>> {
-    let raw: Value = serde_json::from_slice(&fs::read(path)?)?;
-    let servers = raw
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .ok_or_else(|| ApiError::bad("mcpServers must be an object"))?;
-    let mut output = Vec::new();
-    for (name, value) in servers {
-        let command = value
-            .get("command")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let url = value
-            .get("url")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        if command.is_none() && url.is_none() {
-            return Err(ApiError::bad(format!("{name} needs command or url")));
-        }
-        output.push(StoredConnector {
-            name: name.clone(),
-            command,
-            url,
-            args: value
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            env: value
-                .get("env")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or_default(),
-            cwd: value
-                .get("cwd")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-            headers: value
-                .get("headers")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or_default(),
-            enabled: value
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            timeout_ms: value
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(30_000)
-                .clamp(1, 300_000),
-        });
+    if !connector.tools.is_empty() {
+        config.insert("tools".to_owned(), json!(connector.tools));
     }
-    Ok(output)
+    if !connector.read_only.is_empty() {
+        config.insert("read_only".to_owned(), json!(connector.read_only));
+    }
+    if !connector.witness.is_empty() {
+        config.insert("witness".to_owned(), json!(connector.witness));
+    }
+    Value::Object(config)
 }
 
 pub fn provider_draft(
@@ -1306,34 +977,39 @@ mod tests {
     }
 
     #[test]
-    fn legacy_settings_move_to_private_state_and_redacted_saves_keep_secrets() {
+    fn settings_round_trip_and_redacted_saves_keep_secrets() {
         let root = root();
         let project = root.join("project");
         let state = project.join(".eja");
-        std::fs::create_dir_all(project.join("app")).unwrap();
-        std::fs::write(
-            project.join("app/settings.json"),
-            serde_json::to_vec_pretty(&json!({
+        std::fs::create_dir_all(&project).unwrap();
+        let store = SettingsStore::new(Some(project), state.clone());
+        let settings = store
+            .write(json!({
                 "providers": [{
                     "id": "p1",
                     "name": "Example",
                     "baseUrl": "https://example.com/v1",
                     "apiKey": "secret-key-value",
                     "models": ["m1"],
-                    "headers": {"x-session-token": "session-value"}
+                    "headers": [{"key": "x-session-token", "value": "session-value"}]
                 }],
                 "roles": {
                     "eja": {"providerId": "p1", "model": "m1"},
                     "aja": {"providerId": "p1", "model": "m1"}
                 },
-                "connectors": {"servers": [], "managed": true},
-                "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0}
+                "connectors": {"servers": []},
+                "capabilities": {
+                    "workspace": true,
+                    "files": true,
+                    "shell": true,
+                    "git": true,
+                    "mcp": true,
+                    "plugins": false
+                },
+                "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0},
+                "workspaces": {}
             }))
-            .unwrap(),
-        )
-        .unwrap();
-        let store = SettingsStore::new(Some(project), state.clone());
-        let settings = store.read().unwrap();
+            .unwrap();
         assert_eq!(settings.providers[0].api_key, "secret-key-value");
         assert!(state.join("app-settings.json").is_file());
         #[cfg(unix)]
@@ -1360,7 +1036,16 @@ mod tests {
                 "aja": {"providerId": "p1", "model": "m1"}
             },
             "connectors": {"servers": []},
-            "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0}
+            "capabilities": {
+                "workspace": true,
+                "files": true,
+                "shell": true,
+                "git": true,
+                "mcp": true,
+                "plugins": false
+            },
+            "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0},
+            "workspaces": {}
         });
         let saved = store.write(next).unwrap();
         assert_eq!(saved.providers[0].api_key, "secret-key-value");
@@ -1368,7 +1053,7 @@ mod tests {
             saved.providers[0].headers.get("x-session-token"),
             Some(&"session-value".to_owned())
         );
-        let view = serde_json::to_string(&store.view(&store.effective(saved))).unwrap();
+        let view = serde_json::to_string(&store.view(&SettingsStore::effective(saved))).unwrap();
         assert!(!view.contains("secret-key-value"));
         assert!(!view.contains("session-value"));
         let _ = std::fs::remove_dir_all(root);
@@ -1385,41 +1070,31 @@ mod tests {
     }
 
     #[test]
-    fn the_builtin_workspace_connector_is_switchable_and_reserved() {
+    fn capabilities_are_stored_in_the_same_settings_file() {
         let root = root();
-        let project = root.join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let store = SettingsStore::new(Some(project), root.join(".eja"));
-        let effective = store.effective_current().unwrap();
-        assert!(effective.workspace_tools, "on by default");
-        let view = store.view(&effective);
-        assert_eq!(view.connectors.servers[0].name, "workspace");
-        assert!(view.connectors.servers[0].builtin);
-        assert!(view.connectors.servers[0].enabled);
-
-        let base = json!({
+        let store = SettingsStore::new(Some(root.join("project")), root.join(".eja"));
+        let saved = store.write(json!({
             "providers": [],
             "roles": {"eja": {"providerId": "", "model": ""}, "aja": {"providerId": "", "model": ""}},
-            "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0}
-        });
-        let mut off = base.clone();
-        off["connectors"] = json!({"servers": [], "workspaceTools": false});
-        let saved = store.write(off).unwrap();
-        assert!(!saved.connectors.workspace_tools);
-        assert!(
-            saved.connectors.servers.is_empty(),
-            "the builtin is not a stored server"
+            "connectors": {"servers": []},
+            "capabilities": {
+                "workspace": true,
+                "files": false,
+                "shell": true,
+                "git": false,
+                "mcp": true,
+                "plugins": false
+            },
+            "limits": {"slots": 2, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0},
+            "workspaces": {}
+        })).unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(store.read().unwrap()).unwrap()
         );
-
-        // A save that does not mention the switch keeps it.
-        let mut keep = base.clone();
-        keep["connectors"] = json!({"servers": []});
-        let saved = store.write(keep).unwrap();
-        assert!(!saved.connectors.workspace_tools);
-
-        let mut clash = base;
-        clash["connectors"] = json!({"servers": [{"name": "workspace", "command": "x"}]});
-        assert!(store.write(clash).is_err(), "the name is reserved");
+        assert!(saved.capabilities.workspace);
+        assert!(!saved.capabilities.files);
+        assert!(saved.capabilities.shell);
         let _ = std::fs::remove_dir_all(root);
     }
 

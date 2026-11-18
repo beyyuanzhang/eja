@@ -432,7 +432,6 @@ impl NativeWorker {
             permissions.set_readonly(true);
             fs::set_permissions(&context, permissions)?;
         }
-        let context_bytes = fs::metadata(&context).map_or(0, |m| m.len());
         let calls: usize = outcome.counts.values().sum();
         let histogram: Vec<String> = {
             let mut pairs: Vec<_> = outcome.counts.iter().collect();
@@ -456,31 +455,13 @@ impl NativeWorker {
             let _ = write!(digest, "\ncheckpoint unavailable: {error}");
         }
         let manifest = super::records::Manifest {
+            format: "eja.aja".to_owned(),
+            version: 1,
             assignment: assignment.clone(),
             digest: digest.clone(),
-            environment: environment.map_or_else(
-                || "none".to_owned(),
-                |environment| environment.label.clone(),
-            ),
-            environment_kind: environment_record.as_ref().map(|record| match record.kind {
-                super::EnvironmentKind::Shared => "shared".to_owned(),
-                super::EnvironmentKind::Worktree => "worktree".to_owned(),
-                super::EnvironmentKind::Unknown => "unknown".to_owned(),
-            }),
-            environment_root: environment_record
-                .as_ref()
-                .map_or_else(String::new, |record| record.root.clone()),
-            environment_branch: environment_record
-                .as_ref()
-                .and_then(|record| record.branch.clone()),
-            environment_commit: environment_record
-                .as_ref()
-                .and_then(|record| record.commit.clone()),
+            environment: environment_record,
             checkpoint,
             checkpoint_error,
-            context: "context.jsonl".to_string(),
-            context_bytes: usize::try_from(context_bytes).unwrap_or(usize::MAX),
-            frozen: true,
         };
         let temp = aja.join("aja.json.tmp");
         fs::write(&temp, serde_json::to_vec_pretty(&manifest)?)?;
@@ -605,10 +586,15 @@ impl Worker for NativeWorker {
                 .settle(&held.environment, &parent.child(Duration::from_secs(60)))
             {
                 Ok(value) => {
-                    if let (Some(record), Some(commit)) =
-                        (&mut environment_record, value["commit"].as_str())
+                    if let Some(record) = value
+                        .get("environment_record")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .ok()
+                        .flatten()
                     {
-                        record.commit = Some(commit.to_owned());
+                        environment_record = Some(record);
                     }
                     let change = value["change"].as_str().unwrap_or("unreported");
                     let mut line = format!("environment: {}: {change}", held.environment.label);
