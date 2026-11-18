@@ -131,6 +131,7 @@ impl Brain for Script {
             .pop_front()
             .unwrap_or_else(|| Decision {
                 reply: "done".to_string(),
+                choices: Vec::new(),
                 actions: Vec::new(),
                 refused: Vec::new(),
             })
@@ -159,6 +160,7 @@ impl Worker for Done {
 pub fn decision(actions: Vec<Action>) -> Decision {
     Decision {
         reply: "structure".to_string(),
+        choices: Vec::new(),
         actions,
         refused: Vec::new(),
     }

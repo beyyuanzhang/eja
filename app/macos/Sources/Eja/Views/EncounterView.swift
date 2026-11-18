@@ -4,7 +4,9 @@ struct EncounterView: View {
     let model: AppModel
 
     private var spoken: [ChatMessage] {
-        model.encounterMessages.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        model.encounterMessages.filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !$0.choices.isEmpty
+        }
     }
 
     private var visible: [ChatMessage] { Array(spoken.suffix(6)) }
@@ -33,7 +35,13 @@ struct EncounterView: View {
                         }
 
                         ForEach(visible) { message in
-                            MessageBubble(message: message).id(message.id)
+                            VStack(alignment: .leading, spacing: 10) {
+                                MessageBubble(message: message)
+                                if message.id == spoken.last?.id, !message.choices.isEmpty {
+                                    ChoiceButtons(question: message.id, choices: message.choices, model: model)
+                                }
+                            }
+                            .id(message.id)
                         }
 
                         if let optimistic = model.optimistic, !optimisticDuplicate {
@@ -66,6 +74,7 @@ struct EncounterView: View {
                     .padding(.top, 54)
                     .padding(.bottom, 26)
                 }
+                .scrollIndicators(.never)
                 .onChange(of: visible.last?.id) {
                     withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("bottom", anchor: .bottom) }
                 }

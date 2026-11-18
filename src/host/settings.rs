@@ -2,6 +2,7 @@ use super::util::{
     is_local_provider, normalize_base_url, provider_name, unique_strings, write_private_bytes,
     write_private_json, ApiError, ApiResult,
 };
+use eja::WorkspaceGrant;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -115,8 +116,8 @@ pub struct StoredSettings {
     pub connectors: ConnectorSettings,
     #[serde(default)]
     pub limits: Limits,
-    /// The granted workspaces: name → root. The default workspace is the
-    /// host's project directory and is never stored here.
+    /// Extra directories the user has made available to EJA. A task fixes one
+    /// of these roots when it opens.
     #[serde(default)]
     pub workspaces: BTreeMap<String, String>,
 }
@@ -529,18 +530,33 @@ impl SettingsStore {
         Ok(self.effective(self.read()?))
     }
 
-    /// The workspace grant for one turn: the default root first, then every
-    /// granted name whose root still exists. A root that vanished is not
-    /// granted, so a task can never name a world the host cannot give.
-    pub fn grant(&self, settings: &StoredSettings) -> Vec<(String, String)> {
-        let mut grant = vec![("default".to_owned(), self.project.display().to_string())];
-        for (name, root) in &settings.workspaces {
-            let path = Path::new(root);
-            if path.is_dir() && path != self.project.as_path() {
-                grant.push((name.clone(), root.clone()));
+    /// The directories EJA may use. Registration is the durable availability
+    /// decision; a missing directory is not offered and cannot be selected.
+    pub fn grant(&self, settings: &StoredSettings) -> Vec<WorkspaceGrant> {
+        let root = self.project.display().to_string();
+        let mut grants = vec![WorkspaceGrant {
+            id: workspace_id(&root),
+            label: "default".to_owned(),
+            root,
+        }];
+        for (label, root) in &settings.workspaces {
+            let Ok(path) = Path::new(root).canonicalize() else {
+                continue;
+            };
+            if !path.is_dir() || path == self.project {
+                continue;
             }
+            let root = path.display().to_string();
+            if grants.iter().any(|grant| grant.root == root) {
+                continue;
+            }
+            grants.push(WorkspaceGrant {
+                id: workspace_id(&root),
+                label: label.clone(),
+                root,
+            });
         }
-        grant
+        grants
     }
 
     pub fn connector_for_test(&self, body: &Value) -> ApiResult<StoredConnector> {
@@ -705,6 +721,19 @@ fn normalize_roles(input: Roles, providers: &[Provider]) -> ApiResult<Roles> {
         }
     }
     Ok(input)
+}
+
+/// A workspace ID follows the resolved directory, never its display label.
+fn workspace_id(root: &str) -> String {
+    let text = Path::new(root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(root))
+        .display()
+        .to_string();
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("ws_{hash:016x}")
 }
 
 fn normalize_workspaces(
@@ -1367,6 +1396,39 @@ mod tests {
         let mut clash = base;
         clash["connectors"] = json!({"servers": [{"name": "workspace", "command": "x"}]});
         assert!(store.write(clash).is_err(), "the name is reserved");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stored_extra_directories_are_granted_until_they_disappear() {
+        let root = root();
+        let project = root.join("project");
+        let extra = root.join("extra");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let store = SettingsStore::new(project.clone(), root.join(".eja"));
+        let mut settings = StoredSettings::default();
+        settings
+            .workspaces
+            .insert("old".into(), extra.display().to_string());
+
+        let grant = store.grant(&settings);
+        assert_eq!(grant.len(), 2);
+        assert_eq!(grant[0].label, "default");
+        assert_eq!(grant[0].root, project.display().to_string());
+        assert!(grant[0].id.starts_with("ws_"));
+        assert_eq!(grant[1].label, "old");
+        assert_eq!(
+            grant[1].root,
+            extra.canonicalize().unwrap().display().to_string()
+        );
+
+        let again = store.grant(&settings);
+        assert_eq!(grant[0].id, again[0].id);
+        assert_eq!(grant[1].id, again[1].id);
+
+        std::fs::remove_dir_all(&extra).unwrap();
+        assert_eq!(store.grant(&settings).len(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 }

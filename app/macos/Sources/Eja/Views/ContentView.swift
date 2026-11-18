@@ -2,22 +2,30 @@ import SwiftUI
 
 struct ContentView: View {
     let model: AppModel
-    @Environment(\.openSettings) private var openSettings
+    @State private var settingsModel = SettingsModel()
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             Theme.paper.ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                if let journalError = model.state?.health.journalError, !journalError.isEmpty {
-                    journalBanner
+            if model.settingsPresented {
+                SettingsScreen(app: model, model: settingsModel) {
+                    model.settingsPresented = false
                 }
-                stage
-            }
+                .transition(.opacity)
+            } else {
+                VStack(spacing: 0) {
+                    if let journalError = model.state?.health.journalError, !journalError.isEmpty {
+                        journalBanner
+                    }
+                    stage
+                }
 
-            settingsButton
-                .padding(.leading, 16)
-                .padding(.bottom, 15)
+                settingsButton
+                    .padding(.leading, 16)
+                    .padding(.bottom, 15)
+                    .transition(.opacity)
+            }
         }
         .overlay(alignment: .bottom) {
             if let toast = model.toastState {
@@ -33,6 +41,7 @@ struct ContentView: View {
         .sheet(item: rawBinding) { record in
             RawDialog(record: record) { model.raw = nil }
         }
+        .animation(.easeOut(duration: 0.14), value: model.settingsPresented)
         .tint(Theme.accent)
         .foregroundStyle(Theme.ink)
     }
@@ -109,7 +118,7 @@ struct ContentView: View {
 
     private var settingsButton: some View {
         Button {
-            openSettings()
+            model.settingsPresented = true
         } label: {
             Image(systemName: "slider.horizontal.3")
                 .font(.system(size: 13, weight: .regular))

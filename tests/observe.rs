@@ -9,6 +9,7 @@ use support::{control, decision, Done, Script, State};
 fn say(reply: &str, actions: Vec<Action>) -> Decision {
     Decision {
         reply: reply.to_string(),
+        choices: Vec::new(),
         actions,
         refused: Vec::new(),
     }

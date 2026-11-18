@@ -3,7 +3,9 @@
 mod support;
 
 use eja::adapters::{Ports, Shared, WorkspaceWorlds, Worktrees, Worlds};
-use eja::{turn_at_with_options, Action, Assignment, Control, Kind, TurnOptions, Worker};
+use eja::{
+    turn_at_with_options, Action, Assignment, Control, Kind, TurnOptions, Worker, WorkspaceGrant,
+};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -494,9 +496,21 @@ fn two_granted_workspaces_hold_their_own_roots_at_once() {
     ]);
     let options = TurnOptions {
         workspaces: vec![
-            ("default".into(), alpha.display().to_string()),
-            ("alpha".into(), alpha.display().to_string()),
-            ("beta".into(), beta.display().to_string()),
+            WorkspaceGrant {
+                id: "default".into(),
+                label: "default".into(),
+                root: alpha.display().to_string(),
+            },
+            WorkspaceGrant {
+                id: "alpha".into(),
+                label: "alpha".into(),
+                root: alpha.display().to_string(),
+            },
+            WorkspaceGrant {
+                id: "beta".into(),
+                label: "beta".into(),
+                root: beta.display().to_string(),
+            },
         ],
         limits: eja::TurnLimits {
             slots: 2,
@@ -536,7 +550,7 @@ fn two_granted_workspaces_hold_their_own_roots_at_once() {
 }
 
 #[test]
-fn a_task_naming_an_ungranted_workspace_is_refused() {
+fn a_task_naming_an_unavailable_workspace_is_refused() {
     let state = State::new("ungranted");
     let store = state.store();
     let brain = Script::once(vec![Action::OpenTask {
@@ -555,7 +569,11 @@ fn a_task_naming_an_ungranted_workspace_is_refused() {
         &Ports::default(),
         eja::now_utc(),
         &TurnOptions {
-            workspaces: vec![("default".into(), "/tmp".into())],
+            workspaces: vec![WorkspaceGrant {
+                id: "default".into(),
+                label: "default".into(),
+                root: "/tmp".into(),
+            }],
             ..Default::default()
         },
     )
@@ -570,6 +588,76 @@ fn a_task_naming_an_ungranted_workspace_is_refused() {
             .refused
             .iter()
             .any(|note| note.contains("nowhere")),
+        "{:?}",
+        out.context().refused
+    );
+}
+
+#[test]
+fn a_task_cannot_dispatch_after_its_workspace_is_no_longer_available() {
+    let state = State::new("stale-workspace");
+    let store = state.store();
+    let root = tree(&state);
+    let old = root.join("old");
+    let current = root.join("current");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&current).unwrap();
+
+    let open = Script::once(vec![Action::OpenTask {
+        title: "old target".into(),
+        request: "mark the old target".into(),
+        acceptance: "marked".into(),
+        workspace: Some("old".into()),
+        evidence: None,
+        run: false,
+    }]);
+    let old_grant = TurnOptions {
+        workspaces: vec![WorkspaceGrant {
+            id: "old".into(),
+            label: "old".into(),
+            root: old.display().to_string(),
+        }],
+        ..Default::default()
+    };
+    let opened = turn_at_with_options(
+        &store,
+        "open an old target",
+        &open,
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &old_grant,
+    )
+    .expect("open");
+    assert_eq!(opened.dispatched, Vec::<u64>::new());
+
+    let dispatch = Script::once(vec![Action::Dispatch { task_id: 1 }]);
+    let current_grant = TurnOptions {
+        workspaces: vec![WorkspaceGrant {
+            id: "current".into(),
+            label: "current".into(),
+            root: current.display().to_string(),
+        }],
+        ..Default::default()
+    };
+    let out = turn_at_with_options(
+        &store,
+        "dispatch the old target",
+        &dispatch,
+        &Marker,
+        &Ports::default(),
+        eja::now_utc(),
+        &current_grant,
+    )
+    .expect("dispatch");
+
+    assert!(out.dispatched.is_empty());
+    assert!(!old.join("marker-1.txt").exists());
+    assert!(
+        out.context()
+            .refused
+            .iter()
+            .any(|note| note.contains("not available")),
         "{:?}",
         out.context().refused
     );

@@ -18,7 +18,7 @@ struct EjaApp: App {
     @State private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("eja", id: "main") {
+        Window("eja", id: "main") {
             ContentView(model: model)
                 .frame(minWidth: 560, minHeight: 460)
                 .preferredColorScheme(.light)
@@ -34,11 +34,10 @@ struct EjaApp: App {
                 Button("刷新") { model.refreshSoon() }
                     .keyboardShortcut("r", modifiers: .command)
             }
-        }
-
-        Settings {
-            SettingsWindow(app: model)
-                .preferredColorScheme(.light)
+            CommandGroup(replacing: .appSettings) {
+                Button("设置…") { model.settingsPresented = true }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
         }
     }
 

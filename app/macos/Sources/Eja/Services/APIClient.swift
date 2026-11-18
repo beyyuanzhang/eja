@@ -49,15 +49,41 @@ final class APIClient {
         return try await post("/api/connectors/test", body: Envelope(connector: draft))
     }
 
-    func sendTurn(text: String, focus: Int?, approvals: [Int], denials: [Int], gesture: String?) async throws -> TurnResult {
+    func sendTurn(
+        text: String,
+        focus: Int?,
+        approvals: [Int],
+        denials: [Int],
+        gesture: String?,
+        choiceQuestion: Int? = nil,
+        choiceOption: Int? = nil
+    ) async throws -> TurnResult {
+        struct Selection: Encodable {
+            let question: Int
+            let option: Int
+        }
         struct Body: Encodable {
             let text: String
+            let selection: Selection?
             let focus: Int?
             let approvals: [Int]
             let denials: [Int]
             let gesture: String?
         }
-        return try await post("/api/turn", body: Body(text: text, focus: focus, approvals: approvals, denials: denials, gesture: gesture))
+        let selection: Selection?
+        if let choiceQuestion, let choiceOption {
+            selection = Selection(question: choiceQuestion, option: choiceOption)
+        } else {
+            selection = nil
+        }
+        return try await post("/api/turn", body: Body(
+            text: text,
+            selection: selection,
+            focus: focus,
+            approvals: approvals,
+            denials: denials,
+            gesture: gesture
+        ))
     }
 
     func fetchRaw(_ address: String) async throws -> RawRecord {

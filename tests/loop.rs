@@ -61,6 +61,7 @@ fn closed_loop_dispatches_reports_and_accepts() {
         }]),
         Decision {
             reply: "done".to_string(),
+            choices: Vec::new(),
             actions: vec![Action::CloseTask {
                 task_id: 1,
                 accepted: true,

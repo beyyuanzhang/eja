@@ -243,7 +243,15 @@ fn presence_voice(state: &State) -> Value {
         .events()
         .iter()
         .find(|event| {
-            event.kind == Kind::Eja && event.turn == latest.turn && !event.text.trim().is_empty()
+            event.kind == Kind::Eja
+                && event.turn == latest.turn
+                && (!event.text.trim().is_empty()
+                    || event
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("choices"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|choices| !choices.is_empty()))
         })
         .map_or(Value::Null, |event| {
             json!({
@@ -554,6 +562,79 @@ mod tests {
         };
         let state = state_json(&journal, &health(), false, None);
         assert_eq!(state["presence"]["text"], "welcome back");
+    }
+
+    #[test]
+    fn a_silent_return_question_still_reaches_presence() {
+        let journal = Journal {
+            events: vec![
+                event(1, 1, "eja", Kind::Returned, "", json!({})),
+                event(
+                    2,
+                    1,
+                    "eja",
+                    Kind::Eja,
+                    "",
+                    json!({
+                        "choices": [
+                            {"label": "the earlier bug", "value": {"task": 3}},
+                            {"label": "the open review", "value": {"task": 7}}
+                        ]
+                    }),
+                ),
+            ],
+            error: None,
+            torn: false,
+        };
+        let state = state_json(&journal, &health(), false, None);
+        assert_eq!(state["presence"]["text"], "");
+        assert_eq!(state["presence"]["data"]["choices"][1]["value"]["task"], 7);
+    }
+
+    #[test]
+    fn choice_questions_and_answers_reach_the_view_unchanged() {
+        let journal = Journal {
+            events: vec![
+                event(1, 1, "eja", Kind::User, "open the bug", json!({})),
+                event(
+                    2,
+                    1,
+                    "eja",
+                    Kind::Eja,
+                    "which one?",
+                    json!({
+                        "choices": [
+                            {"label": "the earlier bug", "value": {"task": 3}},
+                            {"label": "the open review", "value": {"task": 7}}
+                        ]
+                    }),
+                ),
+                event(
+                    3,
+                    2,
+                    "eja",
+                    Kind::User,
+                    "the open review",
+                    json!({"choice": {"question": 2, "option": 1, "value": {"task": 7}}}),
+                ),
+            ],
+            error: None,
+            torn: false,
+        };
+        let state = state_json(
+            &journal,
+            &health(),
+            false,
+            Some(Encounter {
+                anchor: 0,
+                task: None,
+                proposal: None,
+            }),
+        );
+        let spoken = state["spoken"].as_array().unwrap();
+        assert_eq!(spoken[1]["data"]["choices"][1]["label"], "the open review");
+        assert_eq!(spoken[2]["text"], "the open review");
+        assert_eq!(spoken[2]["data"]["choice"]["value"]["task"], 7);
     }
 
     #[test]

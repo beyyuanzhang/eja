@@ -92,6 +92,7 @@ struct TaskSheet: View {
                 .padding(22)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .scrollIndicators(.never)
             footer
         }
         .frame(width: 540, height: 640)

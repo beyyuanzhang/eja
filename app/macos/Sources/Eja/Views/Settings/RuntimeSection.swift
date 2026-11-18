@@ -10,77 +10,71 @@ struct RuntimeSection: View {
     @State private var ajaTimeoutText = "0"
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 8) {
-                SettingsFieldLabel(text: "连接")
-                VStack(alignment: .leading, spacing: 8) {
+        SettingsPage {
+            SettingsGroup("连接") {
+                SettingsRow("地址") {
                     TextField("http://127.0.0.1:8787", text: baseURLBinding)
-                        .textFieldStyle(.plain)
+                        .textFieldStyle(.roundedBorder)
                         .font(Theme.mono(11.5))
-                        .foregroundStyle(Theme.ink)
-                        .padding(.horizontal, 8)
-                        .frame(height: 28)
-                        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 7))
-                        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.line))
-                    Text("指向本地 eja 运行时的 HTTP 地址，默认 http://127.0.0.1:8787。")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.muted)
+                        .multilineTextAlignment(.leading)
+                        .labelsHidden()
+                        .frame(width: 340)
                 }
-                .card()
             }
-            VStack(alignment: .leading, spacing: 8) {
-                SettingsFieldLabel(text: "限额")
-                VStack(alignment: .leading, spacing: 10) {
+
+            SettingsGroup("限额") {
+                VStack(spacing: 0) {
                     limitRow("并行槽位", text: $slotsText, hint: "1–8") { parsed in
                         model.limits.slots = min(max(parsed, 1), 8)
                     }
-                    Divider().overlay(Theme.line)
+                    SettingsRule()
                     limitRow("回合超时", text: $turnTimeoutText, hint: "ms · 0 = 默认") { parsed in
                         model.limits.turnTimeoutMs = max(parsed, 0)
                     }
-                    Divider().overlay(Theme.line)
+                    SettingsRule()
                     limitRow("AJA 步数", text: $ajaStepsText, hint: "0 = 默认") { parsed in
                         model.limits.ajaSteps = max(parsed, 0)
                     }
-                    Divider().overlay(Theme.line)
+                    SettingsRule()
                     limitRow("AJA 超时", text: $ajaTimeoutText, hint: "ms · 0 = 默认") { parsed in
                         model.limits.ajaTimeoutMs = max(parsed, 0)
                     }
                 }
-                .card()
             }
-            VStack(alignment: .leading, spacing: 8) {
-                SettingsFieldLabel(text: "路径")
+
+            SettingsGroup("路径") {
                 VStack(spacing: 0) {
                     pathRow("runtime", value: model.view?.runtimePath ?? "")
-                    Divider().overlay(Theme.line)
+                    SettingsRule()
                     pathRow("state", value: model.view?.stateDir ?? "")
-                    Divider().overlay(Theme.line)
+                    SettingsRule()
                     pathRow("project", value: model.view?.projectDir ?? "")
                     if let configPath = model.view?.connectors.configPath, !configPath.isEmpty {
-                        Divider().overlay(Theme.line)
+                        SettingsRule()
                         pathRow("mcp", value: configPath)
                     }
-                }
-                .card(padding: 6)
-                if let view = model.view {
-                    if view.connectors.managed {
-                        Text("连接器由应用托管，保存后写入上方 mcp 配置。")
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.muted)
-                    } else {
-                        Text("连接器尚未托管：保存一次设置后由应用接管。")
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.amber)
+                    if let view = model.view,
+                       !view.connectors.managed || !(view.connectors.error ?? "").isEmpty {
+                        SettingsRule()
                     }
-                    if let error = view.connectors.error, !error.isEmpty {
-                        Text(error)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.danger)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                            .background(Theme.dangerWash, in: RoundedRectangle(cornerRadius: 9))
-                            .textSelection(.enabled)
+                    if let view = model.view {
+                        if !view.connectors.managed {
+                            Text("连接器尚未托管：保存一次设置后由应用接管。")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.amber)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 11)
+                        }
+                        if let error = view.connectors.error, !error.isEmpty {
+                            Label(error, systemImage: "exclamationmark.triangle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.danger)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 11)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
             }
@@ -109,24 +103,13 @@ struct RuntimeSection: View {
         hint: String,
         apply: @escaping (Int) -> Void
     ) -> some View {
-        HStack(spacing: 8) {
-            Text(label)
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.inkSoft)
-            Spacer()
-            Text(hint)
-                .font(.system(size: 10.5))
-                .foregroundStyle(Theme.faint)
+        SettingsRow(label, note: hint) {
             TextField("0", text: text)
-                .textFieldStyle(.plain)
+                .textFieldStyle(.roundedBorder)
                 .font(Theme.mono(11.5))
-                .foregroundStyle(Theme.ink)
                 .multilineTextAlignment(.trailing)
                 .frame(width: 96)
-                .padding(.horizontal, 8)
-                .frame(height: 26)
-                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 7))
-                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.line))
+                .labelsHidden()
                 .onChange(of: text.wrappedValue) { _, next in
                     if let parsed = Int(next.trimmingCharacters(in: .whitespaces)), parsed >= 0 {
                         apply(parsed)
@@ -151,8 +134,8 @@ struct RuntimeSection: View {
                 .textSelection(.enabled)
             CopyPathButton(value: value)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
     }
 }
 
@@ -175,7 +158,7 @@ private struct CopyPathButton: View {
                 .foregroundStyle(copied ? Theme.accent : Theme.faint)
                 .frame(width: 24, height: 24)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
         .disabled(value.isEmpty)
         .help("复制路径")
     }

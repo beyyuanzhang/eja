@@ -108,6 +108,7 @@ fn a_situation_opens_a_turn_and_silence_is_whole() {
     ] {
         let brain = Script::new(vec![Decision {
             reply: String::new(),
+            choices: Vec::new(),
             actions: Vec::new(),
             refused: Vec::new(),
         }]);
@@ -519,6 +520,7 @@ fn a_turn_that_asks_delivers_no_reply() {
             }]),
             Decision {
                 reply: String::new(),
+                choices: Vec::new(),
                 actions: vec![],
                 refused: vec![],
             },
@@ -626,6 +628,7 @@ fn a_correction_asks_nothing_and_withdraws_on_the_next_turn() {
         }]),
         Decision {
             reply: "then I will not ask again".to_string(),
+            choices: Vec::new(),
             actions: vec![],
             refused: vec![],
         },

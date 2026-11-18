@@ -270,6 +270,17 @@ pub struct Assignment {
     pub issued_at: i64,
 }
 
+/// One workspace available to a turn.
+///
+/// `id` is the stable reference EJA may name in an action; `label` is display
+/// only. `root` is the exact directory the host makes available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceGrant {
+    pub id: String,
+    pub label: String,
+    pub root: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskOpen<'a> {
     #[serde(default)]
@@ -278,7 +289,7 @@ pub struct TaskOpen<'a> {
     pub(crate) request: &'a str,
     pub(crate) origin: &'a str,
     pub(crate) acceptance: &'a str,
-    /// The granted workspace this task belongs to; empty means the default.
+    /// The available workspace id this task names; empty means the default.
     #[serde(default, skip_serializing_if = "str::is_empty")]
     pub(crate) workspace: &'a str,
     /// A host-interpreted request for acceptance evidence. A judgment counts only
@@ -303,7 +314,7 @@ pub struct Task {
     pub request: String,
     pub origin: String,
     pub acceptance: String,
-    /// The granted workspace root, fixed when the task was opened.
+    /// The available workspace root, fixed when the task was opened.
     pub workspace: String,
     pub status: TaskStatus,
     pub created_at: i64,
@@ -379,8 +390,8 @@ impl Task {
 pub struct EjaContext<'a> {
     pub now: i64,
     pub input: &'a str,
-    /// The workspaces the host grants: (name, root). The first is the default.
-    pub workspaces: &'a [(String, String)],
+    /// The workspaces the host grants. The first is the default.
+    pub workspaces: &'a [WorkspaceGrant],
     pub history: Vec<&'a Event>,
     /// What EJA chose to remember: its open inner records, newest first.
     pub notes: Vec<&'a Event>,
@@ -417,12 +428,31 @@ impl EjaContext<'_> {
 pub struct Decision {
     #[serde(default)]
     pub reply: String,
+    /// Alternatives EJA offers when the user's meaning is not unique. A label
+    /// is what the user sees; the value is the exact fact their choice returns.
+    #[serde(default)]
+    pub choices: Vec<Choice>,
     #[serde(default)]
     pub actions: Vec<Action>,
     /// Actions the decision named that could not be read. The turn records them
     /// as host notes; they are never dropped silently.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub refused: Vec<String>,
+}
+
+/// One answer EJA may offer for precise context alignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    pub label: String,
+    pub value: Value,
+}
+
+/// The user's answer to one recorded choice question. `question` is the Eja
+/// event that carried the choices and `option` is its zero-based position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoiceSelection {
+    pub question: u64,
+    pub option: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,7 +494,7 @@ pub enum Action {
         title: String,
         request: String,
         acceptance: String,
-        /// A granted workspace name; omitted means the default workspace.
+        /// An available workspace id; omitted means the default workspace.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace: Option<String>,
         /// What the host must observe before the task can be judged.
@@ -691,13 +721,16 @@ pub struct TurnOptions {
     pub approvals: Vec<u64>,
     /// The user's declines, supplied by the host like approvals.
     pub denials: Vec<u64>,
+    /// The user's answer to a question EJA asked earlier. This is alignment,
+    /// not approval: its exact value becomes this turn's user input.
+    pub selection: Option<ChoiceSelection>,
     pub focus: Option<TaskId>,
     /// One host situation fact opening this turn: `Returned`, `Departed` or
     /// `Alone`. The host validates the variant; nothing else may enter here.
     pub gesture: Option<Kind>,
-    /// The workspaces the host grants this turn: (name, root), default first.
-    /// A task may only name one of these; the fold stores the resolved root.
-    pub workspaces: Vec<(String, String)>,
+    /// The workspaces available to this turn, default first. A task may only
+    /// name one of these IDs; the fold stores the resolved root.
+    pub workspaces: Vec<WorkspaceGrant>,
     pub limits: TurnLimits,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }

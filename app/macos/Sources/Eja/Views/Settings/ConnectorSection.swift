@@ -5,51 +5,69 @@ struct ConnectorSection: View {
     @Bindable var model: SettingsModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        SettingsPage {
             if let error = model.view?.connectors.error, !error.isEmpty {
-                Text(error)
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(Theme.danger)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                    .background(Theme.dangerWash, in: RoundedRectangle(cornerRadius: 9))
-            }
-            HStack(spacing: 10) {
-                Image(systemName: "folder")
-                    .font(.system(size: 13))
-                    .foregroundStyle(Theme.accent)
-                    .frame(width: 26, height: 26)
-                    .background(Theme.accentWash, in: RoundedRectangle(cornerRadius: 8))
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("workspace")
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(Theme.ink)
-                    Text("内置工作区工具")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.muted)
-                }
-                Spacer()
-                Toggle("", isOn: $model.workspaceTools)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .tint(Theme.accent)
-                    .onChange(of: model.workspaceTools) { _, _ in model.markDirty() }
-            }
-            .card(padding: 12)
-            ForEach($model.connectors) { $connector in
-                ConnectorCard(app: app, connector: $connector) {
-                    model.connectors.removeAll { $0.id == connector.id }
-                    model.markDirty()
-                } onChanged: {
-                    model.markDirty()
+                SettingsGroup("连接器") {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Theme.danger)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                        .textSelection(.enabled)
                 }
             }
-            SettingsAddButton(title: "添加连接器") {
-                model.connectors.append(ConnectorDraft())
-                model.markDirty()
+
+            SettingsGroup("内置") {
+                SettingsRow("workspace") {
+                    Toggle("", isOn: $model.workspaceTools)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .tint(Theme.accent)
+                        .onChange(of: model.workspaceTools) { _, _ in model.markDirty() }
+                }
+            }
+
+            SettingsGroup("MCP") {
+                if model.connectors.isEmpty {
+                    SettingsAddButton(title: "添加连接器") {
+                        model.addConnector()
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 20)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(model.connectors.enumerated()), id: \.element.id) { index, connector in
+                            if index > 0 {
+                                SettingsRule()
+                            }
+                            ConnectorCard(app: app, connector: connectorBinding(for: connector)) {
+                                model.removeConnector(id: connector.id)
+                            } onChanged: {
+                                model.markDirty()
+                            }
+                        }
+                        SettingsRule()
+                        SettingsAddButton(title: "添加连接器") {
+                            model.addConnector()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 11)
+                    }
+                }
             }
         }
+    }
+
+    private func connectorBinding(for connector: ConnectorDraft) -> Binding<ConnectorDraft> {
+        Binding(
+            get: { model.connectors.first(where: { $0.id == connector.id }) ?? connector },
+            set: { next in
+                guard let index = model.connectors.firstIndex(where: { $0.id == connector.id }) else { return }
+                model.connectors[index] = next
+                model.markDirty()
+            }
+        )
     }
 }
 
@@ -64,9 +82,133 @@ private struct ConnectorCard: View {
     @State private var testFailed = false
     @State private var testStderr = ""
     @State private var testTools: [ConnectorTool] = []
+    @State private var expanded = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: 12) {
+                Picker("模式", selection: $connector.mode) {
+                    Text("本地命令").tag("command")
+                    Text("远程 URL").tag("url")
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: connector.mode) { _, _ in draftChanged() }
+                if connector.mode == "url" {
+                    field("URL") {
+                        TextField("https://service.example/mcp", text: $connector.url)
+                            .textFieldStyle(.roundedBorder)
+                            .font(Theme.mono(11.5))
+                            .multilineTextAlignment(.leading)
+                            .labelsHidden()
+                            .onChange(of: connector.url) { _, _ in draftChanged() }
+                    }
+                    DisclosureGroup("Headers") {
+                        KeyValueRowsEditor(rows: $connector.headers, kind: .headers, onChanged: draftChanged)
+                            .padding(.vertical, 6)
+                    }
+                } else {
+                    field("命令") {
+                        TextField("/usr/local/bin/my-mcp-server", text: $connector.command)
+                            .textFieldStyle(.roundedBorder)
+                            .font(Theme.mono(11.5))
+                            .multilineTextAlignment(.leading)
+                            .labelsHidden()
+                            .onChange(of: connector.command) { _, _ in draftChanged() }
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        SettingsFieldLabel(text: "参数")
+                        ForEach(Array(connector.args.enumerated()), id: \.offset) { index, _ in
+                            HStack(spacing: 6) {
+                                TextField("--stdio", text: argRow(index))
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(Theme.mono(11))
+                                    .multilineTextAlignment(.leading)
+                                    .labelsHidden()
+                                    .onChange(of: connector.args[index]) { _, _ in draftChanged() }
+                                SettingsDeleteButton {
+                                    guard connector.args.indices.contains(index) else { return }
+                                    connector.args.remove(at: index)
+                                    draftChanged()
+                                }
+                            }
+                        }
+                        SettingsAddButton(title: "添加参数") {
+                            connector.args.append("")
+                            draftChanged()
+                        }
+                    }
+                    field("工作目录") {
+                        TextField("默认项目目录", text: $connector.cwd)
+                            .textFieldStyle(.roundedBorder)
+                            .font(Theme.mono(11.5))
+                            .multilineTextAlignment(.leading)
+                            .labelsHidden()
+                            .onChange(of: connector.cwd) { _, _ in draftChanged() }
+                    }
+                    DisclosureGroup("环境变量") {
+                        KeyValueRowsEditor(rows: $connector.env, kind: .env, onChanged: draftChanged)
+                            .padding(.vertical, 6)
+                    }
+                }
+                LabeledContent("超时 (ms)") {
+                    HStack(spacing: 8) {
+                        TextField("30000", text: $timeoutText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(Theme.mono(11.5))
+                            .frame(width: 100)
+                            .labelsHidden()
+                            .onChange(of: timeoutText) { _, next in
+                                if let parsed = Int(next.trimmingCharacters(in: .whitespaces)), parsed >= 0 {
+                                    connector.timeoutMs = parsed
+                                    draftChanged()
+                                }
+                            }
+                        Button {
+                            test()
+                        } label: {
+                            HStack(spacing: 5) {
+                                if testing {
+                                    ProgressView().controlSize(.mini)
+                                } else {
+                                    Image(systemName: "bolt.horizontal")
+                                        .font(.system(size: 10.5, weight: .semibold))
+                                }
+                                Text("测试连接")
+                                    .font(.system(size: 11.5))
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Theme.accent)
+                        .disabled(testing)
+                    }
+                }
+                if !testMessage.isEmpty {
+                    Text(testMessage)
+                        .font(.system(size: 11))
+                        .foregroundStyle(testFailed ? Theme.danger : Theme.accent)
+                        .textSelection(.enabled)
+                }
+                if !testTools.isEmpty {
+                    Text(testTools.map { $0.publicName.isEmpty ? $0.name : $0.publicName }.joined(separator: " · "))
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.muted)
+                        .textSelection(.enabled)
+                }
+                if !testStderr.isEmpty {
+                    ScrollView {
+                        Text(testStderr)
+                            .font(Theme.mono(10))
+                            .foregroundStyle(Theme.muted)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 72)
+                    .padding(8)
+                    .background(Theme.surface2, in: RoundedRectangle(cornerRadius: 7))
+                }
+            }
+            .padding(.top, 5)
+        } label: {
             HStack(spacing: 8) {
                 Image(systemName: connector.mode == "url" ? "globe" : "terminal")
                     .font(.system(size: 12))
@@ -77,6 +219,8 @@ private struct ConnectorCard: View {
                     .textFieldStyle(.plain)
                     .font(Theme.mono(12.5))
                     .foregroundStyle(Theme.ink)
+                    .multilineTextAlignment(.leading)
+                    .labelsHidden()
                     .onChange(of: connector.name) { _, _ in draftChanged() }
                 Toggle("", isOn: $connector.enabled)
                     .labelsHidden()
@@ -86,135 +230,9 @@ private struct ConnectorCard: View {
                     .onChange(of: connector.enabled) { _, _ in draftChanged() }
                 SettingsDeleteButton(action: onDelete)
             }
-            Picker("", selection: $connector.mode) {
-                Text("本地命令").tag("command")
-                Text("远程 URL").tag("url")
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .onChange(of: connector.mode) { _, _ in draftChanged() }
-            if connector.mode == "url" {
-                field("URL") {
-                    TextField("https://service.example/mcp", text: $connector.url)
-                        .textFieldStyle(.plain)
-                        .font(Theme.mono(11.5))
-                        .foregroundStyle(Theme.ink)
-                        .onChange(of: connector.url) { _, _ in draftChanged() }
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    SettingsFieldLabel(text: "HEADERS")
-                    KeyValueRowsEditor(rows: $connector.headers, kind: .headers, onChanged: draftChanged)
-                }
-            } else {
-                field("命令") {
-                    TextField("/usr/local/bin/my-mcp-server", text: $connector.command)
-                        .textFieldStyle(.plain)
-                        .font(Theme.mono(11.5))
-                        .foregroundStyle(Theme.ink)
-                        .onChange(of: connector.command) { _, _ in draftChanged() }
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    SettingsFieldLabel(text: "参数")
-                    ForEach(Array(connector.args.enumerated()), id: \.offset) { index, _ in
-                        HStack(spacing: 6) {
-                            TextField("--stdio", text: argRow(index))
-                                .textFieldStyle(.plain)
-                                .font(Theme.mono(11))
-                                .foregroundStyle(Theme.ink)
-                                .padding(.horizontal, 8)
-                                .frame(height: 28)
-                                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 7))
-                                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.line))
-                                .onChange(of: connector.args[index]) { _, _ in draftChanged() }
-                            SettingsDeleteButton {
-                                guard connector.args.indices.contains(index) else { return }
-                                connector.args.remove(at: index)
-                                draftChanged()
-                            }
-                        }
-                    }
-                    SettingsAddButton(title: "添加参数") {
-                        connector.args.append("")
-                        draftChanged()
-                    }
-                }
-                field("工作目录") {
-                    TextField("默认项目目录", text: $connector.cwd)
-                        .textFieldStyle(.plain)
-                        .font(Theme.mono(11.5))
-                        .foregroundStyle(Theme.ink)
-                        .onChange(of: connector.cwd) { _, _ in draftChanged() }
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    SettingsFieldLabel(text: "环境变量")
-                    KeyValueRowsEditor(rows: $connector.env, kind: .env, onChanged: draftChanged)
-                }
-            }
-            HStack(spacing: 8) {
-                SettingsFieldLabel(text: "超时 (ms)")
-                TextField("30000", text: $timeoutText)
-                    .textFieldStyle(.plain)
-                    .font(Theme.mono(11.5))
-                    .foregroundStyle(Theme.ink)
-                    .frame(width: 90)
-                    .padding(.horizontal, 8)
-                    .frame(height: 26)
-                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: 7))
-                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.line))
-                    .onChange(of: timeoutText) { _, next in
-                        if let parsed = Int(next.trimmingCharacters(in: .whitespaces)), parsed >= 0 {
-                            connector.timeoutMs = parsed
-                            draftChanged()
-                        }
-                    }
-                Spacer()
-                Button {
-                    test()
-                } label: {
-                    HStack(spacing: 5) {
-                        if testing {
-                            ProgressView().controlSize(.mini)
-                        } else {
-                            Image(systemName: "bolt.horizontal")
-                                .font(.system(size: 10.5, weight: .semibold))
-                        }
-                        Text("测试连接")
-                            .font(.system(size: 11.5))
-                    }
-                    .foregroundStyle(Theme.accent)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(Theme.accentWash, in: RoundedRectangle(cornerRadius: 7))
-                }
-                .buttonStyle(.plain)
-                .disabled(testing)
-            }
-            if !testMessage.isEmpty {
-                Text(testMessage)
-                    .font(.system(size: 11))
-                    .foregroundStyle(testFailed ? Theme.danger : Theme.accent)
-                    .textSelection(.enabled)
-            }
-            if !testTools.isEmpty {
-                Text(testTools.map { $0.publicName.isEmpty ? $0.name : $0.publicName }.joined(separator: " · "))
-                    .font(Theme.mono(10))
-                    .foregroundStyle(Theme.muted)
-                    .textSelection(.enabled)
-            }
-            if !testStderr.isEmpty {
-                ScrollView {
-                    Text(testStderr)
-                        .font(Theme.mono(10))
-                        .foregroundStyle(Theme.muted)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-                .frame(maxHeight: 72)
-                .padding(8)
-                .background(Theme.surface2, in: RoundedRectangle(cornerRadius: 7))
-            }
         }
-        .card()
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
         .opacity(connector.enabled ? 1 : 0.72)
         .onAppear { timeoutText = String(connector.timeoutMs) }
     }
@@ -223,10 +241,6 @@ private struct ConnectorCard: View {
         VStack(alignment: .leading, spacing: 5) {
             SettingsFieldLabel(text: label)
             content()
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 7))
-                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.line))
         }
     }
 

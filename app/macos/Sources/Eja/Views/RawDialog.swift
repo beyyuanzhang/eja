@@ -52,6 +52,7 @@ struct RawDialog: View {
                     .padding(16)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .scrollIndicators(.never)
 
             if record.truncated == true {
                 Text("内容过大，已截断\(record.bytes.map { "（共 \($0) 字节）" } ?? "")。")

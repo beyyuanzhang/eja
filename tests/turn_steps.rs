@@ -5,8 +5,8 @@ mod support;
 
 use eja::adapters::{Ports, RecordReader};
 use eja::{
-    Action, Assignment, Brain, Decision, EjaContext, Kind, ProposalKind, Selector, Store,
-    TaskStatus, TurnOutcome, Worker,
+    Action, Assignment, Brain, Choice, ChoiceSelection, Decision, EjaContext, Kind, ProposalKind,
+    Selector, Store, TaskStatus, TurnOptions, TurnOutcome, Worker,
 };
 use std::sync::Mutex;
 use support::{aja, decision, task, Done, Script, Seen, State};
@@ -103,6 +103,7 @@ fn close(task_id: u64) -> Action {
 fn answer(reply: &str, actions: Vec<Action>) -> Decision {
     Decision {
         reply: reply.into(),
+        choices: Vec::new(),
         actions,
         refused: Vec::new(),
     }
@@ -345,4 +346,142 @@ fn a_stalled_turn_keeps_its_report_and_never_redispatches_after_restart() {
     assert_eq!(brain.seen()[0].focus.unwrap(), 1);
     assert_eq!(worker.0.lock().unwrap().len(), 1);
     assert!(resumed.dispatched.is_empty());
+}
+
+#[test]
+fn a_choice_is_answered_once_with_its_exact_value() {
+    let state = State::new("steps-choice");
+    let store = state.store();
+    let first = Rendered::new(vec![Decision {
+        reply: "which one?".into(),
+        choices: vec![
+            Choice {
+                label: "the earlier bug".into(),
+                value: serde_json::json!({"task": 3}),
+            },
+            Choice {
+                label: "the open review".into(),
+                value: serde_json::json!({"task": 7}),
+            },
+        ],
+        actions: Vec::new(),
+        refused: Vec::new(),
+    }]);
+    let opened = reading(&store, "open the settings bug", &first, &Done::default());
+    assert_eq!(opened.reply, "which one?");
+    let question = state
+        .events()
+        .into_iter()
+        .find(|event| event.kind == Kind::Eja && event.text == "which one?")
+        .expect("question");
+
+    let second = Rendered::new(vec![Decision {
+        reply: "picked".into(),
+        choices: Vec::new(),
+        actions: Vec::new(),
+        refused: Vec::new(),
+    }]);
+    let selected = eja::turn_at_with_options(
+        &store,
+        "",
+        &second,
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            selection: Some(ChoiceSelection {
+                question: question.id,
+                option: 1,
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("selection");
+
+    assert_eq!(selected.reply, "picked");
+    let views = second.views.lock().unwrap();
+    assert!(views[0].contains("the open review"));
+    assert!(views[0].contains("{\"task\":7}"));
+    drop(views);
+
+    let events = state.events();
+    let answer = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == Kind::User)
+        .expect("answer");
+    assert_eq!(answer.text, "the open review");
+    assert_eq!(answer.data.as_ref().unwrap()["choice"]["value"]["task"], 7);
+
+    let duplicate = eja::turn_at_with_options(
+        &store,
+        "",
+        &Script::new(Vec::new()),
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            selection: Some(ChoiceSelection {
+                question: question.id,
+                option: 0,
+            }),
+            ..Default::default()
+        },
+    );
+    assert!(duplicate.is_err());
+}
+
+#[test]
+fn a_choice_question_accepts_a_free_form_answer() {
+    let state = State::new("steps-choice-free-form");
+    let store = state.store();
+    let first = Rendered::new(vec![Decision {
+        reply: "which one?".into(),
+        choices: vec![
+            Choice {
+                label: "the earlier bug".into(),
+                value: serde_json::json!({"task": 3}),
+            },
+            Choice {
+                label: "the open review".into(),
+                value: serde_json::json!({"task": 7}),
+            },
+        ],
+        actions: Vec::new(),
+        refused: Vec::new(),
+    }]);
+    reading(
+        &store,
+        "look at the thing we discussed",
+        &first,
+        &Done::default(),
+    );
+
+    let second = Rendered::new(vec![Decision {
+        reply: "understood".into(),
+        choices: Vec::new(),
+        actions: Vec::new(),
+        refused: Vec::new(),
+    }]);
+    let answered = reading(
+        &store,
+        "I meant the open review, not the earlier bug",
+        &second,
+        &Done::default(),
+    );
+
+    assert_eq!(answered.reply, "understood");
+    let views = second.views.lock().unwrap();
+    assert!(views[0].contains("I meant the open review, not the earlier bug"));
+    assert!(views[0].contains("option 0: the earlier bug -> {\"task\":3}"));
+    assert!(views[0].contains("option 1: the open review -> {\"task\":7}"));
+    drop(views);
+
+    let answer = state
+        .events()
+        .into_iter()
+        .rfind(|event| event.kind == Kind::User)
+        .expect("answer");
+    assert_eq!(answer.text, "I meant the open review, not the earlier bug");
+    assert!(answer.data.is_none());
 }

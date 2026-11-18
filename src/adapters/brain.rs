@@ -1,7 +1,8 @@
 //! EJA's model transport: one bounded projection in, one typed decision out.
 use crate::fold;
 use crate::{
-    format_utc, Action, Brain, Decision, EjaContext, Kind, Observation, ObservationKind, Selector,
+    format_utc, Action, Brain, Choice, Decision, EjaContext, Kind, Observation, ObservationKind,
+    Selector,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -37,7 +38,7 @@ fn task_address(id: u64) -> String {
 }
 
 pub const SYSTEM_PROMPT: &str = "\
-Return ONE JSON object: {\"reply\":\"...\",\"actions\":[...]}. \
+Return ONE JSON object: {\"reply\":\"...\",\"choices\":[...],\"actions\":[...]}. \
 A decision cannot execute anything: the host validates every action, records it, and \
 runs the executions. Actions run in their listed order. Creating a aja, group or \
 proposal returns its allocated id in the next projection and continues this turn; \
@@ -90,9 +91,20 @@ without the host's observation an acceptance is undecidable, not failed, and a \
 rejection needs no evidence. A run that left an isolated world can be reconciled \
 explicitly; the outcome, conflicts included, is recorded evidence. \
 Tasks are execution ajas; open_group creates a non-executable container. \
-WORKSPACES lists the roots the host grants, default first; open_task may carry \
-\"workspace\":\"<name>\" to fix where its runs write, and omits it for the default. \
-The name is resolved once, when the task opens; the task then states its root. \
+WORKSPACES lists the workspace ids the host grants, default first. The id is the \
+stable target; the label is only a display name. open_task may carry \
+\"workspace\":\"<id>\" to fix where its runs write, and omits it for the default. \
+The id is resolved once, when the task opens; the task then states its root. \
+An omitted workspace uses the first one. Use another only when the request \
+clearly identifies it, and never move an already-open task to a different root. \
+When the user's meaning is not unique and the difference matters, do not guess. \
+You may answer with choices: [{label, value}, ...]. The label is shown to the user; \
+the value is the exact reference returned when they choose it. A choice is an \
+alignment answer, not a proposal and not an approval. When the user selects one, \
+that turn's INPUT names the label and carries the exact value. Use choices only \
+when several real candidates fit; otherwise act directly or ask in ordinary prose. \
+Choices are an optional shortcut, never a required answer: the user may always \
+reply in their own words. The recorded choices remain visible in later context. \
 Dispatches in one decision run in action order; the host may run them at once when \
 it has isolated worlds. A continuation is a new task related to the previous one \
 with {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
@@ -104,7 +116,7 @@ Action shapes: \
 {\"op\":\"note\",\"text\":\"...\",\"closes\":1}; \
 {\"op\":\"open_group\",\"title\":\"...\",\"acceptance\":\"...\"}; \
 {\"op\":\"open_task\",\"title\":\"...\",\"request\":\"...\",\"acceptance\":\"...\",\
-\"workspace\":\"<name>\",\"evidence\":{\"tool\":\"<host tool>\",\"arguments\":{}},\"run\":true}; \
+\"workspace\":\"<id>\",\"evidence\":{\"tool\":\"<host tool>\",\"arguments\":{}},\"run\":true}; \
 {\"op\":\"reconcile\",\"task_id\":1}; \
 {\"op\":\"dispatch\",\"task_id\":1}; \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
@@ -113,6 +125,9 @@ Action shapes: \
 {\"op\":\"look\",\"target\":\"world:src/main.rs\"}; \
 {\"op\":\"look\",\"target\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}; \
 {\"op\":\"look\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
+Choice shape: {\"reply\":\"which one?\",\"choices\":[{\"label\":\"the earlier bug\",\
+\"value\":{\"task\":3}},{\"label\":\"the open review\",\
+\"value\":{\"task\":7}}],\"actions\":[]}. \
 Preconditions: dispatch runs only a task in open state; a task that has a aja \
 record is waiting for judgment, so close it or open a new task for more work. \
 close_task requires a waiting aja, an open aja being cancelled, a group whose \
@@ -529,16 +544,39 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
                 } else {
                     label(event.kind)
                 };
-                addressed(
-                    event_address(event.id),
-                    vec![format!(
-                        "  #{} [{}] {}: {}",
-                        event.id,
-                        tag,
-                        format_utc(event.at),
-                        event.text
-                    )],
-                )
+                let mut lines = vec![format!(
+                    "  #{} [{}] {}: {}",
+                    event.id,
+                    tag,
+                    format_utc(event.at),
+                    event.text
+                )];
+                if let Some(choices) = event
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("choices"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for (index, choice) in choices.iter().enumerate() {
+                        let Some(label) = choice.get("label").and_then(serde_json::Value::as_str)
+                        else {
+                            continue;
+                        };
+                        let Some(value) = choice.get("value") else {
+                            continue;
+                        };
+                        lines.push(format!("  option {index}: {label} -> {value}"));
+                    }
+                }
+                if let Some(value) = event
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("choice"))
+                    .and_then(|choice| choice.get("value"))
+                {
+                    lines.push(format!("  reference: {value}"));
+                }
+                addressed(event_address(event.id), lines)
             })
             .collect(),
     ));
@@ -580,7 +618,12 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
         context
             .workspaces
             .iter()
-            .map(|(name, root)| plain(vec![format!("  {name} -> {root}")]))
+            .map(|workspace| {
+                plain(vec![format!(
+                    "  {} [{}] -> {}",
+                    workspace.id, workspace.label, workspace.root
+                )])
+            })
             .collect(),
     ));
     sections.push(section(
@@ -708,6 +751,7 @@ pub fn parse_decision(raw: &str) -> Decision {
         // Not a decision object: a plain reply is a legitimate answer.
         return Decision {
             reply: trimmed.to_string(),
+            choices: Vec::new(),
             actions: Vec::new(),
             refused: Vec::new(),
         };
@@ -715,6 +759,7 @@ pub fn parse_decision(raw: &str) -> Decision {
     if !value.is_object() {
         return Decision {
             reply: trimmed.to_string(),
+            choices: Vec::new(),
             actions: Vec::new(),
             refused: Vec::new(),
         };
@@ -724,8 +769,25 @@ pub fn parse_decision(raw: &str) -> Decision {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let mut actions = Vec::new();
+    let mut choices = Vec::new();
     let mut notes = Vec::new();
+    match value.get("choices").map(serde_json::Value::as_array) {
+        Some(Some(list)) => {
+            for item in list {
+                match Choice::deserialize(item) {
+                    Ok(mut choice) if !choice.label.trim().is_empty() => {
+                        choice.label = choice.label.trim().to_string();
+                        choices.push(choice);
+                    }
+                    Ok(_) => notes.push(format!("choice label is empty: {item}")),
+                    Err(error) => notes.push(format!("{error}: {item}")),
+                }
+            }
+        }
+        Some(None) => notes.push("choices was not a list".to_string()),
+        None => {}
+    }
+    let mut actions = Vec::new();
     match value.get("actions").map(|actions| actions.as_array()) {
         Some(Some(list)) => {
             // One unreadable action does not discard the rest of the decision:
@@ -742,6 +804,7 @@ pub fn parse_decision(raw: &str) -> Decision {
     }
     Decision {
         reply,
+        choices,
         actions,
         refused: notes,
     }
@@ -817,6 +880,7 @@ impl Brain for OpenAiBrain {
             ),
             Err(error) => Decision {
                 reply: format!("[EJA model error] {error}"),
+                choices: vec![],
                 actions: vec![],
                 refused: Vec::new(),
             },

@@ -31,10 +31,11 @@ Response:
 ```
 
 `presence` is eja's own reply to the latest return, or `null` when it chose not
-to speak or the user has since left. `spoken` is the encounter's exchange: what
-was said since `anchor`, without eja's inner monologue (an eja message appears
-only when the user was present in its turn). `lastEvent` is the bookmark a view
-uses to open an encounter.
+to speak or the user has since left. A reply may be silent text plus optional
+`choices`; choices are shortcuts, never a required answer. `spoken` is the
+encounter's exchange: what was said since `anchor`, without eja's inner
+monologue (an eja message appears only when the user was present in its turn).
+`lastEvent` is the bookmark a view uses to open an encounter.
 
 A `Loop` is one thing that still asks for the user:
 
@@ -51,11 +52,30 @@ A `Loop` is one thing that still asks for the user:
 ## POST /api/turn
 
 ```json
-{ "text": "...", "focus": 7, "approvals": [], "denials": [], "gesture": "return" }
+{
+  "text": "...",
+  "focus": 7,
+  "approvals": [],
+  "denials": [],
+  "gesture": "return"
+}
 ```
 
 `gesture` is `return`, `leave` or `alone`, and stands alone (no text). A turn
 with text opens/continues an encounter; `focus` names the task under discussion.
+Text remains a valid answer to any question, including a free-form answer such
+as "the second one".
+
+A button answer uses the question's recorded option instead:
+
+```json
+{ "selection": { "question": 12, "option": 0 } }
+```
+
+`selection` answers one choice question recorded in eja's `data.choices`; it
+stands alone against text, approvals, denials and gestures. The runtime resolves
+`option` against the recorded question, so a client cannot substitute its own
+value. The answer becomes an ordinary user event carrying the exact value.
 Response: `{ "ok": true, "reply": "..." }`, or `{ "ok": false, "error": "..." }`.
 
 ## GET /api/settings, POST /api/settings

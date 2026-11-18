@@ -17,18 +17,11 @@ struct SettingsAddButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: "plus")
-                    .font(.system(size: 10, weight: .semibold))
-                Text(title)
-                    .font(.system(size: 11.5))
-            }
-            .foregroundStyle(Theme.muted)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(Theme.surface2, in: RoundedRectangle(cornerRadius: 7))
+            Label(title, systemImage: "plus")
+                .font(.system(size: 11.5))
+                .foregroundStyle(Theme.accent)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
     }
 }
 
@@ -48,9 +41,8 @@ struct SettingsDeleteButton: View {
                 .font(.system(size: 11.5))
                 .foregroundStyle(armed ? Theme.danger : Theme.faint)
                 .frame(width: 24, height: 24)
-                .background(armed ? Theme.dangerWash : Color.clear, in: RoundedRectangle(cornerRadius: 6))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
         .help(armed ? "再点一次确认删除" : "删除")
     }
 }
@@ -72,8 +64,8 @@ struct KeyValueRowsEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ForEach($rows) { $row in
-                rowEditor($row)
+            ForEach(rows) { row in
+                rowEditor(row)
             }
             SettingsAddButton(title: kind.addTitle) {
                 rows.append(KeyValueDraft())
@@ -82,35 +74,29 @@ struct KeyValueRowsEditor: View {
         }
     }
 
-    private func rowEditor(_ row: Binding<KeyValueDraft>) -> some View {
-        let rowId = row.wrappedValue.id
-        let isSecret = row.wrappedValue.secret && !revealed.contains(rowId)
+    private func rowEditor(_ row: KeyValueDraft) -> some View {
+        let rowId = row.id
+        let isSecret = row.secret && !revealed.contains(rowId)
         return HStack(spacing: 6) {
-            TextField(kind.keyPlaceholder, text: row.key)
-                .textFieldStyle(.plain)
+            TextField(kind.keyPlaceholder, text: textBinding(rowId, \.key))
+                .textFieldStyle(.roundedBorder)
                 .font(Theme.mono(11))
-                .foregroundStyle(Theme.ink)
-                .padding(.horizontal, 8)
-                .frame(height: 28)
+                .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity)
-                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 7))
-                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.line))
-                .onChange(of: row.wrappedValue.key) { _, newKey in
-                    row.wrappedValue.secret = looksSecret(newKey)
-                    onChanged()
-                }
-            HStack(spacing: 2) {
+                .labelsHidden()
+            HStack(spacing: 4) {
                 Group {
                     if isSecret {
-                        SecureField(valuePlaceholder(for: row.wrappedValue), text: row.value)
+                        SecureField(valuePlaceholder(for: row), text: textBinding(rowId, \.value))
                     } else {
-                        TextField(valuePlaceholder(for: row.wrappedValue), text: row.value)
+                        TextField(valuePlaceholder(for: row), text: textBinding(rowId, \.value))
                     }
                 }
-                .textFieldStyle(.plain)
+                .textFieldStyle(.roundedBorder)
                 .font(Theme.mono(11))
-                .foregroundStyle(Theme.ink)
-                if row.wrappedValue.secret {
+                .multilineTextAlignment(.leading)
+                .labelsHidden()
+                if row.secret {
                     Button {
                         if revealed.contains(rowId) {
                             revealed.remove(rowId)
@@ -123,26 +109,36 @@ struct KeyValueRowsEditor: View {
                             .foregroundStyle(Theme.faint)
                             .frame(width: 22, height: 22)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.borderless)
                     .help(revealed.contains(rowId) ? "隐藏值" : "显示值")
                 }
             }
-            .padding(.leading, 8)
-            .padding(.trailing, 3)
-            .frame(height: 28)
             .frame(maxWidth: .infinity)
-            .background(Theme.surface, in: RoundedRectangle(cornerRadius: 7))
-            .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.line))
-            .onChange(of: row.wrappedValue.value) { _, _ in
-                row.wrappedValue.redacted = false
-                onChanged()
-            }
             SettingsDeleteButton {
                 rows.removeAll { $0.id == rowId }
                 revealed.remove(rowId)
                 onChanged()
             }
         }
+    }
+
+    private func textBinding(
+        _ id: UUID,
+        _ keyPath: WritableKeyPath<KeyValueDraft, String>
+    ) -> Binding<String> {
+        Binding(
+            get: { rows.first(where: { $0.id == id })?[keyPath: keyPath] ?? "" },
+            set: { next in
+                guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
+                rows[index][keyPath: keyPath] = next
+                if keyPath == \.key {
+                    rows[index].secret = looksSecret(next)
+                } else {
+                    rows[index].redacted = false
+                }
+                onChanged()
+            }
+        )
     }
 
     private func valuePlaceholder(for row: KeyValueDraft) -> String {

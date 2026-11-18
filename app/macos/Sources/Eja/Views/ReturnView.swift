@@ -8,13 +8,22 @@ struct ReturnView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     if let presence = model.presence {
-                        MarkdownText(text: presence.text)
-                            .font(Theme.serif(30, weight: .regular))
-                            .lineSpacing(9)
-                            .foregroundStyle(Theme.ink)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: 720, alignment: .leading)
-                            .padding(.top, 64)
+                        VStack(alignment: .leading, spacing: 16) {
+                            MarkdownText(text: presence.text)
+                                .font(Theme.serif(30, weight: .regular))
+                                .lineSpacing(9)
+                                .foregroundStyle(Theme.ink)
+                                .textSelection(.enabled)
+                            if !presence.choices.isEmpty {
+                                ChoiceButtons(
+                                    question: presence.id,
+                                    choices: presence.choices,
+                                    model: model
+                                )
+                            }
+                        }
+                        .frame(maxWidth: 720, alignment: .leading)
+                        .padding(.top, 64)
                     }
 
                     if !model.loops.isEmpty {
@@ -36,6 +45,7 @@ struct ReturnView: View {
                 .padding(.horizontal, 34)
                 .padding(.bottom, 40)
             }
+            .scrollIndicators(.never)
 
             ComposerView(model: model, placeholder: "说一件新的事…", showsBye: false)
         }

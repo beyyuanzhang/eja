@@ -6,9 +6,10 @@
 use crate::domain::{ProposalData, TaskOpen};
 use crate::state::task_scope;
 use crate::{
-    now_utc, Action, Assignment, Brain, CloseOutcome, Control, ControlError, Edge, EjaContext,
-    EventMeta, Host, Kind, Observation, ObservationKind, ProposalKind, RelationKind, Result,
-    Selector, State, Store, Task, TaskId, TaskKind, TaskStatus, TurnEnd, TurnOptions, Worker,
+    now_utc, Action, Assignment, Brain, Choice, ChoiceSelection, CloseOutcome, Control,
+    ControlError, Edge, EjaContext, EventMeta, Host, Kind, Observation, ObservationKind,
+    ProposalKind, RelationKind, Result, Selector, State, Store, Task, TaskId, TaskKind, TaskStatus,
+    TurnEnd, TurnOptions, Worker, WorkspaceGrant,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -37,9 +38,9 @@ pub struct TurnOutcome<'a> {
     input: std::borrow::Cow<'a, str>,
     focus: Option<TaskId>,
     now: chrono::DateTime<chrono::Utc>,
-    /// The grant this turn projected with, kept so the outcome's view states
-    /// the same workspaces the decisions saw.
-    workspaces: Vec<(String, String)>,
+    /// The workspaces this turn projected with, kept so the outcome's view
+    /// states the same roots the decisions saw.
+    workspaces: Vec<WorkspaceGrant>,
 }
 
 impl TurnOutcome<'_> {
@@ -376,24 +377,39 @@ fn open_task(ctx: &ActionCtx<'_>, state: &mut State, input: &TaskOpen<'_>) -> Re
     Ok(id)
 }
 
-/// Resolve the workspace a task names against this turn's grant. An omitted
-/// name is the default (the first granted root); an unknown name is refused.
+/// Resolve the workspace ID a task names against the available workspaces. An
+/// omitted ID is the default (the first root); an unknown ID is refused.
 fn resolve_workspace<'a>(
     options: &'a TurnOptions,
-    name: Option<&str>,
+    id: Option<&str>,
 ) -> std::result::Result<&'a str, String> {
-    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+    let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) else {
         return Ok(options
             .workspaces
             .first()
-            .map_or("", |(_, root)| root.as_str()));
+            .map_or("", |grant| grant.root.as_str()));
     };
     options
         .workspaces
         .iter()
-        .find(|(granted, _)| granted == name)
-        .map(|(_, root)| root.as_str())
-        .ok_or_else(|| format!("open_task refused: no granted workspace named {name}"))
+        .find(|grant| grant.id == id)
+        .map(|grant| grant.root.as_str())
+        .ok_or_else(|| format!("open_task refused: no available workspace id {id}"))
+}
+
+/// A task may only execute in a root available now. An empty workspace is the
+/// host's default and is not re-resolved from task text.
+fn workspace_is_available(options: &TurnOptions, workspace: &str) -> bool {
+    if workspace.is_empty() {
+        return true;
+    }
+    let Ok(target) = std::fs::canonicalize(workspace) else {
+        return false;
+    };
+    options
+        .workspaces
+        .iter()
+        .any(|grant| std::fs::canonicalize(&grant.root).is_ok_and(|granted| granted == target))
 }
 
 fn link_tasks(
@@ -524,6 +540,11 @@ fn reserve_dispatch(
     if task.kind != TaskKind::Aja {
         return Ok(Err(
             "dispatch refused: a group is not an execution aja".into()
+        ));
+    }
+    if !workspace_is_available(ctx.options, &task.workspace) {
+        return Ok(Err(
+            "dispatch refused: task workspace is not available".into()
         ));
     }
     for edge in state
@@ -727,6 +748,11 @@ fn reconcile(
         return Ok(Err(format!(
             "reconcile refused: task {task_id} has no run to reconcile"
         )));
+    }
+    if !workspace_is_available(ctx.options, &task.workspace) {
+        return Ok(Err(
+            "reconcile refused: task workspace is not available".into()
+        ));
     }
     let root = (!task.workspace.is_empty()).then_some(std::path::Path::new(&task.workspace));
     let result = match ctx.host.reconcile(task_id, root, ctx.control) {
@@ -1099,6 +1125,62 @@ fn stop(end: &mut TurnEnd, reason: &mut Option<String>, error: ControlError) {
     *reason = Some(error.to_string());
 }
 
+struct Answer {
+    label: String,
+    input: String,
+    data: Value,
+}
+
+/// Resolve a choice against the Eja event that offered it. The stored option is
+/// the authority, so a client cannot substitute a different reference.
+fn resolve_selection(state: &State, selection: ChoiceSelection) -> Result<Answer> {
+    let question = state
+        .events()
+        .iter()
+        .find(|event| event.id == selection.question && event.kind == Kind::Eja)
+        .ok_or("selection names no Eja choice question")?;
+    let stored = question
+        .data
+        .as_ref()
+        .and_then(|data| data.get("choices"))
+        .ok_or("selection names an event with no choices")?;
+    let choices: Vec<Choice> = serde_json::from_value(stored.clone())?;
+    let choice = choices
+        .get(selection.option)
+        .ok_or("selection is outside the offered choices")?;
+    if choice.label.trim().is_empty() {
+        return Err("selected choice has no label".into());
+    }
+    let already_answered = state.events().iter().any(|event| {
+        event.kind == Kind::User
+            && event
+                .data
+                .as_ref()
+                .and_then(|data| data.get("choice"))
+                .and_then(|choice| choice.get("question"))
+                .and_then(Value::as_u64)
+                == Some(selection.question)
+    });
+    if already_answered {
+        return Err("choice question was already answered".into());
+    }
+    Ok(Answer {
+        label: choice.label.trim().to_string(),
+        input: format!(
+            "{}\nreference: {}",
+            choice.label.trim(),
+            serde_json::to_string(&choice.value)?
+        ),
+        data: serde_json::json!({
+            "choice": {
+                "question": selection.question,
+                "option": selection.option,
+                "value": choice.value,
+            }
+        }),
+    })
+}
+
 pub fn turn_at_with_options<'i>(
     store: &Store,
     input: &'i str,
@@ -1137,23 +1219,48 @@ pub fn turn_at_with_options<'i>(
     if situation.is_some() && options.focus.is_some() {
         return Err("a situation carries no focus".into());
     }
+    let answer = options
+        .selection
+        .map(|selection| resolve_selection(&state, selection))
+        .transpose()?;
+    if answer.is_some()
+        && (situation.is_some()
+            || !input.trim().is_empty()
+            || !options.approvals.is_empty()
+            || !options.denials.is_empty())
+    {
+        return Err("a choice answer is its own turn input".into());
+    }
     if input.trim().is_empty()
+        && answer.is_none()
         && options.approvals.is_empty()
         && options.denials.is_empty()
         && situation.is_none()
     {
-        return Err("a turn needs text, an approval, a denial or a situation".into());
+        return Err("a turn needs text, a choice, an approval, a denial or a situation".into());
     }
-    if situation.is_none() && !input.trim().is_empty() {
-        commit(
-            store,
-            &mut state,
-            Kind::User,
-            "eja",
-            input,
-            turn_no,
-            EventMeta::new(at),
-        )?;
+    if situation.is_none() {
+        if let Some(answer) = &answer {
+            commit(
+                store,
+                &mut state,
+                Kind::User,
+                "eja",
+                &answer.label,
+                turn_no,
+                EventMeta::data(at, answer.data.clone()),
+            )?;
+        } else if !input.trim().is_empty() {
+            commit(
+                store,
+                &mut state,
+                Kind::User,
+                "eja",
+                input,
+                turn_no,
+                EventMeta::new(at),
+            )?;
+        }
     }
     if let Some(kind) = situation {
         commit(
@@ -1173,6 +1280,8 @@ pub fn turn_at_with_options<'i>(
             Some(Kind::Alone) => "alone; time passes".into(),
             _ => "".into(),
         }
+    } else if let Some(answer) = &answer {
+        answer.input.clone().into()
     } else if input.trim().is_empty()
         && (!options.approvals.is_empty() || !options.denials.is_empty())
     {
@@ -1250,6 +1359,7 @@ pub fn turn_at_with_options<'i>(
     };
     let mut progress = Progress::default();
     let mut reply = String::new();
+    let mut choices = Vec::new();
     let mut end = TurnEnd::Complete;
     let mut reason: Option<String> = None;
     let mut actions_used = 0usize;
@@ -1326,6 +1436,7 @@ pub fn turn_at_with_options<'i>(
         // the projection to compare against.
         if !effect.acted() {
             reply = decision.reply.trim().to_string();
+            choices = decision.choices;
             break;
         }
         if !effect.informed {
@@ -1340,6 +1451,7 @@ pub fn turn_at_with_options<'i>(
             end,
             reason.as_deref().unwrap_or("projection repeated")
         );
+        choices.clear();
         meta.data = Some(serde_json::json!({"end": end, "reason": reason}));
     }
     recover_state(store, &mut state, turn_no, at)?;
@@ -1353,6 +1465,10 @@ pub fn turn_at_with_options<'i>(
         .any(|proposal| proposal.turn == turn_no && !proposal.approved);
     if fresh_question && end == TurnEnd::Complete {
         reply = String::new();
+        choices.clear();
+    }
+    if !choices.is_empty() {
+        meta.data = Some(serde_json::json!({"choices": choices}));
     }
     commit(store, &mut state, Kind::Eja, "eja", &reply, turn_no, meta)?;
     Ok(TurnOutcome {

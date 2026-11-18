@@ -22,7 +22,7 @@ use eja::{
         Control, HostTools, NativeWorker, OpenAiBrain, OpenAiModel, Ports, RecordFiles, Shared,
         ToolGateway, Worktrees, Worlds,
     },
-    turn_at_with_options, Assignment, Kind, Store, TurnOptions,
+    turn_at_with_options, Assignment, ChoiceSelection, Kind, Store, TurnOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -92,6 +92,8 @@ pub struct Host {
 struct TurnRequest {
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    selection: Option<ChoiceSelection>,
     #[serde(default)]
     focus: Option<u64>,
     #[serde(default)]
@@ -243,8 +245,15 @@ pub fn serve(options: Options) -> eja::Result<()> {
                 let pulse = pulse_host.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let _reset = TurnFlag(&pulse.turn_in_flight);
-                    let _ =
-                        execute_turn(&pulse, "", None, Vec::new(), Vec::new(), Some(Kind::Alone));
+                    let _ = execute_turn(
+                        &pulse,
+                        "",
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(Kind::Alone),
+                        None,
+                    );
                 })
                 .await;
             }
@@ -644,10 +653,20 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
         Some("alone") => Some(Kind::Alone),
         Some(_) => return Err(ApiError::bad("unknown gesture")),
     };
-    if text.is_empty() && approvals.is_empty() && denials.is_empty() && gesture.is_none() {
+    if turn.selection.is_some()
+        && (!text.is_empty() || !approvals.is_empty() || !denials.is_empty() || gesture.is_some())
+    {
+        return Err(ApiError::bad("a choice answer is its own turn input"));
+    }
+    if text.is_empty()
+        && turn.selection.is_none()
+        && approvals.is_empty()
+        && denials.is_empty()
+        && gesture.is_none()
+    {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
-            message: "a turn needs text, an approval, a denial or a situation".to_owned(),
+            message: "a turn needs text, a choice, an approval, a denial or a situation".to_owned(),
         });
     }
     if gesture.is_some() && !approvals.is_empty() {
@@ -680,6 +699,7 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
             approvals,
             denials,
             gesture,
+            turn.selection,
         )
     })
     .await
@@ -699,6 +719,7 @@ fn execute_turn(
     approvals: Vec<u64>,
     denials: Vec<u64>,
     gesture: Option<Kind>,
+    selection: Option<ChoiceSelection>,
 ) -> ApiResult<String> {
     let effective = host.settings.effective_current()?;
     if !effective.model_ready() {
@@ -737,7 +758,12 @@ fn execute_turn(
     let tools = Arc::new(
         HostTools::new(config, &host.project_dir, &host.state_dir, &startup)?
             .with_workspace_tools(effective.workspace_tools)
-            .with_roots(grant.iter().map(|(_, root)| PathBuf::from(root)).collect()),
+            .with_roots(
+                grant
+                    .iter()
+                    .map(|workspace| PathBuf::from(&workspace.root))
+                    .collect(),
+            ),
     );
     let ajas = host.state_dir.join("ajas");
     let mut aja_limits = eja::aja::Limits::default();
@@ -773,6 +799,7 @@ fn execute_turn(
     let mut options = TurnOptions {
         approvals,
         denials,
+        selection,
         focus,
         gesture,
         workspaces: grant,
@@ -810,13 +837,13 @@ fn header_pairs(role: &RoleConfig) -> Vec<(String, String)> {
 pub fn build_worlds(
     project: &Path,
     state_dir: &Path,
-    grant: &[(String, String)],
+    grant: &[eja::WorkspaceGrant],
     slots: usize,
     startup: &Control,
 ) -> Arc<dyn Worlds> {
     let mut roots: BTreeMap<PathBuf, Arc<dyn Worlds>> = BTreeMap::new();
-    for (index, (_, root)) in grant.iter().enumerate() {
-        let path = normalize_root(root);
+    for (index, grant) in grant.iter().enumerate() {
+        let path = normalize_root(&grant.root);
         if roots.contains_key(&path) {
             continue;
         }
@@ -903,8 +930,8 @@ async fn get_raw(
                 .settings,
         );
         let mut found = None;
-        for (_, root) in &grant {
-            if let Ok(view) = safe_file(Path::new(root), relative, MAX_RAW) {
+        for workspace in &grant {
+            if let Ok(view) = safe_file(Path::new(&workspace.root), relative, MAX_RAW) {
                 found = Some(view);
                 break;
             }

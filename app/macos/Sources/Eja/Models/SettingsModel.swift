@@ -68,6 +68,38 @@ final class SettingsModel {
         flashTask?.cancel()
     }
 
+    func addWorkspace() {
+        workspaces.append(WorkspaceDraft(name: "", path: ""))
+        markDirty()
+    }
+
+    func removeWorkspace(id: UUID) {
+        workspaces.removeAll { $0.id == id }
+        markDirty()
+    }
+
+    func addProvider() {
+        providers.append(ProviderDraft())
+        markDirty()
+    }
+
+    func removeProvider(id: String) {
+        providers.removeAll { $0.id == id }
+        if roles.eja.providerId == id { roles.eja = .empty }
+        if roles.aja.providerId == id { roles.aja = .empty }
+        markDirty()
+    }
+
+    func addConnector() {
+        connectors.append(ConnectorDraft())
+        markDirty()
+    }
+
+    func removeConnector(id: UUID) {
+        connectors.removeAll { $0.id == id }
+        markDirty()
+    }
+
     private func hydrate(from view: SettingsView) {
         self.view = view
         providers = view.providers.map(ProviderDraft.init(view:))

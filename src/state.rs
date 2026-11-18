@@ -8,7 +8,7 @@
 use crate::domain::{ProposalData, TaskOpen};
 use crate::{
     CloseOutcome, Edge, EjaContext, Event, Kind, Observation, ObservationKind, ProposalKind,
-    ProposalView, Result, Run, Store, Task, TaskId, TaskKind, TaskStatus,
+    ProposalView, Result, Run, Store, Task, TaskId, TaskKind, TaskStatus, WorkspaceGrant,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
@@ -330,15 +330,15 @@ impl State {
         self.project_with_workspaces(input, focus, now, &[])
     }
 
-    /// The projection with the host's workspace grant: the names a task may
-    /// choose this turn. The fold itself keeps no configuration.
+    /// The projection with the workspaces available this turn: the ids a task
+    /// may choose. The fold itself keeps no configuration.
     #[must_use]
     pub fn project_with_workspaces<'a>(
         &'a self,
         input: &'a str,
         focus: Option<TaskId>,
         now: DateTime<Utc>,
-        workspaces: &'a [(String, String)],
+        workspaces: &'a [WorkspaceGrant],
     ) -> EjaContext<'a> {
         let turn = self.turn();
         // The current input is separate from the conversation it belongs to.

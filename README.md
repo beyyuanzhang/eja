@@ -115,6 +115,21 @@ Any number of separately hosted frontends may use the same runtime. See
   so a host tool may be named `witness` without becoming acceptance evidence.
   The projection's evidence is folded from the events that recorded it.
 
+## Questions and alignment
+
+When Eja cannot unambiguously tell what the user refers to, it may ask with a
+small set of candidate answers. The candidates are about the referent itself —
+a task, an event, a file, an earlier statement or anything else — and the
+mechanism does not know what their values mean. An option has a label the user
+sees and an exact value. Choosing one records an ordinary user answer carrying
+that value; it is not an approval and not a new task relation.
+
+Options are shortcuts, never a required format. The user can always answer in
+their own words, including by saying “the second one”. Eja's projection carries
+the recorded options into later turns, so a free-form answer refers to the same
+question rather than to a reconstructed client-side copy. A recorded option can
+be used once; all other replies remain ordinary conversation.
+
 ## Tasks and authority
 
 ```
@@ -308,6 +323,11 @@ host runs one shared world. Above one it needs a git project with at least one
 commit, because each run gets its own worktree and branch (`<dir>/worlds/<id>`)
 and is reconciled only when asked. A worktree world starts at `HEAD`: uncommitted
 project changes stay in the project and are reported by the run's own account.
+The runtime project is the default workspace. Every existing extra directory
+saved in settings is also available; a missing directory is not offered.
+Registration is the durable availability decision. When a task opens, it names
+one available workspace id; that root is fixed for the task and never silently
+moves to another directory.
 `--task ID` selects initial focus. `show audit:ID` follows explicit containment
 and continuation edges; matching input text never invents a job relationship.
 

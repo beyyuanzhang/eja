@@ -28,6 +28,7 @@ impl Brain for NoBrain {
     fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
         Decision {
             reply: "ok".to_string(),
+            choices: Vec::new(),
             actions: Vec::new(),
             refused: Vec::new(),
         }
@@ -54,6 +55,7 @@ impl Brain for QueueBrain {
             .pop_front()
             .unwrap_or_else(|| Decision {
                 reply: "ok".to_string(),
+                choices: Vec::new(),
                 actions: Vec::new(),
                 refused: Vec::new(),
             })
@@ -175,6 +177,7 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
         let brain = QueueBrain::new(vec![
             Decision {
                 reply: "start".to_string(),
+                choices: Vec::new(),
                 actions: vec![Action::OpenTask {
                     title: format!("task {index}"),
                     request: "do it".to_string(),
@@ -187,6 +190,7 @@ fn bench_task_turns(root: &Path, count: usize) -> (f64, f64, usize) {
             },
             Decision {
                 reply: "accept".to_string(),
+                choices: Vec::new(),
                 actions: vec![Action::CloseTask {
                     task_id: index as u64 + 1,
                     accepted: true,
@@ -233,11 +237,13 @@ fn bench_turn_actions(root: &Path, events: usize, actions: usize) -> f64 {
     let brain = QueueBrain::new(vec![
         Decision {
             reply: "read".to_string(),
+            choices: Vec::new(),
             actions: (0..actions).map(look).collect(),
             refused: Vec::new(),
         },
         Decision {
             reply: "done".to_string(),
+            choices: Vec::new(),
             actions: Vec::new(),
             refused: Vec::new(),
         },
@@ -262,6 +268,7 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
     for index in 0..count {
         let propose = QueueBrain::new(vec![Decision {
             reply: "propose".to_string(),
+            choices: Vec::new(),
             actions: vec![Action::Propose {
                 kind: eja::ProposalKind::Commitment,
                 target_id: None,
@@ -281,6 +288,7 @@ fn bench_proposals(root: &Path, count: usize) -> f64 {
         let proposal_id = outcome.context().proposals[0].id;
         let confirm = QueueBrain::new(vec![Decision {
             reply: "confirm".to_string(),
+            choices: Vec::new(),
             actions: vec![Action::Confirm { proposal_id }],
             refused: Vec::new(),
         }]);

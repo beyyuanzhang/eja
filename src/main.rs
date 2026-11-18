@@ -176,7 +176,12 @@ fn run() -> Result<()> {
             let tools = Arc::new(
                 HostTools::new(config.as_deref(), &project, &dir, &startup)?
                     .with_workspace_tools(stored.connectors.workspace_tools)
-                    .with_roots(grant.iter().map(|(_, root)| PathBuf::from(root)).collect()),
+                    .with_roots(
+                        grant
+                            .iter()
+                            .map(|workspace| PathBuf::from(&workspace.root))
+                            .collect(),
+                    ),
             );
             let ajas = dir.join("ajas");
             let mut aja_limits = eja::aja::Limits::default();
@@ -265,7 +270,12 @@ fn run() -> Result<()> {
             let tools =
                 HostTools::new(config.as_deref(), &std::env::current_dir()?, &dir, &startup)?
                     .with_workspace_tools(stored.connectors.workspace_tools)
-                    .with_roots(grant.iter().map(|(_, root)| PathBuf::from(root)).collect());
+                    .with_roots(
+                        grant
+                            .iter()
+                            .map(|workspace| PathBuf::from(&workspace.root))
+                            .collect(),
+                    );
             let assignment = Assignment {
                 task_id: options.focus.unwrap_or(0),
                 objective: String::new(),

@@ -32,6 +32,7 @@ final class AppModel {
     var selectedTaskId: Int?
     var raw: RawRecord?
     var toastState: ToastState?
+    var settingsPresented = false
     var pollTick = 0
 
     private var fetching = false
@@ -119,14 +120,18 @@ final class AppModel {
         defer { fetching = false }
         do {
             let next = try await client.fetchState(busy: busy, encounter: encounter)
-            state = next
+            if state != next {
+                state = next
+            }
             if restoredParked {
                 restoredParked = false
                 if let current = encounter, !next.loops.contains(where: { matches($0, current) }) {
                     encounter = nil
                 }
             }
-            fatal = ""
+            if !fatal.isEmpty {
+                fatal = ""
+            }
         } catch {
             let message = friendlyError(error.localizedDescription)
             if state == nil {
@@ -135,7 +140,9 @@ final class AppModel {
                 toast(message, isError: true)
             }
         }
-        initialLoading = false
+        if initialLoading {
+            initialLoading = false
+        }
     }
 
     func beginEncounter(anchor: Int? = nil, taskId: Int? = nil, proposalId: Int? = nil) {
@@ -182,11 +189,28 @@ final class AppModel {
         Task { await transmit("", denials: [proposalId], showOptimistic: false) }
     }
 
+    func choose(question: Int, option: Int, label: String) {
+        guard !busy else { return }
+        if encounter == nil { beginEncounter(anchor: max(0, question - 1)) }
+        Task {
+            await transmit(
+                "",
+                choiceQuestion: question,
+                choiceOption: option,
+                optimisticLabel: label,
+                showOptimistic: true
+            )
+        }
+    }
+
     private func transmit(
         _ text: String,
         approvals: [Int] = [],
         denials: [Int] = [],
         gesture: String? = nil,
+        choiceQuestion: Int? = nil,
+        choiceOption: Int? = nil,
+        optimisticLabel: String? = nil,
         showOptimistic: Bool
     ) async {
         guard !pending, let state else { return }
@@ -194,22 +218,41 @@ final class AppModel {
         let focus = gesture == nil ? encounter?.taskId : nil
         pending = true
         if showOptimistic {
-            optimistic = OptimisticMessage(text: text, at: Int(Date().timeIntervalSince1970))
+            optimistic = OptimisticMessage(
+                text: optimisticLabel ?? text,
+                at: Int(Date().timeIntervalSince1970)
+            )
         }
         defer {
             pending = false
             optimistic = nil
         }
         do {
-            let result = try await client.sendTurn(text: text, focus: focus, approvals: approvals, denials: denials, gesture: gesture)
+            let result = try await client.sendTurn(
+                text: text,
+                focus: focus,
+                approvals: approvals,
+                denials: denials,
+                gesture: gesture,
+                choiceQuestion: choiceQuestion,
+                choiceOption: choiceOption
+            )
             await refresh(quiet: true)
             if !result.ok {
-                restoreIfUnsent(text, after: before, restore: showOptimistic)
+                restoreIfUnsent(
+                    text,
+                    after: before,
+                    restore: showOptimistic && choiceQuestion == nil
+                )
                 toast(result.error ?? result.stderr ?? "这一轮没有走完。", isError: true)
             }
         } catch {
             await refresh(quiet: true)
-            restoreIfUnsent(text, after: before, restore: showOptimistic)
+            restoreIfUnsent(
+                text,
+                after: before,
+                restore: showOptimistic && choiceQuestion == nil
+            )
             toast(error.localizedDescription, isError: true)
         }
     }

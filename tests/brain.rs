@@ -139,6 +139,16 @@ fn a_plain_reply_is_still_a_finished_decision() {
     assert_eq!(decision.reply, "nothing left to do");
 }
 
+#[test]
+fn choices_are_read_as_alignment_not_actions() {
+    let raw = r#"{"reply":"which one?","choices":[{"label":"the earlier bug","value":{"task":3}},{"label":"the open review","value":{"task":7}}],"actions":[]}"#;
+    let decision = eja::adapters::parse_decision(raw);
+    assert!(decision.actions.is_empty());
+    assert_eq!(decision.choices.len(), 2);
+    assert_eq!(decision.choices[0].label, "the earlier bug");
+    assert_eq!(decision.choices[1].value["task"], 7);
+}
+
 fn capture_request(response: &'static str) -> (String, std::thread::JoinHandle<serde_json::Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let port = listener.local_addr().expect("addr").port();

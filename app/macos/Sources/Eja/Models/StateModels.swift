@@ -1,6 +1,6 @@
 import Foundation
 
-struct AppState: Codable, Sendable {
+struct AppState: Codable, Sendable, Equatable {
     var events: [JournalEvent]
     var tasks: [TaskItem]
     var loops: [LoopItem]
@@ -10,7 +10,7 @@ struct AppState: Codable, Sendable {
     var health: Health
 }
 
-struct JournalEvent: Codable, Sendable, Identifiable {
+struct JournalEvent: Codable, Sendable, Identifiable, Equatable {
     var id: Int
     var at: Int
     var turn: Int
@@ -21,16 +21,39 @@ struct JournalEvent: Codable, Sendable, Identifiable {
     var data: JSONValue?
 }
 
-struct ChatMessage: Codable, Sendable, Identifiable {
+struct ChatMessage: Codable, Sendable, Identifiable, Equatable {
     var id: Int
     var role: String
     var text: String
     var at: Int
     var turn: Int
     var data: JSONValue?
+
+    var choices: [ChoiceView] {
+        guard role == "eja",
+              case .object(let data)? = data,
+              case .array(let items)? = data["choices"] else {
+            return []
+        }
+        return items.enumerated().compactMap { index, item in
+            guard case .object(let choice) = item,
+                  let label = choice["label"]?.stringValue,
+                  !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            return ChoiceView(index: index, label: label)
+        }
+    }
 }
 
-struct TaskItem: Codable, Sendable, Identifiable {
+struct ChoiceView: Identifiable, Equatable {
+    var index: Int
+    var label: String
+
+    var id: Int { index }
+}
+
+struct TaskItem: Codable, Sendable, Identifiable, Equatable {
     var id: Int
     var kind: String
     var title: String
@@ -58,12 +81,12 @@ struct TaskItem: Codable, Sendable, Identifiable {
     }
 }
 
-struct TaskClose: Codable, Sendable {
+struct TaskClose: Codable, Sendable, Equatable {
     var accepted: Bool
     var note: String?
 }
 
-struct TaskRun: Codable, Sendable {
+struct TaskRun: Codable, Sendable, Equatable {
     var digest: String?
     var evidence: JSONValue?
     var evidenceId: Int?
@@ -79,7 +102,7 @@ struct TaskRun: Codable, Sendable {
     }
 }
 
-struct Proposal: Codable, Sendable, Identifiable {
+struct Proposal: Codable, Sendable, Identifiable, Equatable {
     var id: Int
     var kind: String
     var targetId: Int?
@@ -93,7 +116,7 @@ struct Proposal: Codable, Sendable, Identifiable {
     }
 }
 
-struct Health: Codable, Sendable {
+struct Health: Codable, Sendable, Equatable {
     var model: Bool
     var modelName: String
     var state: Bool
@@ -104,7 +127,7 @@ struct Health: Codable, Sendable {
     var turnInFlight: Bool
 }
 
-struct LoopItem: Codable, Sendable, Identifiable {
+struct LoopItem: Codable, Sendable, Identifiable, Equatable {
     var key: String
     var kind: String
     var eventId: Int
