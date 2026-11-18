@@ -6,51 +6,48 @@ aja retains no aja-owned MCP client, server or thread.
 
 ## Configuration
 
-Connectors live in `<state>/app-settings.json`, in the same file as providers,
-roles, workspaces and capability switches. There is no separate MCP file and no
-MCP command-line configuration path. No configured server grants no external
-connector tools. Each native aja still has its host-bound read-only record passage
-tool. A configured server that fails to initialize or list its granted tools is
-reported and omitted. Healthy servers remain available.
+Connectors live in the `mcp` capability card in `<state>/app-settings.json`.
+The MCP adapter owns this configuration while the host owns the file and its
+secret-safe API. No configured server grants no external connector tools. Each
+native aja still has its host-bound read-only record passage tool. A configured
+server that fails to initialize or list its granted tools is reported and
+omitted. Healthy servers remain available.
 
 ```json
 {
   "capabilities": {
-    "workspace": true,
-    "files": true,
-    "shell": true,
-    "git": true,
-    "mcp": true,
-    "plugins": false
-  },
-  "connectors": {
-    "servers": [
-      {
-        "name": "local",
-        "command": "/absolute/path/to/server",
-        "args": ["--stdio"],
-        "env": {"SERVICE_TOKEN": "${MY_SERVICE_TOKEN}"},
-        "tools": ["search", "fetch"],
-        "enabled": true,
-        "timeoutMs": 30000
-      },
-      {
-        "name": "remote",
-        "url": "https://your-service.example/mcp",
-        "headers": {"Authorization": "Bearer ${MY_SERVICE_TOKEN}"},
-        "tools": ["search"],
-        "enabled": true,
-        "timeoutMs": 30000
+    "mcp": {
+      "enabled": true,
+      "config": {
+        "servers": [
+          {
+            "name": "local",
+            "command": "/absolute/path/to/server",
+            "args": ["--stdio"],
+            "env": {"SERVICE_TOKEN": "${MY_SERVICE_TOKEN}"},
+            "tools": ["search", "fetch"],
+            "enabled": true,
+            "timeoutMs": 30000
+          },
+          {
+            "name": "remote",
+            "url": "https://your-service.example/mcp",
+            "headers": {"Authorization": "Bearer ${MY_SERVICE_TOKEN}"},
+            "tools": ["search"],
+            "enabled": true,
+            "timeoutMs": 30000
+          }
+        ]
       }
-    ]
+    }
   }
 }
 ```
 
 The surrounding file also needs `providers`, `roles`, `limits` and
-`workspaces`. The app writes the complete shape. Set `capabilities.mcp` to
-`false` to remove every connector tool while leaving the stored definitions
-intact.
+`workspaces`, plus every other capability card. The app writes the complete
+shape. Set `capabilities.mcp.enabled` to `false` to remove every connector tool
+while leaving the stored definitions intact.
 
 Each server specifies exactly one `command` or `url`. Unknown fields are errors.
 Names are 1–24 ASCII letters, digits, underscores or hyphens. Optional

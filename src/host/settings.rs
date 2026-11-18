@@ -1,13 +1,17 @@
 use super::{
+    capability::{
+        self, CapabilityDescriptor, CapabilitySetting, CapabilitySettings, CapabilityView, MCP,
+    },
+    connectors::{self, ConnectorSaveInput, ConnectorSettings, StoredConnector},
+    plugins,
     util::{
         is_local_provider, normalize_base_url, provider_name, unique_strings, write_private_json,
         ApiError, ApiResult,
     },
-    EnabledCapabilities,
 };
 use eja::WorkspaceGrant;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -80,57 +84,13 @@ impl Limits {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StoredConnector {
-    pub name: String,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    #[serde(default)]
-    pub cwd: String,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_timeout")]
-    pub timeout_ms: u64,
-    #[serde(default)]
-    pub tools: Vec<String>,
-    #[serde(default)]
-    pub read_only: Vec<String>,
-    #[serde(default)]
-    pub witness: Vec<String>,
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-const fn default_timeout() -> u64 {
-    30_000
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConnectorSettings {
-    #[serde(default)]
-    pub servers: Vec<StoredConnector>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredSettings {
     #[serde(default)]
     pub providers: Vec<Provider>,
     #[serde(default)]
     pub roles: Roles,
     #[serde(default)]
-    pub connectors: ConnectorSettings,
-    pub capabilities: EnabledCapabilities,
+    pub capabilities: CapabilitySettings,
     pub limits: Limits,
     /// Extra directories the user has made available to EJA. A task fixes one
     /// of these roots when it opens.
@@ -159,44 +119,13 @@ struct ProviderInput {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KeyValueInput {
+pub(super) struct KeyValueInput {
     #[serde(default)]
-    key: String,
+    pub key: String,
     #[serde(default)]
-    value: String,
+    pub value: String,
     #[serde(default)]
-    redacted: bool,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ConnectorInput {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    mode: String,
-    #[serde(default)]
-    command: String,
-    #[serde(default)]
-    url: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    cwd: String,
-    #[serde(default)]
-    env: Vec<KeyValueInput>,
-    #[serde(default)]
-    headers: Vec<KeyValueInput>,
-    #[serde(default = "default_true")]
-    enabled: bool,
-    #[serde(default = "default_timeout")]
-    timeout_ms: u64,
-    #[serde(default)]
-    tools: Vec<String>,
-    #[serde(default)]
-    read_only: Vec<String>,
-    #[serde(default)]
-    witness: Vec<String>,
+    pub redacted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,18 +136,19 @@ struct SaveInput {
     #[serde(default)]
     roles: Roles,
     #[serde(default)]
-    connectors: ConnectorSaveInput,
-    capabilities: EnabledCapabilities,
+    capabilities: BTreeMap<String, CapabilityInput>,
     limits: Limits,
     #[serde(default)]
     workspaces: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ConnectorSaveInput {
+struct CapabilityInput {
     #[serde(default)]
-    servers: Vec<ConnectorInput>,
+    enabled: bool,
+    #[serde(default = "super::capability::empty_object")]
+    config: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,35 +175,10 @@ pub struct ProviderView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConnectorView {
-    pub name: String,
-    pub mode: &'static str,
-    pub command: String,
-    pub url: String,
-    pub args: Vec<String>,
-    pub cwd: String,
-    pub env: Vec<KeyValueView>,
-    pub headers: Vec<KeyValueView>,
-    pub enabled: bool,
-    pub timeout_ms: u64,
-    pub tools: Vec<String>,
-    pub read_only: Vec<String>,
-    pub witness: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectorsView {
-    pub servers: Vec<ConnectorView>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     pub providers: Vec<ProviderView>,
     pub roles: Roles,
-    pub connectors: ConnectorsView,
-    pub capabilities: EnabledCapabilities,
+    pub capabilities: Vec<CapabilityView>,
     pub limits: Limits,
     pub workspaces: BTreeMap<String, String>,
     pub runtime_path: String,
@@ -306,7 +211,8 @@ pub struct Effective {
     pub settings: StoredSettings,
     pub connectors: Vec<StoredConnector>,
     pub roles: EffectiveRoles,
-    pub capabilities: EnabledCapabilities,
+    pub capabilities: CapabilitySettings,
+    pub catalog: Vec<CapabilityDescriptor>,
     pub limits: Limits,
 }
 
@@ -317,7 +223,22 @@ impl Effective {
     }
 
     pub fn mcp_ready(&self) -> bool {
-        self.capabilities.mcp && self.connectors.iter().any(|server| server.enabled)
+        self.capabilities.enabled(MCP) && self.connectors.iter().any(|server| server.enabled)
+    }
+
+    pub fn managed_code_enabled(&self) -> bool {
+        self.capabilities.enabled(capability::MANAGED_PLUGINS)
+            || self.catalog.iter().any(|descriptor| {
+                descriptor.source == "plugin" && self.capabilities.enabled(&descriptor.id)
+            })
+    }
+
+    pub fn grants(&self, settings: &SettingsStore) -> Vec<WorkspaceGrant> {
+        if self.capabilities.enabled(capability::LOCAL_WORKSPACE) {
+            settings.grant(&self.settings)
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -363,17 +284,15 @@ impl SettingsStore {
         let input: SaveInput = serde_json::from_value(input)?;
         let providers = normalize_providers(input.providers, &current.providers)?;
         let roles = normalize_roles(input.roles, &providers)?;
-        let connectors =
-            normalize_connectors(input.connectors.servers, &current.connectors.servers)?;
         let workspaces =
             normalize_workspaces(input.workspaces, self.project.as_deref(), &self.dir)?;
+        let catalog = self.catalog();
+        let capabilities =
+            Self::normalize_capabilities(input.capabilities, &current.capabilities, &catalog)?;
         let next = StoredSettings {
             providers,
             roles,
-            connectors: ConnectorSettings {
-                servers: connectors,
-            },
-            capabilities: input.capabilities,
+            capabilities,
             limits: input.limits.sane(),
             workspaces,
         };
@@ -382,19 +301,24 @@ impl SettingsStore {
         Ok(next)
     }
 
-    pub fn effective(settings: StoredSettings) -> Effective {
-        let connectors = settings.connectors.servers.clone();
+    fn effective_with_catalog(
+        mut settings: StoredSettings,
+        catalog: Vec<CapabilityDescriptor>,
+    ) -> ApiResult<Effective> {
+        settings.capabilities = settings.capabilities.normalize(&catalog);
+        let connectors = mcp_config(&settings.capabilities)?.servers;
         let eja = configured_role(&settings, "eja");
         let aja = configured_role(&settings, "aja").or_else(|| eja.clone());
         let limits = settings.limits.clone().sane();
-        let capabilities = settings.capabilities;
-        Effective {
+        let capabilities = settings.capabilities.clone();
+        Ok(Effective {
             settings,
             connectors,
             roles: EffectiveRoles { eja, aja },
             capabilities,
+            catalog,
             limits,
-        }
+        })
     }
 
     pub fn view(&self, effective: &Effective) -> SettingsView {
@@ -402,10 +326,17 @@ impl SettingsStore {
         SettingsView {
             providers: settings.providers.iter().map(public_provider).collect(),
             roles: settings.roles.clone(),
-            connectors: ConnectorsView {
-                servers: effective.connectors.iter().map(public_connector).collect(),
-            },
-            capabilities: effective.capabilities,
+            capabilities: capability::views(&effective.catalog, &effective.capabilities)
+                .into_iter()
+                .map(|mut view| {
+                    if view.id == MCP {
+                        if let Ok(config) = mcp_config(&effective.capabilities) {
+                            view.config = connectors::public_value(&config);
+                        }
+                    }
+                    view
+                })
+                .collect(),
             limits: settings.limits.clone(),
             workspaces: settings.workspaces.clone(),
             runtime_path: env::current_exe()
@@ -419,7 +350,7 @@ impl SettingsStore {
     }
 
     pub fn effective_current(&self) -> ApiResult<Effective> {
-        Ok(Self::effective(self.read()?))
+        Self::effective_with_catalog(self.read()?, self.catalog())
     }
 
     /// The directories EJA may use. Registration is the durable availability
@@ -459,17 +390,63 @@ impl SettingsStore {
         grants
     }
 
+    fn catalog(&self) -> Vec<CapabilityDescriptor> {
+        let mut catalog = capability::builtins();
+        catalog.extend(plugins::catalog(&self.dir));
+        catalog
+    }
+
+    fn normalize_capabilities(
+        input: BTreeMap<String, CapabilityInput>,
+        previous: &CapabilitySettings,
+        catalog: &[CapabilityDescriptor],
+    ) -> ApiResult<CapabilitySettings> {
+        let mut entries = previous.entries().clone();
+        for (id, capability) in input {
+            let id = id.trim();
+            if !valid_capability_id(id) {
+                return Err(ApiError::bad("能力 ID 无效"));
+            }
+            if !entries.contains_key(id) && !catalog.iter().any(|item| item.id == id) {
+                return Err(ApiError::bad(format!("能力 {id} 不在当前能力目录中")));
+            }
+            if !entries.contains_key(id) && entries.len() >= 128 {
+                return Err(ApiError::bad("最多可以配置 128 个能力"));
+            }
+            let mut config = capability.config;
+            if id == MCP {
+                let previous = mcp_config(previous)?;
+                let input: ConnectorSaveInput = serde_json::from_value(config)?;
+                let servers = connectors::normalize(input.servers, &previous.servers)?;
+                config = serde_json::to_value(ConnectorSettings { servers })?;
+            }
+            let config_limit = if id.starts_with("plugin:") {
+                64 * 1024
+            } else {
+                512 * 1024
+            };
+            if serde_json::to_vec(&config)?.len() > config_limit {
+                return Err(ApiError::bad(format!(
+                    "能力 {id} 的配置超过 {} KiB",
+                    config_limit / 1024
+                )));
+            }
+            entries.insert(
+                id.to_owned(),
+                CapabilitySetting::new(capability.enabled, config),
+            );
+        }
+        let mut capabilities = CapabilitySettings::from_entries(entries);
+        for descriptor in catalog {
+            capabilities.ensure(descriptor);
+        }
+        Ok(capabilities)
+    }
+
     pub fn connector_for_test(&self, body: &Value) -> ApiResult<StoredConnector> {
         let current = self.read()?;
-        let incoming = body.get("connector").unwrap_or(body);
-        let name = incoming.get("name").and_then(Value::as_str).unwrap_or("");
-        let previous = current
-            .connectors
-            .servers
-            .iter()
-            .find(|connector| connector.name == name);
-        let input: ConnectorInput = serde_json::from_value(incoming.clone())?;
-        normalize_connector(input, previous)
+        let previous_config = mcp_config(&current.capabilities)?;
+        connectors::draft(body, &previous_config.servers)
     }
 }
 
@@ -617,116 +594,21 @@ fn normalize_workspaces(
     Ok(output)
 }
 
-fn normalize_connectors(
-    values: Vec<ConnectorInput>,
-    previous: &[StoredConnector],
-) -> ApiResult<Vec<StoredConnector>> {
-    if values.len() > 32 {
-        return Err(ApiError::bad("最多可以配置 32 个连接器"));
-    }
-    let prior: BTreeMap<_, _> = previous
-        .iter()
-        .map(|connector| (connector.name.clone(), connector))
-        .collect();
-    let mut seen = BTreeSet::new();
-    let mut output = Vec::new();
-    for value in values {
-        let previous = prior.get(value.name.trim()).copied();
-        let connector = normalize_connector(value, previous)?;
-        if !seen.insert(connector.name.clone()) {
-            return Err(ApiError::bad(format!("连接器名称重复：{}", connector.name)));
-        }
-        output.push(connector);
-    }
-    Ok(output)
+fn valid_capability_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b':' | b'.')
+        })
 }
 
-fn normalize_connector(
-    value: ConnectorInput,
-    previous: Option<&StoredConnector>,
-) -> ApiResult<StoredConnector> {
-    let name = value.name.trim().to_owned();
-    if !valid_name(&name, 24) {
-        return Err(ApiError::bad(
-            "连接器名称需为 1–24 个字母、数字、下划线或短横线",
-        ));
-    }
-    let url_mode = value.mode == "url" || !value.url.trim().is_empty();
-    let command = if url_mode {
-        String::new()
-    } else {
-        value.command.trim().to_owned()
-    };
-    let url = if url_mode {
-        value.url.trim().to_owned()
-    } else {
-        String::new()
-    };
-    if command.is_empty() && url.is_empty() {
-        return Err(ApiError::bad(format!("{name} 需要本地命令或远程 URL")));
-    }
-    if !url.is_empty() {
-        let parsed =
-            reqwest::Url::parse(&url).map_err(|_| ApiError::bad(format!("{name} 的 URL 无效")))?;
-        if !matches!(parsed.scheme(), "http" | "https")
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-        {
-            return Err(ApiError::bad(format!(
-                "{name} 需要不含账号信息的 HTTP(S) URL"
-            )));
-        }
-    }
-    let env = if url_mode {
-        BTreeMap::new()
-    } else {
-        normalize_key_values(
-            value.env,
-            previous.map_or(&BTreeMap::new(), |connector| &connector.env),
-        )?
-    };
-    for key in env.keys() {
-        let mut chars = key.chars();
-        if !chars
-            .next()
-            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
-            || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        {
-            return Err(ApiError::bad(format!("环境变量名无效：{key}")));
-        }
-    }
-    let headers = if url_mode {
-        normalize_key_values(
-            value.headers,
-            previous.map_or(&BTreeMap::new(), |connector| &connector.headers),
-        )?
-    } else {
-        BTreeMap::new()
-    };
-    for key in headers.keys() {
-        validate_header(key)?;
-    }
-    Ok(StoredConnector {
-        name,
-        command: (!command.is_empty()).then_some(command),
-        url: (!url.is_empty()).then_some(url),
-        args: if url_mode { Vec::new() } else { value.args },
-        env,
-        cwd: if url_mode {
-            String::new()
-        } else {
-            value.cwd.trim().to_owned()
-        },
-        headers,
-        enabled: value.enabled,
-        timeout_ms: value.timeout_ms.clamp(1, 300_000),
-        tools: unique_strings(Some(&value.tools)),
-        read_only: unique_strings(Some(&value.read_only)),
-        witness: unique_strings(Some(&value.witness)),
-    })
+fn mcp_config(capabilities: &CapabilitySettings) -> ApiResult<ConnectorSettings> {
+    Ok(serde_json::from_value(capabilities.config(MCP))?)
 }
 
-fn normalize_key_values(
+pub(super) fn normalize_key_values(
     values: Vec<KeyValueInput>,
     previous: &BTreeMap<String, String>,
 ) -> ApiResult<BTreeMap<String, String>> {
@@ -750,7 +632,7 @@ fn normalize_key_values(
     Ok(output)
 }
 
-fn validate_header(key: &str) -> ApiResult<()> {
+pub(super) fn validate_header(key: &str) -> ApiResult<()> {
     if key.is_empty()
         || !key.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
@@ -778,7 +660,7 @@ fn validate_header(key: &str) -> ApiResult<()> {
     Ok(())
 }
 
-fn valid_name(value: &str, max: usize) -> bool {
+pub(super) fn valid_name(value: &str, max: usize) -> bool {
     !value.is_empty()
         && value.len() <= max
         && value
@@ -816,29 +698,7 @@ fn public_provider(provider: &Provider) -> ProviderView {
     }
 }
 
-fn public_connector(connector: &StoredConnector) -> ConnectorView {
-    ConnectorView {
-        name: connector.name.clone(),
-        mode: if connector.command.is_some() {
-            "command"
-        } else {
-            "url"
-        },
-        command: connector.command.clone().unwrap_or_default(),
-        url: connector.url.clone().unwrap_or_default(),
-        args: connector.args.clone(),
-        cwd: connector.cwd.clone(),
-        env: public_key_values(&connector.env),
-        headers: public_key_values(&connector.headers),
-        enabled: connector.enabled,
-        timeout_ms: connector.timeout_ms,
-        tools: connector.tools.clone(),
-        read_only: connector.read_only.clone(),
-        witness: connector.witness.clone(),
-    }
-}
-
-fn public_key_values(values: &BTreeMap<String, String>) -> Vec<KeyValueView> {
+pub(super) fn public_key_values(values: &BTreeMap<String, String>) -> Vec<KeyValueView> {
     values
         .iter()
         .map(|(key, value)| {
@@ -864,7 +724,7 @@ fn public_key_values(values: &BTreeMap<String, String>) -> Vec<KeyValueView> {
         .collect()
 }
 
-fn is_secret(key: &str) -> bool {
+pub(super) fn is_secret(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     [
         "secret",
@@ -878,37 +738,6 @@ fn is_secret(key: &str) -> bool {
     ]
     .iter()
     .any(|part| lower.contains(part))
-}
-
-pub fn connector_config(connector: &StoredConnector) -> Value {
-    let mut config = serde_json::Map::new();
-    if let Some(command) = &connector.command {
-        config.insert("command".to_owned(), json!(command));
-        config.insert("args".to_owned(), json!(connector.args));
-        if !connector.env.is_empty() {
-            config.insert("env".to_owned(), json!(connector.env));
-        }
-        if !connector.cwd.is_empty() {
-            config.insert("cwd".to_owned(), json!(connector.cwd));
-        }
-    } else {
-        config.insert("url".to_owned(), json!(connector.url));
-        if !connector.headers.is_empty() {
-            config.insert("headers".to_owned(), json!(connector.headers));
-        }
-    }
-    config.insert("enabled".to_owned(), json!(connector.enabled));
-    config.insert("timeout_ms".to_owned(), json!(connector.timeout_ms));
-    if !connector.tools.is_empty() {
-        config.insert("tools".to_owned(), json!(connector.tools));
-    }
-    if !connector.read_only.is_empty() {
-        config.insert("read_only".to_owned(), json!(connector.read_only));
-    }
-    if !connector.witness.is_empty() {
-        config.insert("witness".to_owned(), json!(connector.witness));
-    }
-    Value::Object(config)
 }
 
 pub fn provider_draft(
@@ -997,14 +826,14 @@ mod tests {
                     "eja": {"providerId": "p1", "model": "m1"},
                     "aja": {"providerId": "p1", "model": "m1"}
                 },
-                "connectors": {"servers": []},
                 "capabilities": {
-                    "workspace": true,
-                    "files": true,
-                    "shell": true,
-                    "git": true,
-                    "mcp": true,
-                    "plugins": false
+                    "local-workspace": {"enabled": true},
+                    "files": {"enabled": true},
+                    "shell": {"enabled": true},
+                    "git-worktrees": {"enabled": true},
+                    "checkpoints": {"enabled": true},
+                    "mcp": {"enabled": true, "config": {"servers": []}},
+                    "managed-plugins": {"enabled": false}
                 },
                 "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0},
                 "workspaces": {}
@@ -1035,14 +864,14 @@ mod tests {
                 "eja": {"providerId": "p1", "model": "m1"},
                 "aja": {"providerId": "p1", "model": "m1"}
             },
-            "connectors": {"servers": []},
             "capabilities": {
-                "workspace": true,
-                "files": true,
-                "shell": true,
-                "git": true,
-                "mcp": true,
-                "plugins": false
+                "local-workspace": {"enabled": true},
+                "files": {"enabled": true},
+                "shell": {"enabled": true},
+                "git-worktrees": {"enabled": true},
+                "checkpoints": {"enabled": true},
+                "mcp": {"enabled": true, "config": {"servers": []}},
+                "managed-plugins": {"enabled": false}
             },
             "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0},
             "workspaces": {}
@@ -1053,7 +882,8 @@ mod tests {
             saved.providers[0].headers.get("x-session-token"),
             Some(&"session-value".to_owned())
         );
-        let view = serde_json::to_string(&store.view(&SettingsStore::effective(saved))).unwrap();
+        let effective = store.effective_current().unwrap();
+        let view = serde_json::to_string(&store.view(&effective)).unwrap();
         assert!(!view.contains("secret-key-value"));
         assert!(!view.contains("session-value"));
         let _ = std::fs::remove_dir_all(root);
@@ -1076,14 +906,14 @@ mod tests {
         let saved = store.write(json!({
             "providers": [],
             "roles": {"eja": {"providerId": "", "model": ""}, "aja": {"providerId": "", "model": ""}},
-            "connectors": {"servers": []},
             "capabilities": {
-                "workspace": true,
-                "files": false,
-                "shell": true,
-                "git": false,
-                "mcp": true,
-                "plugins": false
+                "local-workspace": {"enabled": true},
+                "files": {"enabled": false},
+                "shell": {"enabled": true},
+                "git-worktrees": {"enabled": false},
+                "checkpoints": {"enabled": true},
+                "mcp": {"enabled": true, "config": {"servers": []}},
+                "managed-plugins": {"enabled": false}
             },
             "limits": {"slots": 2, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0},
             "workspaces": {}
@@ -1092,9 +922,29 @@ mod tests {
             serde_json::to_value(&saved).unwrap(),
             serde_json::to_value(store.read().unwrap()).unwrap()
         );
-        assert!(saved.capabilities.workspace);
-        assert!(!saved.capabilities.files);
-        assert!(saved.capabilities.shell);
+        assert!(saved.capabilities.enabled("local-workspace"));
+        assert!(!saved.capabilities.enabled("files"));
+        assert!(saved.capabilities.enabled("shell"));
+        assert!(!saved.capabilities.enabled("git-worktrees"));
+        assert!(saved.capabilities.enabled("checkpoints"));
+        assert_eq!(saved.capabilities.config("mcp")["servers"], json!([]));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_cannot_invent_a_capability_card() {
+        let root = root();
+        let store = SettingsStore::new(Some(root.join("project")), root.join(".eja"));
+        let result = store.write(json!({
+            "providers": [],
+            "roles": {"eja": {"providerId": "", "model": ""}, "aja": {"providerId": "", "model": ""}},
+            "capabilities": {
+                "invented": {"enabled": true, "config": {}}
+            },
+            "limits": {"slots": 1, "turnTimeoutMs": 0, "ajaSteps": 0, "ajaTimeoutMs": 0},
+            "workspaces": {}
+        }));
+        assert!(result.is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 

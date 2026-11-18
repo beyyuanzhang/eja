@@ -177,10 +177,7 @@ fn run() -> Result<()> {
             if composed.effective.limits.turn_timeout_ms > 0 {
                 options.limits.timeout_ms = composed.effective.limits.turn_timeout_ms;
             }
-            let grant = composed
-                .effective
-                .capabilities
-                .grants(&settings, &composed.effective.settings);
+            let grant = composed.effective.grants(&settings);
             options.workspaces.clone_from(&grant);
             let eja_role = composed
                 .effective
@@ -274,9 +271,7 @@ fn run() -> Result<()> {
             let project = (!no_project).then(std::env::current_dir).transpose()?;
             let settings = host::SettingsStore::new(project, dir);
             let effective = settings.effective_current()?;
-            let grant = effective
-                .capabilities
-                .grants(&settings, &effective.settings);
+            let grant = effective.grants(&settings);
             let context = state.project_with_workspaces("", options.focus, eja::now_utc(), &grant);
             println!("{}", adapters::render_context(&context));
             println!(

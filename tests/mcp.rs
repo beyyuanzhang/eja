@@ -586,22 +586,25 @@ fn cli_catalog_uses_the_connectors_in_app_settings() {
                 "eja": {"providerId": "", "model": ""},
                 "aja": {"providerId": "", "model": ""}
             },
-            "connectors": {
-                "servers": [{
-                    "name": "fixture",
-                    "command": "/usr/bin/python3",
-                    "args": [script(), f.dir("stdio"), "stdio"],
-                    "enabled": true,
-                    "timeoutMs": 2000
-                }]
-            },
             "capabilities": {
-                "workspace": true,
-                "files": true,
-                "shell": true,
-                "git": true,
-                "mcp": true,
-                "plugins": false
+                "local-workspace": {"enabled": true},
+                "files": {"enabled": true},
+                "shell": {"enabled": true},
+                "git-worktrees": {"enabled": true},
+                "checkpoints": {"enabled": true},
+                "mcp": {
+                    "enabled": true,
+                    "config": {
+                        "servers": [{
+                            "name": "fixture",
+                            "command": "/usr/bin/python3",
+                            "args": [script(), f.dir("stdio"), "stdio"],
+                            "enabled": true,
+                            "timeoutMs": 2000
+                        }]
+                    }
+                },
+                "managed-plugins": {"enabled": false}
             },
             "limits": {
                 "slots": 1,

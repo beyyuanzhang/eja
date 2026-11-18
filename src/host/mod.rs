@@ -1,3 +1,5 @@
+mod capability;
+mod connectors;
 mod plugin_sandbox;
 mod plugins;
 mod settings;
@@ -10,12 +12,13 @@ pub use compose::compose;
 pub use settings::SettingsStore;
 
 use self::{
-    settings::{connector_config, StoredConnector, StoredSettings},
+    capability::{FILES, MANAGED_PLUGINS, MCP, SHELL},
+    connectors::{connector_config, StoredConnector},
     util::{clip, safe_file, ApiError, ApiResult},
 };
 use axum::{
     body::to_bytes,
-    extract::{Query, Request, State},
+    extract::{Path as ApiPath, Query, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -26,7 +29,7 @@ use eja::{
     adapters::{Control, McpTools, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolProvider},
     turn_at_with_options, Assignment, ChoiceSelection, Kind, Store, TurnOptions,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -81,66 +84,6 @@ pub struct Options {
     pub allowed_origins: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum Capability {
-    Workspace,
-    Files,
-    Shell,
-    Git,
-    Mcp,
-    Plugins,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)] // Six independent switches are the contract.
-pub struct EnabledCapabilities {
-    pub workspace: bool,
-    pub files: bool,
-    pub shell: bool,
-    pub git: bool,
-    pub mcp: bool,
-    pub plugins: bool,
-}
-
-impl EnabledCapabilities {
-    pub const fn has(self, capability: Capability) -> bool {
-        match capability {
-            Capability::Workspace => self.workspace,
-            Capability::Files => self.files,
-            Capability::Shell => self.shell,
-            Capability::Git => self.git,
-            Capability::Mcp => self.mcp,
-            Capability::Plugins => self.plugins,
-        }
-    }
-
-    pub fn grants(
-        self,
-        settings: &SettingsStore,
-        stored: &StoredSettings,
-    ) -> Vec<eja::WorkspaceGrant> {
-        if self.has(Capability::Workspace) {
-            settings.grant(stored)
-        } else {
-            Vec::new()
-        }
-    }
-}
-
-impl Default for EnabledCapabilities {
-    fn default() -> Self {
-        Self {
-            workspace: true,
-            files: true,
-            shell: true,
-            git: true,
-            mcp: true,
-            plugins: false,
-        }
-    }
-}
-
 pub struct Host {
     state_dir: PathBuf,
     project_dir: Option<PathBuf>,
@@ -149,6 +92,7 @@ pub struct Host {
     local: bool,
     turn_in_flight: AtomicBool,
     cancelled: Arc<AtomicBool>,
+    state_cache: Mutex<state::Cache>,
     /// The most recent optional-capability failures. They are diagnostics, not
     /// turn failures: a broken connector never disables local tools or judgment.
     diagnostics: Mutex<Vec<String>>,
@@ -187,6 +131,8 @@ struct StateQuery {
     task_id: Option<u64>,
     #[serde(rename = "proposalId")]
     proposal_id: Option<u64>,
+    #[serde(default)]
+    after: u64,
 }
 
 pub fn serve(options: Options) -> eja::Result<()> {
@@ -222,10 +168,11 @@ pub fn serve(options: Options) -> eja::Result<()> {
     }
     let settings = SettingsStore::new(project_dir.clone(), state_dir.clone());
     let effective = settings.effective_current()?;
-    if effective.capabilities.plugins && !local {
+    if effective.managed_code_enabled() && !local {
         return Err("plugin administration requires a local runtime address".into());
     }
     let cancelled = Arc::new(AtomicBool::new(false));
+    let cache_dir = state_dir.clone();
     let host = Arc::new(Host {
         state_dir,
         project_dir,
@@ -234,6 +181,7 @@ pub fn serve(options: Options) -> eja::Result<()> {
         local,
         turn_in_flight: AtomicBool::new(false),
         cancelled: cancelled.clone(),
+        state_cache: Mutex::new(state::Cache::new(cache_dir)),
         diagnostics: Mutex::new(Vec::new()),
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -334,8 +282,9 @@ pub fn serve(options: Options) -> eja::Result<()> {
         let app = Router::new()
             .route("/api/state", get(get_state))
             .route("/api/settings", get(get_settings).post(save_settings))
+            .route("/api/capabilities", get(get_capabilities))
             .route("/api/provider/discover", post(discover_provider))
-            .route("/api/connectors/test", post(test_connector))
+            .route("/api/capabilities/{id}/probe", post(probe_capability))
             .route("/api/turn", post(run_turn))
             .route("/api/raw", get(get_raw))
             .route("/api/health", get(get_health))
@@ -362,19 +311,27 @@ async fn get_state(
         proposal: query.proposal_id,
     });
     let busy = !matches!(query.busy.as_str(), "" | "0" | "false");
-    Ok(Json(state_json(&host, busy, encounter)?))
+    Ok(Json(state_json(&host, busy, encounter, query.after)?))
 }
 
-fn state_json(host: &Host, busy: bool, encounter: Option<state::Encounter>) -> ApiResult<Value> {
-    let journal = state::Journal::read(&host.state_dir);
+#[allow(clippy::significant_drop_tightening)] // One lock covers one coherent cache snapshot.
+fn state_json(
+    host: &Host,
+    busy: bool,
+    encounter: Option<state::Encounter>,
+    after: u64,
+) -> ApiResult<Value> {
     let effective = host.settings.effective_current()?;
-    let capabilities = effective.capabilities;
-    let workspace_tools = (capabilities.has(Capability::Files)
-        || capabilities.has(Capability::Shell))
-        && !capabilities
-            .grants(&host.settings, &effective.settings)
-            .is_empty();
-    let health = state::Health {
+    let capabilities = &effective.capabilities;
+    let workspace_tools = (capabilities.enabled(FILES) || capabilities.enabled(SHELL))
+        && !effective.grants(&host.settings).is_empty();
+    let plugin_tools = effective.managed_code_enabled();
+    let diagnostics = host
+        .diagnostics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut health = state::Health {
         model: effective.model_ready(),
         model_name: effective
             .roles
@@ -382,27 +339,37 @@ fn state_json(host: &Host, busy: bool, encounter: Option<state::Encounter>) -> A
             .as_ref()
             .map_or_else(String::new, |role| role.model.clone()),
         state: host.state_dir.is_dir(),
-        mcp: workspace_tools || (capabilities.has(Capability::Mcp) && effective.mcp_ready()),
-        journal: if journal.error.is_some() {
+        tools: workspace_tools
+            || plugin_tools
+            || (capabilities.enabled(MCP) && effective.mcp_ready()),
+        journal: "ok",
+        journal_error: None,
+        torn: false,
+        turn_in_flight: host.turn_in_flight.load(Ordering::SeqCst),
+        capability_errors: diagnostics,
+    };
+    let view = {
+        let mut cache = host
+            .state_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let journal = cache.journal();
+        health.journal = if journal.error.is_some() {
             "error"
         } else {
             "ok"
-        },
-        journal_error: journal.error.clone(),
-        torn: journal.torn,
-        turn_in_flight: host.turn_in_flight.load(Ordering::SeqCst),
-        capability_errors: host
-            .diagnostics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone(),
+        };
+        health.journal_error.clone_from(&journal.error);
+        health.torn = journal.torn;
+        state::state_json(
+            &mut cache,
+            after,
+            &health,
+            busy || host.turn_in_flight.load(Ordering::SeqCst),
+            encounter,
+        )
     };
-    Ok(state::state_json(
-        &journal,
-        &health,
-        busy || host.turn_in_flight.load(Ordering::SeqCst),
-        encounter,
-    ))
+    Ok(view)
 }
 
 async fn get_settings(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
@@ -410,15 +377,15 @@ async fn get_settings(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
     Ok(Json(serde_json::to_value(host.settings.view(&effective))?))
 }
 
+async fn get_capabilities(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
+    let effective = host.settings.effective_current()?;
+    let view = host.settings.view(&effective);
+    Ok(Json(serde_json::to_value(view.capabilities)?))
+}
+
 async fn save_settings(State(host): State<Arc<Host>>, request: Request) -> ApiResult<Json<Value>> {
     let body = read_json(request).await?;
-    if !host.local
-        && body
-            .get("capabilities")
-            .and_then(|capabilities| capabilities.get("plugins"))
-            .and_then(Value::as_bool)
-            == Some(true)
-    {
+    if !host.local && plugin_admin_requested(&body) {
         return Err(ApiError::bad(
             "plugin administration requires a local runtime address",
         ));
@@ -426,6 +393,17 @@ async fn save_settings(State(host): State<Arc<Host>>, request: Request) -> ApiRe
     host.settings.write(body)?;
     let effective = host.settings.effective_current()?;
     Ok(Json(serde_json::to_value(host.settings.view(&effective))?))
+}
+
+fn plugin_admin_requested(body: &Value) -> bool {
+    body.get("capabilities")
+        .and_then(Value::as_object)
+        .is_some_and(|capabilities| {
+            capabilities.iter().any(|(id, capability)| {
+                (id == MANAGED_PLUGINS || id.starts_with("plugin:"))
+                    && capability.get("enabled").and_then(Value::as_bool) == Some(true)
+            })
+        })
 }
 
 async fn discover_provider(
@@ -599,7 +577,14 @@ fn describe_provider_error(action: &str, status: u16, detail: &str) -> String {
     }
 }
 
-async fn test_connector(State(host): State<Arc<Host>>, request: Request) -> ApiResult<Json<Value>> {
+async fn probe_capability(
+    ApiPath(id): ApiPath<String>,
+    State(host): State<Arc<Host>>,
+    request: Request,
+) -> ApiResult<Json<Value>> {
+    if id != MCP {
+        return Err(ApiError::missing("this capability has no host-side probe"));
+    }
     let body = read_json(request).await?;
     let started = Instant::now();
     let connector = match host.settings.connector_for_test(&body) {
@@ -860,9 +845,7 @@ fn execute_turn(
         aja_role.model.as_str(),
     )
     .with_headers(compose::header_pairs(aja_role));
-    let grant = effective
-        .capabilities
-        .grants(&host.settings, &effective.settings);
+    let grant = effective.grants(&host.settings);
     let ajas = host.state_dir.join("ajas");
     let mut aja_limits = eja::aja::Limits::default();
     if effective.limits.aja_steps > 0 {
@@ -953,9 +936,7 @@ async fn get_raw(
     }
     if let Some(relative) = address.strip_prefix("environment:") {
         let effective = host.settings.effective_current()?;
-        let grant = effective
-            .capabilities
-            .grants(&host.settings, &effective.settings);
+        let grant = effective.grants(&host.settings);
         let mut found = None;
         for workspace in &grant {
             if let Ok(view) = safe_file(Path::new(&workspace.root), relative, MAX_RAW) {
@@ -979,7 +960,9 @@ async fn get_raw(
 }
 
 async fn get_health(State(host): State<Arc<Host>>) -> ApiResult<Json<Value>> {
-    Ok(Json(state_json(&host, false, None)?["health"].clone()))
+    Ok(Json(
+        state_json(&host, false, None, u64::MAX)?["health"].clone(),
+    ))
 }
 
 async fn api_not_found() -> Response {
@@ -998,7 +981,7 @@ async fn cors(State(host): State<Arc<Host>>, request: Request, next: Next) -> Re
     let plugins = host
         .settings
         .effective_current()
-        .is_ok_and(|effective| effective.capabilities.has(Capability::Plugins));
+        .is_ok_and(|effective| effective.managed_code_enabled());
     if plugins && request.method() == Method::POST {
         let allowed_origin = origin.is_some() || !request.headers().contains_key(header::ORIGIN);
         let json = request

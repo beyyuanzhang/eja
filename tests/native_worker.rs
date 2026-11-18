@@ -100,6 +100,8 @@ fn configure_cli(
 ) {
     let dir = state.path().join(".eja");
     eja::Store::new(&dir).expect("state");
+    let mut capabilities = capabilities.clone();
+    capabilities["mcp"]["config"] = json!({"servers": connectors});
     std::fs::write(
         dir.join("app-settings.json"),
         serde_json::to_vec_pretty(&json!({
@@ -114,7 +116,6 @@ fn configure_cli(
                 "eja": {"providerId": "test", "model": "test-model"},
                 "aja": {"providerId": "test", "model": "test-model"}
             },
-            "connectors": {"servers": connectors},
             "capabilities": capabilities,
             "limits": {
                 "slots": slots,
@@ -1265,12 +1266,13 @@ fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
             &fixture,
             &url,
             &json!({
-                "workspace": false,
-                "files": false,
-                "shell": false,
-                "git": false,
-                "mcp": true,
-                "plugins": false
+                "local-workspace": {"enabled": false},
+                "files": {"enabled": false},
+                "shell": {"enabled": false},
+                "git-worktrees": {"enabled": false},
+                "checkpoints": {"enabled": false},
+                "mcp": {"enabled": true, "config": {"servers": []}},
+                "managed-plugins": {"enabled": false}
             }),
             &json!([{
                 "name": "fixture",
@@ -1363,12 +1365,13 @@ fn a_workspace_can_write_files_without_shell_or_git() {
         &fixture,
         &url,
         &json!({
-            "workspace": true,
-            "files": true,
-            "shell": false,
-            "git": false,
-            "mcp": false,
-            "plugins": false
+            "local-workspace": {"enabled": true},
+            "files": {"enabled": true},
+            "shell": {"enabled": false},
+            "git-worktrees": {"enabled": false},
+            "checkpoints": {"enabled": false},
+            "mcp": {"enabled": false, "config": {"servers": []}},
+            "managed-plugins": {"enabled": false}
         }),
         &json!([]),
         2,
@@ -1403,12 +1406,13 @@ fn a_workspace_can_write_files_without_shell_or_git() {
         &fixture,
         &url,
         &json!({
-            "workspace": true,
-            "files": false,
-            "shell": true,
-            "git": false,
-            "mcp": false,
-            "plugins": false
+            "local-workspace": {"enabled": true},
+            "files": {"enabled": false},
+            "shell": {"enabled": true},
+            "git-worktrees": {"enabled": false},
+            "checkpoints": {"enabled": false},
+            "mcp": {"enabled": false, "config": {"servers": []}},
+            "managed-plugins": {"enabled": false}
         }),
         &json!([]),
         2,
@@ -1470,12 +1474,13 @@ fn cli_eja_dispatches_native_aja_reads_frozen_output_and_accepts() {
         &f,
         &url,
         &json!({
-            "workspace": true,
-            "files": false,
-            "shell": false,
-            "git": true,
-            "mcp": true,
-            "plugins": false
+            "local-workspace": {"enabled": true},
+            "files": {"enabled": false},
+            "shell": {"enabled": false},
+            "git-worktrees": {"enabled": true},
+            "checkpoints": {"enabled": true},
+            "mcp": {"enabled": true, "config": {"servers": []}},
+            "managed-plugins": {"enabled": false}
         }),
         &json!([{
             "name": "files",

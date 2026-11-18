@@ -39,8 +39,8 @@ It does not close tasks, resolve proposals, or create a session. Presence and
 open loops come from the runtime; eja's sentences come from the journal, not
 from client copy.
 
-Settings configure providers, model bindings, connectors, capabilities, limits
-and workspaces. They are stored by the runtime in
+Settings configure providers, model bindings, capability cards, limits and
+workspaces. They are stored by the runtime in
 `<stateDir>/app-settings.json` with mode `0600` where available. This is the
-only settings file. It includes capability switches for workspace, files, shell,
-Git, MCP and plugins. The same file drives the CLI and HTTP runtime.
+only settings file. Built-in and plugin-provided cards use the same toggle and
+config shape. The same file drives the CLI and HTTP runtime.

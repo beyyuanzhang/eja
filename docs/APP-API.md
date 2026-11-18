@@ -15,6 +15,9 @@ The view's snapshot. Query parameters:
   `loops` and fills `spoken` for that exchange.
 - `taskId=<id>`, `proposalId=<id>` — the encounter's source, so its own loop
   stays visible even after newer events.
+- `after=<event id>` returns only events newer than that committed id. The
+  runtime keeps a rebuildable derived cache, so polling does not fold the whole
+  journal when the file is unchanged.
 
 Response:
 
@@ -26,7 +29,8 @@ Response:
   "presence": Message | null,
   "spoken": [Message],
   "lastEvent": 42,
-  "health": { "model", "modelName", "state", "mcp", "journal", "journalError", "torn", "turnInFlight" }
+  "health": { "model", "modelName", "state", "tools", "journal", "journalError",
+              "torn", "turnInFlight", "capabilityErrors" }
 }
 ```
 
@@ -35,7 +39,9 @@ to speak or the user has since left. A reply may be silent text plus optional
 `choices`; choices are shortcuts, never a required answer. `spoken` is the
 encounter's exchange: what was said since `anchor`, without eja's inner
 monologue (an eja message appears only when the user was present in its turn).
-`lastEvent` is the bookmark a view uses to open an encounter.
+`lastEvent` is the bookmark a view uses to open an encounter and the cursor for
+the next `after` request. A frontend merges returned events with the events it
+already holds. Tasks, loops and presence remain complete derived views.
 
 A `Loop` is one thing that still asks for the user:
 
@@ -80,21 +86,28 @@ Response: `{ "ok": true, "reply": "..." }`, or `{ "ok": false, "error": "..." }`
 
 ## GET /api/settings, POST /api/settings
 
-The settings view contains providers, role bindings, connectors, the six
-capability switches, limits, workspaces and the runtime paths. Saving accepts the
-same shape, with write-only provider and connector secrets. Connector policy
-fields such as `tools`, `readOnly` and `witness` are returned and must be sent
-back unchanged when a client edits a connector. A save returns the new view.
+The settings view contains providers, role bindings, a flat array of capability
+cards, limits, workspaces and runtime paths. Every card has an id, title,
+description, kind, source, enabled flag and JSON config. Saving accepts a map
+keyed by capability id, each containing `{ "enabled", "config" }`. The MCP card
+owns its connector list. Write-only provider and connector secrets are
+preserved without being returned. A save returns the new view.
+
+## GET /api/capabilities
+
+Returns the same capability cards without provider or runtime settings. Active
+managed plugins add `plugin:NAME` cards through the same catalog.
 
 ## GET /api/raw
 
 `address` is one documented address: `log:task:<id>`, `log:event:<id>`,
 `record:<id>/aja.json`, `record:<id>/context.jsonl`.
 
-## POST /api/provider/discover, POST /api/connectors/test
+## POST /api/provider/discover, POST /api/capabilities/{id}/probe
 
-Provider discovery and connector probes used by settings. Bodies are the draft
-provider/connector; both return a small result record.
+Provider discovery and capability probes used by settings. The `mcp` card
+accepts a draft connector envelope and returns its discovered tools. Built-in
+cards without a host-side probe return 404.
 
 ## CORS
 

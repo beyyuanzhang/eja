@@ -9,7 +9,7 @@ struct SettingsScreen: View {
 
     enum SettingsSectionKind: String, CaseIterable, Identifiable {
         case model
-        case connectors
+        case capabilities
         case runtime
         case workspace
 
@@ -18,7 +18,7 @@ struct SettingsScreen: View {
         var label: String {
             switch self {
             case .model: return "模型"
-            case .connectors: return "连接器"
+            case .capabilities: return "能力"
             case .runtime: return "运行"
             case .workspace: return "工作区"
             }
@@ -27,7 +27,7 @@ struct SettingsScreen: View {
         var icon: String {
             switch self {
             case .model: return "cpu"
-            case .connectors: return "puzzlepiece.extension"
+            case .capabilities: return "puzzlepiece.extension"
             case .runtime: return "speedometer"
             case .workspace: return "folder"
             }
@@ -183,7 +183,7 @@ struct SettingsScreen: View {
         switch section {
         case .model:
             ProviderSection(app: app, model: model)
-        case .connectors:
+        case .capabilities:
             ConnectorSection(app: app, model: model)
         case .runtime:
             RuntimeSection(app: app, model: model)

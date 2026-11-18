@@ -18,8 +18,9 @@ final class APIClient {
         session = URLSession(configuration: configuration)
     }
 
-    func fetchState(busy: Bool, encounter: Encounter?) async throws -> AppState {
+    func fetchState(busy: Bool, encounter: Encounter?, after: Int) async throws -> AppState {
         var query = [URLQueryItem(name: "busy", value: busy ? "1" : "0")]
+        query.append(URLQueryItem(name: "after", value: String(after)))
         if let encounter {
             query.append(URLQueryItem(name: "anchor", value: String(encounter.anchor)))
             if let taskId = encounter.taskId {
@@ -46,7 +47,7 @@ final class APIClient {
 
     func testConnector(_ draft: ConnectorDraft) async throws -> ConnectorTestResult {
         struct Envelope: Encodable { let connector: ConnectorDraft }
-        return try await post("/api/connectors/test", body: Envelope(connector: draft))
+        return try await post("/api/capabilities/mcp/probe", body: Envelope(connector: draft))
     }
 
     func sendTurn(

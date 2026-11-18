@@ -1,7 +1,9 @@
 use super::{
+    capability::{CHECKPOINTS, FILES, GIT_WORKTREES, MANAGED_PLUGINS, MCP, SHELL},
+    connectors::connector_config,
     plugins,
-    settings::{connector_config, Effective, RoleConfig},
-    Capability, SettingsStore,
+    settings::{Effective, RoleConfig},
+    SettingsStore,
 };
 use eja::adapters::{
     Checkpoints, Control, EnvironmentProvider, GitWorktrees, McpTools, NativeWorker, OpenAiModel,
@@ -52,9 +54,9 @@ impl ComposedHost {
 pub fn compose(settings: &SettingsStore, startup: &Control) -> eja::Result<ComposedHost> {
     let mut diagnostics = Vec::new();
     let effective = settings.effective_current()?;
-    let capabilities = effective.capabilities;
+    let capabilities = &effective.capabilities;
 
-    let grant = capabilities.grants(settings, &effective.settings);
+    let grant = effective.grants(settings);
 
     let private = settings.state_dir().canonicalize()?;
     let workspace = settings
@@ -68,17 +70,17 @@ pub fn compose(settings: &SettingsStore, startup: &Control) -> eja::Result<Compo
 
     let mut providers: Vec<Box<dyn ToolProvider>> = Vec::new();
     if let Some(workspace) = &workspace {
-        if capabilities.has(Capability::Files) || capabilities.has(Capability::Shell) {
+        if capabilities.enabled(FILES) || capabilities.enabled(SHELL) {
             providers.push(Box::new(WorkspaceTools::new(
-                capabilities.has(Capability::Files),
-                capabilities.has(Capability::Shell),
+                capabilities.enabled(FILES),
+                capabilities.enabled(SHELL),
                 Some(workspace.clone()),
                 roots,
                 &private,
             )));
         }
     }
-    if capabilities.has(Capability::Mcp) && !effective.connectors.is_empty() {
+    if capabilities.enabled(MCP) && !effective.connectors.is_empty() {
         let servers = effective
             .connectors
             .iter()
@@ -100,11 +102,17 @@ pub fn compose(settings: &SettingsStore, startup: &Control) -> eja::Result<Compo
 
     let mut tools = ToolRegistry::new(&private, providers)?;
     let mut capability_description = None;
-    if capabilities.has(Capability::Plugins) {
-        match plugins::register(&mut tools, &private, startup) {
+    if effective.managed_code_enabled() {
+        match plugins::register(
+            &mut tools,
+            &private,
+            startup,
+            capabilities.enabled(MANAGED_PLUGINS),
+            capabilities,
+        ) {
             Ok(registration) => {
                 diagnostics.extend(registration.diagnostics);
-                capability_description = Some(plugins::DESCRIPTION.to_owned());
+                capability_description = registration.description;
             }
             Err(error) => {
                 diagnostics.push(format!("managed plugin tools are unavailable: {error}"));
@@ -116,11 +124,11 @@ pub fn compose(settings: &SettingsStore, startup: &Control) -> eja::Result<Compo
         &private,
         &grant,
         effective.limits.slots,
-        capabilities.has(Capability::Git),
+        capabilities.enabled(GIT_WORKTREES),
         startup,
     );
     diagnostics.extend(environment_diagnostics);
-    let snapshots = (capabilities.has(Capability::Git) && !grant.is_empty())
+    let snapshots = (capabilities.enabled(CHECKPOINTS) && !grant.is_empty())
         .then(|| Checkpoints::new(private.join("checkpoints"), private.clone()));
 
     Ok(ComposedHost {
@@ -275,7 +283,6 @@ mod tests {
                     "eja": {"providerId": "", "model": ""},
                     "aja": {"providerId": "", "model": ""}
                 },
-                "connectors": {"servers": []},
                 "capabilities": capabilities,
                 "limits": {
                     "slots": 1,
@@ -302,12 +309,13 @@ mod tests {
         configure(
             &settings,
             &json!({
-                "workspace": true,
-                "files": true,
-                "shell": false,
-                "git": false,
-                "mcp": true,
-                "plugins": true
+                "local-workspace": {"enabled": true},
+                "files": {"enabled": true},
+                "shell": {"enabled": false},
+                "git-worktrees": {"enabled": false},
+                "checkpoints": {"enabled": false},
+                "mcp": {"enabled": true, "config": {"servers": []}},
+                "managed-plugins": {"enabled": true}
             }),
         );
         let control = Control::new(Duration::from_secs(30), Arc::default());
@@ -350,12 +358,13 @@ mod tests {
         configure(
             &settings,
             &json!({
-                "workspace": false,
-                "files": false,
-                "shell": false,
-                "git": false,
-                "mcp": false,
-                "plugins": true
+                "local-workspace": {"enabled": false},
+                "files": {"enabled": false},
+                "shell": {"enabled": false},
+                "git-worktrees": {"enabled": false},
+                "checkpoints": {"enabled": false},
+                "mcp": {"enabled": false, "config": {"servers": []}},
+                "managed-plugins": {"enabled": true}
             }),
         );
         let control = Control::new(Duration::from_secs(30), Arc::default());

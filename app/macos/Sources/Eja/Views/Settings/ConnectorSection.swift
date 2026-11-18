@@ -6,23 +6,48 @@ struct ConnectorSection: View {
 
     var body: some View {
         SettingsPage {
-            SettingsGroup("能力") {
-                VStack(spacing: 0) {
-                    capabilityRow("工作区", note: "允许任务使用文件夹", value: $model.capabilities.workspace)
-                    SettingsRule()
-                    capabilityRow("文件", note: "读取、写入和搜索文件", value: $model.capabilities.files)
-                    SettingsRule()
-                    capabilityRow("Shell", note: "运行终端命令", value: $model.capabilities.shell)
-                    SettingsRule()
-                    capabilityRow("Git", note: "建立隔离环境并合并结果", value: $model.capabilities.git)
-                    SettingsRule()
-                    capabilityRow("MCP", note: "使用下方连接器", value: $model.capabilities.mcp)
-                    SettingsRule()
-                    capabilityRow("插件", note: "允许 EJA 安装和更新插件", value: $model.capabilities.plugins)
+            if let errors = app.state?.health.capabilityErrors, !errors.isEmpty {
+                SettingsGroup("能力诊断") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(errors.enumerated()), id: \.offset) { _, error in
+                            Label(error, systemImage: "exclamationmark.triangle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.danger)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
                 }
             }
 
-            SettingsGroup("MCP") {
+            SettingsGroup("能力") {
+                VStack(spacing: 0) {
+                    ForEach(Array(model.capabilities.enumerated()), id: \.element.id) { index, capability in
+                        if index > 0 {
+                            SettingsRule()
+                        }
+                        VStack(spacing: 0) {
+                            capabilityRow(
+                                capability.title,
+                                note: "\(capability.description) · \(capability.kind) · \(capability.source)",
+                                value: capabilityBinding(for: capability)
+                            )
+                            if capability.id != "mcp",
+                               capability.source == "plugin" || capability.config != .object([:]) {
+                                CapabilityConfigEditor(
+                                    config: capabilityConfigBinding(for: capability)
+                                ) {
+                                    model.markDirty()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if mcpEnabled {
+                SettingsGroup("MCP") {
                 if model.connectors.isEmpty {
                     SettingsAddButton(title: "添加连接器") {
                         model.addConnector()
@@ -49,8 +74,42 @@ struct ConnectorSection: View {
                         .padding(.vertical, 11)
                     }
                 }
+                }
             }
         }
+    }
+
+    private var mcpEnabled: Bool {
+        model.capabilities.first(where: { $0.id == "mcp" })?.enabled == true
+    }
+
+    private func capabilityBinding(for capability: CapabilityDraft) -> Binding<Bool> {
+        Binding(
+            get: {
+                model.capabilities.first(where: { $0.id == capability.id })?.enabled ?? false
+            },
+            set: { enabled in
+                guard let index = model.capabilities.firstIndex(where: { $0.id == capability.id }) else {
+                    return
+                }
+                model.capabilities[index].enabled = enabled
+                model.markDirty()
+            }
+        )
+    }
+
+    private func capabilityConfigBinding(for capability: CapabilityDraft) -> Binding<JSONValue> {
+        Binding(
+            get: {
+                model.capabilities.first(where: { $0.id == capability.id })?.config ?? .object([:])
+            },
+            set: { config in
+                guard let index = model.capabilities.firstIndex(where: { $0.id == capability.id }) else {
+                    return
+                }
+                model.capabilities[index].config = config
+            }
+        )
     }
 
     private func capabilityRow(
@@ -77,6 +136,53 @@ struct ConnectorSection: View {
                 model.markDirty()
             }
         )
+    }
+}
+
+private struct CapabilityConfigEditor: View {
+    @Binding var config: JSONValue
+    let onChanged: () -> Void
+    @State private var text = ""
+    @State private var error = ""
+
+    var body: some View {
+        DisclosureGroup("配置") {
+            VStack(alignment: .leading, spacing: 6) {
+                TextEditor(text: $text)
+                    .font(Theme.mono(10.5))
+                    .frame(minHeight: 72, maxHeight: 130)
+                    .padding(6)
+                    .background(Theme.surface2, in: RoundedRectangle(cornerRadius: 7))
+                    .onChange(of: text) { _, next in
+                        apply(next)
+                    }
+                if !error.isEmpty {
+                    Text(error)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.danger)
+                }
+            }
+            .padding(.top, 5)
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 10)
+        .onAppear(perform: sync)
+    }
+
+    private func apply(_ raw: String) {
+        guard let data = raw.data(using: .utf8) else { return }
+        do {
+            let next = try JSONDecoder().decode(JSONValue.self, from: data)
+            config = next
+            error = ""
+            onChanged()
+        } catch {
+            self.error = "配置必须是合法 JSON"
+        }
+    }
+
+    private func sync() {
+        text = config.prettyText
     }
 }
 

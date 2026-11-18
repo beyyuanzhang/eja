@@ -119,7 +119,16 @@ final class AppModel {
         fetching = true
         defer { fetching = false }
         do {
-            let next = try await client.fetchState(busy: busy, encounter: encounter)
+            let current = state
+            var next = try await client.fetchState(
+                busy: busy,
+                encounter: encounter,
+                after: current?.lastEvent ?? 0
+            )
+            if let current, next.lastEvent >= current.lastEvent {
+                let received = Set(next.events.map(\.id))
+                next.events = current.events.filter { !received.contains($0.id) } + next.events
+            }
             if state != next {
                 state = next
             }

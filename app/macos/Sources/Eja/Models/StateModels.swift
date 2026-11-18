@@ -120,11 +120,12 @@ struct Health: Codable, Sendable, Equatable {
     var model: Bool
     var modelName: String
     var state: Bool
-    var mcp: Bool
+    var tools: Bool
     var journal: String
     var journalError: String?
     var torn: Bool
     var turnInFlight: Bool
+    var capabilityErrors: [String]
 }
 
 struct LoopItem: Codable, Sendable, Identifiable, Equatable {

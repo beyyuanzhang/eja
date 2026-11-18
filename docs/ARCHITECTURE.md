@@ -191,11 +191,18 @@ transcript or manufacture an acceptance.
 
 ## Composition
 
-`host::compose` is the single assembly root for CLI and HTTP. It reads
-`app-settings.json`, assembles the selected tool registry and environment
-provider, and returns one `ComposedHost` with record-store services and
-capability diagnostics. The turn then exposes only the matching interfaces
-through `Ports`.
+`host::capability` is the one flat capability catalog. Built-ins and installed
+plugins publish the same card shape: id, title, description, service kind,
+default state and private config. `host::compose` is the single assembly root for
+CLI and HTTP. It reads `app-settings.json`, walks enabled cards, assembles their
+providers and returns one `ComposedHost` with record-store services and
+capability diagnostics. The kernel has no capability enum, plugin list or
+workspace/Git/MCP variant.
+
+The catalog supplies services to existing contracts. A tool card contributes a
+`ToolProvider`, an environment card contributes an `EnvironmentProvider`, and a
+background card contributes host-owned services. The catalog itself has no
+dispatch protocol and adds no kernel authority.
 
 Tools and environments have different contracts because they answer different
 questions. `ToolProvider` declares callable actions and their names.
@@ -215,8 +222,22 @@ can execute a run. It has no dispatch protocol and adds no kernel authority.
 
 Git appears in two external adapter roles. `Checkpoints` freezes Git-visible
 evidence for records. `GitWorktrees` supplies isolated execution environments and
-durable branches. The kernel sees neither role directly and contains no
-repository topology.
+durable branches. They are separate `checkpoints` and `git-worktrees` cards, so
+either service can run without the other. The kernel sees neither role directly
+and contains no repository topology.
+
+Managed plugins are external tool cards. Their manifest supplies card metadata
+and default config, the active pointer versions the code, and the manager stages,
+tests, activates and rolls back versions. A plugin receives its config through
+`EJA_PLUGIN_CONFIG`; it still receives no workspace, host credential or network
+authority. Third-party tools enter through MCP and therefore use the same
+`ToolProvider` boundary as built-in files, shell and connectors.
+
+The HTTP host keeps one `host::state::Cache` derived from the journal. It
+rechecks the file stamp, folds only after a change, and serves event tails after
+the caller's cursor. The cache is rebuildable and never becomes a second
+authority. MCP connector types and normalization remain an adapter-owned config
+detail behind the generic card storage.
 
 ## Port contracts
 

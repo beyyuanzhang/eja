@@ -238,6 +238,7 @@ impl McpTools {
         name: &str,
         launcher: &str,
         args: Vec<String>,
+        env: BTreeMap<String, String>,
         cwd: &Path,
         parent: &Control,
     ) -> Result<Self> {
@@ -245,7 +246,7 @@ impl McpTools {
             command: Some(launcher.into()),
             url: None,
             args,
-            env: BTreeMap::new(),
+            env,
             cwd: None,
             headers: BTreeMap::new(),
             tools: None,

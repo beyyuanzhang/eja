@@ -3,8 +3,7 @@ import Foundation
 struct SettingsView: Codable, Sendable {
     var providers: [ProviderView]
     var roles: RoleBindings
-    var connectors: ConnectorsView
-    var capabilities: CapabilitySettings
+    var capabilities: [CapabilityView]
     var limits: Limits
     var workspaces: [String: String]
     var runtimePath: String
@@ -64,22 +63,39 @@ struct ConnectorView: Codable, Sendable {
     var witness: [String]
 }
 
-struct CapabilitySettings: Codable, Sendable, Equatable {
-    var workspace: Bool
-    var files: Bool
-    var shell: Bool
-    var git: Bool
-    var mcp: Bool
-    var plugins: Bool
+struct CapabilityView: Codable, Sendable, Equatable, Identifiable {
+    var id: String
+    var title: String
+    var description: String
+    var kind: String
+    var source: String
+    var enabled: Bool
+    var config: JSONValue
+}
 
-    static let defaults = CapabilitySettings(
-        workspace: true,
-        files: true,
-        shell: true,
-        git: true,
-        mcp: true,
-        plugins: false
-    )
+struct CapabilityDraft: Sendable, Identifiable, Equatable {
+    var id: String
+    var title: String
+    var description: String
+    var kind: String
+    var source: String
+    var enabled: Bool
+    var config: JSONValue
+
+    init(view: CapabilityView) {
+        id = view.id
+        title = view.title
+        description = view.description
+        kind = view.kind
+        source = view.source
+        enabled = view.enabled
+        config = view.config
+    }
+}
+
+struct CapabilitySaveBody: Encodable, Sendable {
+    var enabled: Bool
+    var config: JSONValue
 }
 
 struct Limits: Codable, Sendable {
@@ -225,8 +241,7 @@ struct ConnectorDraft: Encodable, Sendable, Identifiable {
 struct SettingsSaveBody: Encodable, Sendable {
     var providers: [ProviderDraft]
     var roles: RoleBindings
-    var connectors: ConnectorSaveBody
-    var capabilities: CapabilitySettings
+    var capabilities: [String: CapabilitySaveBody]
     var limits: Limits
     var workspaces: [String: String]
 }

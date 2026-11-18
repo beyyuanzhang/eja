@@ -19,7 +19,7 @@ final class SettingsModel {
     var providers: [ProviderDraft] = []
     var roles: RoleBindings = .empty
     var connectors: [ConnectorDraft] = []
-    var capabilities: CapabilitySettings = .defaults
+    var capabilities: [CapabilityDraft] = []
     var limits: Limits = .fallback
     var workspaces: [WorkspaceDraft] = []
     var view: SettingsView?
@@ -47,8 +47,7 @@ final class SettingsModel {
         let body = SettingsSaveBody(
             providers: providers,
             roles: roles,
-            connectors: ConnectorSaveBody(servers: connectors),
-            capabilities: capabilities,
+            capabilities: capabilityMap(),
             limits: limits,
             workspaces: workspaceMap()
         )
@@ -105,8 +104,8 @@ final class SettingsModel {
         self.view = view
         providers = view.providers.map(ProviderDraft.init(view:))
         roles = view.roles
-        capabilities = view.capabilities
-        connectors = view.connectors.servers.map(ConnectorDraft.init(view:))
+        capabilities = view.capabilities.map(CapabilityDraft.init(view:))
+        connectors = (mcpConnectors(from: view.capabilities) ?? []).map(ConnectorDraft.init(view:))
         limits = view.limits
         workspaces = view.workspaces.keys.sorted().map { name in
             WorkspaceDraft(name: name, path: view.workspaces[name] ?? "")
@@ -126,9 +125,23 @@ final class SettingsModel {
         return output
     }
 
+    private func capabilityMap() -> [String: CapabilitySaveBody] {
+        var output: [String: CapabilitySaveBody] = [:]
+        for capability in capabilities {
+            let config: JSONValue
+            if capability.id == "mcp" {
+                config = jsonValue(ConnectorSaveBody(servers: connectors))
+            } else {
+                config = capability.config
+            }
+            output[capability.id] = CapabilitySaveBody(enabled: capability.enabled, config: config)
+        }
+        return output
+    }
+
     private func reconcile(with saved: SettingsView) {
         view = saved
-        capabilities = saved.capabilities
+        capabilities = saved.capabilities.map(CapabilityDraft.init(view:))
         limits = saved.limits
         let returnedProviders = Dictionary(uniqueKeysWithValues: saved.providers.map { ($0.id, $0) })
         for index in providers.indices {
@@ -141,13 +154,29 @@ final class SettingsModel {
             }
             providers[index].headers = syncRows(providers[index].headers, with: returned.headers)
         }
-        let returnedConnectors = Dictionary(uniqueKeysWithValues: saved.connectors.servers.map { ($0.name, $0) })
+        let returnedConnectors = Dictionary(
+            uniqueKeysWithValues: (mcpConnectors(from: saved.capabilities) ?? []).map { ($0.name, $0) }
+        )
         for index in connectors.indices {
             let name = connectors[index].name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard let returned = returnedConnectors[name] else { continue }
             connectors[index].env = syncRows(connectors[index].env, with: returned.env)
             connectors[index].headers = syncRows(connectors[index].headers, with: returned.headers)
         }
+    }
+
+    private func mcpConnectors(from capabilities: [CapabilityView]) -> [ConnectorView]? {
+        guard let capability = capabilities.first(where: { $0.id == "mcp" }) else { return [] }
+        guard let data = try? JSONEncoder().encode(capability.config) else { return nil }
+        return try? JSONDecoder().decode(ConnectorsView.self, from: data).servers
+    }
+
+    private func jsonValue<T: Encodable>(_ value: T) -> JSONValue {
+        guard let data = try? JSONEncoder().encode(value),
+              let decoded = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+            return .object([:])
+        }
+        return decoded
     }
 
     private func syncRows(_ rows: [KeyValueDraft], with returned: [KeyValueView]) -> [KeyValueDraft] {

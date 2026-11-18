@@ -87,21 +87,23 @@ cargo run -- --no-project --dir .eja turn "..."
 cargo run -- serve --no-project --dir .eja
 ```
 
-There is one settings file and one capability switchboard. The defaults are
-workspace, files, shell, Git and MCP on, and plugins off:
+There is one settings file and one flat capability catalog. Built-in and
+installed capabilities appear as the same kind of card. The defaults enable the
+local workspace, file tools, shell tools, Git worktrees, checkpoints and MCP.
+EJA's plugin-authoring tools start disabled:
 
 ```json
 {
   "providers": [],
   "roles": {},
-  "connectors": {"servers": []},
   "capabilities": {
-    "workspace": true,
-    "files": true,
-    "shell": true,
-    "git": true,
-    "mcp": true,
-    "plugins": false
+    "local-workspace": {"enabled": true, "config": {}},
+    "files": {"enabled": true, "config": {}},
+    "shell": {"enabled": true, "config": {}},
+    "git-worktrees": {"enabled": true, "config": {}},
+    "checkpoints": {"enabled": true, "config": {}},
+    "mcp": {"enabled": true, "config": {"servers": []}},
+    "managed-plugins": {"enabled": false, "config": {}}
   },
   "limits": {
     "slots": 1,
@@ -113,15 +115,16 @@ workspace, files, shell, Git and MCP on, and plugins off:
 }
 ```
 
-File and shell tools need a workspace. Turning off a capability removes its
-provider from the runtime. Optional connector and plugin startup failures are
-reported as capability warnings. A failed provider is omitted while unrelated
-providers and ordinary turns remain usable. The runtime exposes the latest
-warnings as `health.capabilityErrors`.
+File and shell tools need a workspace. Turning off a card removes its provider
+from the runtime. Git worktree isolation and checkpoint evidence are separate
+cards. Optional connector and plugin startup failures are reported as
+capability warnings. A failed provider is omitted while unrelated providers and
+ordinary turns remain usable. The runtime exposes the latest warnings as
+`health.capabilityErrors`.
 
 ### Managed plugins
 
-Set `capabilities.plugins` to `true` to let AJAs stage their own Python stdio MCP
+Set `capabilities.managed-plugins.enabled` to `true` to let AJAs stage their own Python stdio MCP
 servers, test a tool on sample input, and activate a tested version for future
 turns. The same tools also list current and previous activations and roll back a
 version. Active plugin tools appear automatically as `plugin__NAME__TOOL` and
@@ -129,16 +132,19 @@ the run record identifies their version. A turn keeps the version it started
 with. If the newly selected version fails to start, the runtime tries the
 previous one and reports the startup error.
 
-Plugins are available only when both `mcp` and `plugins` are enabled.
+Each active plugin receives its own `plugin:NAME` capability card. Disabling
+that card removes the plugin's tools while leaving its version history intact.
+The MCP card configures external MCP connectors and is independent of managed
+plugin loading.
 
 The managed registry lives under `<dir>/plugins`. A managed server receives its
-versioned source and the arguments to its tool calls. Its process receives no
-workspace, host credentials, or network grant. macOS uses the system sandbox and
-Python from the Command Line Tools or Xcode. Linux needs `/usr/bin/bwrap`, user
-namespaces, and `/usr/bin/python3`. Plugin execution fails if that isolation is
-unavailable. The HTTP runtime restricts managed plugin administration to a local
-listener. Explicitly configured shell and MCP capabilities keep their own trust
-boundaries.
+versioned source, the arguments to its tool calls, and its capability config in
+`EJA_PLUGIN_CONFIG`. Its process receives no workspace, host credentials, or
+network grant. macOS uses the system sandbox and Python from the Command Line
+Tools or Xcode. Linux needs `/usr/bin/bwrap`, user namespaces, and
+`/usr/bin/python3`. Plugin execution fails if that isolation is unavailable.
+The HTTP runtime restricts managed plugin code to a local listener. Explicitly
+configured shell and MCP cards keep their own trust boundaries.
 
 The runtime's <http://127.0.0.1:8787> endpoint is API transport, not a second app.
 Any number of separately hosted frontends may use the same runtime. See
@@ -157,7 +163,7 @@ Any number of separately hosted frontends may use the same runtime. See
 - Working contexts are bounded views. Live tool results and replayed tool results
   use the same view function. Every tool result has a `{aja, entry}` address;
   `eja_read_record` reads a bounded passage from this aja or its ancestry.
-- A checkpoint captures Git-visible workspace files when the coding capability
+- A checkpoint captures Git-visible workspace files when the `checkpoints` card
   is assembled. It is evidence about the environment at that time; a continuation
   inherits observations, not a restored environment. Missing checkpoints are reported
   in both manifest and digest. The record store owns that repository and its one
@@ -347,7 +353,7 @@ cargo run -- --dir /tmp/eja show context
 cargo run -- --dir /tmp/eja --confirm 12 turn "apply the approved proposal"
 ```
 
-Configure providers, roles, connectors, capabilities and workspaces in
+Configure providers, roles, capability cards and workspaces in
 `<dir>/app-settings.json`. The macOS app writes the same file.
 `eja --dir DIR show tools` lists active tool grants without printing credentials.
 Without connectors, a aja has its record reader and can produce a reply; it

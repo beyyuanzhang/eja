@@ -8,7 +8,11 @@ use eja::{
     Event, Kind, OpenProposal, ProposalKind, RelationKind, State, Task, TaskKind, TaskStatus,
 };
 use serde_json::{json, Value};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 /// The view's local encounter bookmark. The runtime owns every derivation;
 /// the bookmark only says which exchange this view is looking at.
@@ -23,6 +27,65 @@ pub struct Journal {
     pub events: Vec<Event>,
     pub error: Option<String>,
     pub torn: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+/// A rebuildable derived view of the journal. The file remains the authority;
+/// this cache only avoids folding and serializing every historical event on
+/// every frontend poll.
+pub struct Cache {
+    dir: PathBuf,
+    stamp: Option<Stamp>,
+    journal: Journal,
+    state: State,
+    events: Vec<Value>,
+}
+
+impl Cache {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            stamp: None,
+            journal: Journal {
+                events: Vec::new(),
+                error: None,
+                torn: false,
+            },
+            state: State::default(),
+            events: Vec::new(),
+        }
+    }
+
+    fn refresh(&mut self) {
+        let stamp = fs::metadata(self.dir.join("log.jsonl"))
+            .ok()
+            .map(|metadata| Stamp {
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+            });
+        if self.stamp == stamp {
+            return;
+        }
+        self.stamp = stamp;
+        self.journal = Journal::read(&self.dir);
+        self.state = State::fold(self.journal.events.clone());
+        self.events = self
+            .journal
+            .events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+            .collect();
+    }
+
+    pub fn journal(&mut self) -> &Journal {
+        self.refresh();
+        &self.journal
+    }
 }
 
 impl Journal {
@@ -82,7 +145,7 @@ pub struct Health {
     pub model: bool,
     pub model_name: String,
     pub state: bool,
-    pub mcp: bool,
+    pub tools: bool,
     pub journal: &'static str,
     pub journal_error: Option<String>,
     pub torn: bool,
@@ -100,7 +163,7 @@ impl serde::Serialize for Health {
         state.serialize_field("model", &self.model)?;
         state.serialize_field("modelName", &self.model_name)?;
         state.serialize_field("state", &self.state)?;
-        state.serialize_field("mcp", &self.mcp)?;
+        state.serialize_field("tools", &self.tools)?;
         state.serialize_field("journal", &self.journal)?;
         state.serialize_field("journalError", &self.journal_error)?;
         state.serialize_field("torn", &self.torn)?;
@@ -150,41 +213,63 @@ fn task_json(state: &State, task: &Task) -> Value {
 
 /// The API state: one core fold, serialized. Nothing here re-derives meaning.
 pub fn state_json(
-    journal: &Journal,
+    cache: &mut Cache,
+    after: u64,
     health: &Health,
     busy: bool,
     encounter: Option<Encounter>,
 ) -> Value {
-    let state = State::fold(journal.events.clone());
-    let events: Vec<Value> = journal
-        .events
+    cache.refresh();
+    render_state(
+        &cache.state,
+        &cache.journal.events,
+        &cache.events,
+        after,
+        health,
+        busy,
+        encounter,
+    )
+}
+
+fn render_state(
+    state: &State,
+    journal_events: &[Event],
+    event_views: &[Value],
+    after: u64,
+    health: &Health,
+    busy: bool,
+    encounter: Option<Encounter>,
+) -> Value {
+    let events: Vec<Value> = journal_events
         .iter()
-        .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+        .zip(event_views)
+        .filter(|(event, _)| event.id > after)
+        .map(|(_, view)| view.clone())
         .collect();
     let tasks: Vec<Value> = state
         .tasks()
         .iter()
-        .map(|task| task_json(&state, task))
+        .map(|task| task_json(state, task))
         .collect();
     let mut view = json!({
         "events": events,
         "tasks": &tasks,
         "lastEvent": state.last_id(),
         "health": health,
-        "presence": presence_voice(&state),
+        "presence": presence_voice(state),
     });
-    let loops = open_loops(&state, &tasks, busy);
+    let loops = open_loops(state, &tasks, busy);
     let loops = match encounter {
         None => loops,
         Some(bookmark) => loops
             .into_iter()
-            .filter(|item| in_encounter(item, &state, bookmark))
+            .filter(|item| in_encounter(item, state, bookmark))
             .collect(),
     };
     view["loops"] = Value::Array(loops);
     view["spoken"] = encounter.map_or_else(
         || Value::Array(Vec::new()),
-        |bookmark| spoken(&state, bookmark),
+        |bookmark| spoken(state, bookmark),
     );
     view
 }
@@ -410,9 +495,10 @@ pub fn journal_task(journal: &Journal, id: u64) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{journal_task, state_json, Encounter, Health, Journal};
+    use super::{journal_task, render_state, state_json, Cache, Encounter, Health, Journal};
     use eja::{Event, Kind};
     use serde_json::{json, Value};
+    use std::io::Write as _;
 
     fn event(id: u64, turn: u64, scope: &str, kind: Kind, text: &str, data: Value) -> Event {
         Event {
@@ -432,13 +518,23 @@ mod tests {
             model: true,
             model_name: "model".to_owned(),
             state: true,
-            mcp: false,
+            tools: false,
             journal: "ok",
             journal_error: None,
             torn: false,
             turn_in_flight: false,
             capability_errors: vec!["connector unavailable".into()],
         }
+    }
+
+    fn view(journal: &Journal, health: &Health, busy: bool, encounter: Option<Encounter>) -> Value {
+        let state = eja::State::fold(journal.events.clone());
+        let views: Vec<Value> = journal
+            .events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect();
+        render_state(&state, &journal.events, &views, 0, health, busy, encounter)
     }
 
     #[test]
@@ -514,7 +610,7 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(&journal, &health(), false, None);
+        let state = view(&journal, &health(), false, None);
 
         assert_eq!(
             state["events"]
@@ -557,7 +653,7 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(&journal, &health(), false, None);
+        let state = view(&journal, &health(), false, None);
         assert_eq!(state["presence"], Value::Null);
         let journal = Journal {
             events: vec![
@@ -567,7 +663,7 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(&journal, &health(), false, None);
+        let state = view(&journal, &health(), false, None);
         assert_eq!(state["presence"]["text"], "welcome back");
     }
 
@@ -593,7 +689,7 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(&journal, &health(), false, None);
+        let state = view(&journal, &health(), false, None);
         assert_eq!(state["presence"]["text"], "");
         assert_eq!(state["presence"]["data"]["choices"][1]["value"]["task"], 7);
     }
@@ -628,7 +724,7 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(
+        let state = view(
             &journal,
             &health(),
             false,
@@ -687,7 +783,7 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(&journal, &health(), false, None);
+        let state = view(&journal, &health(), false, None);
         let loops = state["loops"].as_array().unwrap();
         assert_eq!(loops.len(), 2, "{loops:?}");
         assert_eq!(loops[0]["kind"], "decision");
@@ -704,17 +800,17 @@ mod tests {
             error: None,
             torn: false,
         };
-        let state = state_json(&running, &health(), false, None);
+        let state = view(&running, &health(), false, None);
         let loops = state["loops"].as_array().unwrap();
         assert_eq!(loops[0]["kind"], "interrupted");
-        let state = state_json(&running, &health(), true, None);
+        let state = view(&running, &health(), true, None);
         assert!(state["loops"]
             .as_array()
             .unwrap()
             .iter()
             .all(|item| item["kind"] != "interrupted"));
         // The encounter bookmark keeps its own decision and newer events.
-        let state = state_json(
+        let state = view(
             &journal,
             &health(),
             false,
@@ -744,6 +840,36 @@ mod tests {
         assert_eq!(journal.events.len(), 1);
         assert!(journal.torn);
         assert!(journal.error.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_cache_refreshes_for_appends_and_returns_only_the_requested_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "eja-host-cache-{}-{}",
+            std::process::id(),
+            super::super::util::now_seconds()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = event(1, 1, "eja", Kind::User, "first", json!({}));
+        std::fs::write(
+            root.join("log.jsonl"),
+            format!("{}\n", serde_json::to_string(&first).unwrap()),
+        )
+        .unwrap();
+        let mut cache = Cache::new(root.clone());
+        let initial = state_json(&mut cache, 0, &health(), false, None);
+        assert_eq!(initial["events"].as_array().unwrap().len(), 1);
+
+        let second = event(2, 1, "eja", Kind::Eja, "second", json!({}));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("log.jsonl"))
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(&second).unwrap()).unwrap();
+
+        let tail = state_json(&mut cache, 1, &health(), false, None);
+        assert_eq!(tail["events"], json!([second]));
         let _ = std::fs::remove_dir_all(root);
     }
 }

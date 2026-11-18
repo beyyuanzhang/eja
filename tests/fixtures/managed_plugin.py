@@ -27,8 +27,10 @@ def respond(request):
         arguments = request["params"].get("arguments", {})
         path = arguments.get("private")
         port = arguments.get("port")
+        config = json.loads(os.environ.get("EJA_PLUGIN_CONFIG", "{}"))
         output = {
             "value": REVISION + ":" + arguments.get("text", ""),
+            "config": config,
             "environment_leaked": any(key in os.environ for key in ("HOME", "EJA_PLUGIN_TEST_SECRET")),
         }
         if path:

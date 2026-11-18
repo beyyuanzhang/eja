@@ -1,6 +1,7 @@
 //! Host-owned versions of self-authored, isolated MCP servers.
 
 use super::{
+    capability::{CapabilityDescriptor, CapabilitySettings},
     plugin_sandbox,
     util::{write_private_bytes, write_private_json},
 };
@@ -30,7 +31,7 @@ pub(super) const DESCRIPTION: &str = "The host also grants AJAs managed plugin t
 
 const TOOLS: [(&str, &str, &[&str]); 5] = [
     ("eja_plugin_list", "List managed plugins, their active versions, and startup errors.", &[]),
-    ("eja_plugin_stage", "Stage a complete Python 3 stdio MCP server as a new version. Use only the standard library. The process cannot access the network, services, or project files. Protocol lines go to stdout. Test a tool before activation.", &["name", "source"]),
+    ("eja_plugin_stage", "Stage a complete Python 3 stdio MCP server as a new version. An optional manifest names the capability card. Use only the standard library. The process cannot access the network, services, or project files. Protocol lines go to stdout. Test a tool before activation.", &["name", "source"]),
     ("eja_plugin_test", "Start a staged version in isolation and call the named MCP tool with sample arguments. Only a successful test makes the version eligible for activation.", &["name", "version", "tool", "arguments"]),
     ("eja_plugin_activate", "Activate a tested version for the next turn. Tools are named plugin__NAME__TOOL. This does not change the tools in the current turn.", &["name", "version"]),
     ("eja_plugin_rollback", "Restore the previous version for the next turn. If there is no previous version, deactivate the plugin.", &["name"]),
@@ -40,6 +41,19 @@ const TOOLS: [(&str, &str, &[&str]); 5] = [
 struct Activation {
     current: Option<String>,
     previous: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Manifest {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "tool_kind")]
+    kind: String,
+    #[serde(default = "empty_config")]
+    config: Value,
 }
 
 type Activations = BTreeMap<String, Activation>;
@@ -73,10 +87,33 @@ impl Manager {
         eja::adapters::workspace_path(&self.root, &format!("{name}/{version}"))
     }
 
-    fn stage(&self, name: &str, source: &str) -> Result<Value> {
+    fn manifest(&self, name: &str, version: &str) -> Result<Manifest> {
+        let path = self.version_path(name, version)?.join("manifest.json");
+        match fs::read(path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn stage(&self, name: &str, source: &str, manifest: Option<Value>) -> Result<Value> {
         if source.trim().is_empty() || source.len() > SOURCE_BYTES {
             return Err("plugin source must contain between 1 byte and 64 KiB".into());
         }
+        let manifest = manifest
+            .map(|manifest| -> Result<Manifest> {
+                let manifest: Manifest = serde_json::from_value(manifest)
+                    .map_err(|error| format!("plugin manifest is invalid: {error}"))?;
+                if manifest.title.len() > 80
+                    || manifest.description.len() > 400
+                    || !valid_kind(&manifest.kind)
+                    || serde_json::to_vec(&manifest.config)?.len() > 64 * 1024
+                {
+                    return Err("plugin manifest fields are invalid".into());
+                }
+                Ok(manifest)
+            })
+            .transpose()?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let sequence = VERSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let version = format!("{now}-{}-{sequence}", std::process::id());
@@ -87,19 +124,39 @@ impl Manager {
             .recursive(true)
             .create(parent)?;
         DirBuilder::new().mode(0o700).create(&dir)?;
-        write_private_bytes(&dir.join("plugin.py"), source.as_bytes())
-            .map_err(|error| error.to_string())?;
-        Ok(json!({"name": name, "version": version, "status": "staged"}))
+        let staged = (|| -> Result<Value> {
+            write_private_bytes(&dir.join("plugin.py"), source.as_bytes())
+                .map_err(|error| error.to_string())?;
+            if let Some(manifest) = manifest {
+                write_private_json(&dir.join("manifest.json"), &serde_json::to_value(manifest)?)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(json!({"name": name, "version": version, "status": "staged"}))
+        })();
+        if staged.is_err() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        staged
     }
 
-    fn load_version(&self, name: &str, version: &str, control: &Control) -> Result<McpTools> {
+    fn load_version(
+        &self,
+        name: &str,
+        version: &str,
+        config: &Value,
+        control: &Control,
+    ) -> Result<McpTools> {
         let dir = self.version_path(name, version)?;
         let source = eja::adapters::workspace_path(&dir, "plugin.py")?;
         if !source.is_file() {
             return Err("managed plugin version has no source".into());
         }
         let (launcher, args) = plugin_sandbox::command(&source)?;
-        McpTools::load_managed(name, launcher, args, &dir, control)
+        let env = BTreeMap::from([(
+            "EJA_PLUGIN_CONFIG".to_owned(),
+            serde_json::to_string(config)?,
+        )]);
+        McpTools::load_managed(name, launcher, args, env, &dir, control)
     }
 
     fn test(
@@ -115,7 +172,8 @@ impl Manager {
             .filter(|value| value.is_object())
             .ok_or("arguments must be an object")?;
         let control = context.control.child(Duration::from_secs(10));
-        let provider = self.load_version(name, version, &control)?;
+        let manifest = self.manifest(name, version).unwrap_or_default();
+        let provider = self.load_version(name, version, &manifest.config, &control)?;
         let public = McpTools::managed_tool_name(name, tool);
         let result = provider.call(
             &ToolContext {
@@ -178,9 +236,15 @@ impl Manager {
 impl ToolProvider for Manager {
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         TOOLS.iter().map(|(name, description, required)| {
-            let properties: serde_json::Map<String, Value> = required.iter().map(|field| {
+            let mut properties: serde_json::Map<String, Value> = required.iter().map(|field| {
                 ((*field).into(), json!({"type": if *field == "arguments" {"object"} else {"string"}}))
             }).collect();
+            if *name == "eja_plugin_stage" {
+                properties.insert(
+                    "manifest".to_owned(),
+                    json!({"type":"object","description":"Optional capability card metadata and default config."}),
+                );
+            }
             json!({"type":"function","function":{
                 "name":name,"description":description,
                 "parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}
@@ -204,7 +268,11 @@ impl ToolProvider for Manager {
             );
         }
         match tool {
-            "eja_plugin_stage" => self.stage(name, required(arguments, "source")?),
+            "eja_plugin_stage" => self.stage(
+                name,
+                required(arguments, "source")?,
+                arguments.get("manifest").cloned(),
+            ),
             "eja_plugin_test" => {
                 self.test(name, required(arguments, "version")?, arguments, context)
             }
@@ -223,6 +291,22 @@ fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn capability_id(name: &str) -> String {
+    format!("plugin:{name}")
+}
+
+fn valid_kind(kind: &str) -> bool {
+    matches!(kind, "" | "tools")
+}
+
+fn tool_kind() -> String {
+    "tools".to_owned()
+}
+
+fn empty_config() -> Value {
+    json!({})
 }
 
 fn required<'a>(arguments: &'a Value, field: &str) -> Result<&'a str> {
@@ -254,12 +338,15 @@ impl ToolProvider for LoadedPlugin {
 
 pub(super) struct Registration {
     pub diagnostics: Vec<String>,
+    pub description: Option<String>,
 }
 
 pub(super) fn register(
     tools: &mut ToolRegistry,
     state: &Path,
     parent: &Control,
+    authoring: bool,
+    capabilities: &CapabilitySettings,
 ) -> Result<Registration> {
     let root = eja::adapters::workspace_path(&state.canonicalize()?, "plugins")?;
     DirBuilder::new()
@@ -272,20 +359,31 @@ pub(super) fn register(
         loaded: BTreeMap::new(),
     };
     let mut diagnostics = Vec::new();
+    let mut descriptions = Vec::new();
     let startup = parent.child(Duration::from_secs(20));
     for (name, entry) in manager.read()? {
         let Some(current) = entry.current else {
             continue;
         };
+        if !capabilities.enabled(&capability_id(&name)) {
+            continue;
+        }
+        let manifest = manager.manifest(&name, &current).unwrap_or_else(|error| {
+            diagnostics.push(format!(
+                "managed plugin {name} manifest is invalid: {error}"
+            ));
+            Manifest::default()
+        });
+        let config = capabilities.config(&capability_id(&name));
         let mut status = json!({"requested":current});
         let mut loaded = None;
-        match manager.load_version(&name, &current, &startup) {
+        match manager.load_version(&name, &current, &config, &startup) {
             Ok(provider) => loaded = Some((current.clone(), provider)),
             Err(error) => {
                 let error = error.to_string();
                 status["error"] = json!(error);
                 if let Some(previous) = entry.previous {
-                    match manager.load_version(&name, &previous, &startup) {
+                    match manager.load_version(&name, &previous, &config, &startup) {
                         Ok(provider) => {
                             diagnostics.push(format!(
                                 "managed plugin {name} version {current} failed to start: {error}; using version {previous}"
@@ -301,6 +399,9 @@ pub(super) fn register(
         }
         if let Some((version, provider)) = loaded {
             status["version"] = json!(version);
+            if !manifest.description.trim().is_empty() {
+                descriptions.push(manifest.description.clone());
+            }
             tools.register(Box::new(LoadedPlugin {
                 name: name.clone(),
                 version,
@@ -314,8 +415,52 @@ pub(super) fn register(
         }
         manager.loaded.insert(name, status);
     }
-    tools.register(Box::new(manager))?;
-    Ok(Registration { diagnostics })
+    if authoring {
+        descriptions.push(DESCRIPTION.to_owned());
+        tools.register(Box::new(manager))?;
+    }
+    Ok(Registration {
+        diagnostics,
+        description: (!descriptions.is_empty()).then(|| descriptions.join("\n")),
+    })
+}
+
+pub(super) fn catalog(state: &Path) -> Vec<CapabilityDescriptor> {
+    let Ok(root) = eja::adapters::workspace_path(state, "plugins") else {
+        return Vec::new();
+    };
+    let manager = Manager {
+        root,
+        writes: Mutex::new(()),
+        loaded: BTreeMap::new(),
+    };
+    let Ok(activations) = manager.read() else {
+        return Vec::new();
+    };
+    activations
+        .into_iter()
+        .filter_map(|(name, entry)| {
+            let version = entry.current?;
+            let manifest = manager.manifest(&name, &version).unwrap_or_default();
+            Some(CapabilityDescriptor {
+                id: capability_id(&name),
+                title: if manifest.title.is_empty() {
+                    format!("插件 {name}")
+                } else {
+                    manifest.title
+                },
+                description: if manifest.description.is_empty() {
+                    format!("已安装的 MCP 工具插件 {name}。")
+                } else {
+                    manifest.description
+                },
+                kind: "tools".to_owned(),
+                source: "plugin".to_owned(),
+                default_enabled: true,
+                default_config: manifest.config,
+            })
+        })
+        .collect()
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -331,6 +476,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn an_installed_manifest_becomes_a_capability_card() {
+        let path = std::env::temp_dir().join(format!(
+            "eja-plugin-card-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let root = Remove(path.canonicalize().unwrap());
+        let plugins = root.0.join("plugins");
+        let version = plugins.join("browser").join("1-1");
+        fs::create_dir_all(&version).unwrap();
+        write_private_json(
+            &version.join("manifest.json"),
+            &json!({
+                "title": "Browser",
+                "description": "Read and navigate pages.",
+                "kind": "tools",
+                "config": {"profile": "work"}
+            }),
+        )
+        .unwrap();
+        write_private_json(
+            &plugins.join("active.json"),
+            &json!({"browser":{"current":"1-1","previous":null}}),
+        )
+        .unwrap();
+
+        let cards = catalog(&root.0);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, "plugin:browser");
+        assert_eq!(cards[0].title, "Browser");
+        assert_eq!(cards[0].default_config["profile"], "work");
     }
 
     #[test]
@@ -352,7 +536,8 @@ mod tests {
         };
         let fresh = || {
             let mut tools = ToolRegistry::new(state, Vec::new()).unwrap();
-            register(&mut tools, state, &control).unwrap();
+            let capabilities = CapabilitySettings::default().normalize(&catalog(state));
+            register(&mut tools, state, &control, true, &capabilities).unwrap();
             tools
         };
         let name = "sample";
@@ -363,7 +548,16 @@ mod tests {
                 .call(
                     &context,
                     "eja_plugin_stage",
-                    &json!({"name":name,"source":source}),
+                    &json!({
+                        "name":name,
+                        "source":source,
+                        "manifest":{
+                            "title":"Sample",
+                            "description":"A deterministic test capability.",
+                            "kind":"tools",
+                            "config":{"profile":"work"}
+                        }
+                    }),
                 )
                 .unwrap();
             reply["version"].as_str().unwrap().to_owned()
@@ -387,6 +581,7 @@ mod tests {
         let output = sample(&initial, &first, false).unwrap();
         let output = &output["result"]["structuredContent"];
         assert_eq!(output["value"], "one:hello");
+        assert_eq!(output["config"]["profile"], "work");
         for denied in [
             "environment_leaked",
             "private_readable",
@@ -414,6 +609,10 @@ mod tests {
         let used = use_plugin(&second_turn);
         assert_eq!(used["version"], second);
         assert_eq!(used["result"]["structuredContent"]["value"], "two:later");
+        assert_eq!(
+            used["result"]["structuredContent"]["config"]["profile"],
+            "work"
+        );
 
         // The host can find the previous version even if startup of the new one fails.
         fs::remove_file(
