@@ -1,5 +1,5 @@
 use eja::{
-    adapters::{self, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolGateway},
+    adapters::{self, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolProvider},
     turn_at_with_options, Assignment, Result, State, Store, Task, TaskStatus, TurnEnd, TurnOptions,
 };
 use std::{collections::VecDeque, path::PathBuf, process::ExitCode};
@@ -168,8 +168,8 @@ fn run() -> Result<()> {
         .into());
     }
     let store = Store::new(&dir)?;
-    // The host's private state is not part of the world it observes: keep it out
-    // of any commit, including a worktree world's.
+    // The host's private state is not part of the environment it observes: keep it
+    // out of any commit, including a Git worktree environment's.
     let ignore = dir.join(".gitignore");
     if !ignore.exists() {
         std::fs::write(&ignore, "*\n")?;
@@ -194,34 +194,34 @@ fn run() -> Result<()> {
             // the same workspaces, so a task opened here resolves like one
             // opened over HTTP.
             let settings = host::SettingsStore::new(project, dir.clone());
-            let prepared = host::compose(&settings, capabilities, config.as_deref(), &startup)?;
-            report_capability_diagnostics(&prepared.assembled.diagnostics);
-            options.limits.slots = prepared.effective.limits.slots.max(1);
-            if prepared.effective.limits.turn_timeout_ms > 0 {
-                options.limits.timeout_ms = prepared.effective.limits.turn_timeout_ms;
+            let composed = host::compose(&settings, capabilities, config.as_deref(), &startup)?;
+            report_capability_diagnostics(&composed.diagnostics);
+            options.limits.slots = composed.effective.limits.slots.max(1);
+            if composed.effective.limits.turn_timeout_ms > 0 {
+                options.limits.timeout_ms = composed.effective.limits.turn_timeout_ms;
             }
-            let grant = capabilities.grants(&settings, &prepared.effective.settings);
+            let grant = capabilities.grants(&settings, &composed.effective.settings);
             options.workspaces.clone_from(&grant);
             let mut brain = OpenAiBrain::from_env()?
                 .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?;
-            if let Some(description) = &prepared.assembled.capability_description {
+            if let Some(description) = &composed.capability_description {
                 brain = brain.with_capability_description(description);
             }
             let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
             let ajas = dir.join("ajas");
             let mut aja_limits = eja::aja::Limits::default();
-            if prepared.effective.limits.aja_steps > 0 {
-                aja_limits.steps = Some(prepared.effective.limits.aja_steps);
+            if composed.effective.limits.aja_steps > 0 {
+                aja_limits.steps = Some(composed.effective.limits.aja_steps);
             }
-            if prepared.effective.limits.aja_timeout_ms > 0 {
-                aja_limits.timeout_ms = prepared.effective.limits.aja_timeout_ms;
+            if composed.effective.limits.aja_timeout_ms > 0 {
+                aja_limits.timeout_ms = composed.effective.limits.aja_timeout_ms;
             }
-            let worker = prepared.assembled.worker(&ajas, model, aja_limits)?;
+            let worker = composed.worker(&ajas, model, aja_limits)?;
             let records = RecordFiles::with_checkpoints(&ajas, dir.join("checkpoints"));
             let ports = Ports {
                 aja: Some(&records),
-                capabilities: Some(&*prepared.assembled.tools),
-                worlds: prepared.assembled.worlds.as_deref(),
+                capabilities: Some(&*composed.tools),
+                environments: composed.environments.as_deref(),
             };
             let outcome = turn_at_with_options(
                 &store,
@@ -289,8 +289,8 @@ fn run() -> Result<()> {
                 .then(std::env::current_dir)
                 .transpose()?;
             let settings = host::SettingsStore::new(project, dir);
-            let prepared = host::compose(&settings, capabilities, config.as_deref(), &startup)?;
-            report_capability_diagnostics(&prepared.assembled.diagnostics);
+            let composed = host::compose(&settings, capabilities, config.as_deref(), &startup)?;
+            report_capability_diagnostics(&composed.diagnostics);
             let assignment = Assignment {
                 task_id: options.focus.unwrap_or(0),
                 objective: String::new(),
@@ -302,7 +302,7 @@ fn run() -> Result<()> {
             };
             println!(
                 "{}",
-                serde_json::to_string_pretty(&prepared.assembled.tools.definitions(&assignment))?
+                serde_json::to_string_pretty(&composed.tools.definitions(&assignment))?
             );
         }
         Command::Aja(id) => {

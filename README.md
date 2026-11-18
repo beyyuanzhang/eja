@@ -144,8 +144,8 @@ Any number of separately hosted frontends may use the same runtime. See
   use the same view function. Every tool result has a `{aja, entry}` address;
   `eja_read_record` reads a bounded passage from this aja or its ancestry.
 - A checkpoint captures Git-visible workspace files when the coding capability
-  is assembled. It is evidence about the world at that time; a continuation
-  inherits observations, not a restored world. Missing checkpoints are reported
+  is assembled. It is evidence about the environment at that time; a continuation
+  inherits observations, not a restored environment. Missing checkpoints are reported
   in both manifest and digest. The record store owns that repository and its one
   hermetic git invocation, so a project's hooks, signing settings and global
   configuration never reach a run. A run without a workspace still writes its
@@ -157,8 +157,9 @@ Any number of separately hosted frontends may use the same runtime. See
   scoped to the task. Acceptance needs that observation; a rejection does not,
   so a witness that never answers cannot strand a task in the index.
 - One address space covers every fact a view can read: `log:<target>`,
-  `record:<aja>/<path>`, `world:<path>`. Any other target is a host read
-  tool. A folded region and a live one are read the same way.
+  `record:<aja>/<path>`, `environment:<path>`. Any other target is a host read
+  tool. A folded region and a live one are read the same way. Input beginning
+  with the former `world:` prefix is normalized to `environment:`.
 - An observation says what it is — `look`, `witness` or `reconcile` — and its
   target then names the subject. Its kind is a typed field, not a reserved text,
   so a host tool may be named `witness` without becoming acceptance evidence.
@@ -208,13 +209,13 @@ one turn, so a proposal that needs one ends the turn and the next turn carries
 it: the turn is the unit of waiting, not a mid-turn park.
 
 EJA may observe any host-granted read-only capability. Its ability to observe
-never depends on unrelated tasks. Effects occur through an AJA's host gateway.
+never depends on unrelated tasks. Effects occur through an AJA's host tool provider.
 MCP read-only declarations are scoped to their server and tool.
 
 ## Reading and continuity
 
 ```
-look {source: log | aja | world, target, selector}
+look {target, arguments, selector}
 ```
 
 - Log targets: `task:<id>`, `event:<id>`, `history`, `all`. Discovery uses event
@@ -223,13 +224,13 @@ look {source: log | aja | world, target, selector}
   `partial_events`; `event:<id>` supports byte views so paging always advances.
 - Aja targets: `<id>/context.jsonl`, `<id>/aja.json`, `<id>/<workspace-file>`.
   Whole, range and match use the same source resolver, including checkpoints.
-- World targets: `read_file`, `list_dir`, or a granted read-only connector.
-  World tools select content through their own arguments.
+- Environment targets: `read_file`, `list_dir`, or a granted read-only connector.
+  Environment tools select content through their own arguments.
 - A target may instead be an address: `log:event:12`, `log:task:1`,
-  `record:3/report.md` (one frozen file of aja 3), `world:src/out.txt` (one
+  `record:3/report.md` (one frozen file of aja 3), `environment:src/out.txt` (one
   path of the project). One selector vocabulary applies to the space each
   authority is: a log page takes whole or range (an oversized event also takes
-  bytes), a frozen record file takes whole, range or match, and a world address
+  bytes), a frozen record file takes whole, range or match, and an environment address
   names one path and takes none. A target that is not an address is a host read
   tool, which selects through its own arguments.
 
@@ -268,7 +269,7 @@ A turn runs `project -> decide -> act -> record` until a final decision, repeate
 projection, cancellation, or a host budget. `TurnEnd` distinguishes these cases.
 Creating a aja, group or proposal returns its allocated id through the next
 projection, so the model never needs to guess a new id. Budget/cancellation
-results are explicit; intermediate replies are never final. Every reserved world
+results are explicit; intermediate replies are never final. Every reserved environment
 is settled and released when execution stops. Landing its changes is an explicit
 reconciliation, not an automatic side effect.
 
@@ -288,15 +289,15 @@ Default host budgets:
 One `Control` hierarchy propagates the turn deadline/cancellation to the brain,
 ajas, observations and model/tool calls. A child may shorten the deadline, never
 extend it. Every port requires this control explicitly; there is one entry point
-per operation. The one exception is cleanup: releasing a world runs after the
+per operation. The one exception is cleanup: releasing an environment runs after the
 run's budget may have expired, so the backend declares that bound itself rather
 than inheriting a spent control.
 
 Dispatches run in action order. With one slot they also run one at a time in one
-shared world; with more slots the host must reserve an isolated world per run, and
+shared environment; with more slots the host must reserve an isolated environment per run, and
 the journal still records reports in dispatch order. The turn owns how many runs a
-decision starts; the world backend owns how many may exist at once, because it is
-the only thing that knows whether a world is isolated. A refused world refuses the
+decision starts; the environment provider owns how many may exist at once, because it is
+the only thing that knows whether an environment is isolated. A refused environment refuses the
 run before it costs an aja id, and never reports itself as a budget stop. The host
 owns aja step and time limits; the disposable loop only manages its bounded
 message view.
@@ -328,13 +329,13 @@ a task without a run is a group, and an unreadable observation is a count.
 it commits into the same `State`, so one derivation serves validation and the
 projection. Evidence is that fold's output instead of a second copy a caller
 supplies, an observation carries a typed kind instead of a reserved target string,
-and every folded region names the address that reads it. The world backend is the
-only concurrency guard, a refused world costs no aja id, and the record keeps its
+and every folded region names the address that reads it. The environment provider is the
+only concurrency guard, a refused environment costs no aja id, and the record keeps its
 frozen transcript when it is replayed. 0.12 logs stay readable: new fields default
 to absent.
 
 0.12 turns approvals into events, moves acceptance evidence into the task's own
-contract, adds a slot budget with isolated worlds and world reconciliation, and
+contract, adds a slot budget with isolated environments and environment reconciliation, and
 replaces the look source taxonomy with one address space. Older logs stay
 readable: new fields default to absent, and a proposal without an Approval event
 simply stays pending. A state directory that predates the `ajas/` layout (it has
@@ -370,9 +371,9 @@ Host resource configuration: `EJA_TURN_DECISIONS`, `EJA_TURN_ACTIONS`,
 `EJA_TURN_DISPATCHES`, `EJA_AJA_SLOTS`, `EJA_TURN_TIMEOUT_MS`, `EJA_AJA_STEPS`,
 `EJA_AJA_TIMEOUT_MS`, `EJA_CONTEXT_BYTES`. Limits must be positive.
 `EJA_AJA_SLOTS` is the number of runs that may share a turn. With one slot the
-host uses a shared world when a workspace is granted. With multiple slots, a
+host uses a shared environment when a workspace is granted. With multiple slots, a
 workspace with a Git commit can give runs their own worktrees and branches,
-reconciled only when asked. A deployment without a workspace allocates no world. A worktree world starts
+reconciled only when asked. A deployment without a workspace allocates no environment. A Git worktree starts
 at `HEAD`: uncommitted project changes stay in the project and are reported by
 the run's own account. The runtime project is the default workspace.
 `--no-project` removes that default. Every existing extra directory saved in
@@ -380,7 +381,7 @@ settings is still available; a missing directory is not offered.
 Registration is the durable availability decision. When a task opens, it names
 one available workspace id; that root is fixed for the task and never silently
 moves to another directory.
-Each new run records its world kind, granted root, branch and settled commit.
+Each new run records its environment kind, granted root, branch and settled commit.
 Reconciliation follows that evidence rather than the capabilities enabled at
 restart. If the required backend is unavailable, or an old record cannot name an
 unambiguous workspace, reconciliation refuses and records the reason.
@@ -413,7 +414,7 @@ cycles, host authorization, atomic confirmation, torn-tail recovery, UTF-8 byte
 budgets, deadlines and always-changing model states. Identity regressions add the
 protocol-only contract, self-before-index rendering and addressable folding.
 Acceptance regressions add one-turn approvals and witness-or-undecidable
-judgments; world regressions add parallel slots with ordered reports, explicit
+judgments; environment regressions add parallel slots with ordered reports, explicit
 reconciliation and conflict reporting. Native/MCP tests also cover
 real local HTTP, cancellation, process cleanup and frozen checkpoints, including
 a record repository that asks git for a hostile hook and a signature the run
@@ -423,7 +424,7 @@ Trusted adapters must honor Control, own their resources and bound their output.
 An ordinary child process is not an OS security sandbox. Cancellation cannot
 undo remote side effects. The kernel guarantees bounded host execution under
 these port contracts; it cannot prove a model will solve an arbitrary objective.
-Identity and task state can be replayed; world effects are never replayed by
+Identity and task state can be replayed; environment effects are never replayed by
 folding the log. Legacy records/logs remain readable; past invalid relationships
 are not retroactively authorized, and dispatch refuses ambiguous ancestry.
 

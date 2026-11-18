@@ -3,6 +3,7 @@
 //! These are outside the core state machine. The core only sees typed ports.
 
 mod brain;
+mod environments;
 mod mcp;
 mod model;
 mod native;
@@ -10,21 +11,23 @@ mod ports;
 mod process;
 mod records;
 mod tools;
-mod worlds;
 
 pub use brain::{
     parse_decision, render_context, render_context_within, OpenAiBrain, SYSTEM_PROMPT,
 };
+pub use environments::{
+    EnvironmentKind, EnvironmentLease, EnvironmentProvider, EnvironmentRecord, GitWorktrees,
+    SharedEnvironment, WorkspaceEnvironments,
+};
 pub use mcp::McpTools;
 pub use model::{Control, Model, OpenAiModel};
-pub use native::{NativeRuntime, NativeWorker, INTERRUPTED};
+pub use native::{ExecutionServices, NativeWorker, INTERRUPTED};
 pub use ports::{Capabilities, Ports, RecordReader};
 pub use records::{Checkpoints, RecordFiles};
 pub use tools::{
-    granted_path, workspace_path, FileTools, HostTools, ToolContext, ToolGateway, WorkspaceTools,
-    WORKSPACE_GROUP, WORKSPACE_TOOLS,
+    granted_path, workspace_path, FileTools, ToolContext, ToolProvider, ToolRegistry,
+    WorkspaceTools, WORKSPACE_GROUP, WORKSPACE_TOOLS,
 };
-pub use worlds::{Shared, WorkspaceWorlds, Worktrees, World, WorldKind, WorldRecord, Worlds};
 
 use crate::Kind;
 

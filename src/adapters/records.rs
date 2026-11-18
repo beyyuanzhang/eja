@@ -5,7 +5,7 @@
 //! the host's `record:` address — resolves the same paths and reads the same
 //! manifest through this module, so a record has one shape and one owner.
 
-use super::{RecordReader, WorldKind, WorldRecord};
+use super::{EnvironmentKind, EnvironmentRecord, RecordReader};
 use crate::{fold, Assignment, Control, Result, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,19 +39,24 @@ pub struct Checkpoints {
 
 impl Checkpoints {
     #[must_use]
-    pub const fn new(git_dir: PathBuf, private: PathBuf) -> Self {
-        Self { git_dir, private }
+    pub fn new(git_dir: PathBuf, private: impl AsRef<Path>) -> Self {
+        Self {
+            git_dir,
+            private: super::environments::canonical_boundary(private.as_ref()),
+        }
     }
 
-    /// Freeze one run's world as a commit and return its id.
+    /// Freeze one run's environment as a commit and return its id.
     pub(crate) fn freeze(
         &self,
         task_id: u64,
         issued_at: i64,
-        world: &Path,
+        environment: &Path,
         control: &Control,
     ) -> Result<String> {
-        let git = |args: &[&str]| super::worlds::git_at(Some(&self.git_dir), world, args, control);
+        let git = |args: &[&str]| {
+            super::environments::git_at(Some(&self.git_dir), environment, args, control)
+        };
         if !self.git_dir.join("HEAD").exists() {
             fs::create_dir_all(&self.git_dir)?;
             git(&["init", "--quiet"])?;
@@ -64,7 +69,7 @@ impl Checkpoints {
             ":!.git".into(),
         ];
         // A state directory inside the project is the host's, never evidence.
-        if let Ok(relative) = self.private.strip_prefix(world) {
+        if let Ok(relative) = self.private.strip_prefix(environment) {
             let relative = relative.to_string_lossy().to_string();
             if !relative.is_empty() {
                 spec.push(format!(":!{relative}"));
@@ -85,23 +90,36 @@ pub struct Manifest {
     /// The host's account of what the run left behind.
     #[serde(default)]
     pub(crate) digest: String,
-    /// Where it ran.
-    #[serde(default)]
-    pub(crate) world: String,
+    /// Where it ran. Older records call this field `world`.
+    #[serde(default, alias = "world")]
+    pub(crate) environment: String,
     /// The commit a `record:` file is read from, when one was taken.
     #[serde(default)]
     pub(crate) checkpoint: Option<String>,
     #[serde(default)]
     pub(crate) checkpoint_error: Option<String>,
-    /// The world that measured this run. Older records only have `world`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) world_kind: Option<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) world_root: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) world_branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) world_commit: Option<String>,
+    /// The environment that measured this run. `world_*` remains accepted for
+    /// records written before the environment terminology was introduced.
+    #[serde(default, alias = "world_kind", skip_serializing_if = "Option::is_none")]
+    pub(crate) environment_kind: Option<String>,
+    #[serde(
+        default,
+        alias = "world_root",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub(crate) environment_root: String,
+    #[serde(
+        default,
+        alias = "world_branch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) environment_branch: Option<String>,
+    #[serde(
+        default,
+        alias = "world_commit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) environment_commit: Option<String>,
     /// The transcript's file name in this aja's directory. The protocol fixes it;
     /// it is recorded so a record states its own layout for a reader that only
     /// has the file.
@@ -128,30 +146,30 @@ impl Manifest {
         Ok(serde_json::from_slice(&fs::read(Self::path(root, aja)?)?)?)
     }
 
-    fn world(&self) -> WorldRecord {
-        let old_worktree = self.world.strip_prefix("worktree ");
-        let kind = match self.world_kind.as_deref() {
-            Some("shared") => WorldKind::Shared,
-            Some("worktree") => WorldKind::Worktree,
-            None if self.world == "shared" => WorldKind::Shared,
-            None if old_worktree.is_some() => WorldKind::Worktree,
-            Some(_) | None => WorldKind::Unknown,
+    fn environment(&self) -> EnvironmentRecord {
+        let old_worktree = self.environment.strip_prefix("worktree ");
+        let kind = match self.environment_kind.as_deref() {
+            Some("shared") => EnvironmentKind::Shared,
+            Some("worktree") => EnvironmentKind::Worktree,
+            None if self.environment == "shared" => EnvironmentKind::Shared,
+            None if old_worktree.is_some() => EnvironmentKind::Worktree,
+            Some(_) | None => EnvironmentKind::Unknown,
         };
-        let branch = self.world_branch.clone().or_else(|| {
+        let branch = self.environment_branch.clone().or_else(|| {
             old_worktree
                 .and_then(|rest| rest.split_once(" at "))
                 .map(|(branch, _)| branch.to_owned())
         });
-        let root = if self.world_root.is_empty() {
+        let root = if self.environment_root.is_empty() {
             self.assignment.workspace.clone()
         } else {
-            self.world_root.clone()
+            self.environment_root.clone()
         };
-        WorldRecord {
+        EnvironmentRecord {
             kind,
             root,
             branch,
-            commit: self.world_commit.clone(),
+            commit: self.environment_commit.clone(),
         }
     }
 }
@@ -214,7 +232,8 @@ impl RecordFiles {
     }
 
     /// Resolve one address inside the record authority. A transcript or manifest
-    /// is a file in the aja's directory; anything else is a path inside the world
+    /// is a file in the aja's directory; anything else is a path inside the
+    /// run's environment
     /// the run left behind, read from its checkpoint commit.
     fn source(&self, address: &str) -> Result<Source> {
         let Some((id, rest)) = address.split_once('/') else {
@@ -229,7 +248,7 @@ impl RecordFiles {
                 let commit = checkpoint(&manifest)?;
                 // The same hermetic git every other path uses: a frozen file is
                 // read under the environment that wrote it.
-                let mut child = super::worlds::hermetic(Some(checkpoints), &self.root)
+                let mut child = super::environments::hermetic(Some(checkpoints), &self.root)
                     .args(["show", &format!("{commit}:{rest}")])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
@@ -282,9 +301,9 @@ impl Drop for Source {
 }
 
 impl RecordReader for RecordFiles {
-    fn world(&self, aja: u64) -> Result<Option<WorldRecord>> {
+    fn environment(&self, aja: u64) -> Result<Option<EnvironmentRecord>> {
         match Manifest::read(&self.root, aja) {
-            Ok(manifest) => Ok(Some(manifest.world())),
+            Ok(manifest) => Ok(Some(manifest.environment())),
             Err(error)
                 if error
                     .downcast_ref::<io::Error>()
@@ -613,7 +632,7 @@ mod tests {
         Control::new(Duration::from_secs(30), std::sync::Arc::default())
     }
 
-    fn manifest(world: &str) -> Manifest {
+    fn manifest(environment: &str) -> Manifest {
         Manifest {
             assignment: Assignment {
                 task_id: 3,
@@ -625,11 +644,11 @@ mod tests {
                 issued_at: 1,
             },
             digest: String::new(),
-            world: world.into(),
-            world_kind: None,
-            world_root: String::new(),
-            world_branch: None,
-            world_commit: None,
+            environment: environment.into(),
+            environment_kind: None,
+            environment_root: String::new(),
+            environment_branch: None,
+            environment_commit: None,
             checkpoint: None,
             checkpoint_error: None,
             context: default_context(),
@@ -639,27 +658,59 @@ mod tests {
     }
 
     #[test]
-    fn existing_records_infer_their_world_and_new_records_read_what_was_frozen() {
-        let shared = manifest("shared").world();
-        assert_eq!(shared.kind, WorldKind::Shared);
+    fn existing_records_infer_their_environment_and_new_records_read_what_was_frozen() {
+        let shared = manifest("shared").environment();
+        assert_eq!(shared.kind, EnvironmentKind::Shared);
         assert_eq!(shared.root, "/workspace/project");
 
-        let old_worktree = manifest("worktree eja/aja-3-deadbeef at abcdef123456").world();
-        assert_eq!(old_worktree.kind, WorldKind::Worktree);
+        let old_worktree = manifest("worktree eja/aja-3-deadbeef at abcdef123456").environment();
+        assert_eq!(old_worktree.kind, EnvironmentKind::Worktree);
         assert_eq!(old_worktree.branch.as_deref(), Some("eja/aja-3-deadbeef"));
         assert_eq!(old_worktree.root, "/workspace/project");
 
-        assert_eq!(manifest("none").world().kind, WorldKind::Unknown);
+        assert_eq!(
+            manifest("none").environment().kind,
+            EnvironmentKind::Unknown
+        );
 
         let mut recorded = manifest("worktree eja/aja-3-deadbeef at abcdef123456");
         let commit = "a".repeat(40);
-        recorded.world_kind = Some("worktree".into());
-        recorded.world_root = "/recorded/project".into();
-        recorded.world_branch = Some("eja/aja-3-deadbeef".into());
-        recorded.world_commit = Some(commit.clone());
-        let record = recorded.world();
+        recorded.environment_kind = Some("worktree".into());
+        recorded.environment_root = "/recorded/project".into();
+        recorded.environment_branch = Some("eja/aja-3-deadbeef".into());
+        recorded.environment_commit = Some(commit.clone());
+        let record = recorded.environment();
         assert_eq!(record.root, "/recorded/project");
         assert_eq!(record.commit.as_deref(), Some(commit.as_str()));
+    }
+
+    #[test]
+    fn legacy_manifest_field_names_decode_into_the_environment_record() {
+        let mut old = manifest("worktree eja/aja-3-deadbeef at abcdef123456");
+        old.environment_kind = Some("worktree".into());
+        old.environment_root = "/recorded/project".into();
+        old.environment_branch = Some("eja/aja-3-deadbeef".into());
+        old.environment_commit = Some("a".repeat(40));
+        let mut value = serde_json::to_value(old).expect("manifest value");
+        let fields = value.as_object_mut().expect("manifest object");
+        let environment = fields.remove("environment").expect("environment");
+        fields.insert("world".into(), environment);
+        for (current, legacy) in [
+            ("environment_kind", "world_kind"),
+            ("environment_root", "world_root"),
+            ("environment_branch", "world_branch"),
+            ("environment_commit", "world_commit"),
+        ] {
+            let value = fields.remove(current).expect(current);
+            fields.insert(legacy.into(), value);
+        }
+
+        let decoded: Manifest = serde_json::from_value(value).expect("legacy manifest");
+        let record = decoded.environment();
+        assert_eq!(record.kind, EnvironmentKind::Worktree);
+        assert_eq!(record.root, "/recorded/project");
+        assert_eq!(record.branch.as_deref(), Some("eja/aja-3-deadbeef"));
+        assert_eq!(record.commit.as_deref(), Some("a".repeat(40).as_str()));
     }
 
     #[test]

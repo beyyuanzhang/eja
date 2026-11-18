@@ -591,8 +591,8 @@ fn record_dispatch(
     Ok(())
 }
 
-/// One execution owner per world. Reports are recorded in dispatch order, so the
-/// journal never depends on thread timing; with more than one slot the worlds run
+/// One execution owner per environment. Reports are recorded in dispatch order, so the
+/// journal never depends on thread timing; with more than one slot the environments run
 /// at once, and each completed run leaves its evidence before the next report.
 fn run_dispatches(
     ctx: &ActionCtx<'_>,
@@ -702,7 +702,7 @@ fn observe_evidence(ctx: &ActionCtx<'_>, state: &mut State, task_id: TaskId) -> 
     )
 }
 
-/// Reconciling a world is the host's act and its account is evidence. Conflicts
+/// Reconciling an environment is the host's act and its account is evidence. Conflicts
 /// are recorded, never merged away.
 fn reconcile(
     ctx: &ActionCtx<'_>,

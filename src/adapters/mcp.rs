@@ -1,5 +1,5 @@
 //! Shared, host-owned MCP clients. No connector state is passed to AJA.
-use super::{Control, ToolContext, ToolGateway};
+use super::{Control, ToolContext, ToolProvider};
 use crate::{aja::FRAME_LIMIT, Assignment, Result};
 use rmcp::{
     model::{
@@ -183,23 +183,15 @@ impl McpTools {
         self.tools.get(public).is_some_and(|remote| remote.witness)
     }
 
-    /// Explicit host config only; no home/project auto-discovery or shell expansion.
-    pub fn load(path: &Path, project: &Path, parent: &Control) -> Result<Self> {
-        Self::load_with_workspace(path, Some(project), parent)
-    }
-
-    pub(super) fn load_with_workspace(
-        path: &Path,
-        project: Option<&Path>,
-        parent: &Control,
-    ) -> Result<Self> {
+    /// Load one complete connector set. The first invalid or unavailable
+    /// connector fails the whole call.
+    pub fn load_strict(path: &Path, project: Option<&Path>, parent: &Control) -> Result<Self> {
         Self::load_policy(path, project, parent, false).map(|(tools, _)| tools)
     }
 
-    /// Load every connector that starts successfully. Each unavailable
-    /// connector is reported and omitted so one provider cannot disable the
-    /// rest of the host's capabilities.
-    pub fn load_available_with_workspace(
+    /// Load every healthy connector. Invalid or unavailable connectors are
+    /// returned as diagnostics and omitted.
+    pub fn load_available(
         path: &Path,
         project: Option<&Path>,
         parent: &Control,
@@ -575,7 +567,7 @@ impl McpTools {
                 }
                 // A cancelled or expired host startup is not an optional
                 // connector failure. Preserve that stop instead of turning it
-                // into an empty but apparently healthy gateway.
+                // into an empty but apparently healthy connector set.
                 startup.check()?;
                 host.connections.truncate(connections);
                 host.children.truncate(children);
@@ -587,7 +579,7 @@ impl McpTools {
     }
 }
 
-impl ToolGateway for McpTools {
+impl ToolProvider for McpTools {
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         self.tools.values().map(|t| t.definition.clone()).collect()
     }

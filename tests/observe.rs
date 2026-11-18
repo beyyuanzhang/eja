@@ -29,7 +29,7 @@ impl Capabilities for Weather {
 }
 
 #[test]
-fn a_world_look_does_not_depend_on_waiting_tasks() {
+fn an_environment_look_does_not_depend_on_waiting_tasks() {
     let fixture = State::new("observe-nudge");
     let store = fixture.store();
     let brain = Script::new(vec![
@@ -65,7 +65,7 @@ fn observing_a_read_only_tool_records_a_view() {
     let fixture = State::new("observe");
     let store = fixture.store();
     let brain = Script::new(vec![
-        // The world is read while judging, so the task is opened and run first.
+        // The environment is read while judging, so the task is opened and run first.
         decision(vec![Action::OpenTask {
             title: "sky".into(),
             request: "check the sky".into(),
@@ -112,14 +112,14 @@ fn observing_a_read_only_tool_records_a_view() {
 
 #[test]
 fn eja_can_observe_project_files_but_never_write() {
-    use eja::adapters::{HostTools, WorkspaceTools};
+    use eja::adapters::{ToolRegistry, WorkspaceTools};
     let fixture = State::new("observe-fs");
     let project = fixture.path().join("project");
     let private = fixture.path().join("state");
     std::fs::create_dir_all(&project).expect("project");
     std::fs::create_dir_all(&private).expect("private");
     std::fs::write(project.join("note.txt"), "hello from the project").expect("write");
-    let host = HostTools::from_gateways(
+    let host = ToolRegistry::new(
         &private,
         vec![Box::new(WorkspaceTools::new(
             true,
@@ -138,7 +138,7 @@ fn eja_can_observe_project_files_but_never_write() {
     )
     .expect("project file is observable");
     assert!(value.to_string().contains("hello"));
-    // There is no second area to read from any more; the world is one place.
+    // There is no second area to read from any more; the environment is one place.
     assert!(Capabilities::observe(
         &host,
         "list_dir",
@@ -176,7 +176,7 @@ fn eja_can_observe_project_files_but_never_write() {
 
 #[test]
 fn the_host_reads_every_granted_workspace_and_nothing_else() {
-    use eja::adapters::{HostTools, WorkspaceTools};
+    use eja::adapters::{ToolRegistry, WorkspaceTools};
     let fixture = State::new("observe-grants");
     let alpha = fixture.path().join("alpha");
     let beta = fixture.path().join("beta");
@@ -187,7 +187,7 @@ fn the_host_reads_every_granted_workspace_and_nothing_else() {
     std::fs::write(alpha.join("a.txt"), "in alpha").unwrap();
     std::fs::write(beta.join("b.txt"), "in beta").unwrap();
     std::fs::write(private.join("secret.txt"), "private").unwrap();
-    let host = HostTools::from_gateways(
+    let host = ToolRegistry::new(
         &private,
         vec![Box::new(WorkspaceTools::new(
             true,
@@ -238,14 +238,14 @@ fn the_host_reads_every_granted_workspace_and_nothing_else() {
 
 #[test]
 fn the_workspace_grant_switches_off_every_entry() {
-    use eja::adapters::{HostTools, ToolGateway, WorkspaceTools};
+    use eja::adapters::{ToolProvider, ToolRegistry, WorkspaceTools};
     let fixture = State::new("observe-switch");
     let project = fixture.path().join("project");
     let private = fixture.path().join("state");
     std::fs::create_dir_all(&project).expect("project");
     std::fs::create_dir_all(&private).expect("private");
     std::fs::write(project.join("note.txt"), "hello").expect("write");
-    let host = HostTools::from_gateways(
+    let host = ToolRegistry::new(
         &private,
         vec![Box::new(WorkspaceTools::new(
             false,

@@ -497,7 +497,7 @@ mod tests {
                 "task:2",
                 Kind::Observed,
                 "",
-                json!({"kind": "witness", "target": "world:out", "arguments": {}, "result": {"ok": true}}),
+                json!({"kind": "witness", "target": "environment:out", "arguments": {}, "result": {"ok": true}}),
             ),
             event(
                 8,

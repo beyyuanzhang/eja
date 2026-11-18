@@ -5,7 +5,7 @@ use super::{
     util::{write_private_bytes, write_private_json},
 };
 use eja::{
-    adapters::{HostTools, McpTools, ToolContext, ToolGateway},
+    adapters::{McpTools, ToolContext, ToolProvider, ToolRegistry},
     Assignment, Control, Result,
 };
 use serde::{Deserialize, Serialize};
@@ -115,9 +115,9 @@ impl Manager {
             .filter(|value| value.is_object())
             .ok_or("arguments must be an object")?;
         let control = context.control.child(Duration::from_secs(10));
-        let gateway = self.load_version(name, version, &control)?;
+        let provider = self.load_version(name, version, &control)?;
         let public = McpTools::managed_tool_name(name, tool);
-        let result = gateway.call(
+        let result = provider.call(
             &ToolContext {
                 workspace: None,
                 control: &control,
@@ -175,7 +175,7 @@ impl Manager {
     }
 }
 
-impl ToolGateway for Manager {
+impl ToolProvider for Manager {
     fn definitions(&self, _: &Assignment) -> Vec<Value> {
         TOOLS.iter().map(|(name, description, required)| {
             let properties: serde_json::Map<String, Value> = required.iter().map(|field| {
@@ -234,20 +234,20 @@ fn required<'a>(arguments: &'a Value, field: &str) -> Result<&'a str> {
 struct LoadedPlugin {
     name: String,
     version: String,
-    gateway: McpTools,
+    provider: McpTools,
 }
 
-impl ToolGateway for LoadedPlugin {
+impl ToolProvider for LoadedPlugin {
     fn definitions(&self, assignment: &Assignment) -> Vec<Value> {
-        self.gateway.definitions(assignment)
+        self.provider.definitions(assignment)
     }
 
     fn owns(&self, name: &str) -> bool {
-        self.gateway.owns(name)
+        self.provider.owns(name)
     }
 
     fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value> {
-        let result = self.gateway.call(context, name, arguments)?;
+        let result = self.provider.call(context, name, arguments)?;
         Ok(json!({"plugin":self.name,"version":self.version,"result":result}))
     }
 }
@@ -257,7 +257,7 @@ pub(super) struct Registration {
 }
 
 pub(super) fn register(
-    tools: &mut HostTools,
+    tools: &mut ToolRegistry,
     state: &Path,
     parent: &Control,
 ) -> Result<Registration> {
@@ -280,17 +280,17 @@ pub(super) fn register(
         let mut status = json!({"requested":current});
         let mut loaded = None;
         match manager.load_version(&name, &current, &startup) {
-            Ok(gateway) => loaded = Some((current.clone(), gateway)),
+            Ok(provider) => loaded = Some((current.clone(), provider)),
             Err(error) => {
                 let error = error.to_string();
                 status["error"] = json!(error);
                 if let Some(previous) = entry.previous {
                     match manager.load_version(&name, &previous, &startup) {
-                        Ok(gateway) => {
+                        Ok(provider) => {
                             diagnostics.push(format!(
                                 "managed plugin {name} version {current} failed to start: {error}; using version {previous}"
                             ));
-                            loaded = Some((previous, gateway));
+                            loaded = Some((previous, provider));
                         }
                         Err(fallback) => {
                             status["fallback_error"] = json!(fallback.to_string());
@@ -299,12 +299,12 @@ pub(super) fn register(
                 }
             }
         }
-        if let Some((version, gateway)) = loaded {
+        if let Some((version, provider)) = loaded {
             status["version"] = json!(version);
             tools.register(Box::new(LoadedPlugin {
                 name: name.clone(),
                 version,
-                gateway,
+                provider,
             }));
         } else {
             diagnostics.push(format!(
@@ -351,14 +351,14 @@ mod tests {
             control: &control,
         };
         let fresh = || {
-            let mut tools = HostTools::with_workspace(None, None, state, &control).unwrap();
+            let mut tools = ToolRegistry::new(state, Vec::new()).unwrap();
             register(&mut tools, state, &control).unwrap();
             tools
         };
         let name = "sample";
         let public = "plugin__sample__format";
         let initial = fresh();
-        let stage_version = |tools: &HostTools, source: &str| {
+        let stage_version = |tools: &ToolRegistry, source: &str| {
             let reply = tools
                 .call(
                     &context,
@@ -368,12 +368,12 @@ mod tests {
                 .unwrap();
             reply["version"].as_str().unwrap().to_owned()
         };
-        let sample = |tools: &HostTools, version: &str, fail: bool| {
+        let sample = |tools: &ToolRegistry, version: &str, fail: bool| {
             tools.call(&context, "eja_plugin_test", &json!({
                 "name":name,"version":version,"tool":"format","arguments":{"text":"hello","private":secret,"port":port,"fail":fail}
             }))
         };
-        let activate = |tools: &HostTools, version: &str| {
+        let activate = |tools: &ToolRegistry, version: &str| {
             tools.call(
                 &context,
                 "eja_plugin_activate",
@@ -404,7 +404,7 @@ mod tests {
         );
         sample(&first_turn, &second, false).unwrap();
         activate(&first_turn, &second).unwrap();
-        let use_plugin = |tools: &HostTools| {
+        let use_plugin = |tools: &ToolRegistry| {
             tools
                 .call(&context, public, &json!({"text":"later"}))
                 .unwrap()

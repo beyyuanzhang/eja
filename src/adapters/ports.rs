@@ -1,15 +1,14 @@
 //! Host surface: one read over the three authorities, and the capabilities a
 //! host may add on top of it.
-use super::{WorldRecord, Worlds};
+use super::{EnvironmentProvider, EnvironmentRecord};
 use crate::{Address, Authority, Control, Event, Host, Result, Selector, TaskId, WorkspaceGrant};
 use serde_json::Value;
 
 pub trait RecordReader {
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value>;
-    /// The world evidence a run recorded, when the record carries it. An old
-    /// record without any world fields decodes as `Unknown`, never as today's
-    /// default world.
-    fn world(&self, _aja: u64) -> Result<Option<WorldRecord>> {
+    /// The environment evidence a run recorded, when the record carries it. An
+    /// old record without environment fields decodes as `Unknown`.
+    fn environment(&self, _aja: u64) -> Result<Option<EnvironmentRecord>> {
         Ok(None)
     }
 }
@@ -33,7 +32,7 @@ pub trait Capabilities: Send + Sync {
 pub struct Ports<'a> {
     pub aja: Option<&'a dyn RecordReader>,
     pub capabilities: Option<&'a dyn Capabilities>,
-    pub worlds: Option<&'a dyn Worlds>,
+    pub environments: Option<&'a dyn EnvironmentProvider>,
 }
 
 impl Host for Ports<'_> {
@@ -75,9 +74,11 @@ impl Host for Ports<'_> {
                 selector,
                 control,
             ),
-            Authority::World => {
+            Authority::Environment => {
                 if !matches!(selector, Selector::Whole) {
-                    return Err("a world address names one path; select through arguments".into());
+                    return Err(
+                        "an environment address names one path; select through arguments".into(),
+                    );
                 }
                 self.capabilities
                     .ok_or("no host capabilities are configured")?
@@ -102,18 +103,15 @@ impl Host for Ports<'_> {
         root: Option<&std::path::Path>,
         control: &Control,
     ) -> Result<Value> {
-        let worlds = self
-            .worlds
-            .ok_or("reconcile refused: this host assembles no world service")?;
-        let record = match self.aja {
-            Some(reader) => Some(
-                reader
-                    .world(task)?
-                    .ok_or("reconcile refused: the run record is missing")?,
-            ),
-            None => None,
-        };
-        worlds.reconcile_recorded(task, root, record.as_ref(), control)
+        let environments = self
+            .environments
+            .ok_or("reconcile refused: this host assembles no environment provider")?;
+        let record = self
+            .aja
+            .ok_or("reconcile refused: no record reader is configured")?
+            .environment(task)?
+            .ok_or("reconcile refused: the run record is missing")?;
+        environments.reconcile(root, &record, control)
     }
 }
 

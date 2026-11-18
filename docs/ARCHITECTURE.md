@@ -10,17 +10,17 @@ P = (L, R, K)                         persistent facts and evidence
 S = fold(L)                          logical state
 C = view_B(S, input)                  model's bounded working view
 A = model(C)                         proposed typed actions
-(O, W') = execute(A, W, grants, ctrl) actual observations and external effects
+(O, E') = execute(A, E, grants, ctrl) actual observations and external effects
 L' = L ++ events(A, O)               recorded transition
 ```
 
 `L` owns identity, task and judgment facts. `R` owns raw execution evidence;
-`K` owns optional frozen workspace evidence. The mutable world `W` is external.
+`K` owns optional frozen workspace evidence. The mutable environment `E` is external.
 Every view points at one **address** in one authority — `log:<target>`,
-`record:<aja>/<path>`, `world:<path>` — and any target that is not an
+`record:<aja>/<path>`, `environment:<path>` — and any target that is not an
 address is a host read tool. Folding and reading use that one namespace.
 One fact has one authority; keeping a derived index or snapshot does not create
-another authority. Folding never re-executes world effects.
+another authority. Folding never re-executes environment effects.
 
 `fold` is one value, not a library of scans. `State` applies the journal event by
 event — the initial `fold` and every append inside a turn run the same transition
@@ -64,7 +64,7 @@ outlive its fold would be a second authority, so there is none.
    addressable. One selector vocabulary — whole, range, match, bytes — is applied
    to the space each authority is: a log page takes whole or range (and an
    oversized event also takes bytes), a frozen record file takes whole, range or
-   match, and a world address names one path and takes none. Continuation stores
+   match, and an environment address names one path and takes none. Continuation stores
    parent references, reconstructs a valid prefix, applies the budget before
    transport, and uses the new assignment and new system budget. Views never
    change facts.
@@ -74,11 +74,11 @@ outlive its fold would be a second authority, so there is none.
 5. **Owned finite execution.** Every turn has decision/action/dispatch/time
    budgets and a slot budget. Every aja has its own time/context/response budget.
    One Control hierarchy can only shorten authority's deadline. Each execution
-   reserves one world and owns one process. The turn owns how many runs a decision
-   may start; the world backend owns how many may exist at once, because it is
-   the only thing that knows whether a world is isolated: one shared world has one
-   owner, and refusing a world refuses the run before it costs an aja id. Releasing
-   a world is cleanup, so it runs under a bound the backend declares, never under
+   reserves one environment and owns one process. The turn owns how many runs a decision
+   may start; the environment provider owns how many may exist at once, because it is
+   the only thing that knows whether an environment is isolated: one shared environment has one
+   owner, and refusing an environment refuses the run before it costs an aja id. Releasing
+   an environment is cleanup, so it runs under a bound the provider declares, never under
    the spent control of the run it cleans up after. Stop reasons and evidence
    survive cleanup; recovery never reruns a aja.
 
@@ -117,7 +117,7 @@ Three properties are testable, and `tests/identity.rs` holds them:
 | Aja | dispatch | Open; depends_on targets Done; continues target has a frozen-run report; then Running |
 | Aja | worker report / recovery | Running -> Waiting |
 | Aja | close_task | Waiting -> Done or Failed, EJA's judgment; needs the witness evidence when `evidence` was declared |
-| Aja | reconcile | after a report; the host lands the run's world or reports conflicts |
+| Aja | reconcile | after a report; the host lands the run's environment or reports conflicts |
 | Aja | close_task accepted:false | Open -> Failed, cancellation before execution |
 | Group | open_group | Open, never dispatched |
 | Group | close_task accepted:true | Every child terminal; EJA accepts the aggregate contract; then Done |
@@ -172,7 +172,7 @@ and a transcript leaves them readable as record entries. A aja whose transcript
 cannot fit even as one address line stops with `budget` and continues in a new
 aja, so a transcript is never re-sent pinned at the cap. No checkpoint is
 restored during continuation: historical observations must be distinguished from
-current world observations.
+current environment observations.
 
 Checkpoint file reads and native record reads share one source resolver for
 whole/range/match, and one record module owns the manifest type, the resolver,
@@ -188,32 +188,60 @@ commit, so no adapter keeps a second copy of the record layout.
 Checkpoint failure is recorded explicitly; it cannot erase an already frozen
 transcript or manufacture an acceptance.
 
+## Composition
+
+`host::compose` is the single assembly root for CLI and HTTP. It returns one
+`ComposedHost` containing the selected tool registry, environment provider,
+record-store services and capability diagnostics. The turn then exposes only the
+matching interfaces through `Ports`.
+
+Tools and environments have different contracts because they answer different
+questions. `ToolProvider` declares callable actions and their names.
+`ToolRegistry` routes a name to the provider that owns it. Workspace files, shell,
+MCP servers and managed plugins are peers at that boundary. Each provider owns its
+protocol, path rules, grants and output bound.
+
+`EnvironmentProvider` owns the lifecycle of a mutable execution environment. It
+reserves exclusive access, measures changes at settlement, reconciles a recorded
+result and releases the lease. Shared directories and Git worktrees implement the
+same lifecycle contract. A future container or remote database environment can
+implement it without adding a new kernel action.
+
+`ExecutionServices` is a constructor bundle passed to `NativeWorker`. It groups
+the selected workspace, checkpoint store and environment provider so one worker
+can execute a run. It has no dispatch protocol and adds no kernel authority.
+
+Git appears in two adapter roles. `Checkpoints` freezes Git-visible evidence for
+records. `GitWorktrees` supplies isolated execution environments and durable
+branches. The kernel sees neither role directly and contains no repository
+topology.
+
 ## Port contracts
 
 - `Brain::decide`: return a decision under the supplied Control.
-- `Worker::execute`: own one run in its reserved world; return its observed
+- `Worker::execute`: own one run in its reserved environment; return its observed
   digest. Runs execute in action order; each completed report is recorded
   before the next.
 - `Host::look`: read only, bound output, respect Control; one address space.
 - `Host::witness`: the host's own observation of declared acceptance evidence.
   A host that declares none is still complete: the default refuses, so an
   acceptance is unavailable and only a rejection is left open.
-  `Host::reconcile`: land one run's world, or report its conflicts as the
+  `Host::reconcile`: land one run's environment, or report its conflicts as the
   recorded outcome.
-- `Worlds`: reserve, settle, reconcile and release the world one execution may
-  change. A world is a lease — where a run may write — and the backend keeps the
+- `EnvironmentProvider`: reserve, settle, reconcile and release the environment one execution may
+  change. An environment lease says where a run may write, and the provider keeps the
   reservation that turns it into an account: one line, measured, complete or
   explicitly unobserved. Isolation is the host's decision; the kernel never
   assumes a repository. Reserve is also the concurrency guard: a backend that
   cannot isolate refuses, so no second mechanism counts owners and a refused
-  world costs no aja id. Release is cleanup, so it runs under a bound the backend
+  environment costs no aja id. Release is cleanup, so it runs under a bound the provider
   declares rather than under the spent control of the run it cleans up after.
-- `Model` and `ToolGateway`: host effects under inherited grants/control.
+- `Model` and `ToolProvider`: host effects under inherited grants/control.
 - `RecordReader` / `Capabilities`: what the host lets EJA read or witness,
   composed by Ports, without another state store or task authority.
 
 Every operation requires an explicit Control, including aja-file selection,
-world observation and connector startup. There is no uncontrolled entry point or
+environment observation and connector startup. There is no uncontrolled entry point or
 fallback implementation. Native/model/MCP/project readers honor this contract.
 External adapters are trusted code; their cancellation contracts govern remote effects.
 
@@ -246,9 +274,9 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | A repeated read states the same information, so a turn ends at its fixpoint | turn_steps |
 | The turn's evidence is folded from the journal, never supplied by a caller | projection |
 | A folded region names an address that reads it | fold + identity |
-| Parallel slots run at once and the log keeps action order | worlds |
-| One world, one owner: a second run is refused before it costs an aja id | worlds |
-| A worktree world settles and reconciles explicitly; conflicts are reported | worlds |
+| Parallel slots run at once and the log keeps action order | environments |
+| One shared environment, one owner: a second run is refused before it costs an aja id | environments |
+| A Git worktree environment settles and reconciles explicitly; conflicts are reported | environments |
 
 A decision reports whether it added information: a fact the projection states, or
 a refusal told for the first time. A look that repeats the observation it would

@@ -4,10 +4,13 @@ mod settings;
 mod state;
 mod util;
 
+mod compose;
+
+pub use compose::compose;
 pub use settings::SettingsStore;
 
 use self::{
-    settings::{connector_config, RoleConfig, StoredConnector, StoredSettings},
+    settings::{connector_config, StoredConnector, StoredSettings},
     util::{clip, safe_file, ApiError, ApiResult},
 };
 use axum::{
@@ -20,10 +23,7 @@ use axum::{
     Json, Router,
 };
 use eja::{
-    adapters::{
-        Checkpoints, Control, HostTools, McpTools, NativeRuntime, NativeWorker, OpenAiBrain,
-        OpenAiModel, Ports, RecordFiles, Shared, ToolGateway, WorkspaceTools, Worktrees, Worlds,
-    },
+    adapters::{Control, McpTools, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolProvider},
     turn_at_with_options, Assignment, ChoiceSelection, Kind, Store, TurnOptions,
 };
 use serde::Deserialize;
@@ -676,7 +676,7 @@ fn probe_connector(
         Arc::new(AtomicBool::new(false)),
     );
     let result = (|| {
-        let tools = HostTools::with_workspace(Some(&config), project, state_dir, &control)
+        let tools = McpTools::load_strict(&config, project, &control)
             .map_err(|error| sanitize(&error.to_string(), connector))?;
         let definitions = tools.definitions(&Assignment {
             task_id: 0,
@@ -830,18 +830,18 @@ fn execute_turn(
     selection: Option<ChoiceSelection>,
 ) -> ApiResult<String> {
     let startup = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
-    let prepared = compose(&host.settings, host.capabilities, None, &startup)?;
+    let composed = compose(&host.settings, host.capabilities, None, &startup)?;
     {
         let mut current = host
             .diagnostics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.clone_from(&prepared.assembled.diagnostics);
+        current.clone_from(&composed.diagnostics);
         for diagnostic in &*current {
             eprintln!("capability warning: {diagnostic}");
         }
     }
-    let effective = &prepared.effective;
+    let effective = &composed.effective;
     if !effective.model_ready() {
         return Err(ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -865,8 +865,8 @@ fn execute_turn(
         eja_role.api_key.as_str(),
         eja_role.model.as_str(),
     )
-    .with_headers(header_pairs(eja_role));
-    if let Some(description) = &prepared.assembled.capability_description {
+    .with_headers(compose::header_pairs(eja_role));
+    if let Some(description) = &composed.capability_description {
         brain = brain.with_capability_description(description);
     }
     let model = OpenAiModel::new(
@@ -874,7 +874,7 @@ fn execute_turn(
         aja_role.api_key.as_str(),
         aja_role.model.as_str(),
     )
-    .with_headers(header_pairs(aja_role));
+    .with_headers(compose::header_pairs(aja_role));
     let grant = host
         .capabilities
         .grants(&host.settings, &effective.settings);
@@ -886,13 +886,13 @@ fn execute_turn(
     if effective.limits.aja_timeout_ms > 0 {
         aja_limits.timeout_ms = effective.limits.aja_timeout_ms;
     }
-    let worker = prepared.assembled.worker(&ajas, model, aja_limits)?;
+    let worker = composed.worker(&ajas, model, aja_limits)?;
     // Reading a historical checkpoint is independent of creating new ones.
     let records = RecordFiles::with_checkpoints(&ajas, host.state_dir.join("checkpoints"));
     let ports = Ports {
         aja: Some(&records),
-        capabilities: Some(&*prepared.assembled.tools),
-        worlds: prepared.assembled.worlds.as_deref(),
+        capabilities: Some(&*composed.tools),
+        environments: composed.environments.as_deref(),
     };
     let store = Store::new(&host.state_dir)?;
     let mut options = TurnOptions {
@@ -920,269 +920,6 @@ fn execute_turn(
     )
     .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(outcome.reply)
-}
-
-/// One deployment's assembled optional capabilities and the diagnostics from
-/// assembling them. A failed optional capability is absent, never fatal to the
-/// rest of the turn.
-pub struct Assembled {
-    pub tools: Arc<HostTools>,
-    pub worlds: Option<Arc<dyn Worlds>>,
-    pub diagnostics: Vec<String>,
-    pub capability_description: Option<String>,
-    workspace: Option<PathBuf>,
-    snapshots: Option<Checkpoints>,
-}
-
-impl Assembled {
-    pub fn worker(
-        &self,
-        ajas: &Path,
-        model: OpenAiModel,
-        limits: eja::aja::Limits,
-    ) -> eja::Result<NativeWorker> {
-        NativeWorker::with_runtime(
-            std::env::current_exe()?,
-            ajas,
-            Arc::new(model),
-            self.tools.clone() as Arc<dyn ToolGateway>,
-            NativeRuntime {
-                workspace: self.workspace.clone(),
-                snapshots: self.snapshots.clone(),
-                worlds: self.worlds.clone(),
-            },
-        )?
-        .with_limits(limits)
-    }
-}
-
-pub struct Prepared {
-    pub effective: settings::Effective,
-    pub assembled: Assembled,
-}
-
-/// The one CLI/HTTP composition path. It reads the same effective settings,
-/// grants the same roots, registers the same gateways, and reports optional
-/// startup failures the same way.
-pub fn compose(
-    settings: &SettingsStore,
-    capabilities: EnabledCapabilities,
-    explicit_mcp_path: Option<&Path>,
-    startup: &Control,
-) -> eja::Result<Prepared> {
-    let mut diagnostics = Vec::new();
-    if let Err(error) = settings.prepare() {
-        diagnostics.push(format!(
-            "connector configuration could not be prepared: {error}"
-        ));
-    }
-    let effective = match settings.effective_current() {
-        Ok(effective) => effective,
-        Err(error) => {
-            diagnostics.push(format!(
-                "settings could not be read; using environment configuration: {error}"
-            ));
-            settings.effective(StoredSettings::default())
-        }
-    };
-    if let Some(error) = &effective.connectors.error {
-        diagnostics.push(format!("connector configuration is invalid: {error}"));
-    }
-    let grant = capabilities.grants(settings, &effective.settings);
-    let config = if capabilities.has(Capability::Mcp) {
-        explicit_mcp_path.or(effective.mcp_path.as_deref())
-    } else {
-        None
-    };
-    if capabilities.has(Capability::Mcp)
-        && config.is_none()
-        && effective
-            .connectors
-            .servers
-            .iter()
-            .any(|server| server.enabled)
-    {
-        diagnostics.push(
-            "connectors are enabled but no connector configuration path is available".to_owned(),
-        );
-    }
-    let mut assembled = assemble_capabilities(
-        settings.project_dir(),
-        settings.state_dir(),
-        config,
-        &grant,
-        capabilities.with_workspace_tools(effective.workspace_tools),
-        effective.limits.slots,
-        startup,
-    )?;
-    diagnostics.append(&mut assembled.diagnostics);
-    assembled.diagnostics = diagnostics;
-    Ok(Prepared {
-        effective,
-        assembled,
-    })
-}
-
-/// Assemble local tools, connectors, plugins, worlds and snapshots from the
-/// host's grants. With no workspace and no grant this is connector-only: no file
-/// tools, no project cwd, and no checkpoint repository.
-#[allow(clippy::too_many_arguments)]
-fn assemble_capabilities(
-    project: Option<&Path>,
-    state_dir: &Path,
-    config: Option<&Path>,
-    grant: &[eja::WorkspaceGrant],
-    capabilities: EnabledCapabilities,
-    slots: usize,
-    startup: &Control,
-) -> eja::Result<Assembled> {
-    let private = state_dir.canonicalize()?;
-    let workspace = project
-        .map(Path::to_path_buf)
-        .or_else(|| grant.first().map(|grant| PathBuf::from(&grant.root)));
-    let roots: Vec<PathBuf> = grant
-        .iter()
-        .map(|grant| PathBuf::from(&grant.root))
-        .collect();
-    let mut diagnostics = Vec::new();
-    let mut gateways: Vec<Box<dyn ToolGateway>> = Vec::new();
-    if let Some(workspace) = &workspace {
-        if capabilities.has(Capability::Files) || capabilities.has(Capability::Shell) {
-            gateways.push(Box::new(WorkspaceTools::new(
-                capabilities.has(Capability::Files),
-                capabilities.has(Capability::Shell),
-                Some(workspace.clone()),
-                roots,
-                &private,
-            )));
-        }
-    }
-    if capabilities.has(Capability::Mcp) {
-        if let Some(path) = config {
-            match McpTools::load_available_with_workspace(path, workspace.as_deref(), startup) {
-                Ok((gateway, errors)) => {
-                    diagnostics.extend(errors);
-                    gateways.push(Box::new(gateway));
-                }
-                Err(error) => diagnostics.push(format!(
-                    "connector tools are unavailable from {}: {error}",
-                    path.display()
-                )),
-            }
-        }
-    }
-    let mut tools = HostTools::from_gateways(&private, gateways)?;
-    let mut capability_description = None;
-    if capabilities.has(Capability::Plugins) {
-        match plugins::register(&mut tools, &private, startup) {
-            Ok(registration) => {
-                diagnostics.extend(registration.diagnostics);
-                capability_description = Some(plugins::DESCRIPTION.to_owned());
-            }
-            Err(error) => {
-                diagnostics.push(format!("managed plugin tools are unavailable: {error}"));
-            }
-        }
-    }
-    let (worlds, world_diagnostics) = build_worlds(
-        &private,
-        grant,
-        slots,
-        capabilities.has(Capability::Git),
-        startup,
-    );
-    diagnostics.extend(world_diagnostics);
-    let snapshots = (capabilities.has(Capability::Git) && !grant.is_empty())
-        .then(|| Checkpoints::new(private.join("checkpoints"), private.clone()));
-    Ok(Assembled {
-        tools: Arc::new(tools),
-        worlds,
-        diagnostics,
-        capability_description,
-        workspace,
-        snapshots,
-    })
-}
-
-fn header_pairs(role: &RoleConfig) -> Vec<(String, String)> {
-    role.headers
-        .iter()
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
-}
-
-/// One backend per granted root. With parallel slots a git root gets isolated
-/// worktrees and any other root shares itself; with one slot every root is
-/// shared. The default root is the first grant, so a task that names nothing
-/// works where the host was started.
-fn build_worlds(
-    state_dir: &Path,
-    grant: &[eja::WorkspaceGrant],
-    slots: usize,
-    git: bool,
-    startup: &Control,
-) -> (Option<Arc<dyn Worlds>>, Vec<String>) {
-    let Some(first) = grant.first() else {
-        return (None, Vec::new());
-    };
-    let first_root = normalize_root(&first.root);
-    let mut roots: BTreeMap<PathBuf, Arc<dyn Worlds>> = BTreeMap::new();
-    let mut history: BTreeMap<PathBuf, Arc<dyn Worlds>> = BTreeMap::new();
-    let mut diagnostics = Vec::new();
-    for (index, grant) in grant.iter().enumerate() {
-        let path = normalize_root(&grant.root);
-        if roots.contains_key(&path) || history.contains_key(&path) {
-            continue;
-        }
-        if git {
-            match Worktrees::new(
-                &path,
-                state_dir.join("worlds").join(index.to_string()),
-                state_dir,
-                startup,
-            ) {
-                Ok(worlds) => {
-                    let worktrees: Arc<dyn Worlds> = Arc::new(worlds);
-                    history.insert(path.clone(), worktrees.clone());
-                    if slots > 1 {
-                        roots.insert(path.clone(), worktrees);
-                    } else {
-                        roots.insert(path.clone(), shared_world(&path, state_dir));
-                    }
-                }
-                Err(error) => {
-                    diagnostics.push(format!(
-                        "Git world history is unavailable for {}: {error}; new runs use the shared world and recorded worktrees cannot be reconciled",
-                        path.display()
-                    ));
-                    roots.insert(path.clone(), shared_world(&path, state_dir));
-                }
-            }
-        } else {
-            roots.insert(path.clone(), shared_world(&path, state_dir));
-        }
-    }
-    let Some(default) = roots.get(&first_root).cloned() else {
-        return (None, diagnostics);
-    };
-    (
-        Some(Arc::new(
-            eja::adapters::WorkspaceWorlds::new(default, roots).with_history(history),
-        )),
-        diagnostics,
-    )
-}
-
-fn shared_world(path: &Path, state_dir: &Path) -> Arc<dyn Worlds> {
-    Arc::new(Shared::new(path.to_path_buf(), state_dir.to_path_buf()))
-}
-
-/// Grant keys are real paths: a granted root reached through a symlink is the
-/// same world as the resolved one, never a second backend beside it.
-fn normalize_root(root: &str) -> PathBuf {
-    PathBuf::from(root)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(root))
 }
 
 async fn get_raw(
@@ -1229,7 +966,10 @@ async fn get_raw(
             "truncated": truncated,
         })));
     }
-    if let Some(relative) = address.strip_prefix("world:") {
+    if let Some(relative) = address
+        .strip_prefix("environment:")
+        .or_else(|| address.strip_prefix("world:"))
+    {
         let grant = host.capabilities.grants(
             &host.settings,
             &host
@@ -1256,7 +996,7 @@ async fn get_raw(
         })));
     }
     Err(ApiError::bad(
-        "unknown address; use log:, record:, or world:",
+        "unknown address; use log:, record:, or environment:",
     ))
 }
 
@@ -1354,143 +1094,4 @@ async fn read_json(request: Request) -> ApiResult<Value> {
         return Ok(json!({}));
     }
     serde_json::from_slice(&bytes).map_err(|_| ApiError::bad("request body must be JSON"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eja::adapters::Capabilities as _;
-    use std::{
-        fs,
-        sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    struct Temp(PathBuf);
-
-    impl Temp {
-        fn new(tag: &str) -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_nanos());
-            let path = std::env::temp_dir().join(format!(
-                "eja-host-{tag}-{}-{nonce}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn definition_names(tools: &HostTools) -> Vec<String> {
-        tools
-            .definitions(&Assignment {
-                task_id: 0,
-                objective: String::new(),
-                workspace: String::new(),
-                acceptance: String::new(),
-                input: String::new(),
-                resume: None,
-                issued_at: 0,
-            })
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str().map(ToOwned::to_owned))
-            .collect()
-    }
-
-    #[test]
-    fn broken_optional_capabilities_are_diagnostics_not_lost_local_tools() {
-        let root = Temp::new("optional");
-        let project = root.0.join("project");
-        let state = root.0.join("state");
-        fs::create_dir_all(&project).unwrap();
-        fs::create_dir_all(&state).unwrap();
-        fs::write(project.join("note.txt"), "local work still runs").unwrap();
-        fs::write(state.join("plugins"), "not a directory").unwrap();
-
-        let settings = SettingsStore::new(Some(project), state.clone());
-        let control = Control::new(Duration::from_secs(30), Arc::default());
-        let prepared = compose(
-            &settings,
-            EnabledCapabilities([true, true, false, false, true, true]),
-            Some(&state.join("missing-mcp.json")),
-            &control,
-        )
-        .expect("optional failures do not fail composition");
-
-        let names = definition_names(&prepared.assembled.tools);
-        assert!(names.iter().any(|name| name == "read_file"), "{names:?}");
-        assert!(
-            prepared
-                .assembled
-                .diagnostics
-                .iter()
-                .any(|error| error.contains("connector tools are unavailable")),
-            "{:?}",
-            prepared.assembled.diagnostics
-        );
-        assert!(
-            prepared
-                .assembled
-                .diagnostics
-                .iter()
-                .any(|error| error.contains("managed plugin tools are unavailable")),
-            "{:?}",
-            prepared.assembled.diagnostics
-        );
-        let observed = prepared
-            .assembled
-            .tools
-            .observe("read_file", &json!({"path":"note.txt"}), &control)
-            .expect("the local provider is unaffected");
-        assert!(observed.to_string().contains("local work still runs"));
-    }
-
-    #[test]
-    fn a_plugin_that_cannot_start_keeps_the_registry_and_reports_why() {
-        let root = Temp::new("plugin-start");
-        let state = root.0.join("state");
-        let plugins = state.join("plugins");
-        fs::create_dir_all(&plugins).unwrap();
-        fs::write(
-            plugins.join("active.json"),
-            serde_json::to_vec(&json!({
-                "broken": {"current": "2026-01-01-1", "previous": null}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let settings = SettingsStore::new(None, state);
-        let control = Control::new(Duration::from_secs(30), Arc::default());
-        let prepared = compose(
-            &settings,
-            EnabledCapabilities([false, false, false, false, false, true]),
-            None,
-            &control,
-        )
-        .expect("plugin startup failure is optional");
-        let names = definition_names(&prepared.assembled.tools);
-        assert!(
-            names.iter().any(|name| name == "eja_plugin_list"),
-            "{names:?}"
-        );
-        assert!(
-            prepared
-                .assembled
-                .diagnostics
-                .iter()
-                .any(|error| error.contains("managed plugin broken is unavailable")),
-            "{:?}",
-            prepared.assembled.diagnostics
-        );
-    }
 }

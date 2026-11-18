@@ -518,7 +518,7 @@ pub enum Action {
         #[serde(default)]
         note: String,
     },
-    /// Ask the host to bring one run's world back. The outcome, conflicts
+    /// Ask the host to bring one run's environment back. The outcome, conflicts
     /// included, is recorded evidence; nothing merges silently.
     Reconcile {
         task_id: TaskId,
@@ -530,7 +530,7 @@ pub enum Action {
     },
     #[serde(rename = "look")]
     Look {
-        /// An address (`log:`, `record:`, `world:`) or a host read tool.
+        /// An address (`log:`, `record:`, `environment:`) or a host read tool.
         #[serde(default)]
         target: String,
         #[serde(default)]
@@ -571,7 +571,7 @@ pub enum ObservationKind {
     Look,
     /// The host's answer to the acceptance evidence one task asked for.
     Witness,
-    /// The host's account of one run's world.
+    /// The host's account of one run's environment.
     Reconcile,
 }
 
@@ -632,7 +632,7 @@ impl<'a> Observation<'a> {
 
 /// The host: one read primitive, and the two host acts a turn may request.
 ///
-/// Every method inherits host control. A host that declares no worlds and no
+/// Every method inherits host control. A host that declares no environments and no
 /// acceptance evidence is still a complete host; the defaults say so.
 pub trait Host {
     /// Resolve the workspace a task names. The host owns both the id table and
@@ -677,7 +677,8 @@ pub trait Host {
         Err("this host observes no acceptance evidence".into())
     }
 
-    /// Bring one run's world back into the shared world. The account, conflicts
+    /// Bring one run's environment back into its shared environment. The account,
+    /// conflicts
     /// included, is evidence; the host never merges silently.
     fn reconcile(
         &self,
@@ -685,7 +686,7 @@ pub trait Host {
         _root: Option<&std::path::Path>,
         _control: &Control,
     ) -> Result<Value> {
-        Err("this host isolates no worlds".into())
+        Err("this host isolates no environments".into())
     }
 }
 
@@ -712,8 +713,8 @@ pub struct TurnLimits {
     pub decisions: usize,
     pub actions: usize,
     pub dispatches: usize,
-    /// How many worlds one decision may run at once. Each slot needs its own
-    /// world, so this is also the isolation budget.
+    /// How many environments one decision may run at once. Each slot needs exclusive
+    /// access to an environment, so this is also the isolation budget.
     pub slots: usize,
     pub timeout_ms: u64,
 }
@@ -771,13 +772,18 @@ pub enum Authority {
     Log,
     /// One entry or file of a frozen execution record.
     Record,
-    /// A path in the world the host grants.
-    World,
+    /// A path in an execution environment the host grants. The serialized
+    /// `world` spelling remains accepted for events written before this name.
+    #[serde(alias = "world")]
+    Environment,
 }
 
 /// An address names one region of one authority, so a folded region and a live
-/// one are read the same way: `log:event:12`, `record:3/report.md`,
-/// `world:src/out.txt`.
+/// one are read the same way.
+///
+/// The examples are `log:event:12`, `record:3/report.md`, and
+/// `environment:src/out.txt`. The former `world:` spelling remains an input
+/// alias for records and callers written before the terminology changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Address {
     pub authority: Authority,
@@ -794,7 +800,7 @@ impl Address {
         let authority = match scheme {
             "log" => Authority::Log,
             "record" => Authority::Record,
-            "world" => Authority::World,
+            "environment" | "world" => Authority::Environment,
             _ => return None,
         };
         Some(Self {
@@ -809,7 +815,7 @@ impl std::fmt::Display for Address {
         let scheme = match self.authority {
             Authority::Log => "log",
             Authority::Record => "record",
-            Authority::World => "world",
+            Authority::Environment => "environment",
         };
         write!(formatter, "{scheme}:{}", self.id)
     }

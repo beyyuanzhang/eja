@@ -47,9 +47,9 @@ A dispatch returns the host's account of one run; the run's record is its eviden
 Treat a run's last message as its account, not as a verified outcome. \
 Every read is one action: a look names a target and a selector. A target is an \
 address -- log:event:12, log:task:1, log:history, record:3/report.md (one frozen \
-file of aja 3), world:src/out.txt (one path of the project) -- or a host read tool \
+file of aja 3), environment:src/out.txt (one path of the project) -- or a host read tool \
 such as read_file, list_dir or a granted connector, which selects its result through \
-its own arguments. A world address takes no selector; a log page takes whole \
+its own arguments. An environment address takes no selector; a log page takes whole \
 (newest 40) or range, and event:<id> also takes bytes; a frozen record file takes \
 whole, range or match. \
 Identity changes (goal, commitment, correction) are proposals: propose them, then \
@@ -88,7 +88,7 @@ frozen record, and part_of targets an open group. A group can be closed after it
 children settle; judge its own acceptance contract, not its children's verdicts. \
 An aja opened with evidence asks the host for the observation its judgment needs; \
 without the host's observation an acceptance is undecidable, not failed, and a \
-rejection needs no evidence. A run that left an isolated world can be reconciled \
+rejection needs no evidence. A run that left an isolated environment can be reconciled \
 explicitly; the outcome, conflicts included, is recorded evidence. \
 Tasks are execution ajas; open_group creates a non-executable container. \
 WORKSPACES lists the workspace ids the host grants, default first. The id is the \
@@ -106,7 +106,7 @@ when several real candidates fit; otherwise act directly or ask in ordinary pros
 Choices are an optional shortcut, never a required answer: the user may always \
 reply in their own words. The recorded choices remain visible in later context. \
 Dispatches in one decision run in action order; the host may run them at once when \
-it has isolated worlds. A continuation is a new task related to the previous one \
+it has isolated environments. A continuation is a new task related to the previous one \
 with {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
 Action shapes: \
 {\"op\":\"propose\",\"kind\":\"goal|commitment|correction\",\"target_id\":1,\"text\":\"...\"}; \
@@ -122,7 +122,7 @@ Action shapes: \
 {\"op\":\"close_task\",\"task_id\":1,\"accepted\":true,\"note\":\"...\"}; \
 {\"op\":\"focus\",\"task_id\":1}; \
 {\"op\":\"look\",\"target\":\"log:task:1\"}; \
-{\"op\":\"look\",\"target\":\"world:src/main.rs\"}; \
+{\"op\":\"look\",\"target\":\"environment:src/main.rs\"}; \
 {\"op\":\"look\",\"target\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}; \
 {\"op\":\"look\",\"target\":\"mcp__server__tool\",\"arguments\":{}}. \
 Choice shape: {\"reply\":\"which one?\",\"choices\":[{\"label\":\"the earlier bug\",\

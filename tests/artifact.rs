@@ -140,7 +140,7 @@ fn a_match_returns_every_hit_and_the_view_budget_is_the_only_limit() {
 
 #[test]
 fn list_dir_reads_the_project_and_reports_what_it_hid() {
-    use eja::adapters::{FileTools, ToolContext, ToolGateway};
+    use eja::adapters::{FileTools, ToolContext, ToolProvider};
     use std::io::Write;
     let state = State::new("list");
     let project = state.path().join("project");
@@ -169,7 +169,7 @@ fn list_dir_reads_the_project_and_reports_what_it_hid() {
 
 #[test]
 fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
-    use eja::adapters::{FileTools, ToolContext, ToolGateway};
+    use eja::adapters::{FileTools, ToolContext, ToolProvider};
     let state = State::new("edit");
     let work = state.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -218,12 +218,12 @@ fn edit_file_replaces_one_exact_match_and_refuses_ambiguity() {
 
 #[test]
 fn file_tools_reach_the_reserved_worktree_but_not_its_private_parent() {
-    use eja::adapters::{FileTools, ToolContext, ToolGateway};
+    use eja::adapters::{FileTools, ToolContext, ToolProvider};
     use serde_json::json;
 
     let fixture = State::new("isolated-file-tools");
     let private = fixture.path().join("state");
-    let worktree = private.join("worlds/0/1");
+    let worktree = private.join("environments/0/1");
     std::fs::create_dir_all(&worktree).unwrap();
     let journal = private.join("log.jsonl");
     std::fs::write(&journal, "host facts").unwrap();
@@ -322,8 +322,8 @@ fn overlapping_match_windows_follow_hit_positions_including_the_file_end() {
 }
 
 #[test]
-fn world_and_frozen_text_reads_share_encoding_bounds_and_cancellation() {
-    use eja::adapters::{FileTools, RecordFiles, ToolContext, ToolGateway};
+fn environment_and_frozen_text_reads_share_encoding_bounds_and_cancellation() {
+    use eja::adapters::{FileTools, RecordFiles, ToolContext, ToolProvider};
     let state = State::new("text-budget");
     std::fs::create_dir_all(state.path()).unwrap();
     std::fs::write(
@@ -344,15 +344,15 @@ fn world_and_frozen_text_reads_share_encoding_bounds_and_cancellation() {
     let aja = reader
         .slice("escaped.txt", &Selector::Whole, &control)
         .unwrap();
-    let world = FileTools
+    let environment = FileTools
         .call(
             &context,
             "read_file",
             &serde_json::json!({"path":"escaped.txt"}),
         )
         .unwrap();
-    assert_eq!(aja["text"], world["text"]);
-    for value in [aja, world] {
+    assert_eq!(aja["text"], environment["text"]);
+    for value in [aja, environment] {
         assert_eq!(value["truncated"], true);
         // The frame cap bounds the serialized page, so measure it as sent.
         assert!(value.to_string().len() <= eja::aja::FRAME_LIMIT);

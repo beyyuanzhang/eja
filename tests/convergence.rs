@@ -288,8 +288,8 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
     assert_eq!(out.context().refused.len(), 2);
 }
 
-struct World;
-impl Capabilities for World {
+struct EnvironmentLease;
+impl Capabilities for EnvironmentLease {
     fn observe(&self, _: &str, _: &Value, _: &eja::Control) -> Result<Value> {
         Ok(json!({"fact":7}))
     }
@@ -302,11 +302,11 @@ fn look() -> Action {
     }
 }
 #[test]
-fn unrelated_tasks_do_not_change_world_capabilities() {
+fn unrelated_tasks_do_not_change_environment_capabilities() {
     let fixture = Fixture::new("convergence");
     let store = fixture.store();
     let ports = Ports {
-        capabilities: Some(&World),
+        capabilities: Some(&EnvironmentLease),
         ..Default::default()
     };
     let first = turn(

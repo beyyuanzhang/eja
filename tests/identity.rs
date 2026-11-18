@@ -98,7 +98,18 @@ fn addresses_are_one_scheme_and_plain_targets_are_host_tools() {
     assert!(eja::Address::parse("log:event:1").is_some());
     assert!(eja::Address::parse("record:3/4").is_some());
     assert!(eja::Address::parse("record:3/report.md").is_some());
+    assert!(eja::Address::parse("environment:README.md").is_some());
     assert!(eja::Address::parse("world:README.md").is_some());
+    assert_eq!(
+        eja::Address::parse("world:README.md")
+            .expect("legacy address")
+            .to_string(),
+        "environment:README.md"
+    );
+    let legacy: eja::Address =
+        serde_json::from_value(serde_json::json!({"authority":"world","id":"README.md"}))
+            .expect("legacy serialized authority");
+    assert_eq!(legacy.to_string(), "environment:README.md");
     assert!(eja::Address::parse("history").is_none());
     assert!(eja::Address::parse("read_file").is_none());
     assert!(eja::Address::parse("log:").is_none());
@@ -119,9 +130,13 @@ fn an_address_without_its_authority_is_an_error_not_a_fallback() {
     // No record reader, no capabilities: each authority refuses instead of
     // quietly reading something else.
     assert!(look("record:1/report.md", Selector::Whole).is_err());
-    assert!(look("world:README.md", Selector::Whole).is_err());
-    // A world address names one path; it has no page to select.
-    assert!(look("world:README.md", Selector::Range { from: 0, lines: 1 }).is_err());
+    assert!(look("environment:README.md", Selector::Whole).is_err());
+    // An environment address names one path; it has no page to select.
+    assert!(look(
+        "environment:README.md",
+        Selector::Range { from: 0, lines: 1 }
+    )
+    .is_err());
     // An unknown target is a host tool, so with no capabilities it is refused too.
     assert!(look("read_file", Selector::Whole).is_err());
 }

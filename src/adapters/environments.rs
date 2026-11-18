@@ -1,8 +1,7 @@
-//! Worlds: where one execution may change things, and how that comes back.
+//! Execution environments: where one run may change things, and how that comes back.
 //!
-//! The kernel reserves a world before a run and settles it after. A world is a
-//! lease — where this run may write — and nothing else: what the run did is the
-//! backend's account, measured against the reservation the backend kept.
+//! The host leases an environment before a run and settles it after. The
+//! provider owns the lease and measures the run against what it reserved.
 use super::process;
 use crate::{Control, Result};
 use serde::{Deserialize, Serialize};
@@ -18,14 +17,27 @@ use std::{
 pub const ENTRIES: usize = 20_000;
 /// Names shown per change class before the rest are counted.
 const NAMES: usize = 6;
-/// Releasing a world is cleanup, and it runs after the run's own budget may have
+/// Releasing an environment is cleanup, and it runs after the run's own budget may have
 /// expired: it gets this declared bound of its own instead of inheriting a spent
 /// control. Cleanup never decides whether a run succeeded.
 const RELEASE: std::time::Duration = std::time::Duration::from_secs(30);
 
 type Inventory = BTreeMap<String, (u64, i64)>;
 
-/// What one run did to one world: the host's measurement, never the runner's claim.
+/// Canonicalize the existing prefix of a path even when its final directory has
+/// not been created yet. Platform aliases such as `/var` and `/private/var` must
+/// not produce two spellings for the same environment boundary.
+pub fn canonical_boundary(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    canonical_boundary(parent).join(name)
+}
+
+/// What one run did to one environment: the host's measurement, never the runner's claim.
 #[derive(Debug, Default)]
 struct ProjectDelta {
     created: Vec<String>,
@@ -114,7 +126,7 @@ impl ProjectDelta {
     }
 }
 
-/// Every regular file in one world, with its size and modification time.
+/// Every regular file in one environment, with its size and modification time.
 fn snapshot(root: &Path, skip: &Path, control: &Control) -> (Inventory, bool) {
     let mut state = Inventory::new();
     let mut truncated = false;
@@ -168,10 +180,10 @@ fn snapshot(root: &Path, skip: &Path, control: &Control) -> (Inventory, bool) {
     (state, truncated)
 }
 
-/// One world reserved for one execution: where it may write.
+/// One environment reserved for one execution: where it may write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorldKind {
+pub enum EnvironmentKind {
     /// A record written before the kind was stated.
     #[default]
     Unknown,
@@ -179,12 +191,12 @@ pub enum WorldKind {
     Worktree,
 }
 
-/// The durable part of a reserved world: what kind of environment it was, the
+/// The durable part of a reserved environment: what kind it was, the
 /// granted root it belonged to, and the ref that holds the run's result.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorldRecord {
+pub struct EnvironmentRecord {
     #[serde(default)]
-    pub kind: WorldKind,
+    pub kind: EnvironmentKind,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,9 +205,9 @@ pub struct WorldRecord {
     pub commit: Option<String>,
 }
 
-impl WorldRecord {
+impl EnvironmentRecord {
     #[must_use]
-    pub fn of(kind: WorldKind, root: &Path) -> Self {
+    pub fn of(kind: EnvironmentKind, root: &Path) -> Self {
         Self {
             kind,
             root: root
@@ -208,43 +220,37 @@ impl WorldRecord {
     }
 }
 
-pub struct World {
+/// One provider-owned reservation for a single run.
+pub struct EnvironmentLease {
     task: u64,
     pub label: String,
     pub root: PathBuf,
     /// What reconciliation needs to return to this run, not to today's default.
-    pub record: WorldRecord,
+    pub record: EnvironmentRecord,
 }
 
-/// Reserve, settle, reconcile and release the world one execution may change.
-pub trait Worlds: Send + Sync {
+/// Reserve, settle, reconcile and release the environment one execution may change.
+pub trait EnvironmentProvider: Send + Sync {
     /// `root` names the granted workspace this run works in; `None` is the
     /// host's default. A backend that owns several roots isolates them apart.
-    fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World>;
-    /// The host's account of a finished run, including whatever makes the world
-    /// durable. The account carries a one-line `change`, measured against the
-    /// reservation this backend kept — not against the runner's claims.
-    fn settle(&self, world: &World, control: &Control) -> Result<Value>;
-    /// Bring one run's world back into the shared world.
-    fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value>;
-    /// Reconcile using the world the run recorded. The default preserves the
-    /// direct port for hosts that keep their own world evidence.
-    fn reconcile_recorded(
+    fn reserve(
         &self,
         task: u64,
         root: Option<&Path>,
-        record: Option<&WorldRecord>,
         control: &Control,
-    ) -> Result<Value> {
-        if record.is_some() {
-            return Err(
-                "reconcile refused: this world backend cannot use the run's recorded environment"
-                    .into(),
-            );
-        }
-        self.reconcile(task, root, control)
-    }
-    fn release(&self, world: &World);
+    ) -> Result<EnvironmentLease>;
+    /// The host's account of a finished run, including whatever makes the environment
+    /// durable. The account carries a one-line `change`, measured against the
+    /// reservation this backend kept — not against the runner's claims.
+    fn settle(&self, environment: &EnvironmentLease, control: &Control) -> Result<Value>;
+    /// Bring one run's recorded environment back into its base environment.
+    fn reconcile(
+        &self,
+        root: Option<&Path>,
+        record: &EnvironmentRecord,
+        control: &Control,
+    ) -> Result<Value>;
+    fn release(&self, environment: &EnvironmentLease);
 }
 
 /// What a backend remembers between reserve and settle.
@@ -264,7 +270,7 @@ impl Reservation {
     }
 
     /// The account of one run. Settlement runs under its own deadline, so a
-    /// truncated run still gets a full measurement of the world it left.
+    /// truncated run still gets a full measurement of the environment it left.
     fn delta(&self, root: &Path, skip: &Path, control: &Control) -> ProjectDelta {
         let (after, truncated) = snapshot(root, skip, control);
         ProjectDelta::between(&self.before, &after, self.complete, !truncated)
@@ -286,7 +292,7 @@ fn take(open: &Open, task: u64) -> Result<Reservation> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&task)
         .map(|(_, reservation)| reservation)
-        .ok_or_else(|| "this world has no open reservation".into())
+        .ok_or_else(|| "this environment has no open reservation".into())
 }
 
 fn forget(open: &Open, task: u64) {
@@ -295,18 +301,19 @@ fn forget(open: &Open, task: u64) {
         .remove(&task);
 }
 
-/// The default: every execution shares one world, so only one may run at a time.
-pub struct Shared {
+/// The default: every execution shares one environment, so only one may run at a time.
+pub struct SharedEnvironment {
     project: PathBuf,
     private: PathBuf,
     open: Open,
 }
 
-impl Shared {
+impl SharedEnvironment {
     pub fn new(project: impl Into<PathBuf>, private: impl Into<PathBuf>) -> Self {
+        let private = canonical_boundary(&private.into());
         Self {
             project: project.into(),
-            private: private.into(),
+            private,
             open: Mutex::new(HashMap::new()),
         }
     }
@@ -316,63 +323,65 @@ impl Shared {
     }
 }
 
-impl Worlds for Shared {
-    fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World> {
+impl EnvironmentProvider for SharedEnvironment {
+    fn reserve(
+        &self,
+        task: u64,
+        root: Option<&Path>,
+        control: &Control,
+    ) -> Result<EnvironmentLease> {
         let root = self.root_of(root);
         if !root.is_dir() {
             return Err(format!("workspace is not a directory: {}", root.display()).into());
         }
+        // Tool boundaries compare paths structurally. Canonicalize at the lease
+        // boundary so a workspace reached through a platform alias (for example
+        // `/var` and `/private/var`) cannot make the private state appear outside
+        // the environment it belongs to.
+        let root = root.canonicalize()?;
         let mut open = self
             .open
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // One mutable world has one owner per root. Two runs in two granted
+        // One mutable environment has one owner per root. Two runs in two granted
         // workspaces may hold their own roots at once; a second run in a root
         // that is held is refused instead of letting two runs write it.
-        if open.values().any(|(held, _)| held == root) {
+        if open.values().any(|(held, _)| held == &root) {
             return Err(
-                "the shared world has one owner; a second run needs an isolated world".into(),
+                "the shared environment has one owner; a second run needs an isolated environment"
+                    .into(),
             );
         }
         open.insert(
             task,
             (
-                root.to_path_buf(),
-                Reservation::start(root, &self.private, control),
+                root.clone(),
+                Reservation::start(&root, &self.private, control),
             ),
         );
         // The reservation is recorded; the map must not stay locked while the
-        // world is handed back.
+        // environment is handed back.
         drop(open);
-        Ok(World {
+        Ok(EnvironmentLease {
             task,
             label: "shared".to_string(),
-            root: root.to_path_buf(),
-            record: WorldRecord::of(WorldKind::Shared, root),
+            root: root.clone(),
+            record: EnvironmentRecord::of(EnvironmentKind::Shared, &root),
         })
     }
 
-    fn settle(&self, world: &World, control: &Control) -> Result<Value> {
-        let reservation = take(&self.open, world.task)?;
-        let delta = reservation.delta(&world.root, &self.private, control);
-        Ok(json!({"world": "shared", "change": delta.line()}))
+    fn settle(&self, environment: &EnvironmentLease, control: &Control) -> Result<Value> {
+        let reservation = take(&self.open, environment.task)?;
+        let delta = reservation.delta(&environment.root, &self.private, control);
+        Ok(json!({"environment": "shared", "change": delta.line()}))
     }
 
-    fn reconcile(&self, _task: u64, _root: Option<&Path>, _control: &Control) -> Result<Value> {
-        Ok(json!({"world": "shared", "merged": true,
-                  "detail": "the run happened in the shared world"}))
-    }
-
-    fn reconcile_recorded(
+    fn reconcile(
         &self,
-        task: u64,
-        root: Option<&Path>,
-        record: Option<&WorldRecord>,
-        control: &Control,
+        _root: Option<&Path>,
+        record: &EnvironmentRecord,
+        _control: &Control,
     ) -> Result<Value> {
-        let Some(record) = record else {
-            return self.reconcile(task, root, control);
-        };
         if !record.root.is_empty()
             && normalize_run_root(&record.root)
                 != normalize_run_root(&self.project.display().to_string())
@@ -385,26 +394,30 @@ impl Worlds for Shared {
             .into());
         }
         match record.kind {
-            WorldKind::Shared => self.reconcile(task, root, control),
-            WorldKind::Worktree => Err(
-                "reconcile refused: the run used an isolated Git worktree, but this runtime has no Git world service to merge its recorded branch"
+            EnvironmentKind::Shared => Ok(json!({
+                "environment": "shared",
+                "merged": true,
+                "detail": "the run happened in the shared environment"
+            })),
+            EnvironmentKind::Worktree => Err(
+                "reconcile refused: the run used an isolated Git worktree, but this runtime has no Git environment provider to merge its recorded branch"
                     .into(),
             ),
-            WorldKind::Unknown => Err(
-                "reconcile refused: the run record does not identify the world backend it used"
+            EnvironmentKind::Unknown => Err(
+                "reconcile refused: the run record does not identify the environment provider it used"
                     .into(),
             ),
         }
     }
 
-    fn release(&self, world: &World) {
-        forget(&self.open, world.task);
+    fn release(&self, environment: &EnvironmentLease) {
+        forget(&self.open, environment.task);
     }
 }
 
-/// One git worktree and one branch per execution: parallel runs cannot overwrite
+/// One Git worktree and one branch per execution: parallel runs cannot overwrite
 /// each other, and the result is a ref the host may reconcile explicitly.
-pub struct Worktrees {
+pub struct GitWorktrees {
     project: PathBuf,
     granted: PathBuf,
     root: PathBuf,
@@ -462,8 +475,8 @@ fn git(cwd: &Path, args: &[&str], control: &Control) -> Result<String> {
     git_at(None, cwd, args, control)
 }
 
-impl Worktrees {
-    /// A world per run needs a committed project: a worktree branches from HEAD.
+impl GitWorktrees {
+    /// An isolated environment per run needs a committed project.
     pub fn new(
         project: impl Into<PathBuf>,
         root: impl Into<PathBuf>,
@@ -474,15 +487,18 @@ impl Worktrees {
         let project = project.canonicalize().unwrap_or(project);
         let root = root.into();
         let top = git(&project, &["rev-parse", "--show-toplevel"], control)
-            .map_err(|error| format!("isolated worlds need a Git project: {error}"))?;
-        git(&project, &["rev-parse", "--verify", "HEAD"], control)
-            .map_err(|error| format!("isolated worlds need one commit to branch from: {error}"))?;
+            .map_err(|error| format!("isolated environments need a Git project: {error}"))?;
+        git(&project, &["rev-parse", "--verify", "HEAD"], control).map_err(|error| {
+            format!("isolated environments need one commit to branch from: {error}")
+        })?;
         std::fs::create_dir_all(&root)?;
+        let root = root.canonicalize()?;
+        let private = canonical_boundary(&private.into());
         Ok(Self {
             project: PathBuf::from(top),
             granted: project,
             root,
-            private: private.into(),
+            private,
             open: Mutex::new(HashMap::new()),
         })
     }
@@ -511,10 +527,15 @@ impl Worktrees {
     }
 }
 
-impl Worlds for Worktrees {
-    fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World> {
+impl EnvironmentProvider for GitWorktrees {
+    fn reserve(
+        &self,
+        task: u64,
+        root: Option<&Path>,
+        control: &Control,
+    ) -> Result<EnvironmentLease> {
         if !self.owns(root) {
-            return Err("an isolated world belongs to its own git project".into());
+            return Err("an isolated environment belongs to its own Git project".into());
         }
         let root = self.root.join(task.to_string());
         if root.exists() {
@@ -544,14 +565,14 @@ impl Worlds for Worktrees {
             &self.project,
             Reservation::start(&root, &self.private, control),
         );
-        // An isolated world starts at a commit: uncommitted project changes stay
+        // An isolated environment starts at a commit: uncommitted project changes stay
         // behind, and the label carries the commit the run started from.
-        Ok(World {
+        Ok(EnvironmentLease {
             task,
             label: format!("worktree {branch} at {}", &head[..head.len().min(12)]),
             root,
-            record: WorldRecord {
-                kind: WorldKind::Worktree,
+            record: EnvironmentRecord {
+                kind: EnvironmentKind::Worktree,
                 root: self.granted.display().to_string(),
                 branch: Some(branch),
                 commit: None,
@@ -559,53 +580,44 @@ impl Worlds for Worktrees {
         })
     }
 
-    fn settle(&self, world: &World, control: &Control) -> Result<Value> {
-        let reservation = take(&self.open, world.task)?;
-        let delta = reservation.delta(&world.root, &self.private, control);
-        git(&world.root, &["add", "-A", "--", "."], control)?;
+    fn settle(&self, environment: &EnvironmentLease, control: &Control) -> Result<Value> {
+        let reservation = take(&self.open, environment.task)?;
+        let delta = reservation.delta(&environment.root, &self.private, control);
+        git(&environment.root, &["add", "-A", "--", "."], control)?;
         git(
-            &world.root,
+            &environment.root,
             &[
                 "commit",
                 "--quiet",
                 "--allow-empty",
                 "-m",
-                "eja: settle world",
+                "eja: settle environment",
             ],
             control,
         )?;
-        let commit = git(&world.root, &["rev-parse", "HEAD"], control)?;
-        let mut record = world.record.clone();
+        let commit = git(&environment.root, &["rev-parse", "HEAD"], control)?;
+        let mut record = environment.record.clone();
         record.commit = Some(commit.clone());
         Ok(json!({
-            "world": world.label,
+            "environment": environment.label,
             "change": delta.line(),
             "commit": commit,
             "kind": record.kind,
             "root": record.root,
             "branch": record.branch,
-            "world_record": record,
+            "environment_record": record,
         }))
     }
 
-    fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value> {
-        if !self.owns(root) {
-            return Err("an isolated world belongs to its own git project".into());
-        }
-        let branch = self.branch(task);
-        merge_branch(&self.project, &branch, None, control)
-    }
-
-    fn reconcile_recorded(
+    fn reconcile(
         &self,
-        task: u64,
         root: Option<&Path>,
-        record: Option<&WorldRecord>,
+        record: &EnvironmentRecord,
         control: &Control,
     ) -> Result<Value> {
-        let Some(record) = record else {
-            return self.reconcile(task, root, control);
-        };
+        if !self.owns(root) {
+            return Err("an isolated environment belongs to its own Git project".into());
+        }
         if !record.root.is_empty()
             && normalize_run_root(&record.root)
                 != normalize_run_root(&self.granted.display().to_string())
@@ -618,30 +630,30 @@ impl Worlds for Worktrees {
             .into());
         }
         match record.kind {
-            WorldKind::Shared => Ok(json!({
-                "world": "shared",
+            EnvironmentKind::Shared => Ok(json!({
+                "environment": "shared",
                 "merged": true,
-                "detail": "the run happened in the shared world"
+                "detail": "the run happened in the shared environment"
             })),
-            WorldKind::Worktree => {
+            EnvironmentKind::Worktree => {
                 let branch = record
                     .branch
                     .as_deref()
                     .ok_or("reconcile refused: the isolated run record names no branch artifact")?;
                 merge_branch(&self.project, branch, record.commit.as_deref(), control)
             }
-            WorldKind::Unknown => Err(
-                "reconcile refused: the run record does not identify the world backend it used"
+            EnvironmentKind::Unknown => Err(
+                "reconcile refused: the run record does not identify the environment provider it used"
                     .into(),
             ),
         }
     }
 
-    fn release(&self, world: &World) {
+    fn release(&self, environment: &EnvironmentLease) {
         // The branch keeps the work; the directory is only a workspace.
-        forget(&self.open, world.task);
+        forget(&self.open, environment.task);
         let control = crate::Control::new(RELEASE, std::sync::Arc::default());
-        let text = world.root.to_string_lossy().to_string();
+        let text = environment.root.to_string_lossy().to_string();
         let _ = git(
             &self.project,
             &["worktree", "remove", "--force", &text],
@@ -673,7 +685,7 @@ fn merge_branch(
     };
     match git(project, &["merge", "--no-ff", "--no-edit", target], control) {
         Ok(output) => Ok(json!({
-            "world": branch,
+            "environment": branch,
             "merged": true,
             "detail": output.lines().next().unwrap_or_default(),
         })),
@@ -686,7 +698,7 @@ fn merge_branch(
             .unwrap_or_default();
             let _ = git(project, &["merge", "--abort"], control);
             Ok(json!({
-                "world": branch,
+                "environment": branch,
                 "merged": false,
                 "conflicts": conflicts.lines().take(20).collect::<Vec<_>>(),
                 "detail": error.to_string(),
@@ -703,24 +715,27 @@ fn normalize_run_root(root: &str) -> PathBuf {
 
 /// One backend per granted root.
 ///
-/// A run reserves the world of the workspace its task named, and every root
+/// A run reserves the environment of the workspace its task named, and every root
 /// keeps the isolation rule of its own backend. Roots without a backend of
 /// their own share the default.
-pub struct WorkspaceWorlds {
-    default: Arc<dyn Worlds>,
-    roots: BTreeMap<PathBuf, Arc<dyn Worlds>>,
+pub struct WorkspaceEnvironments {
+    default: Arc<dyn EnvironmentProvider>,
+    roots: BTreeMap<PathBuf, Arc<dyn EnvironmentProvider>>,
     /// Backends that can land a historical isolated run. A shared execution
     /// backend still gives a restart one way to merge a branch recorded by an
     /// earlier isolated composition.
-    history: BTreeMap<PathBuf, Arc<dyn Worlds>>,
-    /// The backend that reserved each run: an isolated world's root is a
+    history: BTreeMap<PathBuf, Arc<dyn EnvironmentProvider>>,
+    /// The provider that reserved each run: an isolated environment's root is a
     /// worktree path, not the granted root, so settle and release must return
     /// to the backend that owns the reservation.
-    held: Mutex<HashMap<u64, Arc<dyn Worlds>>>,
+    held: Mutex<HashMap<u64, Arc<dyn EnvironmentProvider>>>,
 }
 
-impl WorkspaceWorlds {
-    pub fn new(default: Arc<dyn Worlds>, roots: BTreeMap<PathBuf, Arc<dyn Worlds>>) -> Self {
+impl WorkspaceEnvironments {
+    pub fn new(
+        default: Arc<dyn EnvironmentProvider>,
+        roots: BTreeMap<PathBuf, Arc<dyn EnvironmentProvider>>,
+    ) -> Self {
         let history = roots.clone();
         Self {
             default,
@@ -731,58 +746,58 @@ impl WorkspaceWorlds {
     }
 
     #[must_use]
-    pub fn with_history(mut self, history: BTreeMap<PathBuf, Arc<dyn Worlds>>) -> Self {
+    pub fn with_history(
+        mut self,
+        history: BTreeMap<PathBuf, Arc<dyn EnvironmentProvider>>,
+    ) -> Self {
         self.history = history;
         self
     }
 
-    fn backend(&self, root: Option<&Path>) -> &Arc<dyn Worlds> {
+    fn backend(&self, root: Option<&Path>) -> &Arc<dyn EnvironmentProvider> {
         root.and_then(|root| self.roots.get(root))
             .unwrap_or(&self.default)
     }
 
-    fn reserved(&self, world: &World) -> Arc<dyn Worlds> {
+    fn reserved(&self, environment: &EnvironmentLease) -> Arc<dyn EnvironmentProvider> {
         self.held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&world.task)
+            .get(&environment.task)
             .cloned()
-            .unwrap_or_else(|| self.backend(Some(&world.root)).clone())
+            .unwrap_or_else(|| self.backend(Some(&environment.root)).clone())
     }
 }
 
-impl Worlds for WorkspaceWorlds {
-    fn reserve(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<World> {
+impl EnvironmentProvider for WorkspaceEnvironments {
+    fn reserve(
+        &self,
+        task: u64,
+        root: Option<&Path>,
+        control: &Control,
+    ) -> Result<EnvironmentLease> {
         let backend = self.backend(root);
-        let world = backend.reserve(task, root, control)?;
+        let environment = backend.reserve(task, root, control)?;
         self.held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(task, backend.clone());
-        Ok(world)
+        Ok(environment)
     }
 
-    fn settle(&self, world: &World, control: &Control) -> Result<Value> {
-        let backend = self.reserved(world);
+    fn settle(&self, environment: &EnvironmentLease, control: &Control) -> Result<Value> {
+        let backend = self.reserved(environment);
         // The reservation stays held through release: settle alone must not
-        // hand the world back to a root lookup that no longer knows it.
-        backend.settle(world, control)
+        // hand the environment back to a root lookup that no longer knows it.
+        backend.settle(environment, control)
     }
 
-    fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value> {
-        self.backend(root).reconcile(task, root, control)
-    }
-
-    fn reconcile_recorded(
+    fn reconcile(
         &self,
-        task: u64,
         root: Option<&Path>,
-        record: Option<&WorldRecord>,
+        record: &EnvironmentRecord,
         control: &Control,
     ) -> Result<Value> {
-        let Some(record) = record else {
-            return self.reconcile(task, root, control);
-        };
         let task_root = root.map(|root| normalize_run_root(&root.display().to_string()));
         let recorded_root = (!record.root.is_empty()).then(|| normalize_run_root(&record.root));
         if let (Some(task_root), Some(recorded_root)) = (&task_root, &recorded_root) {
@@ -796,12 +811,12 @@ impl Worlds for WorkspaceWorlds {
             }
         }
         match record.kind {
-            WorldKind::Shared => Ok(json!({
-                "world": "shared",
+            EnvironmentKind::Shared => Ok(json!({
+                "environment": "shared",
                 "merged": true,
-                "detail": "the run happened in the shared world"
+                "detail": "the run happened in the shared environment"
             })),
-            WorldKind::Worktree => {
+            EnvironmentKind::Worktree => {
                 let key = recorded_root.or(task_root).or_else(|| {
                     if self.history.len() == 1 {
                         self.history.keys().next().cloned()
@@ -809,33 +824,33 @@ impl Worlds for WorkspaceWorlds {
                         None
                     }
                 }).ok_or(
-                    "reconcile refused: the run record does not bind its isolated world to a workspace",
+                    "reconcile refused: the run record does not bind its isolated environment to a workspace",
                 )?;
                 self.history.get(&key).map_or_else(
                     || {
                         Err(format!(
-                            "reconcile refused: no Git world service is configured for {}; the run's recorded branch cannot be merged",
+                            "reconcile refused: no Git environment provider is configured for {}; the run's recorded branch cannot be merged",
                             key.display()
                         )
                         .into())
                     },
-                    |backend| backend.reconcile_recorded(task, root, Some(record), control),
+                    |backend| backend.reconcile(root, record, control),
                 )
             }
-            WorldKind::Unknown => Err(
-                "reconcile refused: the run record does not identify the world backend it used"
+            EnvironmentKind::Unknown => Err(
+                "reconcile refused: the run record does not identify the environment provider it used"
                     .into(),
             ),
         }
     }
 
-    fn release(&self, world: &World) {
-        let backend = self.reserved(world);
+    fn release(&self, environment: &EnvironmentLease) {
+        let backend = self.reserved(environment);
         self.held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&world.task);
-        backend.release(world);
+            .remove(&environment.task);
+        backend.release(environment);
     }
 }
 
@@ -854,7 +869,7 @@ mod tests {
     fn a_partial_inventory_reports_only_what_it_observed() {
         let before = inventory(&[("kept.txt", 1), ("other.txt", 1)]);
         let empty = Inventory::new();
-        // The second inventory never saw the world: it proves nothing.
+        // The second inventory never saw the environment: it proves nothing.
         let delta = ProjectDelta::between(&before, &empty, true, false);
         assert!(delta.deleted.is_empty(), "{delta:?}");
         assert!(delta.created.is_empty());
@@ -864,7 +879,7 @@ mod tests {
             "{}",
             delta.line()
         );
-        // An unobserved earlier world cannot invent creations either.
+        // An unobserved earlier environment cannot invent creations either.
         let delta = ProjectDelta::between(&empty, &before, false, true);
         assert!(delta.created.is_empty(), "{delta:?}");
         assert!(delta.truncated);

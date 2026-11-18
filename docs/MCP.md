@@ -117,4 +117,4 @@ request to the server; it cannot guarantee rollback or termination of remote
 work, and a deliberately detached process requires its own lifecycle management.
 
 The current CLI host lives for one command. A future long-running app can retain
-the same `HostTools` for its application lifetime without changing AJA.
+the same `ToolRegistry` for its application lifetime without changing AJA.

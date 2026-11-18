@@ -1,5 +1,5 @@
 //! Host tools. Connectors implement this same boundary; ajas never load plugins.
-use super::{cut_chars, worlds::ENTRIES, Capabilities, Control};
+use super::{cut_chars, environments::ENTRIES, Capabilities, Control};
 use crate::{aja::FRAME_LIMIT, Result};
 use serde_json::{json, Value};
 use std::{
@@ -92,12 +92,12 @@ impl ToolContext<'_> {
     }
 }
 
-pub trait ToolGateway: Send + Sync {
+pub trait ToolProvider: Send + Sync {
     fn definitions(&self, assignment: &crate::Assignment) -> Vec<Value>;
     /// Trusted host implementations must honor control and bound their output/resources.
     fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value>;
     /// The host's own read of this tool. A provider resolves its own paths and
-    /// authority; the registry only routes to the gateway that owns the name.
+    /// authority; the registry only routes to the provider that owns the name.
     fn inspect(
         &self,
         context: &ToolContext<'_>,
@@ -114,7 +114,7 @@ pub trait ToolGateway: Send + Sync {
         }
         self.call(context, name, arguments)
     }
-    /// Whether the host itself may call this tool to look at the world. An
+    /// Whether the host itself may call this tool to inspect an environment. An
     /// effect is never an observation; connectors declare their own read-only
     /// tools instead.
     fn observes(&self, _name: &str) -> bool {
@@ -123,7 +123,7 @@ pub trait ToolGateway: Send + Sync {
     fn witnesses(&self, name: &str) -> bool {
         self.observes(name)
     }
-    /// Whether this gateway declares the name: the registry routes by it.
+    /// Whether this provider declares the name: the registry routes by it.
     fn owns(&self, name: &str) -> bool;
 }
 
@@ -142,7 +142,7 @@ pub const WORKSPACE_TOOLS: [&str; 7] = [
     "shell",
 ];
 
-impl<T: ToolGateway + ?Sized> ToolGateway for std::sync::Arc<T> {
+impl<T: ToolProvider + ?Sized> ToolProvider for std::sync::Arc<T> {
     fn definitions(&self, assignment: &crate::Assignment) -> Vec<Value> {
         (**self).definitions(assignment)
     }
@@ -302,7 +302,7 @@ impl WorkspaceTools {
     }
 }
 
-impl ToolGateway for WorkspaceTools {
+impl ToolProvider for WorkspaceTools {
     fn definitions(&self, _: &crate::Assignment) -> Vec<Value> {
         WORKSPACE_TOOLS
             .iter()
@@ -411,7 +411,7 @@ fn workspace_definition(name: &str) -> Value {
     json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":properties,"required":required,"additionalProperties":false}}})
 }
 
-impl ToolGateway for FileTools {
+impl ToolProvider for FileTools {
     fn definitions(&self, _: &crate::Assignment) -> Vec<Value> {
         WORKSPACE_TOOLS
             .iter()
@@ -518,72 +518,30 @@ impl ToolGateway for FileTools {
     }
 }
 
-/// The application's gateway registry. It knows nothing about a gateway's
+/// The application's tool registry. It knows nothing about a provider's
 /// protocol, workspace roots or tools: it concatenates definitions and routes a
-/// name to the one gateway that declares it.
-pub struct HostTools {
-    gateways: Vec<Box<dyn ToolGateway>>,
+/// name to the one provider that declares it.
+pub struct ToolRegistry {
+    providers: Vec<Box<dyn ToolProvider>>,
     private: PathBuf,
 }
 
-impl HostTools {
-    pub fn from_gateways(
-        private: impl Into<PathBuf>,
-        gateways: Vec<Box<dyn ToolGateway>>,
-    ) -> Result<Self> {
+impl ToolRegistry {
+    pub fn new(private: impl Into<PathBuf>, providers: Vec<Box<dyn ToolProvider>>) -> Result<Self> {
         Ok(Self {
-            gateways,
+            providers,
             private: private.into().canonicalize()?,
         })
     }
 
-    pub fn new(
-        config: Option<&Path>,
-        project: &Path,
-        private: &Path,
-        control: &Control,
-    ) -> Result<Self> {
-        Self::with_workspace(config, Some(project), private, control)
+    pub fn register(&mut self, provider: Box<dyn ToolProvider>) {
+        self.providers.push(provider);
     }
 
-    /// A compatibility wrapper for consumers that assemble the historical
-    /// default: local file tools plus connectors over one workspace.
-    pub fn with_workspace(
-        config: Option<&Path>,
-        workspace: Option<&Path>,
-        private: &Path,
-        control: &Control,
-    ) -> Result<Self> {
-        let private = private.canonicalize()?;
-        let workspace = workspace.map(Path::canonicalize).transpose()?;
-        let mut gateways: Vec<Box<dyn ToolGateway>> = Vec::new();
-        if let Some(workspace) = &workspace {
-            gateways.push(Box::new(WorkspaceTools::new(
-                true,
-                true,
-                Some(workspace.clone()),
-                vec![workspace.clone()],
-                &private,
-            )));
-        }
-        if let Some(path) = config {
-            gateways.push(Box::new(super::McpTools::load_with_workspace(
-                path,
-                workspace.as_deref(),
-                control,
-            )?));
-        }
-        Self::from_gateways(private, gateways)
-    }
-
-    pub fn register(&mut self, gateway: Box<dyn ToolGateway>) {
-        self.gateways.push(gateway);
-    }
-
-    fn gateway(&self, tool: &str) -> Result<&dyn ToolGateway> {
-        self.gateways
+    fn provider(&self, tool: &str) -> Result<&dyn ToolProvider> {
+        self.providers
             .iter()
-            .find(|gateway| gateway.owns(tool))
+            .find(|provider| provider.owns(tool))
             .map(Box::as_ref)
             .ok_or_else(|| format!("{tool} is not a declared host tool").into())
     }
@@ -601,21 +559,21 @@ impl HostTools {
             private: &self.private,
             control,
         };
-        self.gateway(tool)?
+        self.provider(tool)?
             .inspect(&context, tool, arguments, witness)
     }
 }
 
-impl ToolGateway for HostTools {
+impl ToolProvider for ToolRegistry {
     fn definitions(&self, assignment: &crate::Assignment) -> Vec<Value> {
-        self.gateways
+        self.providers
             .iter()
-            .flat_map(|gateway| gateway.definitions(assignment))
+            .flat_map(|provider| provider.definitions(assignment))
             .collect()
     }
 
     fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
-        self.gateway(name)?.call(ctx, name, args)
+        self.provider(name)?.call(ctx, name, args)
     }
 
     fn inspect(
@@ -626,25 +584,25 @@ impl ToolGateway for HostTools {
         witness: bool,
     ) -> Result<Value> {
         let _ = ctx;
-        self.gateway(name)?.inspect(ctx, name, args, witness)
+        self.provider(name)?.inspect(ctx, name, args, witness)
     }
 
     fn observes(&self, name: &str) -> bool {
-        self.gateway(name)
-            .is_ok_and(|gateway| gateway.observes(name))
+        self.provider(name)
+            .is_ok_and(|provider| provider.observes(name))
     }
 
     fn witnesses(&self, name: &str) -> bool {
-        self.gateway(name)
-            .is_ok_and(|gateway| gateway.witnesses(name))
+        self.provider(name)
+            .is_ok_and(|provider| provider.witnesses(name))
     }
 
     fn owns(&self, name: &str) -> bool {
-        self.gateways.iter().any(|gateway| gateway.owns(name))
+        self.providers.iter().any(|provider| provider.owns(name))
     }
 }
 
-impl Capabilities for HostTools {
+impl Capabilities for ToolRegistry {
     fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
         self.inspect(
             tool,

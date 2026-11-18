@@ -1,8 +1,9 @@
 # Native AJA protocol
 
 The same executable runs in private `--aja-worker` mode. It starts with an empty
-environment in the world the host reserved for this run: the project itself when
-there is one shared world, a worktree when slots are isolated. The host owns model credentials, MCP
+process environment in the execution environment the host reserved for this run:
+the project itself for a shared environment, a Git worktree when slots are
+isolated. The host owns model credentials, MCP
 connections, tool grants and all external effects. The aja only runs framed IPC.
 
 ## Startup
@@ -15,7 +16,7 @@ The host resolves the explicit predecessor's frozen record ancestry, reconstruct
 its valid working view, replaces the old system contract, adds the new assignment,
 and fits the resulting messages before sending Start. The serialized JSON frame
 is at most 256 KiB, followed by a newline. A fresh aja has system + assignment
-messages; continuation adds historical observations, not restored world state.
+messages; continuation adds historical observations, not restored environment state.
 The assignment is frozen once in the host manifest; its prepared messages cross
 IPC without a second copy of the same brief. Step/time/response limits belong to
 the host, not a mirrored execution counter in the child. The child receives only
@@ -40,7 +41,8 @@ line each, and the oldest fold into one address range. Nothing is deleted from
 the record. Every step line names the record entry it came from, and the fold line
 names the range of those entries, so a folded step is read back with
 `eja_read_record {aja, entry}` — the record half of the same address space that
-`log:` and `world:` name from the host side.
+`log:` and `environment:` name from the host side. The old `world:` prefix is
+accepted as an input alias.
 A contract that cannot fit even at that scale ends with budget. Incomplete
 provider responses and invalid tool messages end with error.
 
@@ -58,7 +60,7 @@ entry would cost the square of a long record for no new information.
 `aja.json` is published by atomic rename after process cleanup and transcript
 sync. It contains assignment, digest, optional checkpoint, checkpoint_error,
 context file/size and frozen:true. Frozen files become read-only. Checkpointing
-captures the Git-visible files of that world; whole/range/match read the same
+captures the Git-visible files of that environment; whole/range/match read the same
 commit.
 Checkpoint failure remains visible and does not discard the execution record.
 
@@ -68,9 +70,9 @@ A continuation uses a new aja id and a single explicit predecessor.
 
 ## Lifetime
 
-Native execution runs in one reserved world per aja. With one slot that world is
+Native execution runs in one reserved environment per aja. With one slot that environment is
 the shared project, so runs are serial; with more slots each run gets its own
-worktree and the host records reports in dispatch order. Host cancellation and
+Git worktree and the host records reports in dispatch order. Host cancellation and
 deadlines propagate through model requests and tool calls. The host kills/reaps the aja,
 joins its IPC reader and revokes its run before publishing the frozen record.
 Waiting for EJA judgment retains no AJA process. All cleanup and checkpoint

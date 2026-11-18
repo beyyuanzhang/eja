@@ -7,8 +7,8 @@ mod support;
 
 use eja::{
     adapters::{
-        Checkpoints, Control, FileTools, Model, NativeRuntime, NativeWorker, OpenAiModel,
-        ToolContext, ToolGateway, Worktrees,
+        Checkpoints, Control, ExecutionServices, FileTools, GitWorktrees, Model, NativeWorker,
+        OpenAiModel, SharedEnvironment, ToolContext, ToolProvider,
     },
     aja::Limits,
     Assignment, Result, Worker,
@@ -44,16 +44,26 @@ fn workspace(tag: &str) -> State {
 fn worker_for(
     state: &State,
     model: Arc<dyn Model>,
-    tools: Arc<dyn ToolGateway>,
+    tools: Arc<dyn ToolProvider>,
     limits: Limits,
 ) -> Arc<NativeWorker> {
     Arc::new(
-        NativeWorker::new(
+        NativeWorker::with_services(
             env!("CARGO_BIN_EXE_eja"),
             state.path().join(".eja/ajas"),
-            state.path(),
             model,
             tools,
+            ExecutionServices {
+                workspace: Some(state.path().to_path_buf()),
+                snapshots: Some(Checkpoints::new(
+                    state.path().join(".eja/checkpoints"),
+                    state.path().join(".eja"),
+                )),
+                environments: Some(Arc::new(SharedEnvironment::new(
+                    state.path(),
+                    state.path().join(".eja"),
+                ))),
+            },
         )
         .unwrap()
         .with_limits(limits)
@@ -202,7 +212,7 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
     let digest = w.execute(&assignment(1), &control());
     assert!(digest.contains("ended: message"), "{digest}");
     assert!(
-        digest.contains("world: shared: +1 created (out.txt)"),
+        digest.contains("environment: shared: +1 created (out.txt)"),
         "{digest}"
     );
     assert_eq!(
@@ -261,7 +271,7 @@ fn a_worktree_run_persists_the_environment_and_stable_artifact_it_settled() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let fixture = workspace("native-world-record");
+    let fixture = workspace("native-environment-record");
     let state_dir = fixture.path().join(".eja");
     std::fs::create_dir_all(&state_dir).unwrap();
     std::fs::write(fixture.path().join("base.txt"), "base\n").unwrap();
@@ -279,10 +289,10 @@ fn a_worktree_run_persists_the_environment_and_stable_artifact_it_settled() {
         assert!(status.success());
     }
     let control = control();
-    let worlds = Arc::new(
-        Worktrees::new(
+    let environments = Arc::new(
+        GitWorktrees::new(
             fixture.path(),
-            state_dir.join("worlds"),
+            state_dir.join("environments"),
             &state_dir,
             &control,
         )
@@ -295,18 +305,18 @@ fn a_worktree_run_persists_the_environment_and_stable_artifact_it_settled() {
         )]),
         final_message(&["out.txt"]),
     ]));
-    let worker = NativeWorker::with_runtime(
+    let worker = NativeWorker::with_services(
         env!("CARGO_BIN_EXE_eja"),
         state_dir.join("ajas"),
         model,
         Arc::new(FileTools),
-        NativeRuntime {
+        ExecutionServices {
             workspace: Some(fixture.path().to_path_buf()),
             snapshots: Some(Checkpoints::new(
                 state_dir.join("checkpoints"),
                 state_dir.clone(),
             )),
-            worlds: Some(worlds),
+            environments: Some(environments),
         },
     )
     .unwrap();
@@ -314,19 +324,19 @@ fn a_worktree_run_persists_the_environment_and_stable_artifact_it_settled() {
     assert!(digest.contains("ended: message"), "{digest}");
     assert!(!fixture.path().join("out.txt").exists());
     let manifest = manifest_of(&fixture, 1);
-    assert_eq!(manifest["world_kind"], "worktree", "{manifest}");
+    assert_eq!(manifest["environment_kind"], "worktree", "{manifest}");
     assert_eq!(
-        manifest["world_root"],
+        manifest["environment_root"],
         fixture.path().canonicalize().unwrap().display().to_string()
     );
     assert!(
-        manifest["world_branch"]
+        manifest["environment_branch"]
             .as_str()
             .is_some_and(|branch| branch.starts_with("eja/aja-1-")),
         "{manifest}"
     );
     assert!(
-        manifest["world_commit"]
+        manifest["environment_commit"]
             .as_str()
             .is_some_and(|commit| commit.len() == 40 || commit.len() == 64),
         "{manifest}"
@@ -335,7 +345,7 @@ fn a_worktree_run_persists_the_environment_and_stable_artifact_it_settled() {
 }
 
 #[test]
-fn shell_glob_and_grep_work_inside_the_world() {
+fn shell_glob_and_grep_work_inside_the_environment() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -439,9 +449,9 @@ fn a_shell_command_dies_with_its_run() {
 }
 
 /// Effects that reach past the work area, so the digest can be checked against
-/// the world rather than the aja's own account.
+/// the environment rather than the aja's own account.
 struct Effects;
-impl ToolGateway for Effects {
+impl ToolProvider for Effects {
     fn owns(&self, name: &str) -> bool {
         name == "effect"
     }
@@ -486,13 +496,13 @@ fn the_digest_reports_what_the_project_gained() {
     let w = worker_for(&f, model, Arc::new(Effects), Limits::default());
     let digest = w.execute(&assignment(1), &control());
     assert!(
-        digest.contains("world: shared: +2 created (delivered.txt, nested/also.txt)"),
+        digest.contains("environment: shared: +2 created (delivered.txt, nested/also.txt)"),
         "{digest}"
     );
 }
 
 #[test]
-fn the_aja_leaves_a_fossil_of_the_world_it_ended_in() {
+fn the_aja_leaves_a_fossil_of_the_environment_it_ended_in() {
     let _lock = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -522,9 +532,9 @@ fn the_aja_leaves_a_fossil_of_the_world_it_ended_in() {
     assert_eq!(String::from_utf8_lossy(&read.stdout), "delivered");
 }
 
-/// A gateway that answers with something far larger than a aja should carry.
+/// A tool provider that answers with something far larger than a aja should carry.
 struct Big;
-impl ToolGateway for Big {
+impl ToolProvider for Big {
     fn owns(&self, name: &str) -> bool {
         name == "big"
     }
@@ -617,7 +627,7 @@ fn a_continuation_starts_from_the_predecessor_record() {
 }
 
 struct Policy;
-impl ToolGateway for Policy {
+impl ToolProvider for Policy {
     fn owns(&self, name: &str) -> bool {
         FileTools.owns(name)
     }
@@ -695,17 +705,23 @@ fn traversal_private_state_and_symlinks_are_not_file_capabilities() {
     ]));
     let w = worker_for(&f, model.clone(), Arc::new(FileTools), Limits::default());
     let digest = w.execute(&assignment(1), &control());
-    // The claim mentions an escaping path; the world did not move.
-    assert!(digest.contains("world: shared: unchanged"), "{digest}");
+    // The claim mentions an escaping path; the environment did not move.
+    assert!(
+        digest.contains("environment: shared: unchanged"),
+        "{digest}"
+    );
     assert!(!f.path().join("escape.txt").exists());
     assert_eq!(manifest_of(&f, 1)["frozen"], true);
-    assert_eq!(
-        model.seen.lock().unwrap()[1]
-            .iter()
-            .filter(|m| m["role"] == "tool" && m["content"].as_str().unwrap().contains("error"))
-            .count(),
-        3
-    );
+    let seen = model.seen.lock().unwrap();
+    let results = seen[1]
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| message["content"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 3, "{results:?}");
+    for result in results {
+        assert!(result.contains("error"), "{result}");
+    }
 }
 
 #[test]
@@ -731,7 +747,10 @@ fn step_context_and_output_limits_stop_the_aja_and_preserve_partial_work() {
     // A spent budget stops the aja without calling its work a failure.
     assert!(r.contains("ended: budget"), "{r}");
     assert!(r.contains("budget"), "{r}");
-    assert!(r.contains("world: shared: +1 created (partial.txt)"), "{r}");
+    assert!(
+        r.contains("environment: shared: +1 created (partial.txt)"),
+        "{r}"
+    );
     assert!(manifest_of(&f, 1)["digest"]
         .as_str()
         .unwrap()
@@ -821,7 +840,8 @@ fn timeout_cancellation_and_busy_slot_release_all_aja_resources() {
         }
         let pids = worker_pids();
         assert!(!pids.is_empty());
-        // One shared world has one owner: the second run is refused by the world,
+        // One shared environment has one owner: the second run is refused by the
+        // provider,
         // not by a slot counter in the worker, and it costs no aja id.
         let refused = w.execute(&assignment(2), &control());
         assert!(refused.contains("ended: error"), "{refused}");
@@ -868,7 +888,7 @@ fn a_aja_stopped_mid_run_claims_no_invented_project_change() {
     let digest = join.join().unwrap();
     assert!(digest.contains("ended: budget"), "{digest}");
     // A cancelled run still gets a measured account, and never an invented one:
-    // it can report what the world holds, never a change it did not observe.
+    // it can report what the environment holds, never a change it did not observe.
     assert!(!digest.contains("deleted"), "{digest}");
     assert!(!digest.contains("created"), "{digest}");
     assert!(
@@ -1026,7 +1046,7 @@ fn real_http_transport_drives_the_native_worker_tool_round_trip() {
         .iter()
         .any(|m| m["role"] == "tool"));
     assert!(
-        digest.contains("world: shared: +1 created (http.txt)"),
+        digest.contains("environment: shared: +1 created (http.txt)"),
         "{digest}"
     );
 }
@@ -1174,7 +1194,7 @@ fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
     for via_http in [false, true] {
         let fixture = workspace("connector-only");
         let state = fixture.path().join(".eja");
-        let old_worktree = state.join("worlds/1");
+        let old_worktree = state.join("environments/1");
         std::fs::create_dir_all(&old_worktree).unwrap();
         std::fs::write(old_worktree.join("existing.txt"), "old worktree").unwrap();
         let peer = fixture.path().join("peer");
@@ -1453,7 +1473,7 @@ fn live_and_replayed_results_share_one_view_and_large_records_still_resume() {
 }
 
 struct Passage;
-impl ToolGateway for Passage {
+impl ToolProvider for Passage {
     fn owns(&self, name: &str) -> bool {
         name == "big"
     }
@@ -1682,16 +1702,29 @@ fn relative_private_root_is_canonical_and_excluded_from_project_evidence() {
     relative.push(".eja/ajas");
     assert!(relative.is_relative());
     let model = Arc::new(Script::new(vec![final_message(&[])]));
-    let worker = NativeWorker::new(
+    let worker = NativeWorker::with_services(
         env!("CARGO_BIN_EXE_eja"),
         relative,
-        f.path(),
         model,
         Arc::new(FileTools),
+        ExecutionServices {
+            workspace: Some(f.path().to_path_buf()),
+            snapshots: Some(Checkpoints::new(
+                f.path().join(".eja/checkpoints"),
+                f.path().join(".eja"),
+            )),
+            environments: Some(Arc::new(SharedEnvironment::new(
+                f.path(),
+                f.path().join(".eja"),
+            ))),
+        },
     )
     .unwrap();
     let digest = worker.execute(&assignment(1), &control());
-    assert!(digest.contains("world: shared: unchanged"), "{digest}");
+    assert!(
+        digest.contains("environment: shared: unchanged"),
+        "{digest}"
+    );
     let manifest = manifest_of(&f, 1);
     let commit = manifest["checkpoint"].as_str().unwrap();
     let tree = Command::new("git")

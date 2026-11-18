@@ -3,7 +3,10 @@
 mod support;
 
 use eja::{
-    adapters::{Control, HostTools, McpTools, Model, NativeWorker, ToolContext, ToolGateway},
+    adapters::{
+        Checkpoints, Control, ExecutionServices, McpTools, Model, NativeWorker, SharedEnvironment,
+        ToolContext, ToolProvider, ToolRegistry, WorkspaceTools,
+    },
     aja::Limits,
     Assignment, Result, Worker,
 };
@@ -52,7 +55,7 @@ impl Fixture {
     #[allow(clippy::needless_pass_by_value)] // callers build the request literal inline
     fn call(
         &self,
-        tools: &dyn ToolGateway,
+        tools: &dyn ToolProvider,
         control: &Control,
         name: &str,
         args: Value,
@@ -81,6 +84,24 @@ impl Fixture {
 }
 fn script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_server.py")
+}
+fn registry(fixture: &Fixture, config: &Path) -> ToolRegistry {
+    let control = control();
+    let root = fixture.root().to_path_buf();
+    ToolRegistry::new(
+        fixture.root(),
+        vec![
+            Box::new(WorkspaceTools::new(
+                true,
+                true,
+                Some(root.clone()),
+                vec![root],
+                fixture.root(),
+            )),
+            Box::new(McpTools::load_strict(config, Some(fixture.root()), &control).unwrap()),
+        ],
+    )
+    .unwrap()
 }
 fn assignment(id: u64) -> Assignment {
     Assignment {
@@ -111,7 +132,7 @@ fn until(mut predicate: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
-fn tool_names(tools: &dyn ToolGateway) -> Vec<String> {
+fn tool_names(tools: &dyn ToolProvider) -> Vec<String> {
     tools
         .definitions(&assignment(1))
         .iter()
@@ -126,7 +147,7 @@ fn stdio_discovery_grants_results_and_owned_process_group() {
     config["env"] = json!({"MCP_MARKER":"${PATH}"});
     config["tools"] = json!(["echo", "fail", "a.b"]);
     let path = f.config(&json!({"mcpServers":{"fixture":config, "disabled":{"enabled":false,"command":"does-not-exist"}}}));
-    let host = HostTools::new(Some(&path), f.root(), f.root(), &control()).unwrap();
+    let host = registry(&f, &path);
     assert_eq!(
         tool_names(&host),
         [
@@ -181,7 +202,7 @@ fn cancellation_deadline_and_size_limits_leave_connection_usable() {
     let _lock = serial();
     let f = Fixture::new();
     let path = f.config(&json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
-    let host = McpTools::load(&path, f.root(), &control()).unwrap();
+    let host = McpTools::load_strict(&path, Some(f.root()), &control()).unwrap();
     let flag = Arc::new(AtomicBool::new(false));
     let c = Control::new(Duration::from_secs(3), flag.clone());
     std::thread::scope(|scope| {
@@ -246,7 +267,7 @@ fn configuration_failure_cleans_previous_servers_and_initializing_child() {
     hang["timeout_ms"] = json!(150);
     let path = f.config(&json!({"mcpServers":{"a_good":f.stdio("good", "stdio"),"z_hang":hang}}));
     let start = Instant::now();
-    assert!(McpTools::load(&path, f.root(), &control()).is_err());
+    assert!(McpTools::load_strict(&path, Some(f.root()), &control()).is_err());
     assert!(start.elapsed() < Duration::from_secs(3));
     assert!(!alive(f.pid("good", "pid")));
     assert!(!alive(f.pid("hang", "pid")));
@@ -257,12 +278,12 @@ fn configuration_failure_cleans_previous_servers_and_initializing_child() {
         json!({"mcpServers":{"fixture":{"command":"x","timeout_ms":0}}}),
         json!({"mcpServers":{"fixture":{"command":"x","typo":true}}}),
     ] {
-        assert!(McpTools::load(&f.config(&bad), f.root(), &control()).is_err());
+        assert!(McpTools::load_strict(&f.config(&bad), Some(f.root()), &control()).is_err());
     }
     for mode in ["collision", "repeat_cursor"] {
-        assert!(McpTools::load(
+        assert!(McpTools::load_strict(
             &f.config(&json!({"mcpServers":{"fixture":f.stdio(mode,mode)}})),
-            f.root(),
+            Some(f.root()),
             &control()
         )
         .is_err());
@@ -270,17 +291,17 @@ fn configuration_failure_cleans_previous_servers_and_initializing_child() {
     }
     let mut missing = f.stdio("missing", "stdio");
     missing["tools"] = json!(["not-present"]);
-    assert!(McpTools::load(
+    assert!(McpTools::load_strict(
         &f.config(&json!({"mcpServers":{"fixture":missing}})),
-        f.root(),
+        Some(f.root()),
         &control()
     )
     .is_err());
     let mut empty = f.stdio("empty", "stdio");
     empty["tools"] = json!([]);
-    let host = McpTools::load(
+    let host = McpTools::load_strict(
         &f.config(&json!({"mcpServers":{"fixture":empty}})),
-        f.root(),
+        Some(f.root()),
         &control(),
     )
     .unwrap();
@@ -300,8 +321,7 @@ fn one_connector_startup_failure_keeps_other_connectors() {
             "z_hang": hang
         }
     }));
-    let (host, diagnostics) =
-        McpTools::load_available_with_workspace(&path, Some(f.root()), &control()).unwrap();
+    let (host, diagnostics) = McpTools::load_available(&path, Some(f.root()), &control()).unwrap();
     let names = tool_names(&host);
     assert!(
         names.iter().any(|name| name == "mcp__a_good__echo"),
@@ -358,7 +378,7 @@ fn streamable_http_json_sse_headers_session_reinit_once_and_no_replay() {
     let f = Fixture::new();
     let (_server, url) = http(&f);
     let path = f.config(&json!({"mcpServers":{"remote":{"url":url,"headers":{"Authorization":"Bearer ${USER}"},"timeout_ms":2000}}}));
-    let host = McpTools::load(&path, f.root(), &control()).unwrap();
+    let host = McpTools::load_strict(&path, Some(f.root()), &control()).unwrap();
     assert_eq!(tool_names(&host).len(), 6);
     for text in ["json", "sse"] {
         assert_eq!(
@@ -441,7 +461,7 @@ fn streamable_http_json_sse_headers_session_reinit_once_and_no_replay() {
             .iter()
             .any(|e| e["method"] == "http_delete")
     });
-    let host = McpTools::load(&path, f.root(), &control()).unwrap();
+    let host = McpTools::load_strict(&path, Some(f.root()), &control()).unwrap();
     let inits = f
         .events("http")
         .iter()
@@ -500,15 +520,20 @@ fn native_ajas_share_one_host_connection_and_freeze_independently() {
     let _lock = serial();
     let f = Fixture::new();
     let path = f.config(&json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
-    let tools = Arc::new(HostTools::new(Some(&path), f.root(), f.root(), &control()).unwrap());
+    let tools = Arc::new(registry(&f, &path));
     let pid = f.pid("fixture", "pid");
     let root = f.root().join(".eja/ajas");
-    let worker = NativeWorker::new(
+    let state = f.root().join(".eja");
+    let worker = NativeWorker::with_services(
         env!("CARGO_BIN_EXE_eja"),
         &root,
-        f.root(),
         Arc::new(ConnectorModel),
         tools.clone(),
+        ExecutionServices {
+            workspace: Some(f.root().to_path_buf()),
+            snapshots: Some(Checkpoints::new(state.join("checkpoints"), state.clone())),
+            environments: Some(Arc::new(SharedEnvironment::new(f.root(), state.clone()))),
+        },
     )
     .unwrap();
     let fd_dir = if Path::new("/dev/fd").is_dir() {
@@ -604,7 +629,7 @@ fn host_declared_read_only_tools_are_observable() {
     let mut config = f.stdio("fixture", "descendant");
     config["read_only"] = json!(["echo"]);
     let path = f.config(&json!({"mcpServers":{"fixture":config}}));
-    let host = HostTools::new(Some(&path), f.root(), f.root(), &control()).unwrap();
+    let host = registry(&f, &path);
     let value = eja::adapters::Capabilities::observe(
         &host,
         "mcp__fixture__echo",
@@ -635,7 +660,7 @@ fn host_read_only_declarations_do_not_cross_server_namespaces() {
     let mut b = f.stdio("write-b", "normal");
     b["tools"] = json!(["echo"]);
     let config = f.config(&json!({"mcpServers":{"a":a,"b":b}}));
-    let tools = McpTools::load(&config, f.root(), &control()).unwrap();
+    let tools = McpTools::load_strict(&config, Some(f.root()), &control()).unwrap();
     assert!(tools.is_read_only("mcp__a__echo"));
     assert!(!tools.is_read_only("mcp__b__echo"));
 }
@@ -655,7 +680,9 @@ fn explicit_cancellation_interrupts_initialization_and_reaps_the_child() {
             cancelled.store(true, Ordering::SeqCst);
         });
         let start = Instant::now();
-        let error = McpTools::load(&path, f.root(), &control).err().unwrap();
+        let error = McpTools::load_strict(&path, Some(f.root()), &control)
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("cancelled"), "{error}");
         assert!(start.elapsed() < Duration::from_secs(2));
     });
@@ -669,7 +696,7 @@ fn initialization_deadline_does_not_shorten_future_call_timeouts() {
     let mut server = f.stdio("fixture", "stdio");
     server["timeout_ms"] = json!(3000);
     let path = f.config(&json!({"mcpServers":{"fixture":server}}));
-    let host = McpTools::load(&path, f.root(), &deadline(1000)).unwrap();
+    let host = McpTools::load_strict(&path, Some(f.root()), &deadline(1000)).unwrap();
     let value = f
         .call(
             &host,
