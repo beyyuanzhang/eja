@@ -112,14 +112,24 @@ fn observing_a_read_only_tool_records_a_view() {
 
 #[test]
 fn eja_can_observe_project_files_but_never_write() {
-    use eja::adapters::HostTools;
+    use eja::adapters::{HostTools, WorkspaceTools};
     let fixture = State::new("observe-fs");
     let project = fixture.path().join("project");
     let private = fixture.path().join("state");
     std::fs::create_dir_all(&project).expect("project");
     std::fs::create_dir_all(&private).expect("private");
     std::fs::write(project.join("note.txt"), "hello from the project").expect("write");
-    let host = HostTools::new(None, &project, &private, &control()).expect("tools");
+    let host = HostTools::from_gateways(
+        &private,
+        vec![Box::new(WorkspaceTools::new(
+            true,
+            true,
+            Some(project.clone()),
+            vec![project],
+            &private,
+        ))],
+    )
+    .expect("tools");
     let value = Capabilities::observe(
         &host,
         "read_file",
@@ -166,7 +176,7 @@ fn eja_can_observe_project_files_but_never_write() {
 
 #[test]
 fn the_host_reads_every_granted_workspace_and_nothing_else() {
-    use eja::adapters::HostTools;
+    use eja::adapters::{HostTools, WorkspaceTools};
     let fixture = State::new("observe-grants");
     let alpha = fixture.path().join("alpha");
     let beta = fixture.path().join("beta");
@@ -177,9 +187,17 @@ fn the_host_reads_every_granted_workspace_and_nothing_else() {
     std::fs::write(alpha.join("a.txt"), "in alpha").unwrap();
     std::fs::write(beta.join("b.txt"), "in beta").unwrap();
     std::fs::write(private.join("secret.txt"), "private").unwrap();
-    let host = HostTools::new(None, &alpha, &private, &control())
-        .expect("tools")
-        .with_roots(vec![alpha.clone(), beta.clone()]);
+    let host = HostTools::from_gateways(
+        &private,
+        vec![Box::new(WorkspaceTools::new(
+            true,
+            true,
+            Some(alpha.clone()),
+            vec![alpha, beta.clone()],
+            &private,
+        ))],
+    )
+    .expect("tools");
     let value = Capabilities::observe(
         &host,
         "read_file",
@@ -220,16 +238,24 @@ fn the_host_reads_every_granted_workspace_and_nothing_else() {
 
 #[test]
 fn the_workspace_grant_switches_off_every_entry() {
-    use eja::adapters::{HostTools, ToolGateway};
+    use eja::adapters::{HostTools, ToolGateway, WorkspaceTools};
     let fixture = State::new("observe-switch");
     let project = fixture.path().join("project");
     let private = fixture.path().join("state");
     std::fs::create_dir_all(&project).expect("project");
     std::fs::create_dir_all(&private).expect("private");
     std::fs::write(project.join("note.txt"), "hello").expect("write");
-    let host = HostTools::new(None, &project, &private, &control())
-        .expect("tools")
-        .with_workspace_tools(false);
+    let host = HostTools::from_gateways(
+        &private,
+        vec![Box::new(WorkspaceTools::new(
+            false,
+            false,
+            Some(project.clone()),
+            vec![project.clone()],
+            &private,
+        ))],
+    )
+    .expect("tools");
     assert!(host
         .definitions(&eja::Assignment {
             task_id: 1,

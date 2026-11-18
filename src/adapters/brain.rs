@@ -821,7 +821,7 @@ const DECIDE_TIMEOUT: Duration = Duration::from_secs(180);
 pub struct OpenAiBrain {
     model: OpenAiModel,
     context_budget: usize,
-    managed_plugins: bool,
+    capability_description: String,
 }
 
 impl OpenAiBrain {
@@ -840,7 +840,7 @@ impl OpenAiBrain {
         Self {
             model: OpenAiModel::new(base, key, model),
             context_budget: DEFAULT_CONTEXT_BYTES,
-            managed_plugins: false,
+            capability_description: String::new(),
         }
     }
     #[must_use]
@@ -857,18 +857,18 @@ impl OpenAiBrain {
     }
 
     #[must_use]
-    pub const fn with_managed_plugins(mut self, enabled: bool) -> Self {
-        self.managed_plugins = enabled;
+    pub fn with_capability_description(mut self, description: impl Into<String>) -> Self {
+        self.capability_description = description.into();
         self
     }
 }
 
 impl Brain for OpenAiBrain {
     fn decide(&self, context: &EjaContext, parent: &Control) -> Decision {
-        let system = if self.managed_plugins {
-            std::borrow::Cow::Owned(format!("{SYSTEM_PROMPT}\nThe host grants AJAs managed plugin tools. An AJA may stage a Python MCP plugin, test it on sample input, and activate it for subsequent turns. Activate only when the task calls for a new or improved capability. It may list or roll back installed versions."))
-        } else {
+        let system = if self.capability_description.is_empty() {
             std::borrow::Cow::Borrowed(SYSTEM_PROMPT)
+        } else {
+            std::borrow::Cow::Owned(format!("{SYSTEM_PROMPT}\n{}", self.capability_description))
         };
         let messages = vec![
             json!({"role":"system","content":system}),

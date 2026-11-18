@@ -386,6 +386,14 @@ impl SettingsStore {
         Ok(settings)
     }
 
+    pub fn project_dir(&self) -> Option<&Path> {
+        self.project.as_deref()
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn write(&self, input: Value) -> ApiResult<StoredSettings> {
         let _guard = self
             .write_lock

@@ -5,6 +5,7 @@
 //! backend's account, measured against the reservation the backend kept.
 use super::process;
 use crate::{Control, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -168,10 +169,51 @@ fn snapshot(root: &Path, skip: &Path, control: &Control) -> (Inventory, bool) {
 }
 
 /// One world reserved for one execution: where it may write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldKind {
+    /// A record written before the kind was stated.
+    #[default]
+    Unknown,
+    Shared,
+    Worktree,
+}
+
+/// The durable part of a reserved world: what kind of environment it was, the
+/// granted root it belonged to, and the ref that holds the run's result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldRecord {
+    #[serde(default)]
+    pub kind: WorldKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
+impl WorldRecord {
+    #[must_use]
+    pub fn of(kind: WorldKind, root: &Path) -> Self {
+        Self {
+            kind,
+            root: root
+                .canonicalize()
+                .unwrap_or_else(|_| root.to_path_buf())
+                .display()
+                .to_string(),
+            ..Self::default()
+        }
+    }
+}
+
 pub struct World {
     task: u64,
     pub label: String,
     pub root: PathBuf,
+    /// What reconciliation needs to return to this run, not to today's default.
+    pub record: WorldRecord,
 }
 
 /// Reserve, settle, reconcile and release the world one execution may change.
@@ -185,6 +227,23 @@ pub trait Worlds: Send + Sync {
     fn settle(&self, world: &World, control: &Control) -> Result<Value>;
     /// Bring one run's world back into the shared world.
     fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value>;
+    /// Reconcile using the world the run recorded. The default preserves the
+    /// direct port for hosts that keep their own world evidence.
+    fn reconcile_recorded(
+        &self,
+        task: u64,
+        root: Option<&Path>,
+        record: Option<&WorldRecord>,
+        control: &Control,
+    ) -> Result<Value> {
+        if record.is_some() {
+            return Err(
+                "reconcile refused: this world backend cannot use the run's recorded environment"
+                    .into(),
+            );
+        }
+        self.reconcile(task, root, control)
+    }
     fn release(&self, world: &World);
 }
 
@@ -289,6 +348,7 @@ impl Worlds for Shared {
             task,
             label: "shared".to_string(),
             root: root.to_path_buf(),
+            record: WorldRecord::of(WorldKind::Shared, root),
         })
     }
 
@@ -301,6 +361,40 @@ impl Worlds for Shared {
     fn reconcile(&self, _task: u64, _root: Option<&Path>, _control: &Control) -> Result<Value> {
         Ok(json!({"world": "shared", "merged": true,
                   "detail": "the run happened in the shared world"}))
+    }
+
+    fn reconcile_recorded(
+        &self,
+        task: u64,
+        root: Option<&Path>,
+        record: Option<&WorldRecord>,
+        control: &Control,
+    ) -> Result<Value> {
+        let Some(record) = record else {
+            return self.reconcile(task, root, control);
+        };
+        if !record.root.is_empty()
+            && normalize_run_root(&record.root)
+                != normalize_run_root(&self.project.display().to_string())
+        {
+            return Err(format!(
+                "reconcile refused: the run belongs to {}, not {}",
+                record.root,
+                self.project.display()
+            )
+            .into());
+        }
+        match record.kind {
+            WorldKind::Shared => self.reconcile(task, root, control),
+            WorldKind::Worktree => Err(
+                "reconcile refused: the run used an isolated Git worktree, but this runtime has no Git world service to merge its recorded branch"
+                    .into(),
+            ),
+            WorldKind::Unknown => Err(
+                "reconcile refused: the run record does not identify the world backend it used"
+                    .into(),
+            ),
+        }
     }
 
     fn release(&self, world: &World) {
@@ -377,11 +471,12 @@ impl Worktrees {
         control: &Control,
     ) -> Result<Self> {
         let project = project.into();
+        let project = project.canonicalize().unwrap_or(project);
         let root = root.into();
         let top = git(&project, &["rev-parse", "--show-toplevel"], control)
-            .map_err(|_| "isolated worlds need a git project")?;
+            .map_err(|error| format!("isolated worlds need a Git project: {error}"))?;
         git(&project, &["rev-parse", "--verify", "HEAD"], control)
-            .map_err(|_| "isolated worlds need one commit to branch from")?;
+            .map_err(|error| format!("isolated worlds need one commit to branch from: {error}"))?;
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             project: PathBuf::from(top),
@@ -455,6 +550,12 @@ impl Worlds for Worktrees {
             task,
             label: format!("worktree {branch} at {}", &head[..head.len().min(12)]),
             root,
+            record: WorldRecord {
+                kind: WorldKind::Worktree,
+                root: self.granted.display().to_string(),
+                branch: Some(branch),
+                commit: None,
+            },
         })
     }
 
@@ -474,10 +575,16 @@ impl Worlds for Worktrees {
             control,
         )?;
         let commit = git(&world.root, &["rev-parse", "HEAD"], control)?;
+        let mut record = world.record.clone();
+        record.commit = Some(commit.clone());
         Ok(json!({
             "world": world.label,
             "change": delta.line(),
             "commit": commit,
+            "kind": record.kind,
+            "root": record.root,
+            "branch": record.branch,
+            "world_record": record,
         }))
     }
 
@@ -486,31 +593,47 @@ impl Worlds for Worktrees {
             return Err("an isolated world belongs to its own git project".into());
         }
         let branch = self.branch(task);
-        match git(
-            &self.project,
-            &["merge", "--no-ff", "--no-edit", &branch],
-            control,
-        ) {
-            Ok(output) => Ok(json!({
-                "world": branch,
+        merge_branch(&self.project, &branch, None, control)
+    }
+
+    fn reconcile_recorded(
+        &self,
+        task: u64,
+        root: Option<&Path>,
+        record: Option<&WorldRecord>,
+        control: &Control,
+    ) -> Result<Value> {
+        let Some(record) = record else {
+            return self.reconcile(task, root, control);
+        };
+        if !record.root.is_empty()
+            && normalize_run_root(&record.root)
+                != normalize_run_root(&self.granted.display().to_string())
+        {
+            return Err(format!(
+                "reconcile refused: the run belongs to {}, not {}",
+                record.root,
+                self.granted.display()
+            )
+            .into());
+        }
+        match record.kind {
+            WorldKind::Shared => Ok(json!({
+                "world": "shared",
                 "merged": true,
-                "detail": output.lines().next().unwrap_or_default(),
+                "detail": "the run happened in the shared world"
             })),
-            Err(error) => {
-                let conflicts = git(
-                    &self.project,
-                    &["diff", "--name-only", "--diff-filter=U"],
-                    control,
-                )
-                .unwrap_or_default();
-                let _ = git(&self.project, &["merge", "--abort"], control);
-                Ok(json!({
-                    "world": branch,
-                    "merged": false,
-                    "conflicts": conflicts.lines().take(20).collect::<Vec<_>>(),
-                    "detail": error.to_string(),
-                }))
+            WorldKind::Worktree => {
+                let branch = record
+                    .branch
+                    .as_deref()
+                    .ok_or("reconcile refused: the isolated run record names no branch artifact")?;
+                merge_branch(&self.project, branch, record.commit.as_deref(), control)
             }
+            WorldKind::Unknown => Err(
+                "reconcile refused: the run record does not identify the world backend it used"
+                    .into(),
+            ),
         }
     }
 
@@ -527,6 +650,57 @@ impl Worlds for Worktrees {
     }
 }
 
+fn merge_branch(
+    project: &Path,
+    branch: &str,
+    commit: Option<&str>,
+    control: &Control,
+) -> Result<Value> {
+    let target = if let Some(commit) = commit {
+        if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("reconcile refused: the run record names an invalid commit".into());
+        }
+        commit
+    } else if branch.starts_with("eja/aja-")
+        && branch
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_'))
+    {
+        branch
+    } else {
+        return Err("reconcile refused: the run record names an invalid branch".into());
+    };
+    match git(project, &["merge", "--no-ff", "--no-edit", target], control) {
+        Ok(output) => Ok(json!({
+            "world": branch,
+            "merged": true,
+            "detail": output.lines().next().unwrap_or_default(),
+        })),
+        Err(error) => {
+            let conflicts = git(
+                project,
+                &["diff", "--name-only", "--diff-filter=U"],
+                control,
+            )
+            .unwrap_or_default();
+            let _ = git(project, &["merge", "--abort"], control);
+            Ok(json!({
+                "world": branch,
+                "merged": false,
+                "conflicts": conflicts.lines().take(20).collect::<Vec<_>>(),
+                "detail": error.to_string(),
+            }))
+        }
+    }
+}
+
+fn normalize_run_root(root: &str) -> PathBuf {
+    PathBuf::from(root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(root))
+}
+
 /// One backend per granted root.
 ///
 /// A run reserves the world of the workspace its task named, and every root
@@ -535,6 +709,10 @@ impl Worlds for Worktrees {
 pub struct WorkspaceWorlds {
     default: Arc<dyn Worlds>,
     roots: BTreeMap<PathBuf, Arc<dyn Worlds>>,
+    /// Backends that can land a historical isolated run. A shared execution
+    /// backend still gives a restart one way to merge a branch recorded by an
+    /// earlier isolated composition.
+    history: BTreeMap<PathBuf, Arc<dyn Worlds>>,
     /// The backend that reserved each run: an isolated world's root is a
     /// worktree path, not the granted root, so settle and release must return
     /// to the backend that owns the reservation.
@@ -543,11 +721,19 @@ pub struct WorkspaceWorlds {
 
 impl WorkspaceWorlds {
     pub fn new(default: Arc<dyn Worlds>, roots: BTreeMap<PathBuf, Arc<dyn Worlds>>) -> Self {
+        let history = roots.clone();
         Self {
             default,
             roots,
+            history,
             held: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[must_use]
+    pub fn with_history(mut self, history: BTreeMap<PathBuf, Arc<dyn Worlds>>) -> Self {
+        self.history = history;
+        self
     }
 
     fn backend(&self, root: Option<&Path>) -> &Arc<dyn Worlds> {
@@ -585,6 +771,62 @@ impl Worlds for WorkspaceWorlds {
 
     fn reconcile(&self, task: u64, root: Option<&Path>, control: &Control) -> Result<Value> {
         self.backend(root).reconcile(task, root, control)
+    }
+
+    fn reconcile_recorded(
+        &self,
+        task: u64,
+        root: Option<&Path>,
+        record: Option<&WorldRecord>,
+        control: &Control,
+    ) -> Result<Value> {
+        let Some(record) = record else {
+            return self.reconcile(task, root, control);
+        };
+        let task_root = root.map(|root| normalize_run_root(&root.display().to_string()));
+        let recorded_root = (!record.root.is_empty()).then(|| normalize_run_root(&record.root));
+        if let (Some(task_root), Some(recorded_root)) = (&task_root, &recorded_root) {
+            if task_root != recorded_root {
+                return Err(format!(
+                    "reconcile refused: the run belongs to {}, not the task's fixed workspace {}",
+                    record.root,
+                    task_root.display()
+                )
+                .into());
+            }
+        }
+        match record.kind {
+            WorldKind::Shared => Ok(json!({
+                "world": "shared",
+                "merged": true,
+                "detail": "the run happened in the shared world"
+            })),
+            WorldKind::Worktree => {
+                let key = recorded_root.or(task_root).or_else(|| {
+                    if self.history.len() == 1 {
+                        self.history.keys().next().cloned()
+                    } else {
+                        None
+                    }
+                }).ok_or(
+                    "reconcile refused: the run record does not bind its isolated world to a workspace",
+                )?;
+                self.history.get(&key).map_or_else(
+                    || {
+                        Err(format!(
+                            "reconcile refused: no Git world service is configured for {}; the run's recorded branch cannot be merged",
+                            key.display()
+                        )
+                        .into())
+                    },
+                    |backend| backend.reconcile_recorded(task, root, Some(record), control),
+                )
+            }
+            WorldKind::Unknown => Err(
+                "reconcile refused: the run record does not identify the world backend it used"
+                    .into(),
+            ),
+        }
     }
 
     fn release(&self, world: &World) {
@@ -648,5 +890,18 @@ mod tests {
             delta.line(),
             "+1 created (new.txt), ~1 modified (kept.txt), -1 deleted (gone.txt)"
         );
+    }
+
+    #[test]
+    fn an_invalid_stable_commit_is_never_replaced_by_the_branch() {
+        let control = Control::new(std::time::Duration::from_secs(1), Arc::default());
+        let error = merge_branch(
+            Path::new("."),
+            "eja/aja-1-deadbeef",
+            Some("not-a-commit"),
+            &control,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid commit"), "{error}");
     }
 }

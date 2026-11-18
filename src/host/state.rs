@@ -87,6 +87,7 @@ pub struct Health {
     pub journal_error: Option<String>,
     pub torn: bool,
     pub turn_in_flight: bool,
+    pub capability_errors: Vec<String>,
 }
 
 impl serde::Serialize for Health {
@@ -95,7 +96,7 @@ impl serde::Serialize for Health {
         S: serde::ser::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Health", 8)?;
+        let mut state = serializer.serialize_struct("Health", 9)?;
         state.serialize_field("model", &self.model)?;
         state.serialize_field("modelName", &self.model_name)?;
         state.serialize_field("state", &self.state)?;
@@ -104,6 +105,7 @@ impl serde::Serialize for Health {
         state.serialize_field("journalError", &self.journal_error)?;
         state.serialize_field("torn", &self.torn)?;
         state.serialize_field("turnInFlight", &self.turn_in_flight)?;
+        state.serialize_field("capabilityErrors", &self.capability_errors)?;
         state.end()
     }
 }
@@ -435,6 +437,7 @@ mod tests {
             journal_error: None,
             torn: false,
             turn_in_flight: false,
+            capability_errors: vec!["connector unavailable".into()],
         }
     }
 
@@ -533,6 +536,10 @@ mod tests {
         );
         assert_eq!(state["tasks"][1]["close"]["accepted"], true);
         assert_eq!(state["tasks"][1]["event_ids"], json!([3, 5, 6, 7, 8]));
+        assert_eq!(
+            state["health"]["capabilityErrors"],
+            json!(["connector unavailable"])
+        );
 
         let raw = journal_task(&journal, 2).expect("task");
         assert_eq!(raw["task"]["title"], "build");

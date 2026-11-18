@@ -5,7 +5,7 @@
 //! the host's `record:` address — resolves the same paths and reads the same
 //! manifest through this module, so a record has one shape and one owner.
 
-use super::RecordReader;
+use super::{RecordReader, WorldKind, WorldRecord};
 use crate::{fold, Assignment, Control, Result, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -38,7 +38,8 @@ pub struct Checkpoints {
 }
 
 impl Checkpoints {
-    pub(crate) const fn new(git_dir: PathBuf, private: PathBuf) -> Self {
+    #[must_use]
+    pub const fn new(git_dir: PathBuf, private: PathBuf) -> Self {
         Self { git_dir, private }
     }
 
@@ -92,6 +93,15 @@ pub struct Manifest {
     pub(crate) checkpoint: Option<String>,
     #[serde(default)]
     pub(crate) checkpoint_error: Option<String>,
+    /// The world that measured this run. Older records only have `world`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) world_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) world_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) world_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) world_commit: Option<String>,
     /// The transcript's file name in this aja's directory. The protocol fixes it;
     /// it is recorded so a record states its own layout for a reader that only
     /// has the file.
@@ -116,6 +126,33 @@ impl Manifest {
 
     pub(crate) fn read(root: &Path, aja: u64) -> Result<Self> {
         Ok(serde_json::from_slice(&fs::read(Self::path(root, aja)?)?)?)
+    }
+
+    fn world(&self) -> WorldRecord {
+        let old_worktree = self.world.strip_prefix("worktree ");
+        let kind = match self.world_kind.as_deref() {
+            Some("shared") => WorldKind::Shared,
+            Some("worktree") => WorldKind::Worktree,
+            None if self.world == "shared" => WorldKind::Shared,
+            None if old_worktree.is_some() => WorldKind::Worktree,
+            Some(_) | None => WorldKind::Unknown,
+        };
+        let branch = self.world_branch.clone().or_else(|| {
+            old_worktree
+                .and_then(|rest| rest.split_once(" at "))
+                .map(|(branch, _)| branch.to_owned())
+        });
+        let root = if self.world_root.is_empty() {
+            self.assignment.workspace.clone()
+        } else {
+            self.world_root.clone()
+        };
+        WorldRecord {
+            kind,
+            root,
+            branch,
+            commit: self.world_commit.clone(),
+        }
     }
 }
 
@@ -245,6 +282,20 @@ impl Drop for Source {
 }
 
 impl RecordReader for RecordFiles {
+    fn world(&self, aja: u64) -> Result<Option<WorldRecord>> {
+        match Manifest::read(&self.root, aja) {
+            Ok(manifest) => Ok(Some(manifest.world())),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value> {
         control.check()?;
         if matches!(selector, Selector::Bytes { .. }) {
@@ -560,6 +611,55 @@ mod tests {
 
     fn control() -> Control {
         Control::new(Duration::from_secs(30), std::sync::Arc::default())
+    }
+
+    fn manifest(world: &str) -> Manifest {
+        Manifest {
+            assignment: Assignment {
+                task_id: 3,
+                objective: String::new(),
+                workspace: "/workspace/project".into(),
+                acceptance: String::new(),
+                input: String::new(),
+                resume: None,
+                issued_at: 1,
+            },
+            digest: String::new(),
+            world: world.into(),
+            world_kind: None,
+            world_root: String::new(),
+            world_branch: None,
+            world_commit: None,
+            checkpoint: None,
+            checkpoint_error: None,
+            context: default_context(),
+            context_bytes: 0,
+            frozen: true,
+        }
+    }
+
+    #[test]
+    fn existing_records_infer_their_world_and_new_records_read_what_was_frozen() {
+        let shared = manifest("shared").world();
+        assert_eq!(shared.kind, WorldKind::Shared);
+        assert_eq!(shared.root, "/workspace/project");
+
+        let old_worktree = manifest("worktree eja/aja-3-deadbeef at abcdef123456").world();
+        assert_eq!(old_worktree.kind, WorldKind::Worktree);
+        assert_eq!(old_worktree.branch.as_deref(), Some("eja/aja-3-deadbeef"));
+        assert_eq!(old_worktree.root, "/workspace/project");
+
+        assert_eq!(manifest("none").world().kind, WorldKind::Unknown);
+
+        let mut recorded = manifest("worktree eja/aja-3-deadbeef at abcdef123456");
+        let commit = "a".repeat(40);
+        recorded.world_kind = Some("worktree".into());
+        recorded.world_root = "/recorded/project".into();
+        recorded.world_branch = Some("eja/aja-3-deadbeef".into());
+        recorded.world_commit = Some(commit.clone());
+        let record = recorded.world();
+        assert_eq!(record.root, "/recorded/project");
+        assert_eq!(record.commit.as_deref(), Some(commit.as_str()));
     }
 
     #[test]

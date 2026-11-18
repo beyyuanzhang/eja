@@ -2,17 +2,56 @@
 
 mod support;
 
-use eja::adapters::{Ports, Shared, WorkspaceWorlds, Worktrees, Worlds};
+use eja::adapters::{
+    Ports, Shared, WorkspaceWorlds, Worktrees, World, WorldKind, WorldRecord, Worlds,
+};
 use eja::{
     turn_at_with_options, Action, Assignment, Control, Kind, TurnOptions, Worker, WorkspaceGrant,
 };
-use std::path::PathBuf;
+use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use support::{control, Done, Script, State};
+
+#[derive(Default)]
+struct ReconcileProbe {
+    calls: AtomicUsize,
+}
+
+impl Worlds for ReconcileProbe {
+    fn reserve(&self, _: u64, _: Option<&Path>, _: &Control) -> eja::Result<World> {
+        Err("probe does not reserve worlds".into())
+    }
+
+    fn settle(&self, _: &World, _: &Control) -> eja::Result<Value> {
+        Err("probe does not settle worlds".into())
+    }
+
+    fn reconcile(&self, _: u64, _: Option<&Path>, _: &Control) -> eja::Result<Value> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"merged": true}))
+    }
+
+    fn reconcile_recorded(
+        &self,
+        _: u64,
+        _: Option<&Path>,
+        _: Option<&WorldRecord>,
+        _: &Control,
+    ) -> eja::Result<Value> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"merged": true}))
+    }
+
+    fn release(&self, _: &World) {}
+}
 
 /// Records how many runs were alive at once. A run waits for a sibling so a
 /// serial host is reported as serial instead of being hidden by timing.
@@ -232,6 +271,149 @@ fn a_conflicting_world_is_reported_and_never_merged_silently() {
         "a conflict leaves the shared world untouched"
     );
     worlds.release(&world);
+}
+
+#[test]
+fn a_recorded_shared_run_never_enters_the_current_isolated_backend() {
+    let state = State::new("recorded-shared");
+    let project = tree(&state);
+    let probe = Arc::new(ReconcileProbe::default());
+    let current: Arc<dyn Worlds> = probe.clone();
+    let worlds = WorkspaceWorlds::new(
+        current.clone(),
+        BTreeMap::from([(project.clone(), current)]),
+    );
+    let record = WorldRecord {
+        kind: WorldKind::Shared,
+        root: project.display().to_string(),
+        ..WorldRecord::default()
+    };
+    let outcome = worlds
+        .reconcile_recorded(7, Some(&project), Some(&record), &control())
+        .expect("a shared run needs no current backend work");
+    assert_eq!(outcome["merged"], json!(true), "{outcome}");
+    assert_eq!(
+        probe.calls.load(Ordering::SeqCst),
+        0,
+        "today's isolated default must not process a run recorded as shared"
+    );
+}
+
+#[test]
+fn a_recorded_worktree_without_a_git_service_is_refused_without_touching_the_project() {
+    let state = State::new("recorded-no-git");
+    let project = project_with_one_commit(&state);
+    let shared: Arc<dyn Worlds> = Arc::new(Shared::new(project.clone(), state.path().join(".eja")));
+    let worlds = WorkspaceWorlds::new(shared.clone(), BTreeMap::from([(project.clone(), shared)]));
+    let record = WorldRecord {
+        kind: WorldKind::Worktree,
+        root: project.display().to_string(),
+        branch: Some("eja/aja-8-deadbeef".into()),
+        commit: None,
+    };
+    let error = worlds
+        .reconcile_recorded(8, Some(&project), Some(&record), &control())
+        .expect_err("absent Git history cannot land a worktree");
+    assert!(
+        error.to_string().contains("no Git world service"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("base.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(!project.join("out.txt").exists());
+}
+
+#[test]
+fn a_recorded_worktree_merges_its_stable_commit_when_history_is_available() {
+    let state = State::new("recorded-worktree");
+    let project = project_with_one_commit(&state);
+    let control = control();
+    let backend = Arc::new(
+        Worktrees::new(
+            &project,
+            state.path().join(".eja/worlds"),
+            state.path().join(".eja"),
+            &control,
+        )
+        .expect("worktrees"),
+    );
+    let world = backend.reserve(9, None, &control).expect("reserve");
+    std::fs::write(world.root.join("out.txt"), "recorded result\n").unwrap();
+    let settled = backend.settle(&world, &control).expect("settle");
+    let record: WorldRecord =
+        serde_json::from_value(settled["world_record"].clone()).expect("recorded world");
+    assert!(record.commit.is_some(), "{settled}");
+    backend.release(&world);
+
+    let shared: Arc<dyn Worlds> = Arc::new(Shared::new(project.clone(), state.path().join(".eja")));
+    let history: Arc<dyn Worlds> = backend;
+    let worlds = WorkspaceWorlds::new(shared.clone(), BTreeMap::from([(project.clone(), shared)]))
+        .with_history(BTreeMap::from([(project.clone(), history)]));
+    let outcome = worlds
+        .reconcile_recorded(9, Some(&project), Some(&record), &control)
+        .expect("recorded branch merges");
+    assert_eq!(outcome["merged"], json!(true), "{outcome}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("out.txt")).unwrap(),
+        "recorded result\n"
+    );
+}
+
+#[test]
+fn a_bare_legacy_worktree_uses_the_only_available_history() {
+    let state = State::new("recorded-legacy-worktree");
+    let project = project_with_one_commit(&state);
+    let control = control();
+    let backend = Arc::new(
+        Worktrees::new(
+            &project,
+            state.path().join(".eja/worlds"),
+            state.path().join(".eja"),
+            &control,
+        )
+        .expect("worktrees"),
+    );
+    let world = backend.reserve(11, None, &control).expect("reserve");
+    std::fs::write(world.root.join("legacy.txt"), "legacy result\n").unwrap();
+    let settled = backend.settle(&world, &control).expect("settle");
+    let mut record: WorldRecord =
+        serde_json::from_value(settled["world_record"].clone()).expect("recorded world");
+    record.root.clear();
+    backend.release(&world);
+
+    let shared: Arc<dyn Worlds> = Arc::new(Shared::new(project.clone(), state.path().join(".eja")));
+    let history: Arc<dyn Worlds> = backend;
+    let worlds = WorkspaceWorlds::new(shared, BTreeMap::new())
+        .with_history(BTreeMap::from([(project.clone(), history)]));
+    let outcome = worlds
+        .reconcile_recorded(11, None, Some(&record), &control)
+        .expect("an unambiguous legacy record still reconciles");
+    assert_eq!(outcome["merged"], json!(true), "{outcome}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("legacy.txt")).unwrap(),
+        "legacy result\n"
+    );
+}
+
+#[test]
+fn a_recorded_world_for_another_workspace_is_refused() {
+    let state = State::new("recorded-wrong-root");
+    let project = tree(&state);
+    let other = tree(&State::new("recorded-wrong-root-other"));
+    let shared: Arc<dyn Worlds> = Arc::new(Shared::new(project.clone(), state.path().join(".eja")));
+    let worlds = WorkspaceWorlds::new(shared.clone(), BTreeMap::from([(project.clone(), shared)]));
+    let record = WorldRecord {
+        kind: WorldKind::Worktree,
+        root: other.display().to_string(),
+        branch: Some("eja/aja-10-deadbeef".into()),
+        commit: None,
+    };
+    let error = worlds
+        .reconcile_recorded(10, Some(&project), Some(&record), &control())
+        .expect_err("a task keeps its originally assigned workspace");
+    assert!(error.to_string().contains("belongs to"), "{error}");
 }
 
 #[test]

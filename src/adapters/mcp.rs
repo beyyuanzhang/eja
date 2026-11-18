@@ -1,6 +1,5 @@
 //! Shared, host-owned MCP clients. No connector state is passed to AJA.
-use super::Capabilities;
-use super::{Control, FileTools, ToolContext, ToolGateway};
+use super::{Control, ToolContext, ToolGateway};
 use crate::{aja::FRAME_LIMIT, Assignment, Result};
 use rmcp::{
     model::{
@@ -33,10 +32,9 @@ use tokio::{
 #[serde(deny_unknown_fields)]
 struct Config {
     #[serde(rename = "mcpServers", default)]
-    servers: BTreeMap<String, ServerConfig>,
+    servers: BTreeMap<String, Value>,
 }
-
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ServerConfig {
     command: Option<String>,
@@ -67,7 +65,6 @@ const fn enabled() -> bool {
 const fn timeout() -> u64 {
     30_000
 }
-
 /// How long a cancelled request may take to acknowledge the cancellation.
 const CANCEL_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -191,7 +188,31 @@ impl McpTools {
         Self::load_with_workspace(path, Some(project), parent)
     }
 
-    fn load_with_workspace(path: &Path, project: Option<&Path>, parent: &Control) -> Result<Self> {
+    pub(super) fn load_with_workspace(
+        path: &Path,
+        project: Option<&Path>,
+        parent: &Control,
+    ) -> Result<Self> {
+        Self::load_policy(path, project, parent, false).map(|(tools, _)| tools)
+    }
+
+    /// Load every connector that starts successfully. Each unavailable
+    /// connector is reported and omitted so one provider cannot disable the
+    /// rest of the host's capabilities.
+    pub fn load_available_with_workspace(
+        path: &Path,
+        project: Option<&Path>,
+        parent: &Control,
+    ) -> Result<(Self, Vec<String>)> {
+        Self::load_policy(path, project, parent, true)
+    }
+
+    fn load_policy(
+        path: &Path,
+        project: Option<&Path>,
+        parent: &Control,
+        keep_available: bool,
+    ) -> Result<(Self, Vec<String>)> {
         parent.check()?;
         let mut bytes = Vec::new();
         fs::File::open(path)?
@@ -205,7 +226,7 @@ impl McpTools {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        Self::load_config(config, config_dir, project, "mcp", parent)
+        Self::load_config(config, config_dir, project, "mcp", parent, keep_available)
     }
 
     /// Connect a host-prepared, isolated process. Managed plugins receive no
@@ -230,15 +251,9 @@ impl McpTools {
             enabled: true,
             timeout_ms: 5_000,
         };
-        Self::load_config(
-            Config {
-                servers: BTreeMap::from([(name.to_owned(), server)]),
-            },
-            cwd,
-            None,
-            "plugin",
-            parent,
-        )
+        let servers = BTreeMap::from([(name.to_owned(), serde_json::to_value(server)?)]);
+        Self::load_config(Config { servers }, cwd, None, "plugin", parent, false)
+            .map(|(tools, _)| tools)
     }
 
     #[must_use]
@@ -252,7 +267,8 @@ impl McpTools {
         project: Option<&Path>,
         prefix: &str,
         parent: &Control,
-    ) -> Result<Self> {
+        keep_available: bool,
+    ) -> Result<(Self, Vec<String>)> {
         if config.servers.len() > 32 {
             return Err("MCP config exceeds 32 servers".into());
         }
@@ -266,275 +282,308 @@ impl McpTools {
             tools: BTreeMap::new(),
         };
         let startup = parent.child(Duration::from_secs(300));
-        for (name, config) in config.servers {
+        let mut diagnostics = Vec::new();
+        for (name, raw) in config.servers {
             startup.check()?;
+            let config: ServerConfig = match serde_json::from_value(raw) {
+                Ok(config) => config,
+                Err(error) if keep_available => {
+                    diagnostics.push(format!(
+                        "MCP connector {name} has an invalid configuration: {error}"
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!("MCP {name} has an invalid configuration: {error}").into())
+                }
+            };
             if !config.enabled {
                 continue;
             }
-            if name.is_empty()
-                || name.len() > 24
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
-                return Err(
+            let connections = host.connections.len();
+            let children = host.children.len();
+            let result = (|| -> Result<()> {
+                if name.is_empty()
+                    || name.len() > 24
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                {
+                    return Err(
                     "MCP server names must be 1..24 ASCII letters, digits, underscores or hyphens"
                         .into(),
                 );
-            }
-            if config.timeout_ms == 0 || config.timeout_ms > 300_000 {
-                return Err(format!("invalid MCP timeout for {name}").into());
-            }
-            let control = startup.child(Duration::from_millis(config.timeout_ms));
-            let timeout = Duration::from_millis(config.timeout_ms);
-            let client = ClientConfig::new(
-                ClientCapabilities::default(),
-                Implementation::new("eja", env!("CARGO_PKG_VERSION")),
-            );
-            let service = match (&config.command, &config.url) {
-                (Some(program), None) => {
-                    if !config.headers.is_empty() {
-                        return Err("stdio MCP cannot have HTTP headers".into());
-                    }
-                    let cwd = config.cwd.as_ref().map_or_else(
-                        || project.map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf),
-                        |p| {
-                            if p.is_relative() {
-                                config_dir.join(p)
-                            } else {
-                                p.clone()
-                            }
-                        },
-                    );
-                    let mut command = Command::new(program);
-                    command
-                        .args(&config.args)
-                        .current_dir(cwd)
-                        .env_clear()
-                        .kill_on_drop(true)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(if prefix == "plugin" {
-                            Stdio::null()
-                        } else {
-                            Stdio::inherit()
-                        });
-                    if prefix == "mcp" {
-                        for key in ["PATH", "HOME", "TMPDIR", "TMP", "LANG", "SYSTEMROOT"] {
-                            if let Some(value) = std::env::var_os(key) {
-                                command.env(key, value);
-                            }
-                        }
-                    }
-                    for (key, value) in &config.env {
-                        command.env(key, expand(value)?);
-                    }
-                    command.process_group(0);
-                    let mut child = host.runtime.block_on(async { command.spawn() })?;
-                    let output = child.stdout.take().ok_or("missing MCP stdout")?;
-                    let input = child.stdin.take().ok_or("missing MCP stdin")?;
-                    host.children.push(LocalServer {
-                        child,
-                        stopped: false,
-                    });
-                    let transport = AsyncRwTransport::new_client(output, input)
-                        .with_max_line_length(FRAME_LIMIT * 2);
-                    host.runtime.block_on(async {
-                        super::controlled(&control, async {
-                            Ok(client
-                                .serve(transport)
-                                .await
-                                .map_err(|_| format!("MCP {name}: stdio initialization failed"))?)
-                        })
-                        .await
-                    })?
                 }
-                (None, Some(url)) => {
-                    if !config.args.is_empty() || !config.env.is_empty() || config.cwd.is_some() {
-                        return Err("HTTP MCP cannot have command arguments, env or cwd".into());
-                    }
-                    let parsed = reqwest::Url::parse(url)?;
-                    if !matches!(parsed.scheme(), "http" | "https")
-                        || !parsed.username().is_empty()
-                        || parsed.password().is_some()
-                    {
-                        return Err(
-                            "MCP requires an HTTP(S) endpoint without URL credentials".into()
-                        );
-                    }
-                    let mut headers = HashMap::new();
-                    for (key, value) in &config.headers {
-                        let key = reqwest::header::HeaderName::from_bytes(key.as_bytes())?;
-                        if matches!(
-                            key.as_str(),
-                            "mcp-session-id"
-                                | "mcp-protocol-version"
-                                | "content-type"
-                                | "accept"
-                                | "host"
-                                | "content-length"
-                        ) {
-                            return Err("MCP protocol headers are managed by the host".into());
-                        }
-                        headers.insert(
-                            key,
-                            reqwest::header::HeaderValue::from_str(&expand(value)?)?,
-                        );
-                    }
-                    let http = reqwest::Client::builder()
-                        .redirect(reqwest::redirect::Policy::none())
-                        .connect_timeout(timeout)
-                        .build()?;
-                    host.runtime.block_on(async {
-                        let transport = StreamableHttpClientTransport::with_client(
-                            http,
-                            StreamableHttpClientTransportConfig::with_uri(url.clone())
-                                .custom_headers(headers)
-                                .max_sse_event_size(FRAME_LIMIT * 2)
-                                .max_concurrent_requests(1)
-                                .control_request_timeout(Duration::from_millis(500))
-                                .reinit_on_expired_session(true),
-                        );
-                        super::controlled(&control, async {
-                            Ok(client
-                                .serve(transport)
-                                .await
-                                .map_err(|_| format!("MCP {name}: HTTP initialization failed"))?)
-                        })
-                        .await
-                    })?
+                if config.timeout_ms == 0 || config.timeout_ms > 300_000 {
+                    return Err(format!("invalid MCP timeout for {name}").into());
                 }
-                _ => return Err(format!("MCP {name} needs exactly one command or url").into()),
-            };
-            let index = host.connections.len();
-            host.connections.push(Connection {
-                name: name.clone(),
-                timeout,
-                service,
-            });
-            let listed = host.runtime.block_on(async {
-                super::controlled(&control, async {
-                    let mut all = Vec::new();
-                    let mut cursor = None;
-                    let mut seen = HashSet::new();
-                    let mut bytes = 0;
-                    loop {
-                        let page = host.connections[index]
-                            .service
-                            .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
-                            .await?;
-                        bytes += serde_json::to_vec(&page.tools)?.len();
-                        all.extend(page.tools);
-                        if all.len() > 256 || seen.len() >= 256 {
-                            return Err("MCP catalog exceeds 256 tools/pages".into());
-                        }
-                        if bytes > FRAME_LIMIT {
-                            return Err("MCP tool catalog exceeds limit".into());
-                        }
-                        cursor = page.next_cursor;
-                        match &cursor {
-                            None => return Ok::<Vec<Tool>, crate::Error>(all),
-                            Some(c) if !seen.insert(c.clone()) => {
-                                return Err("MCP pagination cursor repeated".into())
-                            }
-                            _ => {}
-                        }
-                    }
-                })
-                .await
-            })?;
-            let requested: Option<HashSet<_>> = config
-                .tools
-                .as_ref()
-                .map(|items| items.iter().cloned().collect());
-            let available: HashSet<_> = listed.iter().map(|t| t.name.to_string()).collect();
-            if requested
-                .as_ref()
-                .is_some_and(|wanted| !wanted.is_subset(&available))
-            {
-                return Err(format!(
-                    "MCP {name}: configured tool is absent from the server catalog"
-                )
-                .into());
-            }
-            if config
-                .read_only
-                .iter()
-                .any(|declared| !available.contains(declared))
-            {
-                return Err(format!(
-                    "MCP {name}: read_only tool is absent from the server catalog"
-                )
-                .into());
-            }
-            if config
-                .witness
-                .iter()
-                .any(|declared| !available.contains(declared))
-            {
-                return Err(
-                    format!("MCP {name}: witness tool is absent from the server catalog").into(),
+                let control = startup.child(Duration::from_millis(config.timeout_ms));
+                let timeout = Duration::from_millis(config.timeout_ms);
+                let client = ClientConfig::new(
+                    ClientCapabilities::default(),
+                    Implementation::new("eja", env!("CARGO_PKG_VERSION")),
                 );
-            }
-            for tool in listed {
+                let service = match (&config.command, &config.url) {
+                    (Some(program), None) => {
+                        if !config.headers.is_empty() {
+                            return Err("stdio MCP cannot have HTTP headers".into());
+                        }
+                        let cwd = config.cwd.as_ref().map_or_else(
+                            || project.map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf),
+                            |p| {
+                                if p.is_relative() {
+                                    config_dir.join(p)
+                                } else {
+                                    p.clone()
+                                }
+                            },
+                        );
+                        let mut command = Command::new(program);
+                        command
+                            .args(&config.args)
+                            .current_dir(cwd)
+                            .env_clear()
+                            .kill_on_drop(true)
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(if prefix == "plugin" {
+                                Stdio::null()
+                            } else {
+                                Stdio::inherit()
+                            });
+                        if prefix == "mcp" {
+                            for key in ["PATH", "HOME", "TMPDIR", "TMP", "LANG", "SYSTEMROOT"] {
+                                if let Some(value) = std::env::var_os(key) {
+                                    command.env(key, value);
+                                }
+                            }
+                        }
+                        for (key, value) in &config.env {
+                            command.env(key, expand(value)?);
+                        }
+                        command.process_group(0);
+                        let mut child = host.runtime.block_on(async { command.spawn() })?;
+                        let output = child.stdout.take().ok_or("missing MCP stdout")?;
+                        let input = child.stdin.take().ok_or("missing MCP stdin")?;
+                        host.children.push(LocalServer {
+                            child,
+                            stopped: false,
+                        });
+                        let transport = AsyncRwTransport::new_client(output, input)
+                            .with_max_line_length(FRAME_LIMIT * 2);
+                        host.runtime.block_on(async {
+                            super::controlled(&control, async {
+                                Ok(client.serve(transport).await.map_err(|_| {
+                                    format!("MCP {name}: stdio initialization failed")
+                                })?)
+                            })
+                            .await
+                        })?
+                    }
+                    (None, Some(url)) => {
+                        if !config.args.is_empty() || !config.env.is_empty() || config.cwd.is_some()
+                        {
+                            return Err("HTTP MCP cannot have command arguments, env or cwd".into());
+                        }
+                        let parsed = reqwest::Url::parse(url)?;
+                        if !matches!(parsed.scheme(), "http" | "https")
+                            || !parsed.username().is_empty()
+                            || parsed.password().is_some()
+                        {
+                            return Err(
+                                "MCP requires an HTTP(S) endpoint without URL credentials".into()
+                            );
+                        }
+                        let mut headers = HashMap::new();
+                        for (key, value) in &config.headers {
+                            let key = reqwest::header::HeaderName::from_bytes(key.as_bytes())?;
+                            if matches!(
+                                key.as_str(),
+                                "mcp-session-id"
+                                    | "mcp-protocol-version"
+                                    | "content-type"
+                                    | "accept"
+                                    | "host"
+                                    | "content-length"
+                            ) {
+                                return Err("MCP protocol headers are managed by the host".into());
+                            }
+                            headers.insert(
+                                key,
+                                reqwest::header::HeaderValue::from_str(&expand(value)?)?,
+                            );
+                        }
+                        let http = reqwest::Client::builder()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .connect_timeout(timeout)
+                            .build()?;
+                        host.runtime.block_on(async {
+                            let transport = StreamableHttpClientTransport::with_client(
+                                http,
+                                StreamableHttpClientTransportConfig::with_uri(url.clone())
+                                    .custom_headers(headers)
+                                    .max_sse_event_size(FRAME_LIMIT * 2)
+                                    .max_concurrent_requests(1)
+                                    .control_request_timeout(Duration::from_millis(500))
+                                    .reinit_on_expired_session(true),
+                            );
+                            super::controlled(&control, async {
+                                Ok(client.serve(transport).await.map_err(|_| {
+                                    format!("MCP {name}: HTTP initialization failed")
+                                })?)
+                            })
+                            .await
+                        })?
+                    }
+                    _ => return Err(format!("MCP {name} needs exactly one command or url").into()),
+                };
+                let index = host.connections.len();
+                host.connections.push(Connection {
+                    name: name.clone(),
+                    timeout,
+                    service,
+                });
+                let listed = host.runtime.block_on(async {
+                    super::controlled(&control, async {
+                        let mut all = Vec::new();
+                        let mut cursor = None;
+                        let mut seen = HashSet::new();
+                        let mut bytes = 0;
+                        loop {
+                            let page = host.connections[index]
+                                .service
+                                .list_tools(Some(
+                                    PaginatedRequestParams::default().with_cursor(cursor),
+                                ))
+                                .await?;
+                            bytes += serde_json::to_vec(&page.tools)?.len();
+                            all.extend(page.tools);
+                            if all.len() > 256 || seen.len() >= 256 {
+                                return Err("MCP catalog exceeds 256 tools/pages".into());
+                            }
+                            if bytes > FRAME_LIMIT {
+                                return Err("MCP tool catalog exceeds limit".into());
+                            }
+                            cursor = page.next_cursor;
+                            match &cursor {
+                                None => return Ok::<Vec<Tool>, crate::Error>(all),
+                                Some(c) if !seen.insert(c.clone()) => {
+                                    return Err("MCP pagination cursor repeated".into())
+                                }
+                                _ => {}
+                            }
+                        }
+                    })
+                    .await
+                })?;
+                let requested: Option<HashSet<_>> = config
+                    .tools
+                    .as_ref()
+                    .map(|items| items.iter().cloned().collect());
+                let available: HashSet<_> = listed.iter().map(|t| t.name.to_string()).collect();
                 if requested
                     .as_ref()
-                    .is_some_and(|wanted| !wanted.contains(tool.name.as_ref()))
+                    .is_some_and(|wanted| !wanted.is_subset(&available))
                 {
-                    continue;
-                }
-                let public = alias(prefix, &name, &tool.name);
-                let definition = json!({
-                    "type": "function",
-                    "function": {
-                        "name": public,
-                        "description": format!("MCP {name}/{}: {}", tool.name, tool.description.as_deref().unwrap_or("")),
-                        "parameters": tool.input_schema
-                    }
-                });
-                if host
-                    .tools
-                    .insert(
-                        public,
-                        RemoteTool {
-                            server: index,
-                            name: tool.name.to_string(),
-                            definition,
-                            witness: config
-                                .witness
-                                .iter()
-                                .any(|witness| witness == tool.name.as_ref()),
-                            read_only: prefix == "mcp"
-                                && (config
-                                    .read_only
-                                    .iter()
-                                    .any(|name| name == tool.name.as_ref())
-                                    || tool
-                                        .annotations
-                                        .as_ref()
-                                        .and_then(|annotations| annotations.read_only_hint)
-                                        .unwrap_or(false)),
-                        },
+                    return Err(format!(
+                        "MCP {name}: configured tool is absent from the server catalog"
                     )
-                    .is_some()
-                {
-                    return Err("MCP tool names collide after normalization".into());
+                    .into());
                 }
-            }
-            if serde_json::to_vec(
-                &host
-                    .tools
-                    .values()
-                    .map(|t| &t.definition)
-                    .collect::<Vec<_>>(),
-            )?
-            .len()
-                > FRAME_LIMIT
-            {
-                return Err("MCP tool definitions exceed limit".into());
+                if config
+                    .read_only
+                    .iter()
+                    .any(|declared| !available.contains(declared))
+                {
+                    return Err(format!(
+                        "MCP {name}: read_only tool is absent from the server catalog"
+                    )
+                    .into());
+                }
+                if config
+                    .witness
+                    .iter()
+                    .any(|declared| !available.contains(declared))
+                {
+                    return Err(format!(
+                        "MCP {name}: witness tool is absent from the server catalog"
+                    )
+                    .into());
+                }
+                for tool in listed {
+                    if requested
+                        .as_ref()
+                        .is_some_and(|wanted| !wanted.contains(tool.name.as_ref()))
+                    {
+                        continue;
+                    }
+                    let public = alias(prefix, &name, &tool.name);
+                    let definition = json!({
+                        "type": "function",
+                        "function": {
+                            "name": public,
+                            "description": format!("MCP {name}/{}: {}", tool.name, tool.description.as_deref().unwrap_or("")),
+                            "parameters": tool.input_schema
+                        }
+                    });
+                    if host
+                        .tools
+                        .insert(
+                            public,
+                            RemoteTool {
+                                server: index,
+                                name: tool.name.to_string(),
+                                definition,
+                                witness: config
+                                    .witness
+                                    .iter()
+                                    .any(|witness| witness == tool.name.as_ref()),
+                                read_only: prefix == "mcp"
+                                    && (config
+                                        .read_only
+                                        .iter()
+                                        .any(|name| name == tool.name.as_ref())
+                                        || tool
+                                            .annotations
+                                            .as_ref()
+                                            .and_then(|annotations| annotations.read_only_hint)
+                                            .unwrap_or(false)),
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err("MCP tool names collide after normalization".into());
+                    }
+                }
+                if serde_json::to_vec(
+                    &host
+                        .tools
+                        .values()
+                        .map(|t| &t.definition)
+                        .collect::<Vec<_>>(),
+                )?
+                .len()
+                    > FRAME_LIMIT
+                {
+                    return Err("MCP tool definitions exceed limit".into());
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if !keep_available {
+                    return Err(error);
+                }
+                // A cancelled or expired host startup is not an optional
+                // connector failure. Preserve that stop instead of turning it
+                // into an empty but apparently healthy gateway.
+                startup.check()?;
+                host.connections.truncate(connections);
+                host.children.truncate(children);
+                host.tools.retain(|_, tool| tool.server < connections);
+                diagnostics.push(format!("MCP connector {name} is unavailable: {error}"));
             }
         }
-        Ok(host)
+        Ok((host, diagnostics))
     }
 }
 
@@ -623,204 +672,5 @@ impl Drop for McpTools {
                 child.close().await;
             }
         });
-    }
-}
-
-/// The application's one tool entry point. Shared MCP servers outlive ajas.
-pub struct HostTools {
-    groups: Vec<Group>,
-    workspace: Option<PathBuf>,
-    private: PathBuf,
-    roots: Vec<PathBuf>,
-}
-
-/// One connector: a name, a grant, and a gateway. The assembly knows nothing
-/// about what is inside a group; adding a tool or a protocol adds a group.
-struct Group {
-    builtin: bool,
-    enabled: bool,
-    gateway: Box<dyn ToolGateway>,
-}
-
-impl HostTools {
-    pub fn new(
-        config: Option<&Path>,
-        project: &Path,
-        private: &Path,
-        control: &Control,
-    ) -> Result<Self> {
-        Self::with_workspace(config, Some(project), private, control)
-    }
-
-    pub fn with_workspace(
-        config: Option<&Path>,
-        workspace: Option<&Path>,
-        private: &Path,
-        control: &Control,
-    ) -> Result<Self> {
-        let workspace = workspace.map(Path::canonicalize).transpose()?;
-        let mut groups = Vec::new();
-        if workspace.is_some() {
-            groups.push(Group {
-                builtin: true,
-                enabled: true,
-                gateway: Box::new(FileTools),
-            });
-        }
-        if let Some(path) = config {
-            let gateway = McpTools::load_with_workspace(path, workspace.as_deref(), control)?;
-            groups.push(Group {
-                builtin: false,
-                enabled: true,
-                gateway: Box::new(gateway),
-            });
-        }
-        Ok(Self {
-            groups,
-            workspace,
-            private: private.canonicalize()?,
-            roots: Vec::new(),
-        })
-    }
-
-    /// The roots the host grants this deployment. The host's own reads reach
-    /// every granted workspace; a run still writes only its own world.
-    #[must_use]
-    pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
-        self.roots = roots;
-        self
-    }
-
-    fn enabled_group(&self, tool: &str) -> Result<&Group> {
-        let group = self
-            .groups
-            .iter()
-            .find(|group| group.gateway.owns(tool))
-            .ok_or_else(|| format!("{tool} is not a declared connector tool"))?;
-        if !group.enabled {
-            return Err("the workspace file tools are switched off".into());
-        }
-        Ok(group)
-    }
-
-    fn inspect(
-        &self,
-        tool: &str,
-        arguments: &Value,
-        control: &Control,
-        witness: bool,
-    ) -> Result<Value> {
-        let group = self.enabled_group(tool)?;
-        let allowed = if witness {
-            group.gateway.witnesses(tool)
-        } else {
-            group.gateway.observes(tool)
-        };
-        if !allowed {
-            return Err(if group.builtin {
-                "EJA only observes; edits belong to ajas".into()
-            } else if witness {
-                format!("{tool} is not a declared witness").into()
-            } else {
-                "EJA may only observe read-only connector tools".into()
-            });
-        }
-        let mut context = ToolContext {
-            aja_id: 0,
-            workspace: self.workspace.as_deref(),
-            private: &self.private,
-            control,
-        };
-        if group.builtin {
-            let roots = if self.roots.is_empty() {
-                self.workspace.as_slice()
-            } else {
-                &self.roots
-            };
-            let path = arguments["path"].as_str().ok_or("missing path")?;
-            let full = super::granted_path(roots, path)?;
-            if full.starts_with(&self.private) {
-                return Err("the host's private state is not readable".into());
-            }
-            context.workspace = roots
-                .iter()
-                .find(|root| full.starts_with(root))
-                .map(PathBuf::as_path);
-            return group
-                .gateway
-                .call(&context, tool, &json!({"path": full.to_string_lossy()}));
-        }
-        group.gateway.call(&context, tool, arguments)
-    }
-
-    /// The built-in workspace file tools are a grant the host may switch off;
-    /// connectors are unaffected.
-    #[must_use]
-    pub fn with_workspace_tools(self, enabled: bool) -> Self {
-        self.with_local_tools(enabled, enabled)
-    }
-
-    #[must_use]
-    pub fn with_local_tools(mut self, files: bool, shell: bool) -> Self {
-        if let Some(group) = self.groups.iter_mut().find(|group| group.builtin) {
-            group.enabled = files || shell;
-            group.gateway = Box::new(super::tools::LocalTools { files, shell });
-        }
-        self
-    }
-
-    pub fn register(&mut self, gateway: Box<dyn ToolGateway>) {
-        self.groups.push(Group {
-            builtin: false,
-            enabled: true,
-            gateway,
-        });
-    }
-}
-impl ToolGateway for HostTools {
-    /// The registry concatenates its enabled groups; a name is routed to the
-    /// group that declares it. No tool name is known here.
-    fn definitions(&self, assignment: &Assignment) -> Vec<Value> {
-        self.groups
-            .iter()
-            .filter(|group| group.enabled)
-            .flat_map(|group| group.gateway.definitions(assignment))
-            .collect()
-    }
-    fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
-        self.enabled_group(name)?.gateway.call(ctx, name, args)
-    }
-    fn observes(&self, name: &str) -> bool {
-        self.enabled_group(name)
-            .is_ok_and(|group| group.gateway.observes(name))
-    }
-    fn owns(&self, name: &str) -> bool {
-        self.groups.iter().any(|group| group.gateway.owns(name))
-    }
-}
-
-impl Capabilities for HostTools {
-    fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
-        self.inspect(
-            tool,
-            arguments,
-            &parent.child(Duration::from_secs(60)),
-            false,
-        )
-    }
-
-    fn witness(&self, request: &Value, control: &Control) -> Result<Value> {
-        let tool = request["tool"]
-            .as_str()
-            .filter(|name| !name.is_empty())
-            .ok_or("a witness names one host tool")?;
-        let empty = json!({});
-        let arguments = request.get("arguments").unwrap_or(&empty);
-        self.inspect(
-            tool,
-            arguments,
-            &control.child(Duration::from_secs(120)),
-            true,
-        )
     }
 }

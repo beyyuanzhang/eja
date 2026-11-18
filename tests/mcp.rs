@@ -287,6 +287,48 @@ fn configuration_failure_cleans_previous_servers_and_initializing_child() {
     assert!(tool_names(&host).is_empty());
 }
 
+#[test]
+fn one_connector_startup_failure_keeps_other_connectors() {
+    let _lock = serial();
+    let f = Fixture::new();
+    let mut hang = f.stdio("hang", "hang_init");
+    hang["timeout_ms"] = json!(150);
+    let path = f.config(&json!({
+        "mcpServers": {
+            "a_good": f.stdio("good", "stdio"),
+            "m_bad": {"typo": true},
+            "z_hang": hang
+        }
+    }));
+    let (host, diagnostics) =
+        McpTools::load_available_with_workspace(&path, Some(f.root()), &control()).unwrap();
+    let names = tool_names(&host);
+    assert!(
+        names.iter().any(|name| name == "mcp__a_good__echo"),
+        "{names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name.starts_with("mcp__z_hang__")),
+        "{names:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|error| error.contains("z_hang") && error.contains("unavailable")),
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|error| error.contains("m_bad") && error.contains("invalid configuration")),
+        "{diagnostics:?}"
+    );
+    assert!(alive(f.pid("good", "pid")));
+    until(|| !alive(f.pid("hang", "pid")));
+    drop(host);
+    until(|| !alive(f.pid("good", "pid")));
+}
+
 struct HttpServer(Child);
 impl Drop for HttpServer {
     fn drop(&mut self) {
@@ -505,7 +547,7 @@ fn native_ajas_share_one_host_connection_and_freeze_independently() {
 }
 
 #[test]
-fn cli_catalog_uses_owned_default_config_and_fails_explicit_missing_path() {
+fn cli_catalog_uses_owned_default_config_and_reports_an_explicit_missing_path() {
     let _lock = serial();
     let f = Fixture::new();
     let path = f.config(&json!({"mcpServers":{"fixture":f.stdio("fixture", "stdio")}}));
@@ -537,7 +579,22 @@ fn cli_catalog_uses_owned_default_config_and_fails_explicit_missing_path() {
         ])
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("connector tools are unavailable"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(value
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "read_file"));
 }
 
 #[test]

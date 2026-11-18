@@ -7,9 +7,13 @@ aja retains no aja-owned MCP client, server or thread.
 ## Configuration
 
 The CLI loads `<dir>/mcp.json` when present, or the exact `--mcp-config FILE` path.
-It does not search personal or other project configuration directories.
-No config grants no external connector tools. Each native aja still has its host-bound read-only record passage tool. A configured server that fails to initialize or
-list its granted tools fails startup, rather than silently removing capabilities.
+It does not search personal or other project configuration directories. No config
+grants no external connector tools. Each native aja still has its host-bound
+read-only record passage tool. A configured server that fails to initialize or
+list its granted tools is reported and omitted. Healthy servers from the same
+configuration remain available. An unreadable or invalid connector configuration
+is also reported as a capability warning and cannot disable unrelated local or
+managed capabilities.
 
 ```json
 {
@@ -53,7 +57,8 @@ eja --dir .eja --mcp-config /path/to/mcp.json turn "use the connector"
 ```
 
 Tool names become `mcp__<server>__<tool>`; unsupported characters become `_`.
-Names longer than 64 bytes get a stable hash suffix. Collisions are errors.
+Names longer than 64 bytes get a stable hash suffix. A normalized collision is
+rejected and reported rather than silently shadowing either tool.
 The `tools` command prints the actual model-visible names and schemas, without
 printing host config or authentication headers.
 
@@ -85,7 +90,8 @@ resource browser or prompt registry.
   never replayed.
 - Shutdown closes HTTP sessions and kills/waits for owned stdio processes. On
   Unix, ordinary descendants in their server's process group are killed too.
-  Initialization failures clean up servers already started.
+  A failed server's partial process and connection are cleaned up without
+  discarding healthy servers that already started.
 
 ## Acceptance witnesses
 

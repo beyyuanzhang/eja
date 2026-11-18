@@ -1,5 +1,5 @@
 //! Host tools. Connectors implement this same boundary; ajas never load plugins.
-use super::{cut_chars, worlds::ENTRIES, Control};
+use super::{cut_chars, worlds::ENTRIES, Capabilities, Control};
 use crate::{aja::FRAME_LIMIT, Result};
 use serde_json::{json, Value};
 use std::{
@@ -96,6 +96,24 @@ pub trait ToolGateway: Send + Sync {
     fn definitions(&self, assignment: &crate::Assignment) -> Vec<Value>;
     /// Trusted host implementations must honor control and bound their output/resources.
     fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value>;
+    /// The host's own read of this tool. A provider resolves its own paths and
+    /// authority; the registry only routes to the gateway that owns the name.
+    fn inspect(
+        &self,
+        context: &ToolContext<'_>,
+        name: &str,
+        arguments: &Value,
+        witness: bool,
+    ) -> Result<Value> {
+        if witness {
+            if !self.witnesses(name) {
+                return Err(format!("{name} is not a declared witness").into());
+            }
+        } else if !self.observes(name) {
+            return Err("EJA may only observe read-only host tools".into());
+        }
+        self.call(context, name, arguments)
+    }
     /// Whether the host itself may call this tool to look at the world. An
     /// effect is never an observation; connectors declare their own read-only
     /// tools instead.
@@ -130,6 +148,15 @@ impl<T: ToolGateway + ?Sized> ToolGateway for std::sync::Arc<T> {
     }
     fn call(&self, context: &ToolContext<'_>, name: &str, arguments: &Value) -> Result<Value> {
         (**self).call(context, name, arguments)
+    }
+    fn inspect(
+        &self,
+        context: &ToolContext<'_>,
+        name: &str,
+        arguments: &Value,
+        witness: bool,
+    ) -> Result<Value> {
+        (**self).inspect(context, name, arguments, witness)
     }
     fn observes(&self, name: &str) -> bool {
         (**self).observes(name)
@@ -223,12 +250,59 @@ pub fn granted_path(roots: &[PathBuf], name: &str) -> Result<PathBuf> {
 
 pub struct FileTools;
 
-pub(super) struct LocalTools {
-    pub files: bool,
-    pub shell: bool,
+/// The workspace provider.
+///
+/// It owns the local path authority: a run's tool calls stay in the environment
+/// it was given, while the host's own observations resolve across every granted
+/// root and never into private state.
+pub struct WorkspaceTools {
+    files: bool,
+    shell: bool,
+    workspace: Option<PathBuf>,
+    roots: Vec<PathBuf>,
+    private: PathBuf,
 }
 
-impl ToolGateway for LocalTools {
+impl WorkspaceTools {
+    pub fn new(
+        files: bool,
+        shell: bool,
+        workspace: Option<PathBuf>,
+        roots: Vec<PathBuf>,
+        private: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            files,
+            shell,
+            workspace,
+            roots,
+            private: private.into(),
+        }
+    }
+
+    fn observed_path(&self, arguments: &Value) -> Result<(PathBuf, &Path)> {
+        let path = arguments["path"].as_str().ok_or("missing path")?;
+        let full = granted_path(&self.roots, path)?;
+        if full.starts_with(&self.private) {
+            return Err("the host's private state is not readable".into());
+        }
+        let root = if let Some(root) = self
+            .roots
+            .iter()
+            .filter(|root| full.starts_with(root))
+            .max_by_key(|root| root.components().count())
+        {
+            root.as_path()
+        } else {
+            self.workspace
+                .as_deref()
+                .ok_or("this host assembled no workspace")?
+        };
+        Ok((full, root))
+    }
+}
+
+impl ToolGateway for WorkspaceTools {
     fn definitions(&self, _: &crate::Assignment) -> Vec<Value> {
         WORKSPACE_TOOLS
             .iter()
@@ -244,8 +318,45 @@ impl ToolGateway for LocalTools {
         FileTools.call(ctx, name, arguments)
     }
 
+    fn inspect(
+        &self,
+        ctx: &ToolContext<'_>,
+        name: &str,
+        arguments: &Value,
+        witness: bool,
+    ) -> Result<Value> {
+        let allowed = if witness {
+            self.witnesses(name)
+        } else {
+            self.observes(name)
+        };
+        if !allowed {
+            return Err(if witness {
+                format!("{name} is not a declared witness").into()
+            } else {
+                "EJA only observes; edits belong to ajas".into()
+            });
+        }
+        let (full, root) = self.observed_path(arguments)?;
+        let context = ToolContext {
+            aja_id: ctx.aja_id,
+            workspace: Some(root),
+            private: &self.private,
+            control: ctx.control,
+        };
+        FileTools.call(
+            &context,
+            name,
+            &json!({"path": full.to_string_lossy().into_owned()}),
+        )
+    }
+
     fn observes(&self, name: &str) -> bool {
         self.files && FileTools.observes(name)
+    }
+
+    fn witnesses(&self, name: &str) -> bool {
+        self.files && FileTools.witnesses(name)
     }
 
     fn owns(&self, name: &str) -> bool {
@@ -404,6 +515,158 @@ impl ToolGateway for FileTools {
     }
     fn owns(&self, name: &str) -> bool {
         WORKSPACE_TOOLS.contains(&name)
+    }
+}
+
+/// The application's gateway registry. It knows nothing about a gateway's
+/// protocol, workspace roots or tools: it concatenates definitions and routes a
+/// name to the one gateway that declares it.
+pub struct HostTools {
+    gateways: Vec<Box<dyn ToolGateway>>,
+    private: PathBuf,
+}
+
+impl HostTools {
+    pub fn from_gateways(
+        private: impl Into<PathBuf>,
+        gateways: Vec<Box<dyn ToolGateway>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            gateways,
+            private: private.into().canonicalize()?,
+        })
+    }
+
+    pub fn new(
+        config: Option<&Path>,
+        project: &Path,
+        private: &Path,
+        control: &Control,
+    ) -> Result<Self> {
+        Self::with_workspace(config, Some(project), private, control)
+    }
+
+    /// A compatibility wrapper for consumers that assemble the historical
+    /// default: local file tools plus connectors over one workspace.
+    pub fn with_workspace(
+        config: Option<&Path>,
+        workspace: Option<&Path>,
+        private: &Path,
+        control: &Control,
+    ) -> Result<Self> {
+        let private = private.canonicalize()?;
+        let workspace = workspace.map(Path::canonicalize).transpose()?;
+        let mut gateways: Vec<Box<dyn ToolGateway>> = Vec::new();
+        if let Some(workspace) = &workspace {
+            gateways.push(Box::new(WorkspaceTools::new(
+                true,
+                true,
+                Some(workspace.clone()),
+                vec![workspace.clone()],
+                &private,
+            )));
+        }
+        if let Some(path) = config {
+            gateways.push(Box::new(super::McpTools::load_with_workspace(
+                path,
+                workspace.as_deref(),
+                control,
+            )?));
+        }
+        Self::from_gateways(private, gateways)
+    }
+
+    pub fn register(&mut self, gateway: Box<dyn ToolGateway>) {
+        self.gateways.push(gateway);
+    }
+
+    fn gateway(&self, tool: &str) -> Result<&dyn ToolGateway> {
+        self.gateways
+            .iter()
+            .find(|gateway| gateway.owns(tool))
+            .map(Box::as_ref)
+            .ok_or_else(|| format!("{tool} is not a declared host tool").into())
+    }
+
+    fn inspect(
+        &self,
+        tool: &str,
+        arguments: &Value,
+        control: &Control,
+        witness: bool,
+    ) -> Result<Value> {
+        let context = ToolContext {
+            aja_id: 0,
+            workspace: None,
+            private: &self.private,
+            control,
+        };
+        self.gateway(tool)?
+            .inspect(&context, tool, arguments, witness)
+    }
+}
+
+impl ToolGateway for HostTools {
+    fn definitions(&self, assignment: &crate::Assignment) -> Vec<Value> {
+        self.gateways
+            .iter()
+            .flat_map(|gateway| gateway.definitions(assignment))
+            .collect()
+    }
+
+    fn call(&self, ctx: &ToolContext<'_>, name: &str, args: &Value) -> Result<Value> {
+        self.gateway(name)?.call(ctx, name, args)
+    }
+
+    fn inspect(
+        &self,
+        ctx: &ToolContext<'_>,
+        name: &str,
+        args: &Value,
+        witness: bool,
+    ) -> Result<Value> {
+        let _ = ctx;
+        self.gateway(name)?.inspect(ctx, name, args, witness)
+    }
+
+    fn observes(&self, name: &str) -> bool {
+        self.gateway(name)
+            .is_ok_and(|gateway| gateway.observes(name))
+    }
+
+    fn witnesses(&self, name: &str) -> bool {
+        self.gateway(name)
+            .is_ok_and(|gateway| gateway.witnesses(name))
+    }
+
+    fn owns(&self, name: &str) -> bool {
+        self.gateways.iter().any(|gateway| gateway.owns(name))
+    }
+}
+
+impl Capabilities for HostTools {
+    fn observe(&self, tool: &str, arguments: &Value, parent: &Control) -> Result<Value> {
+        self.inspect(
+            tool,
+            arguments,
+            &parent.child(Duration::from_secs(60)),
+            false,
+        )
+    }
+
+    fn witness(&self, request: &Value, control: &Control) -> Result<Value> {
+        let tool = request["tool"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or("a witness names one host tool")?;
+        let empty = json!({});
+        let arguments = request.get("arguments").unwrap_or(&empty);
+        self.inspect(
+            tool,
+            arguments,
+            &control.child(Duration::from_secs(120)),
+            true,
+        )
     }
 }
 

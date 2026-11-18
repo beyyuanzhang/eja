@@ -93,6 +93,10 @@ cargo run -- serve --no-project --dir .eja
 and isolated Git worktrees, and `mcp` loads configured connectors. File and shell
 tools need a workspace. The existing workspace-tools setting still switches both
 off. Previously frozen Git evidence can still be read by address.
+Optional connector and managed-plugin startup failures are reported as capability
+warnings. A failed provider is omitted, while unrelated providers, local tools and
+ordinary turns remain usable. The runtime exposes the latest warnings as
+`health.capabilityErrors`.
 
 For file editing without shell or Git:
 
@@ -263,8 +267,10 @@ re-sending a transcript pinned at the cap.
 A turn runs `project -> decide -> act -> record` until a final decision, repeated
 projection, cancellation, or a host budget. `TurnEnd` distinguishes these cases.
 Creating a aja, group or proposal returns its allocated id through the next
-projection, so the model never needs to guess a new id. Budget/cancellation results are explicit; intermediate replies are never final.
-Every reserved running task is reconciled when execution stops.
+projection, so the model never needs to guess a new id. Budget/cancellation
+results are explicit; intermediate replies are never final. Every reserved world
+is settled and released when execution stops. Landing its changes is an explicit
+reconciliation, not an automatic side effect.
 
 Default host budgets:
 
@@ -374,6 +380,10 @@ settings is still available; a missing directory is not offered.
 Registration is the durable availability decision. When a task opens, it names
 one available workspace id; that root is fixed for the task and never silently
 moves to another directory.
+Each new run records its world kind, granted root, branch and settled commit.
+Reconciliation follows that evidence rather than the capabilities enabled at
+restart. If the required backend is unavailable, or an old record cannot name an
+unambiguous workspace, reconciliation refuses and records the reason.
 `--task ID` selects initial focus. `show audit:ID` follows explicit containment
 and continuation edges; matching input text never invents a job relationship.
 

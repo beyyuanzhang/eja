@@ -6,7 +6,10 @@
 mod support;
 
 use eja::{
-    adapters::{Control, FileTools, Model, NativeWorker, OpenAiModel, ToolContext, ToolGateway},
+    adapters::{
+        Checkpoints, Control, FileTools, Model, NativeRuntime, NativeWorker, OpenAiModel,
+        ToolContext, ToolGateway, Worktrees,
+    },
     aja::Limits,
     Assignment, Result, Worker,
 };
@@ -131,6 +134,32 @@ impl Model for Script {
     }
 }
 
+struct Queue(Mutex<VecDeque<Value>>);
+
+impl Queue {
+    fn new(replies: Vec<Value>) -> Self {
+        Self(Mutex::new(replies.into()))
+    }
+}
+
+impl Model for Queue {
+    fn complete(
+        &self,
+        _: &[Value],
+        _: &[Value],
+        _: &Limits,
+        control: &Control,
+        _: bool,
+    ) -> Result<Value> {
+        control.check()?;
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| "unexpected model call".into())
+    }
+}
+
 fn worker_pids() -> Vec<i32> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,ppid=,args="])
@@ -225,6 +254,84 @@ fn native_loop_calls_host_tools_and_seals_a_versioned_result() {
         .execute(&assignment(1), &control())
         .contains("ended: error"));
     assert_eq!(manifest_of(&f, 1), before);
+}
+
+#[test]
+fn a_worktree_run_persists_the_environment_and_stable_artifact_it_settled() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = workspace("native-world-record");
+    let state_dir = fixture.path().join(".eja");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(fixture.path().join("base.txt"), "base\n").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "base.txt"],
+        vec!["commit", "--quiet", "-m", "base"],
+    ] {
+        let status = Command::new("git")
+            .current_dir(fixture.path())
+            .args(["-c", "user.name=eja", "-c", "user.email=eja@local"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let control = control();
+    let worlds = Arc::new(
+        Worktrees::new(
+            fixture.path(),
+            state_dir.join("worlds"),
+            &state_dir,
+            &control,
+        )
+        .unwrap(),
+    );
+    let model = Arc::new(Queue::new(vec![
+        calls(vec![call(
+            "write_file",
+            json!({"path":"out.txt","text":"isolated result"}),
+        )]),
+        final_message(&["out.txt"]),
+    ]));
+    let worker = NativeWorker::with_runtime(
+        env!("CARGO_BIN_EXE_eja"),
+        state_dir.join("ajas"),
+        model,
+        Arc::new(FileTools),
+        NativeRuntime {
+            workspace: Some(fixture.path().to_path_buf()),
+            snapshots: Some(Checkpoints::new(
+                state_dir.join("checkpoints"),
+                state_dir.clone(),
+            )),
+            worlds: Some(worlds),
+        },
+    )
+    .unwrap();
+    let digest = worker.execute(&assignment(1), &control);
+    assert!(digest.contains("ended: message"), "{digest}");
+    assert!(!fixture.path().join("out.txt").exists());
+    let manifest = manifest_of(&fixture, 1);
+    assert_eq!(manifest["world_kind"], "worktree", "{manifest}");
+    assert_eq!(
+        manifest["world_root"],
+        fixture.path().canonicalize().unwrap().display().to_string()
+    );
+    assert!(
+        manifest["world_branch"]
+            .as_str()
+            .is_some_and(|branch| branch.starts_with("eja/aja-1-")),
+        "{manifest}"
+    );
+    assert!(
+        manifest["world_commit"]
+            .as_str()
+            .is_some_and(|commit| commit.len() == 40 || commit.len() == 64),
+        "{manifest}"
+    );
+    assert!(manifest["checkpoint"].as_str().is_some(), "{manifest}");
 }
 
 #[test]

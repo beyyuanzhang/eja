@@ -728,7 +728,14 @@ fn reconcile(
     let root = (!task.workspace.is_empty()).then_some(std::path::Path::new(&task.workspace));
     let result = match ctx.host.reconcile(task_id, root, ctx.control) {
         Ok(result) => result,
-        Err(error) => return Ok(Err(format!("reconcile refused: {error}"))),
+        Err(error) => {
+            let error = error.to_string();
+            return Ok(Err(if error.starts_with("reconcile refused:") {
+                error
+            } else {
+                format!("reconcile refused: {error}")
+            }));
+        }
     };
     let target = task_scope(task_id);
     let arguments = serde_json::json!({"task": task_id});

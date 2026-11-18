@@ -1,11 +1,17 @@
 //! Host surface: one read over the three authorities, and the capabilities a
 //! host may add on top of it.
-use super::Worlds;
+use super::{WorldRecord, Worlds};
 use crate::{Address, Authority, Control, Event, Host, Result, Selector, TaskId, WorkspaceGrant};
 use serde_json::Value;
 
 pub trait RecordReader {
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value>;
+    /// The world evidence a run recorded, when the record carries it. An old
+    /// record without any world fields decodes as `Unknown`, never as today's
+    /// default world.
+    fn world(&self, _aja: u64) -> Result<Option<WorldRecord>> {
+        Ok(None)
+    }
 }
 
 /// What the host declares EJA may do.
@@ -96,9 +102,18 @@ impl Host for Ports<'_> {
         root: Option<&std::path::Path>,
         control: &Control,
     ) -> Result<Value> {
-        self.worlds
-            .ok_or("this host isolates no worlds")?
-            .reconcile(task, root, control)
+        let worlds = self
+            .worlds
+            .ok_or("reconcile refused: this host assembles no world service")?;
+        let record = match self.aja {
+            Some(reader) => Some(
+                reader
+                    .world(task)?
+                    .ok_or("reconcile refused: the run record is missing")?,
+            ),
+            None => None,
+        };
+        worlds.reconcile_recorded(task, root, record.as_ref(), control)
     }
 }
 

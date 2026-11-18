@@ -98,6 +98,12 @@ fn env<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
     }
 }
 
+fn report_capability_diagnostics(diagnostics: &[String]) {
+    for diagnostic in diagnostics {
+        eprintln!("capability warning: {diagnostic}");
+    }
+}
+
 /// Requests a clean stop at the next control check. It only stores a flag, which
 /// is what makes it safe to run inside a signal handler.
 extern "C" fn on_sigint(_: libc::c_int) {
@@ -161,10 +167,6 @@ fn run() -> Result<()> {
         )
         .into());
     }
-    let config = config.or_else(|| {
-        let path = dir.join("mcp.json");
-        path.exists().then_some(path)
-    });
     let store = Store::new(&dir)?;
     // The host's private state is not part of the world it observes: keep it out
     // of any commit, including a worktree world's.
@@ -185,39 +187,41 @@ fn run() -> Result<()> {
             limits.timeout_ms = env("EJA_TURN_TIMEOUT_MS", limits.timeout_ms)?;
             limits.slots = env("EJA_AJA_SLOTS", limits.slots)?;
             limits.validate()?;
-            let brain = OpenAiBrain::from_env()?
-                .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?
-                .with_managed_plugins(capabilities.has(Capability::Plugins));
-            let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
             let project = (capabilities.has(Capability::Workspace) && !no_project)
                 .then(std::env::current_dir)
                 .transpose()?;
             // The CLI shares the runtime's grant: the same settings file names
             // the same workspaces, so a task opened here resolves like one
             // opened over HTTP.
-            let settings = host::SettingsStore::new(project.clone(), dir.clone());
-            let stored = settings.read().unwrap_or_default();
-            let grant = capabilities.grants(&settings, &stored);
+            let settings = host::SettingsStore::new(project, dir.clone());
+            let prepared = host::compose(&settings, capabilities, config.as_deref(), &startup)?;
+            report_capability_diagnostics(&prepared.assembled.diagnostics);
+            options.limits.slots = prepared.effective.limits.slots.max(1);
+            if prepared.effective.limits.turn_timeout_ms > 0 {
+                options.limits.timeout_ms = prepared.effective.limits.turn_timeout_ms;
+            }
+            let grant = capabilities.grants(&settings, &prepared.effective.settings);
             options.workspaces.clone_from(&grant);
-            let assembled = host::assemble_capabilities(
-                project.as_deref(),
-                &dir,
-                config.as_deref(),
-                &grant,
-                capabilities.with_workspace_tools(stored.connectors.workspace_tools),
-                limits.slots,
-                &startup,
-            )?;
+            let mut brain = OpenAiBrain::from_env()?
+                .ok_or("turn needs LNA_BASE_URL/LNA_API_KEY/LNA_MODEL (or JIYUAN_* / OPENAI_*)")?;
+            if let Some(description) = &prepared.assembled.capability_description {
+                brain = brain.with_capability_description(description);
+            }
+            let model = OpenAiModel::from_env().ok_or("AJA needs the host model configuration")?;
             let ajas = dir.join("ajas");
             let mut aja_limits = eja::aja::Limits::default();
-            aja_limits.steps = Some(env("EJA_AJA_STEPS", eja::aja::DEFAULT_STEPS)?);
-            aja_limits.timeout_ms = env("EJA_AJA_TIMEOUT_MS", aja_limits.timeout_ms)?;
-            let worker = assembled.worker(&ajas, model, aja_limits)?;
+            if prepared.effective.limits.aja_steps > 0 {
+                aja_limits.steps = Some(prepared.effective.limits.aja_steps);
+            }
+            if prepared.effective.limits.aja_timeout_ms > 0 {
+                aja_limits.timeout_ms = prepared.effective.limits.aja_timeout_ms;
+            }
+            let worker = prepared.assembled.worker(&ajas, model, aja_limits)?;
             let records = RecordFiles::with_checkpoints(&ajas, dir.join("checkpoints"));
             let ports = Ports {
                 aja: Some(&records),
-                capabilities: Some(&*assembled.tools),
-                worlds: assembled.worlds.as_deref(),
+                capabilities: Some(&*prepared.assembled.tools),
+                worlds: prepared.assembled.worlds.as_deref(),
             };
             let outcome = turn_at_with_options(
                 &store,
@@ -284,18 +288,9 @@ fn run() -> Result<()> {
             let project = (capabilities.has(Capability::Workspace) && !no_project)
                 .then(std::env::current_dir)
                 .transpose()?;
-            let settings = host::SettingsStore::new(project.clone(), dir.clone());
-            let stored = settings.read().map_err(|error| error.to_string())?;
-            let grant = capabilities.grants(&settings, &stored);
-            let assembled = host::assemble_capabilities(
-                project.as_deref(),
-                &dir,
-                config.as_deref(),
-                &grant,
-                capabilities.with_workspace_tools(stored.connectors.workspace_tools),
-                1,
-                &startup,
-            )?;
+            let settings = host::SettingsStore::new(project, dir);
+            let prepared = host::compose(&settings, capabilities, config.as_deref(), &startup)?;
+            report_capability_diagnostics(&prepared.assembled.diagnostics);
             let assignment = Assignment {
                 task_id: options.focus.unwrap_or(0),
                 objective: String::new(),
@@ -307,7 +302,7 @@ fn run() -> Result<()> {
             };
             println!(
                 "{}",
-                serde_json::to_string_pretty(&assembled.tools.definitions(&assignment))?
+                serde_json::to_string_pretty(&prepared.assembled.tools.definitions(&assignment))?
             );
         }
         Command::Aja(id) => {

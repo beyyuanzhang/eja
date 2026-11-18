@@ -26,6 +26,8 @@ const SOURCE_BYTES: usize = 64 * 1024;
 const MAX_ACTIVE: usize = 16;
 static VERSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+pub(super) const DESCRIPTION: &str = "The host also grants AJAs managed plugin tools. An AJA may stage a Python MCP plugin, test it on sample input, and activate it for subsequent turns. Activate only when the task calls for a new or improved capability. It may list or roll back installed versions.";
+
 const TOOLS: [(&str, &str, &[&str]); 5] = [
     ("eja_plugin_list", "List managed plugins, their active versions, and startup errors.", &[]),
     ("eja_plugin_stage", "Stage a complete Python 3 stdio MCP server as a new version. Use only the standard library. The process cannot access the network, services, or project files. Protocol lines go to stdout. Test a tool before activation.", &["name", "source"]),
@@ -250,7 +252,15 @@ impl ToolGateway for LoadedPlugin {
     }
 }
 
-pub(super) fn register(tools: &mut HostTools, state: &Path, parent: &Control) -> Result<()> {
+pub(super) struct Registration {
+    pub diagnostics: Vec<String>,
+}
+
+pub(super) fn register(
+    tools: &mut HostTools,
+    state: &Path,
+    parent: &Control,
+) -> Result<Registration> {
     let root = eja::adapters::workspace_path(&state.canonicalize()?, "plugins")?;
     DirBuilder::new()
         .mode(0o700)
@@ -261,35 +271,51 @@ pub(super) fn register(tools: &mut HostTools, state: &Path, parent: &Control) ->
         writes: Mutex::new(()),
         loaded: BTreeMap::new(),
     };
+    let mut diagnostics = Vec::new();
     let startup = parent.child(Duration::from_secs(20));
     for (name, entry) in manager.read()? {
         let Some(current) = entry.current else {
             continue;
         };
         let mut status = json!({"requested":current});
-        let mut loaded = manager
-            .load_version(&name, &current, &startup)
-            .map(|gateway| (current.clone(), gateway));
-        if let Err(error) = &loaded {
-            status["error"] = json!(error.to_string());
-            if let Some(previous) = entry.previous {
-                loaded = manager
-                    .load_version(&name, &previous, &startup)
-                    .map(|gateway| (previous, gateway));
+        let mut loaded = None;
+        match manager.load_version(&name, &current, &startup) {
+            Ok(gateway) => loaded = Some((current.clone(), gateway)),
+            Err(error) => {
+                let error = error.to_string();
+                status["error"] = json!(error);
+                if let Some(previous) = entry.previous {
+                    match manager.load_version(&name, &previous, &startup) {
+                        Ok(gateway) => {
+                            diagnostics.push(format!(
+                                "managed plugin {name} version {current} failed to start: {error}; using version {previous}"
+                            ));
+                            loaded = Some((previous, gateway));
+                        }
+                        Err(fallback) => {
+                            status["fallback_error"] = json!(fallback.to_string());
+                        }
+                    }
+                }
             }
         }
-        if let Ok((version, gateway)) = loaded {
+        if let Some((version, gateway)) = loaded {
             status["version"] = json!(version);
             tools.register(Box::new(LoadedPlugin {
                 name: name.clone(),
                 version,
                 gateway,
             }));
+        } else {
+            diagnostics.push(format!(
+                "managed plugin {name} is unavailable: {}",
+                status["error"].as_str().unwrap_or("startup failed")
+            ));
         }
         manager.loaded.insert(name, status);
     }
     tools.register(Box::new(manager));
-    Ok(())
+    Ok(Registration { diagnostics })
 }
 
 #[cfg(all(test, target_os = "macos"))]
