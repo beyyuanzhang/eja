@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 
@@ -15,6 +16,7 @@ struct OptimisticMessage {
 @Observable
 final class AppModel {
     var client: APIClient
+    let supervisor: RuntimeSupervisor
     var baseURLString: String {
         didSet { UserDefaults.standard.set(baseURLString, forKey: Self.baseURLKey) }
     }
@@ -37,6 +39,8 @@ final class AppModel {
     var settingsPresented = false
     var pollTick = 0
 
+    private var pollTask: Task<Void, Never>?
+    private var didArrive = false
     private var fetching = false
     private var toastGeneration = 0
     private var restoredParked = false
@@ -46,16 +50,107 @@ final class AppModel {
     private static let baseURLKey = "eja.baseURL"
 
     init() {
-        let stored = UserDefaults.standard.string(forKey: Self.baseURLKey) ?? "http://127.0.0.1:8787"
+        let stored = ProcessInfo.processInfo.environment["EJA_BASE_URL"]
+            ?? UserDefaults.standard.string(forKey: Self.baseURLKey)
+            ?? "http://127.0.0.1:8787"
         baseURLString = stored
         let url = URL(string: stored) ?? URL(string: "http://127.0.0.1:8787")!
         client = APIClient(baseURL: url)
+        supervisor = RuntimeSupervisor(
+            baseURL: url,
+            stateDirectory: AppPaths.stateDirectory,
+            projectDirectory: AppPaths.projectDirectory,
+            logFile: AppPaths.logFile
+        )
         restoreEncounter(for: url)
     }
 
     var busy: Bool { pending || (state?.health.turnInFlight ?? false) }
     var pollDelay: Duration { busy ? .seconds(2) : .seconds(5) }
     var serviceKey: String { Self.serviceIdentity(client.baseURL) }
+    var projectPath: String { supervisor.projectDirectory.path }
+    var statePath: String { supervisor.stateDirectory.path }
+    var logPath: String { supervisor.logFile.path }
+    var canRestartRuntime: Bool {
+        if supervisor.isManaged { return true }
+        if case .failed = supervisor.phase { return supervisor.isLocal }
+        return false
+    }
+
+    var statusTitle: String {
+        guard state != nil else {
+            switch supervisor.phase {
+            case .starting:
+                return "正在启动"
+            case .failed:
+                return "实例未启动"
+            case .idle:
+                return "正在连接"
+            case .running:
+                return "正在连接"
+            }
+        }
+        if busy { return "运行中" }
+        if !loops.isEmpty { return "\(loops.count) 项待处理" }
+        return "空闲"
+    }
+
+    var statusDetail: String {
+        guard state != nil else { return supervisor.statusDetail }
+        if busy { return "EJA 正在执行这一轮。" }
+        if !loops.isEmpty { return "有决定或任务在等你。" }
+        return supervisor.isManaged
+            ? "由 Eja 启动 · \(baseURLString)"
+            : "外部实例 · \(baseURLString)"
+    }
+
+    var menuIcon: String {
+        guard state != nil else {
+            switch supervisor.phase {
+            case .starting:
+                return "arrow.triangle.2.circlepath"
+            case .failed:
+                return "exclamationmark.triangle"
+            case .idle, .running:
+                return "circle.dashed"
+            }
+        }
+        if busy { return "circle.dotted" }
+        if !loops.isEmpty { return "bell.badge" }
+        return "circle"
+    }
+
+    var menuBadge: String? {
+        guard state != nil, !busy, !loops.isEmpty else { return nil }
+        return String(loops.count)
+    }
+
+    func start() {
+        guard pollTask == nil else { return }
+        pollTask = Task { [weak self] in
+            guard let self else { return }
+            await self.supervisor.ensureRunning()
+            await self.refresh(quiet: true)
+            self.arriveIfNeeded()
+            while !Task.isCancelled {
+                await self.refresh(quiet: true)
+                self.arriveIfNeeded()
+                let tick = self.pollTick
+                let delay = self.pollDelay
+                var elapsed = Duration.zero
+                while elapsed < delay && self.pollTick == tick && !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    elapsed += .milliseconds(200)
+                }
+            }
+        }
+    }
+
+    func stopRuntime() {
+        pollTask?.cancel()
+        pollTask = nil
+        supervisor.stop()
+    }
 
     var presence: ChatMessage? {
         guard let state, encounter == nil else { return nil }
@@ -95,7 +190,10 @@ final class AppModel {
         baseURLString = trimmed
         client = APIClient(baseURL: url)
         guard previousService != nextService else {
-            refreshSoon()
+            Task {
+                await supervisor.reconfigure(baseURL: url)
+                await refresh(quiet: true)
+            }
             return
         }
 
@@ -110,9 +208,70 @@ final class AppModel {
         selectedTaskId = nil
         raw = nil
         toastState = nil
+        didArrive = false
         restoreEncounter(for: url)
         refreshSoon()
-        Task { await refresh(quiet: true) }
+        Task {
+            await supervisor.reconfigure(baseURL: url)
+            await refresh(quiet: true)
+        }
+    }
+
+    func retryRuntime() {
+        Task {
+            toast("正在启动 Eja 实例…")
+            await supervisor.ensureRunning()
+            await refresh(quiet: false)
+            if case .failed(let message) = supervisor.phase {
+                toast(message, isError: true)
+            } else if state != nil {
+                toast("Eja 已连上。")
+            }
+        }
+    }
+
+    func restartRuntime() {
+        Task {
+            guard canRestartRuntime else {
+                toast("当前连接的是外部实例，Eja 不会结束它。", isError: true)
+                return
+            }
+            toast("正在重启 Eja 实例…")
+            await supervisor.restart()
+            didArrive = false
+            await refresh(quiet: false)
+            if case .failed(let message) = supervisor.phase {
+                toast(message, isError: true)
+            } else if state != nil {
+                toast("Eja 已重启。")
+            }
+        }
+    }
+
+    func chooseProjectDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "选择"
+        panel.message = "选择 EJA 工作的默认目录"
+        panel.directoryURL = supervisor.projectDirectory
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        AppPaths.setProjectDirectory(url)
+        let wasManaged = supervisor.isManaged
+        Task {
+            toast("工作目录已更新。")
+            await supervisor.updateProjectDirectory(url)
+            didArrive = false
+            await refresh(quiet: true)
+            if !wasManaged {
+                toast("新目录会在下次启动实例时生效。")
+            }
+        }
+    }
+
+    func openRuntimeLog() {
+        supervisor.openLog()
     }
 
     func refreshSoon() {
@@ -216,6 +375,12 @@ final class AppModel {
         }
         guard state != nil, encounter == nil, !busy else { return }
         await transmit("", gesture: "return", showOptimistic: false)
+    }
+
+    private func arriveIfNeeded() {
+        guard !didArrive, state != nil, encounter == nil, !busy else { return }
+        didArrive = true
+        Task { await arrive() }
     }
 
     func approve(_ proposalId: Int) {

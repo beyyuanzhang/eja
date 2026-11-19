@@ -83,14 +83,23 @@ struct ContentView: View {
                 .foregroundStyle(Theme.muted)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 420)
-            Text("cargo run -- serve --dir .eja --project .")
+            Text(model.statusDetail)
+                .font(.system(size: 10.5))
+                .foregroundStyle(Theme.faint)
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+                .frame(maxWidth: 440)
+            Text(model.logPath)
                 .font(Theme.mono(11))
                 .foregroundStyle(Theme.inkSoft)
                 .card(padding: 12)
             HStack(spacing: 13) {
-                Button("再试一次") { model.refreshSoon() }
+                Button("重试启动") { model.retryRuntime() }
                     .buttonStyle(PrimaryButtonStyle())
-                Text("确认运行时已启动，或在设置里核对地址")
+                Button("打开日志") { model.openRuntimeLog() }
+                    .buttonStyle(.plain)
+                    .underline()
+                Text("关闭窗口后，Eja 仍会在菜单栏运行")
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.faint)
             }

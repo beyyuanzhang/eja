@@ -6,21 +6,28 @@ encounter. There is no new-chat, session list, or client-side proposal state.
 
 ## Run
 
-Start the runtime from the repository root:
-
-```sh
-cargo run -- serve --dir .eja --project .
-```
-
-Build and open the app:
+Build the app and its bundled runtime:
 
 ```sh
 app/macos/build.sh
 open app/macos/dist/Eja.app
 ```
 
-The app talks to the HTTP API at <http://127.0.0.1:8787>. The runtime and app
-are separate processes; the app never embeds the runtime.
+Drag `Eja.app` into Applications to install it. A normal launch needs no
+terminal: the app starts the bundled `eja` runtime at
+<http://127.0.0.1:8787> when nothing is listening there. If another runtime
+already answers at the configured address, the app attaches to it and leaves it
+alone.
+
+Closing the window hides it; Eja remains in the menu bar and the runtime keeps
+running. Quitting Eja stops the runtime only when this app started it. The
+runtime is still a separate process and still serves the same HTTP API, so other
+frontends are unaffected.
+
+The app keeps its state under `~/Library/Application Support/Eja/state`, uses
+`~/Library/Application Support/Eja/workspace` as the default project, and writes
+runtime output to `~/Library/Logs/Eja/runtime.log`. The project directory can be
+changed in Settings → 运行 → 本机实例.
 
 ## Talk
 

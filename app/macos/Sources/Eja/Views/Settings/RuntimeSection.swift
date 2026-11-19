@@ -11,6 +11,46 @@ struct RuntimeSection: View {
 
     var body: some View {
         SettingsPage {
+            SettingsGroup("本机实例") {
+                VStack(spacing: 0) {
+                    SettingsRow("状态", note: app.supervisor.isManaged ? "由 Eja 启动" : "外部运行时") {
+                        HStack(spacing: 10) {
+                            Text(app.statusTitle)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(Theme.ink)
+                            Button("重启") { app.restartRuntime() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(!app.canRestartRuntime)
+                        }
+                    }
+                    SettingsRule()
+                    SettingsRow("工作目录", note: "新建任务时的默认目录") {
+                        HStack(spacing: 8) {
+                            Text(app.projectPath)
+                                .font(Theme.mono(10.5))
+                                .foregroundStyle(Theme.muted)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(width: 250, alignment: .trailing)
+                            Button("选择…") { app.chooseProjectDirectory() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
+                    }
+                    SettingsRule()
+                    pathRow("状态", value: app.statePath)
+                    SettingsRule()
+                    pathRow("日志", value: app.logPath)
+                    SettingsRule()
+                    Text("关闭窗口不会停止实例；退出 Eja 会停止由 Eja 启动的实例。")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Theme.faint)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                }
+            }
+
             SettingsGroup("连接") {
                 SettingsRow("地址") {
                     TextField("http://127.0.0.1:8787", text: baseURLBinding)

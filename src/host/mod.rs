@@ -270,13 +270,32 @@ pub fn serve(options: Options) -> eja::Result<()> {
             .layer(middleware::from_fn_with_state(cors_host, cors))
             .with_state(host);
         axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                cancelled.store(true, Ordering::SeqCst);
-            })
+            .with_graceful_shutdown(shutdown_signal(cancelled))
             .await?;
         Ok(())
     })
+}
+
+async fn shutdown_signal(cancelled: Arc<AtomicBool>) {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    cancelled.store(true, Ordering::SeqCst);
 }
 
 async fn get_state(

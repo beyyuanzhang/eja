@@ -1,6 +1,10 @@
 #!/bin/zsh
 set -euo pipefail
 cd "$(dirname "$0")"
+ROOT="$(cd ../.. && pwd)"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+
+cargo build --release --manifest-path "$ROOT/Cargo.toml"
 
 # The CLT toolchain ships no SwiftUIMacros plugin, which the macOS 27 SDK's
 # SwiftUI interface requires for @State. The macOS 26 SDK still exposes the
@@ -16,6 +20,7 @@ APP=dist/Eja.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp .build/release/Eja "$APP/Contents/MacOS/Eja"
+cp "$TARGET_DIR/release/eja" "$APP/Contents/MacOS/eja-runtime"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -33,9 +38,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+    <key>LSMultipleInstancesProhibited</key><true/>
 </dict>
 </plist>
 PLIST
 
+codesign --force --sign - "$APP/Contents/MacOS/eja-runtime" >/dev/null 2>&1 || true
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 echo "built $APP"

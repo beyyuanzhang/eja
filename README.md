@@ -70,10 +70,14 @@ Constitution:
 `app/macos` is the native SwiftUI interface for continuous conversation with
 EJA. It has one surface, **talk**: either the return screen of open loops or one
 active encounter. There is no new-chat or session control. Build it with
-`app/macos/build.sh` and open `app/macos/dist/Eja.app`.
+`app/macos/build.sh` and open `app/macos/dist/Eja.app`; drag the app into
+Applications to install it.
 
-The HTTP runtime is part of the `eja` executable and stays separate from the
-app:
+The app bundles the `eja` runtime and starts it when no runtime is already
+answering at the configured address. Closing the window leaves the app in the
+menu bar; quitting the app stops only a runtime that the app started. The
+runtime remains a separate process with the same HTTP API, so other frontends
+can use it independently. To run a runtime yourself instead:
 
 ```sh
 cargo run -- serve --dir .eja --project .
