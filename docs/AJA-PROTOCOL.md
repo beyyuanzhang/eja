@@ -71,7 +71,8 @@ A continuation uses a new aja id and a single explicit predecessor.
 
 Native execution runs in one reserved environment per aja. With one slot that environment is
 the shared project, so runs are serial; with more slots each run gets its own
-Git worktree and the host records reports in dispatch order. Host cancellation and
+Git worktree and each run's report is committed and witnessed as soon as it completes, so
+reports appear in completion order rather than dispatch order. Host cancellation and
 deadlines propagate through model requests and tool calls. The host kills/reaps the aja,
 joins its IPC reader and revokes its run before publishing the frozen record.
 Waiting for EJA judgment retains no AJA process. All cleanup and checkpoint

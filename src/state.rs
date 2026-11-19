@@ -65,6 +65,9 @@ pub struct State {
     /// Proposals the user declined; the fact lives in the journal, the fold
     /// only needs the ids.
     denials: Vec<u64>,
+    /// Turns with a user presence fact. This is the one derivation used by both
+    /// the model view and the API's spoken history.
+    present_turns: HashSet<u64>,
     /// The highest task id this log has allocated, decodable or not.
     last_task_id: TaskId,
 }
@@ -197,6 +200,13 @@ impl State {
             .collect()
     }
 
+    /// Whether the user was present in one turn. EJA's own automatic approval is
+    /// not presence; a host approval carrying the user's answer is.
+    #[must_use]
+    pub fn present(&self, turn: u64) -> bool {
+        self.present_turns.contains(&turn)
+    }
+
     /// Actions this turn that the host could not carry out, from EJA's own words.
     ///
     /// A turn's facts are the journal's tail, so the scan stops at its first
@@ -209,7 +219,7 @@ impl State {
             .iter()
             .rev()
             .take_while(|event| event.turn == turn)
-            .filter(|event| event.kind == Kind::Refused)
+            .filter(|event| matches!(event.kind, Kind::Refused | Kind::Failure))
             .map(|event| event.text.as_str())
             .collect()
     }
@@ -368,6 +378,7 @@ impl State {
                 .filter(|event| event.turn < history_before)
                 .rev()
                 .collect(),
+            present_turns: &self.present_turns,
             goal: self.goal(),
             notes: self.notes(),
             identity: self.identity(),
@@ -392,6 +403,16 @@ impl State {
 
     fn apply(&mut self, event: &Event) {
         let index = self.events.len();
+        let host_approval = event.kind == Kind::Approval
+            && event
+                .data
+                .as_ref()
+                .and_then(|data| data.get("source"))
+                .and_then(serde_json::Value::as_str)
+                != Some("eja");
+        if matches!(event.kind, Kind::User | Kind::Returned | Kind::Denial) || host_approval {
+            self.present_turns.insert(event.turn);
+        }
         if let Some(id) = task_id_in_scope(&event.scope) {
             self.last_task_id = self.last_task_id.max(id);
             if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
@@ -451,7 +472,6 @@ impl State {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
                     task.status = TaskStatus::Running;
                     task.assigned_at = Some(event.at);
-                    task.assignment.clone_from(&event.data);
                 }
             }
             Kind::WorkerReport => {
@@ -461,7 +481,6 @@ impl State {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
                     let run = task.run.get_or_insert_with(Run::default);
                     run.digest = Some(event.text.clone());
-                    run.digest_at = Some(event.at);
                     task.reported_at = Some(event.at);
                     task.status = TaskStatus::Waiting;
                 }
@@ -520,6 +539,7 @@ impl State {
             Kind::User
             | Kind::Eja
             | Kind::Refused
+            | Kind::Failure
             | Kind::Returned
             | Kind::Departed
             | Kind::Alone => {}
@@ -527,9 +547,18 @@ impl State {
     }
 
     fn resolve(&mut self, event: &Event) {
-        if let Some(id) = proposal_of(event) {
-            self.proposals.retain(|proposal| proposal.id != id);
+        let Some(data) = event.data.as_ref() else {
+            return;
+        };
+        let primary = data.get("proposal_id").and_then(serde_json::Value::as_u64);
+        let correction = data
+            .get("correction_proposal_id")
+            .and_then(serde_json::Value::as_u64);
+        if primary.is_none() && correction.is_none() {
+            return;
         }
+        self.proposals
+            .retain(|proposal| Some(proposal.id) != primary && Some(proposal.id) != correction);
     }
 
     fn opened(&mut self, event: &Event) {
@@ -554,7 +583,6 @@ impl State {
             closed_at: None,
             close: None,
             event_ids: vec![event.id],
-            assignment: None,
             // Only a task that executes carries a run; a group never does.
             run: (open.kind == TaskKind::Aja).then(|| Run::opened(open.evidence)),
         };

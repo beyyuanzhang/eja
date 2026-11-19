@@ -509,7 +509,10 @@ impl GitWorktrees {
 
     /// A grant inside this git project belongs to it; a foreign root does not.
     fn owns(&self, root: Option<&Path>) -> bool {
-        root.is_none_or(|root| root.starts_with(&self.project) || root == self.granted)
+        root.is_none_or(|root| {
+            let root = canonical_boundary(root);
+            root.starts_with(&self.project) || root == self.granted
+        })
     }
 
     /// One branch per (state directory, task). Two instances that share a

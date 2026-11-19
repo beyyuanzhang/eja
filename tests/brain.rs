@@ -105,7 +105,7 @@ fn openai_adapter_sends_rendered_context_and_parses_a_decision() {
     });
 
     let brain = OpenAiBrain::new(format!("http://127.0.0.1:{port}"), "test-key", "test-model");
-    let decision = brain.decide(&context, &control());
+    let decision = brain.decide(&context, &control()).expect("decision");
     assert_eq!(decision.reply, "recorded");
     assert_eq!(
         decision.actions,

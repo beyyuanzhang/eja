@@ -143,11 +143,11 @@ fn a_situation_opens_a_turn_and_silence_is_whole() {
 }
 
 #[test]
-fn a_situation_carries_the_users_words_without_fabricating_them() {
+fn a_situation_with_text_is_refused_before_any_business_write() {
     let fixture = Fixture::new("situation-with-words");
     let store = fixture.store();
     let brain = Script::new(vec![decision(vec![])]);
-    eja::turn_at_with_options(
+    let error = eja::turn_at_with_options(
         &store,
         "hello",
         &brain,
@@ -159,13 +159,9 @@ fn a_situation_carries_the_users_words_without_fabricating_them() {
             ..Default::default()
         },
     )
-    .expect("situation with words");
-    let events = store.events().expect("events");
-    assert!(
-        events.iter().all(|event| event.kind != Kind::User),
-        "the caller's words beside a situation are not the user's speech"
-    );
-    assert!(events.iter().any(|event| event.kind == Kind::Returned));
+    .expect_err("a situation cannot also carry text");
+    assert!(error.to_string().contains("own turn input"), "{error}");
+    assert!(store.events().expect("events").is_empty());
 }
 
 #[test]
@@ -680,4 +676,153 @@ fn a_correction_asks_nothing_and_withdraws_on_the_next_turn() {
                 .and_then(serde_json::Value::as_u64)
                 == Some(question_id)
     }));
+}
+
+#[test]
+fn withdrawing_a_pending_question_is_one_atomic_fact_across_every_prefix() {
+    let fixture = Fixture::new("correction-prefix-pending");
+    let store = fixture.store();
+    let proposed = turn_at(
+        &store,
+        "call me mars",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "the user is mars".to_string(),
+        }])],
+    );
+    let question = proposed.context().proposals[0].id;
+    let withdrawn = turn_at(
+        &store,
+        "never mind",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Correction,
+            target_id: Some(question),
+            text: "the user declined".to_string(),
+        }])],
+    );
+    let correction = withdrawn
+        .context()
+        .proposals
+        .iter()
+        .find(|proposal| proposal.kind == ProposalKind::Correction)
+        .expect("correction")
+        .id;
+    turn_at(
+        &store,
+        "withdraw it",
+        vec![decision(vec![Action::Confirm {
+            proposal_id: correction,
+        }])],
+    );
+
+    let events = store.events().unwrap();
+    let correction_appeared = events
+        .iter()
+        .position(|event| event.id == correction)
+        .expect("correction proposal");
+    let rejection = events
+        .iter()
+        .find(|event| {
+            event.kind == Kind::ProposalRejected
+                && event
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("correction_proposal_id"))
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(correction)
+        })
+        .expect("one withdrawal fact");
+    assert_eq!(
+        rejection
+            .data
+            .as_ref()
+            .and_then(|data| data.get("proposal_id"))
+            .and_then(serde_json::Value::as_u64),
+        Some(question)
+    );
+    for end in correction_appeared + 1..=events.len() {
+        let state = eja::State::fold(events[..end].to_vec());
+        let question_open = state.proposals().iter().any(|p| p.id == question);
+        let correction_open = state.proposals().iter().any(|p| p.id == correction);
+        assert_eq!(
+            question_open, correction_open,
+            "no durable prefix may leave only one side of the withdrawal open"
+        );
+    }
+}
+
+#[test]
+fn withdrawing_an_existing_fact_adds_no_second_confirmation() {
+    let fixture = Fixture::new("correction-prefix-existing");
+    let store = fixture.store();
+    let proposed = turn_at(
+        &store,
+        "remember this",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Commitment,
+            target_id: None,
+            text: "the user values the record".to_string(),
+        }])],
+    );
+    let proposal = proposed.context().proposals[0].id;
+    let confirmed = approved(
+        &store,
+        "yes",
+        vec![decision(vec![Action::Confirm {
+            proposal_id: proposal,
+        }])],
+        vec![proposal],
+    );
+    let target = confirmed.context().commitments[0].id;
+    let withdrawn = turn_at(
+        &store,
+        "take it back",
+        vec![decision(vec![Action::Propose {
+            kind: ProposalKind::Correction,
+            target_id: Some(target),
+            text: "the user withdrew it".to_string(),
+        }])],
+    );
+    let correction = withdrawn
+        .context()
+        .proposals
+        .iter()
+        .find(|pending| pending.kind == ProposalKind::Correction)
+        .expect("correction")
+        .id;
+    turn_at(
+        &store,
+        "confirm the withdrawal",
+        vec![decision(vec![Action::Confirm {
+            proposal_id: correction,
+        }])],
+    );
+
+    let events = store.events().unwrap();
+    assert!(
+        !events.iter().any(|event| {
+            event.kind == Kind::ProposalConfirmed
+                && event
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("proposal_id"))
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(correction)
+        }),
+        "the correction fact already withdraws; a second confirmation is redundant"
+    );
+    let correction_appeared = events
+        .iter()
+        .position(|event| event.id == correction)
+        .unwrap();
+    for end in correction_appeared + 1..=events.len() {
+        let state = eja::State::fold(events[..end].to_vec());
+        let target_open = state.commitments().iter().any(|event| event.id == target);
+        let correction_open = state.proposals().iter().any(|p| p.id == correction);
+        assert!(
+            target_open || !correction_open,
+            "no durable prefix may close the target while its correction still asks"
+        );
+    }
 }

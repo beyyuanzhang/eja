@@ -87,6 +87,9 @@ depends_on needs its target done, continues has exactly one predecessor with a \
 frozen record, and part_of targets an open group. A group can be closed after its \
 children settle; judge its own acceptance contract, not its children's verdicts. \
 An aja opened with evidence asks the host for the observation its judgment needs; \
+evidence is either a host call bound to that task's workspace, \
+{\"tool\":\"<host tool>\",\"arguments\":{}}, or the task's frozen run output, \
+{\"source\":\"record\",\"path\":\"<path inside the run>\"}; \
 without the host's observation an acceptance is undecidable, not failed, and a \
 rejection needs no evidence. A run that left an isolated environment can be reconciled \
 explicitly; the outcome, conflicts included, is recorded evidence. \
@@ -105,8 +108,9 @@ that turn's INPUT names the label and carries the exact value. Use choices only 
 when several real candidates fit; otherwise act directly or ask in ordinary prose. \
 Choices are an optional shortcut, never a required answer: the user may always \
 reply in their own words. The recorded choices remain visible in later context. \
-Dispatches in one decision run in action order; the host may run them at once when \
-it has isolated environments. A continuation is a new task related to the previous one \
+Dispatches in one decision are validated and reserved in action order; the host may \
+run them at once when it has isolated environments, and each report is committed \
+when that run completes. A continuation is a new task related to the previous one \
 with {\"op\":\"relate\",\"from\":NEW,\"to\":OLD,\"kind\":\"continues\"}. \
 Action shapes: \
 {\"op\":\"propose\",\"kind\":\"goal|commitment|correction\",\"target_id\":1,\"text\":\"...\"}; \
@@ -394,7 +398,8 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             if let Some(digest) = &run.digest {
                 lines.push(format!(
                     "  aja record at: {}",
-                    run.digest_at.map_or_else(|| "-".to_string(), format_utc)
+                    task.reported_at
+                        .map_or_else(|| "-".to_string(), format_utc)
                 ));
                 for line in digest.lines() {
                     lines.push(format!("  record: {line}"));
@@ -522,23 +527,9 @@ pub fn render_context_within(context: &EjaContext, budget: usize) -> String {
             .history
             .iter()
             .map(|event| {
-                // Presence decides where a reply lands: a turn the user spoke
-                // in, returned in, or answered a proposal in is addressed to
-                // them; a turn they are absent from is inner monologue.
-                let present = context.history.iter().any(|other| {
-                    other.turn == event.turn
-                        && matches!(
-                            other.kind,
-                            Kind::User | Kind::Returned | Kind::Approval | Kind::Denial
-                        )
-                        && (other.kind != Kind::Approval
-                            || other
-                                .data
-                                .as_ref()
-                                .and_then(|data| data.get("source"))
-                                .and_then(serde_json::Value::as_str)
-                                != Some("eja"))
-                });
+                // Presence is a fold result, not a second inference in the
+                // renderer and the HTTP view.
+                let present = context.present_turns.contains(&event.turn);
                 let tag = if event.kind == Kind::Eja && !present {
                     "monologue".to_string()
                 } else {
@@ -864,7 +855,7 @@ impl OpenAiBrain {
 }
 
 impl Brain for OpenAiBrain {
-    fn decide(&self, context: &EjaContext, parent: &Control) -> Decision {
+    fn decide(&self, context: &EjaContext, parent: &Control) -> crate::Result<Decision> {
         let system = if self.capability_description.is_empty() {
             std::borrow::Cow::Borrowed(SYSTEM_PROMPT)
         } else {
@@ -875,28 +866,24 @@ impl Brain for OpenAiBrain {
             json!({"role":"user","content":render_context_within(context, self.context_budget)}),
         ];
         let control = parent.child(DECIDE_TIMEOUT);
-        match self.model.complete(
-            &messages,
-            &[],
-            &crate::aja::Limits {
-                response_bytes: crate::aja::FRAME_LIMIT,
-                ..Default::default()
-            },
-            &control,
-            true,
-        ) {
-            Ok(value) => parse_decision(
-                value
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-            ),
-            Err(error) => Decision {
-                reply: format!("[EJA model error] {error}"),
-                choices: vec![],
-                actions: vec![],
-                refused: Vec::new(),
-            },
-        }
+        let value = self
+            .model
+            .complete(
+                &messages,
+                &[],
+                &crate::aja::Limits {
+                    response_bytes: crate::aja::FRAME_LIMIT,
+                    ..Default::default()
+                },
+                &control,
+                true,
+            )
+            .map_err(|error| format!("EJA model call failed: {error}"))?;
+        Ok(parse_decision(
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        ))
     }
 }

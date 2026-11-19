@@ -7,9 +7,9 @@ use crate::domain::{ProposalData, TaskOpen};
 use crate::state::task_scope;
 use crate::{
     now_utc, Action, Assignment, Brain, Choice, ChoiceSelection, CloseOutcome, Control,
-    ControlError, Edge, EjaContext, EventMeta, Host, Kind, Observation, ObservationKind,
-    ProposalKind, RelationKind, Result, Selector, State, Store, Task, TaskId, TaskKind, TaskStatus,
-    TurnEnd, TurnOptions, Worker, WorkspaceGrant,
+    ControlError, Edge, EjaContext, EventMeta, Host, JournalLease, Kind, Observation,
+    ObservationKind, ProposalKind, RelationKind, Result, Selector, State, Store, Task, TaskId,
+    TaskKind, TaskStatus, TurnEnd, TurnOptions, WitnessContext, Worker, WorkspaceGrant,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -63,13 +63,13 @@ struct Progress {
 
 /// What one decision produced.
 ///
-/// `committed` follows the state machine's own rule about which actions continue
-/// a turn; `informed` is the finer question the fixpoint needs: did they change
-/// anything the projection states? A look that repeats the observation it would
-/// replace committed a fact and added no information.
+/// `changed` records a fact the next projection must see; `informed` is the
+/// finer fixpoint question: did any fact change what the projection states?
+/// Naming the former this way keeps it from reading as "any write needs another
+/// model call".
 #[derive(Debug, Default, Clone, Copy)]
 struct Effect {
-    committed: bool,
+    changed: bool,
     told: bool,
     informed: bool,
 }
@@ -77,7 +77,7 @@ struct Effect {
 impl Effect {
     /// An action whose fact the projection states.
     const fn fact(&mut self) {
-        self.committed = true;
+        self.changed = true;
         self.informed = true;
     }
 
@@ -87,8 +87,8 @@ impl Effect {
         self.informed |= told;
     }
 
-    const fn acted(self) -> bool {
-        self.committed || self.told
+    const fn needs_next_decision(self) -> bool {
+        self.changed || self.told
     }
 }
 
@@ -255,22 +255,26 @@ fn confirm_proposal(
             .iter()
             .any(|pending| pending.id == target);
         if target_is_proposal {
-            let note = reject_proposal(store, state, target, &reason, turn, at)?;
-            if note.is_none() {
-                commit(
-                    store,
-                    state,
-                    Kind::ProposalRejected,
-                    "eja",
-                    "",
-                    turn,
-                    EventMeta::data(
-                        at,
-                        serde_json::json!({"proposal_id": proposal_id, "note": reason}),
-                    ),
-                )?;
-            }
-            return Ok(note);
+            // Withdrawing a pending question resolves two ids: the question and
+            // the correction that withdrew it. One fact carries both, so no
+            // durable prefix can leave only one of them pending.
+            commit(
+                store,
+                state,
+                Kind::ProposalRejected,
+                "eja",
+                "",
+                turn,
+                EventMeta::data(
+                    at,
+                    serde_json::json!({
+                        "proposal_id": target,
+                        "correction_proposal_id": proposal_id,
+                        "note": reason,
+                    }),
+                ),
+            )?;
+            return Ok(None);
         }
         commit(
             store,
@@ -284,15 +288,6 @@ fn confirm_proposal(
                 closes: Some(target),
                 data: Some(serde_json::json!({"proposal_id": proposal_id})),
             },
-        )?;
-        commit(
-            store,
-            state,
-            Kind::ProposalConfirmed,
-            "eja",
-            "",
-            turn,
-            EventMeta::data(at, serde_json::json!({"proposal_id": proposal_id})),
         )?;
         return Ok(None);
     }
@@ -550,6 +545,13 @@ fn reserve_dispatch(
             "dispatch refused: continuation needs a completed aja record".into(),
         ));
     }
+    if let Some(id) = resume {
+        if let Err(error) = ctx.host.continuation_ready(id, ctx.control) {
+            return Ok(Err(format!(
+                "dispatch refused: predecessor {id} has no readable frozen record: {error}"
+            )));
+        }
+    }
     let assignment = Assignment {
         task_id: task.id,
         objective: task.request.clone(),
@@ -591,9 +593,9 @@ fn record_dispatch(
     Ok(())
 }
 
-/// One execution owner per environment. Reports are recorded in dispatch order, so the
-/// journal never depends on thread timing; with more than one slot the environments run
-/// at once, and each completed run leaves its evidence before the next report.
+/// One execution owner per environment. Executions may run at once, but each
+/// completed run is reported and witnessed immediately. A slower sibling cannot
+/// leave an already-finished run looking `Running` if the host exits.
 fn run_dispatches(
     ctx: &ActionCtx<'_>,
     state: &mut State,
@@ -614,6 +616,7 @@ fn run_dispatches(
         return Ok(());
     }
     let started = Instant::now();
+    let expected = pending.len();
     let worker = ctx.worker;
     let control = ctx.control.clone();
     let queue = std::sync::Mutex::new(
@@ -622,36 +625,39 @@ fn run_dispatches(
             .enumerate()
             .collect::<std::collections::VecDeque<_>>(),
     );
-    let results = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let result = std::thread::scope(|scope| -> Result<()> {
         for _ in 0..slots {
             let queue = &queue;
-            let results = &results;
             let control = &control;
+            let sender = sender.clone();
             scope.spawn(move || loop {
                 let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
                 let Some((index, assignment)) = next else {
                     break;
                 };
                 let digest = run_one(worker, &assignment, control);
-                if let Ok(mut results) = results.lock() {
-                    results.push((index, assignment, digest));
+                if sender.send((index, assignment, digest)).is_err() {
+                    break;
                 }
             });
         }
+        drop(sender);
+        let mut completions = 0;
+        for (_index, assignment, digest) in receiver {
+            completions += 1;
+            ctx.control.check()?;
+            let task_id = assignment.task_id;
+            record_dispatch(ctx, state, progress, &assignment, &digest)?;
+            observe_evidence(ctx, state, task_id)?;
+        }
+        if completions != expected {
+            return Err("dispatch results are unavailable".into());
+        }
+        Ok(())
     });
     progress.worker_ms += started.elapsed().as_millis();
-    let mut collected = results
-        .into_inner()
-        .map_err(|_| "dispatch results are unavailable")?;
-    collected.sort_by_key(|(index, _, _)| *index);
-    for (_, assignment, digest) in collected {
-        ctx.control.check()?;
-        let task_id = assignment.task_id;
-        record_dispatch(ctx, state, progress, &assignment, &digest)?;
-        observe_evidence(ctx, state, task_id)?;
-    }
-    Ok(())
+    result
 }
 
 fn run_one(worker: &dyn Worker, assignment: &Assignment, control: &Control) -> String {
@@ -676,18 +682,69 @@ fn observe_evidence(ctx: &ActionCtx<'_>, state: &mut State, task_id: TaskId) -> 
         if task.evidence_id().is_some() {
             return Ok(());
         }
-        let target = request["tool"].as_str().unwrap_or("witness");
-        let (result, error) = match ctx.host.witness(request, ctx.control) {
-            Ok(result) => (result, None),
-            Err(error) => (serde_json::Value::Null, Some(error.to_string())),
+        let source = request
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("workspace");
+        let (target, arguments, result, error) = match source {
+            "record" => {
+                let Some(path) = request.get("path").and_then(Value::as_str) else {
+                    return Ok(());
+                };
+                let target = format!("record:{task_id}/{path}");
+                let arguments = serde_json::json!({"path": path});
+                let error = if ctx.host.continuation_ready(task_id, ctx.control).is_err() {
+                    Some("the task left no readable frozen record; reconcile it or witness the current workspace explicitly".to_string())
+                } else {
+                    None
+                };
+                let (result, error) = error.map_or_else(
+                    || match ctx.host.look(
+                        &target,
+                        &arguments,
+                        &Selector::Whole,
+                        state.events(),
+                        ctx.control,
+                    ) {
+                        Ok(result) => (result, None),
+                        Err(error) => (Value::Null, Some(error.to_string())),
+                    },
+                    |error| (Value::Null, Some(error)),
+                );
+                (target, arguments, result, error)
+            }
+            "workspace" => {
+                let target = request["tool"].as_str().unwrap_or("witness").to_string();
+                let witness = WitnessContext {
+                    task_id,
+                    workspace: task.workspace.as_str(),
+                };
+                let (result, error) = match ctx.host.witness(request, witness, ctx.control) {
+                    Ok(result) => (result, None),
+                    Err(error) => (Value::Null, Some(error.to_string())),
+                };
+                (target, request.clone(), result, error)
+            }
+            other => {
+                let target = "witness";
+                let error =
+                    format!("unknown evidence source {other:?}; use \"workspace\" or \"record\"");
+                (
+                    target.to_string(),
+                    request.clone(),
+                    Value::Null,
+                    Some(error),
+                )
+            }
         };
+        let error = error.as_deref();
         let observation = Observation {
             kind: ObservationKind::Witness,
-            target,
-            arguments: request,
+            target: &target,
+            arguments: &arguments,
             selector: Selector::Whole,
             result: &result,
-            error: error.as_deref(),
+            error,
         };
         serde_json::to_value(&observation)?
     };
@@ -1008,7 +1065,7 @@ fn apply_actions(
                 // Navigating to the task this turn is already about states
                 // nothing new, so it is committed but not informative.
                 effect.informed |= *focus != Some(*task_id);
-                effect.committed = true;
+                effect.changed = true;
                 *focus = Some(*task_id);
             }
             Action::Look {
@@ -1053,7 +1110,7 @@ fn apply_actions(
                         .find(|previous| previous.same_subject(&observation))
                         .is_none_or(|previous| !previous.same_content(&observation))
                 };
-                effect.committed = true;
+                effect.changed = true;
                 commit(
                     ctx.store,
                     state,
@@ -1105,6 +1162,73 @@ fn stop(end: &mut TurnEnd, reason: &mut Option<String>, error: ControlError) {
         ControlError::Deadline => TurnEnd::Budget,
     };
     *reason = Some(error.to_string());
+}
+
+/// Validate combinations that need no journal.
+///
+/// Both the CLI and HTTP call this before they claim a turn or write any fact;
+/// the kernel calls it again under the journal lease, so callers cannot bypass
+/// the contract.
+pub fn validate_turn_input(input: &str, options: &TurnOptions) -> Result<()> {
+    let situation = match options.gesture {
+        None => None,
+        Some(kind @ (Kind::Returned | Kind::Departed | Kind::Alone)) => Some(kind),
+        Some(_) => return Err("gesture names an unknown situation".into()),
+    };
+    if options.approvals.contains(&0) || options.denials.contains(&0) {
+        return Err("proposal ids must be positive".into());
+    }
+    if options
+        .approvals
+        .iter()
+        .any(|id| options.denials.contains(id))
+    {
+        return Err("a proposal cannot be approved and denied in one turn".into());
+    }
+    if options.focus == Some(0) {
+        return Err("focus must be a positive task id".into());
+    }
+    if let Some(kind) = situation {
+        if !input.trim().is_empty() {
+            return Err(format!(
+                "a {} situation is its own turn input and carries no text",
+                kind.as_str()
+            )
+            .into());
+        }
+        if options.focus.is_some() {
+            return Err("a situation carries no focus".into());
+        }
+        if options.selection.is_some() {
+            return Err("a situation carries no choice answer".into());
+        }
+        if !options.approvals.is_empty() {
+            return Err("a situation carries no approvals".into());
+        }
+        if !options.denials.is_empty() {
+            return Err("a situation carries no denials".into());
+        }
+    }
+    if options.selection.is_some() {
+        if !input.trim().is_empty() {
+            return Err("a choice answer is its own turn input".into());
+        }
+        if options.focus.is_some() {
+            return Err("a choice answer carries no focus".into());
+        }
+        if !options.approvals.is_empty() || !options.denials.is_empty() {
+            return Err("a choice answer carries no approval or denial".into());
+        }
+    }
+    if input.trim().is_empty()
+        && options.selection.is_none()
+        && options.approvals.is_empty()
+        && options.denials.is_empty()
+        && situation.is_none()
+    {
+        return Err("a turn needs text, a choice, an approval, a denial or a situation".into());
+    }
+    Ok(())
 }
 
 struct Answer {
@@ -1163,6 +1287,337 @@ fn resolve_selection(state: &State, selection: ChoiceSelection) -> Result<Answer
     })
 }
 
+/// One turn's inputs. The owned lease variant lets a host check a condition and
+/// decide under the same lease instead of taking it a second time.
+pub struct TurnRun<'a, 'i> {
+    pub store: &'a Store,
+    pub input: &'i str,
+    pub brain: &'a dyn Brain,
+    pub worker: &'a dyn Worker,
+    pub host: &'a dyn Host,
+    pub now: DateTime<Utc>,
+    pub options: &'a TurnOptions,
+}
+
+impl<'i> TurnRun<'_, 'i> {
+    pub fn execute(self) -> Result<TurnOutcome<'i>> {
+        let lease = self.store.lock_turn()?;
+        self.execute_under_lease(&lease)
+    }
+
+    pub fn execute_under_lease(self, _journal_lease: &JournalLease) -> Result<TurnOutcome<'i>> {
+        let TurnRun {
+            store,
+            input,
+            brain,
+            worker,
+            host,
+            now,
+            options,
+        } = self;
+        validate_turn_input(input, options)?;
+        options.limits.validate()?;
+        let control = Control::new(
+            Duration::from_millis(options.limits.timeout_ms),
+            options.cancelled.clone(),
+        );
+        let at = now.timestamp();
+        let turn_no = store.next_turn()?;
+        // One read of the journal, then every commit updates the same fold: an
+        // action is validated against the state it will produce, never a re-scan.
+        let mut state = State::load(store)?;
+        if options.focus.is_some_and(|id| !state.knows(id)) {
+            return Err("focus names an unknown task".into());
+        }
+        let situation = options.gesture;
+        let answer = options
+            .selection
+            .map(|selection| resolve_selection(&state, selection))
+            .transpose()?;
+        // Recovery is a business write. Only a fully valid input may reach it.
+        recover_state(store, &mut state, turn_no, at)?;
+        if situation.is_none() {
+            if let Some(answer) = &answer {
+                commit(
+                    store,
+                    &mut state,
+                    Kind::User,
+                    "eja",
+                    &answer.label,
+                    turn_no,
+                    EventMeta::data(at, answer.data.clone()),
+                )?;
+            } else if !input.trim().is_empty() {
+                commit(
+                    store,
+                    &mut state,
+                    Kind::User,
+                    "eja",
+                    input,
+                    turn_no,
+                    EventMeta::new(at),
+                )?;
+            }
+        }
+        if let Some(kind) = situation {
+            commit(
+                store,
+                &mut state,
+                kind,
+                "eja",
+                "",
+                turn_no,
+                EventMeta::new(at),
+            )?;
+        }
+        let input: std::borrow::Cow<'i, str> = if situation.is_some() {
+            match situation {
+                Some(Kind::Returned) => "user returned".into(),
+                Some(Kind::Departed) => "user departed".into(),
+                Some(Kind::Alone) => "alone; time passes".into(),
+                _ => "".into(),
+            }
+        } else if let Some(answer) = &answer {
+            answer.input.clone().into()
+        } else if input.trim().is_empty()
+            && (!options.approvals.is_empty() || !options.denials.is_empty())
+        {
+            // The user's answer is this turn's input: a fact, not invented words.
+            let mut parts = Vec::new();
+            if !options.approvals.is_empty() {
+                parts.push(format!(
+                    "user approved proposal(s) {}",
+                    options
+                        .approvals
+                        .iter()
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !options.denials.is_empty() {
+                parts.push(format!(
+                    "user denied proposal(s) {}",
+                    options
+                        .denials
+                        .iter()
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            parts.join("; ").into()
+        } else {
+            input.into()
+        };
+        // An approval is a fact, not a caller's flag: it is recorded once, with the
+        // turn it authorizes, and every later read comes from the journal.
+        for proposal_id in &options.approvals {
+            approve(store, &mut state, *proposal_id, turn_no, at, "user")?;
+        }
+        // A denial is the user's answer, recorded like an approval: the proposal
+        // stays pending until EJA itself withdraws or re-asks.
+        for proposal_id in &options.denials {
+            commit(
+                store,
+                &mut state,
+                Kind::Denial,
+                "eja",
+                "",
+                turn_no,
+                EventMeta::data(
+                    at,
+                    serde_json::json!({"proposal_id": proposal_id, "source": "host"}),
+                ),
+            )?;
+        }
+
+        let active: Vec<&Task> = state
+            .tasks()
+            .iter()
+            .filter(|task| task.status.is_active())
+            .collect();
+        let mut focus = options.focus.or_else(|| {
+            if situation.is_none() && active.len() == 1 && active[0].status == TaskStatus::Waiting {
+                Some(active[0].id)
+            } else {
+                None
+            }
+        });
+        let ctx = ActionCtx {
+            store,
+            input: &input,
+            turn: turn_no,
+            at,
+            worker,
+            host,
+            control: &control,
+            options,
+        };
+        let mut progress = Progress::default();
+        let mut reply = String::new();
+        let mut choices = Vec::new();
+        let mut end = TurnEnd::Complete;
+        let mut reason: Option<String> = None;
+        let mut actions_used = 0usize;
+        loop {
+            if let Err(error) = control.check() {
+                stop(&mut end, &mut reason, error);
+                break;
+            }
+            if progress.decisions >= options.limits.decisions {
+                end = TurnEnd::Budget;
+                reason = Some("turn decision budget exhausted".into());
+                break;
+            }
+            progress.decisions += 1;
+            // The projection is a borrow of the fold, so it lives exactly as long as
+            // this decision: the actions that follow commit facts, which needs the
+            // fold mutably.
+            let decision = {
+                let context =
+                    state.project_with_workspaces(&input, focus, now, &options.workspaces);
+                match brain.decide(&context, &control) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        end = TurnEnd::Failed;
+                        reason = Some(format!("model transport failed: {error}"));
+                        break;
+                    }
+                }
+            };
+            if let Err(error) = control.check() {
+                stop(&mut end, &mut reason, error);
+                break;
+            }
+            if decision.actions.len() > options.limits.actions.saturating_sub(actions_used) {
+                end = TurnEnd::Budget;
+                reason = Some("turn action budget exhausted".into());
+                break;
+            }
+            let dispatches = decision
+                .actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        Action::Dispatch { .. } | Action::OpenTask { run: true, .. }
+                    )
+                })
+                .count();
+            if dispatches
+                > options
+                    .limits
+                    .dispatches
+                    .saturating_sub(progress.dispatched.len())
+            {
+                end = TurnEnd::Budget;
+                reason = Some("turn dispatch budget exhausted".into());
+                break;
+            }
+            actions_used += decision.actions.len();
+            for note in &decision.refused {
+                refuse(store, &mut state, &ctx, note)?;
+            }
+            let effect = match apply_actions(
+                &decision.actions,
+                &ctx,
+                &mut state,
+                &mut progress,
+                &mut focus,
+            ) {
+                Ok(effect) => effect,
+                Err(error) => {
+                    if let Err(stopped) = control.check() {
+                        stop(&mut end, &mut reason, stopped);
+                        break;
+                    }
+                    return Err(error);
+                }
+            };
+            // A decision that committed nothing is a final reply. One that committed
+            // facts but states nothing new is the turn's fixpoint: the kernel knows
+            // that from what each action produced, without keeping a second copy of
+            // the projection to compare against.
+            if !effect.needs_next_decision() {
+                reply = decision.reply.trim().to_string();
+                choices = decision.choices;
+                break;
+            }
+            if !effect.informed {
+                end = TurnEnd::Stalled;
+                break;
+            }
+        }
+        if end == TurnEnd::Failed {
+            reply.clear();
+            choices.clear();
+            commit(
+                store,
+                &mut state,
+                Kind::Failure,
+                "eja",
+                reason.as_deref().unwrap_or("model transport failed"),
+                turn_no,
+                EventMeta::new(at),
+            )?;
+            return Ok(TurnOutcome {
+                reply,
+                dispatched: progress.dispatched,
+                decisions: progress.decisions,
+                worker_ms: progress.worker_ms,
+                end,
+                reason,
+                state,
+                input,
+                focus,
+                now,
+                workspaces: options.workspaces.clone(),
+            });
+        }
+        let mut meta = EventMeta::new(at);
+        if end != TurnEnd::Complete {
+            reply = format!(
+                "[turn {:?}] {}",
+                end,
+                reason.as_deref().unwrap_or("projection repeated")
+            );
+            choices.clear();
+            meta.data = Some(serde_json::json!({"end": end, "reason": reason}));
+        }
+        recover_state(store, &mut state, turn_no, at)?;
+        // A turn that asks the user a question delivers the question, not a reply:
+        // the answer comes first, and EJA speaks to it in the turn the answer opens.
+        // The model's text for this turn stays its monologue. A correction the host
+        // approved itself asks nothing, so it does not silence the turn.
+        let fresh_question = state
+            .pending_proposals(turn_no)
+            .iter()
+            .any(|proposal| proposal.turn == turn_no && !proposal.approved);
+        if fresh_question && end == TurnEnd::Complete {
+            reply = String::new();
+            choices.clear();
+        }
+        if !choices.is_empty() {
+            meta.data = Some(serde_json::json!({"choices": choices}));
+        }
+        commit(store, &mut state, Kind::Eja, "eja", &reply, turn_no, meta)?;
+        Ok(TurnOutcome {
+            reply,
+            dispatched: progress.dispatched,
+            decisions: progress.decisions,
+            worker_ms: progress.worker_ms,
+            end,
+            reason,
+            state,
+            input,
+            focus,
+            now,
+            workspaces: options.workspaces.clone(),
+        })
+    }
+}
+
 pub fn turn_at_with_options<'i>(
     store: &Store,
     input: &'i str,
@@ -1172,298 +1627,14 @@ pub fn turn_at_with_options<'i>(
     now: DateTime<Utc>,
     options: &TurnOptions,
 ) -> Result<TurnOutcome<'i>> {
-    let _journal_lease = store.lock_turn()?;
-    options.limits.validate()?;
-    let control = Control::new(
-        Duration::from_millis(options.limits.timeout_ms),
-        options.cancelled.clone(),
-    );
-    let at = now.timestamp();
-    let turn_no = store.next_turn()?;
-    // One read of the journal, then every commit updates the same fold: an
-    // action is validated against the state it will produce, never a re-scan.
-    let mut state = State::load(store)?;
-    recover_state(store, &mut state, turn_no, at)?;
-    if options.focus.is_some_and(|id| !state.knows(id)) {
-        return Err("focus names an unknown task".into());
-    }
-    let situation = match options.gesture {
-        None => None,
-        Some(kind @ (Kind::Returned | Kind::Departed | Kind::Alone)) => Some(kind),
-        Some(_) => return Err("gesture names an unknown situation".into()),
-    };
-    if situation.is_some() && !options.approvals.is_empty() {
-        return Err("a situation carries no approvals".into());
-    }
-    if situation.is_some() && !options.denials.is_empty() {
-        return Err("a situation carries no denials".into());
-    }
-    if situation.is_some() && options.focus.is_some() {
-        return Err("a situation carries no focus".into());
-    }
-    let answer = options
-        .selection
-        .map(|selection| resolve_selection(&state, selection))
-        .transpose()?;
-    if answer.is_some()
-        && (situation.is_some()
-            || !input.trim().is_empty()
-            || !options.approvals.is_empty()
-            || !options.denials.is_empty())
-    {
-        return Err("a choice answer is its own turn input".into());
-    }
-    if input.trim().is_empty()
-        && answer.is_none()
-        && options.approvals.is_empty()
-        && options.denials.is_empty()
-        && situation.is_none()
-    {
-        return Err("a turn needs text, a choice, an approval, a denial or a situation".into());
-    }
-    if situation.is_none() {
-        if let Some(answer) = &answer {
-            commit(
-                store,
-                &mut state,
-                Kind::User,
-                "eja",
-                &answer.label,
-                turn_no,
-                EventMeta::data(at, answer.data.clone()),
-            )?;
-        } else if !input.trim().is_empty() {
-            commit(
-                store,
-                &mut state,
-                Kind::User,
-                "eja",
-                input,
-                turn_no,
-                EventMeta::new(at),
-            )?;
-        }
-    }
-    if let Some(kind) = situation {
-        commit(
-            store,
-            &mut state,
-            kind,
-            "eja",
-            "",
-            turn_no,
-            EventMeta::new(at),
-        )?;
-    }
-    let input: std::borrow::Cow<'i, str> = if situation.is_some() {
-        match situation {
-            Some(Kind::Returned) => "user returned".into(),
-            Some(Kind::Departed) => "user departed".into(),
-            Some(Kind::Alone) => "alone; time passes".into(),
-            _ => "".into(),
-        }
-    } else if let Some(answer) = &answer {
-        answer.input.clone().into()
-    } else if input.trim().is_empty()
-        && (!options.approvals.is_empty() || !options.denials.is_empty())
-    {
-        // The user's answer is this turn's input: a fact, not invented words.
-        let mut parts = Vec::new();
-        if !options.approvals.is_empty() {
-            parts.push(format!(
-                "user approved proposal(s) {}",
-                options
-                    .approvals
-                    .iter()
-                    .map(|id| format!("#{id}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if !options.denials.is_empty() {
-            parts.push(format!(
-                "user denied proposal(s) {}",
-                options
-                    .denials
-                    .iter()
-                    .map(|id| format!("#{id}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        parts.join("; ").into()
-    } else {
-        input.into()
-    };
-    // An approval is a fact, not a caller's flag: it is recorded once, with the
-    // turn it authorizes, and every later read comes from the journal.
-    for proposal_id in &options.approvals {
-        approve(store, &mut state, *proposal_id, turn_no, at, "user")?;
-    }
-    // A denial is the user's answer, recorded like an approval: the proposal
-    // stays pending until EJA itself withdraws or re-asks.
-    for proposal_id in &options.denials {
-        commit(
-            store,
-            &mut state,
-            Kind::Denial,
-            "eja",
-            "",
-            turn_no,
-            EventMeta::data(
-                at,
-                serde_json::json!({"proposal_id": proposal_id, "source": "host"}),
-            ),
-        )?;
-    }
-
-    let active: Vec<&Task> = state
-        .tasks()
-        .iter()
-        .filter(|task| task.status.is_active())
-        .collect();
-    let mut focus = options.focus.or_else(|| {
-        if situation.is_none() && active.len() == 1 && active[0].status == TaskStatus::Waiting {
-            Some(active[0].id)
-        } else {
-            None
-        }
-    });
-    let ctx = ActionCtx {
+    TurnRun {
         store,
-        input: &input,
-        turn: turn_no,
-        at,
+        input,
+        brain,
         worker,
         host,
-        control: &control,
-        options,
-    };
-    let mut progress = Progress::default();
-    let mut reply = String::new();
-    let mut choices = Vec::new();
-    let mut end = TurnEnd::Complete;
-    let mut reason: Option<String> = None;
-    let mut actions_used = 0usize;
-    loop {
-        if let Err(error) = control.check() {
-            stop(&mut end, &mut reason, error);
-            break;
-        }
-        if progress.decisions >= options.limits.decisions {
-            end = TurnEnd::Budget;
-            reason = Some("turn decision budget exhausted".into());
-            break;
-        }
-        progress.decisions += 1;
-        // The projection is a borrow of the fold, so it lives exactly as long as
-        // this decision: the actions that follow commit facts, which needs the
-        // fold mutably.
-        let decision = {
-            let context = state.project_with_workspaces(&input, focus, now, &options.workspaces);
-            brain.decide(&context, &control)
-        };
-        if let Err(error) = control.check() {
-            stop(&mut end, &mut reason, error);
-            break;
-        }
-        if decision.actions.len() > options.limits.actions.saturating_sub(actions_used) {
-            end = TurnEnd::Budget;
-            reason = Some("turn action budget exhausted".into());
-            break;
-        }
-        let dispatches = decision
-            .actions
-            .iter()
-            .filter(|action| {
-                matches!(
-                    action,
-                    Action::Dispatch { .. } | Action::OpenTask { run: true, .. }
-                )
-            })
-            .count();
-        if dispatches
-            > options
-                .limits
-                .dispatches
-                .saturating_sub(progress.dispatched.len())
-        {
-            end = TurnEnd::Budget;
-            reason = Some("turn dispatch budget exhausted".into());
-            break;
-        }
-        actions_used += decision.actions.len();
-        for note in &decision.refused {
-            refuse(store, &mut state, &ctx, note)?;
-        }
-        let effect = match apply_actions(
-            &decision.actions,
-            &ctx,
-            &mut state,
-            &mut progress,
-            &mut focus,
-        ) {
-            Ok(effect) => effect,
-            Err(error) => {
-                if let Err(stopped) = control.check() {
-                    stop(&mut end, &mut reason, stopped);
-                    break;
-                }
-                return Err(error);
-            }
-        };
-        // A decision that committed nothing is a final reply. One that committed
-        // facts but states nothing new is the turn's fixpoint: the kernel knows
-        // that from what each action produced, without keeping a second copy of
-        // the projection to compare against.
-        if !effect.acted() {
-            reply = decision.reply.trim().to_string();
-            choices = decision.choices;
-            break;
-        }
-        if !effect.informed {
-            end = TurnEnd::Stalled;
-            break;
-        }
-    }
-    let mut meta = EventMeta::new(at);
-    if end != TurnEnd::Complete {
-        reply = format!(
-            "[turn {:?}] {}",
-            end,
-            reason.as_deref().unwrap_or("projection repeated")
-        );
-        choices.clear();
-        meta.data = Some(serde_json::json!({"end": end, "reason": reason}));
-    }
-    recover_state(store, &mut state, turn_no, at)?;
-    // A turn that asks the user a question delivers the question, not a reply:
-    // the answer comes first, and EJA speaks to it in the turn the answer opens.
-    // The model's text for this turn stays its monologue. A correction the host
-    // approved itself asks nothing, so it does not silence the turn.
-    let fresh_question = state
-        .pending_proposals(turn_no)
-        .iter()
-        .any(|proposal| proposal.turn == turn_no && !proposal.approved);
-    if fresh_question && end == TurnEnd::Complete {
-        reply = String::new();
-        choices.clear();
-    }
-    if !choices.is_empty() {
-        meta.data = Some(serde_json::json!({"choices": choices}));
-    }
-    commit(store, &mut state, Kind::Eja, "eja", &reply, turn_no, meta)?;
-    Ok(TurnOutcome {
-        reply,
-        dispatched: progress.dispatched,
-        decisions: progress.decisions,
-        worker_ms: progress.worker_ms,
-        end,
-        reason,
-        state,
-        input,
-        focus,
         now,
-        workspaces: options.workspaces.clone(),
-    })
+        options,
+    }
+    .execute()
 }

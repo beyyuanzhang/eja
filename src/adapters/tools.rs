@@ -1,6 +1,10 @@
 //! Host tools. Connectors implement this same boundary; ajas never load plugins.
-use super::{cut_chars, environments::ENTRIES, Capabilities, Control};
-use crate::{aja::FRAME_LIMIT, Result};
+use super::{
+    cut_chars,
+    environments::{canonical_boundary, ENTRIES},
+    Capabilities, Control,
+};
+use crate::{aja::FRAME_LIMIT, Result, WitnessContext};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -81,15 +85,15 @@ impl ToolContext<'_> {
     // A reserved worktree can live beneath the state directory. Protect private
     // state inside a granted workspace while the workspace resolver keeps an
     // isolated run within its own root.
-    fn private_in_workspace(&self) -> Option<&Path> {
-        self.workspace
-            .filter(|workspace| self.private.starts_with(workspace))
-            .map(|_| self.private)
+    fn private_in_workspace(&self) -> Option<PathBuf> {
+        let workspace = canonical_boundary(self.workspace?);
+        let private = canonical_boundary(self.private);
+        private.starts_with(&workspace).then_some(private)
     }
 
     fn is_private(&self, path: &Path) -> bool {
         self.private_in_workspace()
-            .is_some_and(|private| path.starts_with(private))
+            .is_some_and(|private| canonical_boundary(path).starts_with(private))
     }
 }
 
@@ -281,10 +285,28 @@ impl WorkspaceTools {
         }
     }
 
-    fn observed_path(&self, arguments: &Value) -> Result<(PathBuf, &Path)> {
+    fn observed_path(
+        &self,
+        ctx: &ToolContext<'_>,
+        arguments: &Value,
+        witness: bool,
+    ) -> Result<(PathBuf, PathBuf)> {
         let path = arguments["path"].as_str().ok_or("missing path")?;
+        // A witness is bound to the task's fixed workspace. This keeps two
+        // granted roots with the same relative filename from answering for one
+        // another.
+        if let Some(workspace) = ctx.workspace {
+            let full = workspace_path(workspace, path)?;
+            if canonical_boundary(&full).starts_with(canonical_boundary(&self.private)) {
+                return Err("the host's private state is not readable".into());
+            }
+            return Ok((full, workspace.to_path_buf()));
+        }
+        if witness {
+            return Err("a file witness needs the task's fixed workspace".into());
+        }
         let full = granted_path(&self.roots, path)?;
-        if full.starts_with(&self.private) {
+        if canonical_boundary(&full).starts_with(canonical_boundary(&self.private)) {
             return Err("the host's private state is not readable".into());
         }
         let root = if let Some(root) = self
@@ -293,10 +315,10 @@ impl WorkspaceTools {
             .filter(|root| full.starts_with(root))
             .max_by_key(|root| root.components().count())
         {
-            root.as_path()
+            root.clone()
         } else {
             self.workspace
-                .as_deref()
+                .clone()
                 .ok_or("this host assembled no workspace")?
         };
         Ok((full, root))
@@ -338,10 +360,10 @@ impl ToolProvider for WorkspaceTools {
                 "EJA only observes; edits belong to ajas".into()
             });
         }
-        let (full, root) = self.observed_path(arguments)?;
+        let (full, root) = self.observed_path(ctx, arguments, witness)?;
         let context = ToolContext {
             aja_id: ctx.aja_id,
-            workspace: Some(root),
+            workspace: Some(&root),
             private: &self.private,
             control: ctx.control,
         };
@@ -645,19 +667,28 @@ impl Capabilities for ToolRegistry {
         )
     }
 
-    fn witness(&self, request: &Value, control: &Control) -> Result<Value> {
+    fn witness(
+        &self,
+        request: &Value,
+        task: WitnessContext<'_>,
+        control: &Control,
+    ) -> Result<Value> {
         let tool = request["tool"]
             .as_str()
             .filter(|name| !name.is_empty())
             .ok_or("a witness names one host tool")?;
         let empty = json!({});
         let arguments = request.get("arguments").unwrap_or(&empty);
-        self.inspect(
-            tool,
-            arguments,
-            &control.child(Duration::from_secs(120)),
-            true,
-        )
+        let control = control.child(Duration::from_secs(120));
+        let workspace = (!task.workspace.is_empty()).then(|| std::path::Path::new(task.workspace));
+        let context = ToolContext {
+            aja_id: task.task_id,
+            workspace,
+            private: &self.private,
+            control: &control,
+        };
+        self.provider(tool)?
+            .inspect(&context, tool, arguments, true)
     }
 }
 
@@ -667,6 +698,7 @@ fn walk(root: &Path, private: Option<&Path>, control: &Control) -> Result<(Vec<P
     let mut files = Vec::new();
     let mut truncated = false;
     let mut pending = vec![root.to_path_buf()];
+    let private = private.map(canonical_boundary);
     while let Some(dir) = pending.pop() {
         control.check()?;
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -679,7 +711,10 @@ fn walk(root: &Path, private: Option<&Path>, control: &Control) -> Result<(Vec<P
                 break;
             }
             let path = entry.path();
-            if private.is_some_and(|private| path.starts_with(private)) {
+            if private
+                .as_ref()
+                .is_some_and(|private| canonical_boundary(&path).starts_with(private))
+            {
                 continue;
             }
             let Ok(metadata) = path.symlink_metadata() else {
@@ -774,7 +809,8 @@ fn glob(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
     let shown = cut_chars(pattern, PATTERN_CAP);
     let root = search_root(ctx, args)?;
     let workspace = ctx.workspace()?;
-    let (files, mut truncated) = walk(&root, ctx.private_in_workspace(), ctx.control)?;
+    let private = ctx.private_in_workspace();
+    let (files, mut truncated) = walk(&root, private.as_deref(), ctx.control)?;
     let mut matched: Vec<(String, i64)> = Vec::new();
     for file in files {
         let Ok(relative) = file.strip_prefix(workspace) else {
@@ -817,7 +853,8 @@ fn grep(ctx: &ToolContext<'_>, args: &Value) -> Result<Value> {
     let include = args["include"].as_str().filter(|glob| !glob.is_empty());
     let root = search_root(ctx, args)?;
     let workspace = ctx.workspace()?;
-    let (files, mut truncated) = walk(&root, ctx.private_in_workspace(), ctx.control)?;
+    let private = ctx.private_in_workspace();
+    let (files, mut truncated) = walk(&root, private.as_deref(), ctx.control)?;
     let mut matches = Vec::new();
     let mut budget = crate::measure::Budget::new(FRAME_LIMIT);
     budget.admit(256);

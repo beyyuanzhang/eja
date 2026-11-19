@@ -211,7 +211,6 @@ pub struct Effective {
     pub settings: StoredSettings,
     pub connectors: Vec<StoredConnector>,
     pub roles: EffectiveRoles,
-    pub capabilities: CapabilitySettings,
     pub catalog: Vec<CapabilityDescriptor>,
     pub limits: Limits,
 }
@@ -223,18 +222,25 @@ impl Effective {
     }
 
     pub fn mcp_ready(&self) -> bool {
-        self.capabilities.enabled(MCP) && self.connectors.iter().any(|server| server.enabled)
+        self.settings.capabilities.enabled(MCP)
+            && self.connectors.iter().any(|server| server.enabled)
     }
 
     pub fn managed_code_enabled(&self) -> bool {
-        self.capabilities.enabled(capability::MANAGED_PLUGINS)
+        self.settings
+            .capabilities
+            .enabled(capability::MANAGED_PLUGINS)
             || self.catalog.iter().any(|descriptor| {
-                descriptor.source == "plugin" && self.capabilities.enabled(&descriptor.id)
+                descriptor.source == "plugin" && self.settings.capabilities.enabled(&descriptor.id)
             })
     }
 
     pub fn grants(&self, settings: &SettingsStore) -> Vec<WorkspaceGrant> {
-        if self.capabilities.enabled(capability::LOCAL_WORKSPACE) {
+        if self
+            .settings
+            .capabilities
+            .enabled(capability::LOCAL_WORKSPACE)
+        {
             settings.grant(&self.settings)
         } else {
             Vec::new()
@@ -265,10 +271,6 @@ impl SettingsStore {
             return Ok(StoredSettings::default());
         }
         Ok(serde_json::from_slice(&fs::read(&self.path)?)?)
-    }
-
-    pub fn project_dir(&self) -> Option<&Path> {
-        self.project.as_deref()
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -310,12 +312,10 @@ impl SettingsStore {
         let eja = configured_role(&settings, "eja");
         let aja = configured_role(&settings, "aja").or_else(|| eja.clone());
         let limits = settings.limits.clone().sane();
-        let capabilities = settings.capabilities.clone();
         Ok(Effective {
             settings,
             connectors,
             roles: EffectiveRoles { eja, aja },
-            capabilities,
             catalog,
             limits,
         })
@@ -326,11 +326,11 @@ impl SettingsStore {
         SettingsView {
             providers: settings.providers.iter().map(public_provider).collect(),
             roles: settings.roles.clone(),
-            capabilities: capability::views(&effective.catalog, &effective.capabilities)
+            capabilities: capability::views(&effective.catalog, &settings.capabilities)
                 .into_iter()
                 .map(|mut view| {
                     if view.id == MCP {
-                        if let Ok(config) = mcp_config(&effective.capabilities) {
+                        if let Ok(config) = mcp_config(&settings.capabilities) {
                             view.config = connectors::public_value(&config);
                         }
                     }

@@ -15,6 +15,7 @@ use std::{
     io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Stdio},
+    sync::{Arc, Mutex},
 };
 
 /// The tool a aja uses to read a passage of its own or an inherited record.
@@ -35,6 +36,10 @@ pub struct Checkpoints {
     git_dir: PathBuf,
     /// The host's private state, excluded from every frozen tree.
     private: PathBuf,
+    /// `add`, `commit` and reading `HEAD` form one transaction in the shared
+    /// checkpoint repository. Executions stay parallel; only the freeze is
+    /// serialized.
+    freeze_lock: Arc<Mutex<()>>,
 }
 
 impl Checkpoints {
@@ -43,6 +48,7 @@ impl Checkpoints {
         Self {
             git_dir,
             private: super::environments::canonical_boundary(private.as_ref()),
+            freeze_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -54,6 +60,10 @@ impl Checkpoints {
         environment: &Path,
         control: &Control,
     ) -> Result<String> {
+        let _freeze = self
+            .freeze_lock
+            .lock()
+            .map_err(|_| "checkpoint freeze lock is unavailable")?;
         let git = |args: &[&str]| {
             super::environments::git_at(Some(&self.git_dir), environment, args, control)
         };
@@ -166,10 +176,17 @@ impl RecordFiles {
         }
     }
     pub fn with_checkpoints(root: impl Into<PathBuf>, checkpoints: impl Into<PathBuf>) -> Self {
+        Self::with_checkpoints_and_limit(root, checkpoints, crate::aja::FRAME_LIMIT)
+    }
+    pub fn with_checkpoints_and_limit(
+        root: impl Into<PathBuf>,
+        checkpoints: impl Into<PathBuf>,
+        max_bytes: usize,
+    ) -> Self {
         Self {
             root: root.into(),
             checkpoints: Some(checkpoints.into()),
-            max_bytes: crate::aja::FRAME_LIMIT,
+            max_bytes,
         }
     }
     pub fn with_limit(root: impl Into<PathBuf>, max_bytes: usize) -> Self {
@@ -250,6 +267,10 @@ impl Drop for Source {
 }
 
 impl RecordReader for RecordFiles {
+    fn continuation_ready(&self, aja: u64, control: &Control) -> Result<()> {
+        lineage(&self.root, Some(aja), control).map(|_| ())
+    }
+
     fn environment(&self, aja: u64) -> Result<Option<EnvironmentRecord>> {
         match Manifest::read(&self.root, aja) {
             Ok(manifest) => Ok(manifest.environment),
@@ -654,6 +675,50 @@ mod tests {
             .expect("a run is never blocked by the projects own policy");
         assert_eq!(commit.len(), 40, "a commit id, not an error");
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_freezes_keep_each_runs_commit_and_contents_together() {
+        let root = std::env::temp_dir().join(format!("eja-freeze-parallel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let alpha = root.join("alpha");
+        let beta = root.join("beta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        fs::write(alpha.join("result.txt"), "alpha result\n").unwrap();
+        fs::write(beta.join("result.txt"), "beta result\n").unwrap();
+        let checkpoints = Checkpoints::new(root.join("checkpoints"), root.clone());
+        let together = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for (task, tree, expected) in [(1, alpha, "alpha result"), (2, beta, "beta result")] {
+            let checkpoints = checkpoints.clone();
+            let together = together.clone();
+            let git_dir = root.join("checkpoints");
+            let tree_root = root.clone();
+            threads.push(std::thread::spawn(move || {
+                together.wait();
+                let commit = checkpoints
+                    .freeze(task, i64::try_from(task).unwrap(), &tree, &control())
+                    .expect("freeze");
+                let shown = crate::adapters::environments::git_at(
+                    Some(&git_dir),
+                    &tree_root,
+                    &["show", &format!("{commit}:result.txt")],
+                    &control(),
+                )
+                .expect("read frozen content");
+                (commit, expected.to_owned(), shown)
+            }));
+        }
+        let frozen: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("freeze thread"))
+            .collect();
+        assert_ne!(frozen[0].0, frozen[1].0, "each run has its own commit");
+        for (_, expected, shown) in frozen {
+            assert_eq!(shown, expected);
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

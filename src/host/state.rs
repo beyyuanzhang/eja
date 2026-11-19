@@ -5,7 +5,8 @@
 //! renders that one state as the API's JSON. Semantics live in the core.
 
 use eja::{
-    Event, Kind, OpenProposal, ProposalKind, RelationKind, State, Task, TaskKind, TaskStatus,
+    inspect_journal, Event, Kind, OpenProposal, ProposalKind, RelationKind, State, Task, TaskKind,
+    TaskStatus,
 };
 use serde_json::{json, Value};
 use std::{
@@ -72,69 +73,51 @@ impl Cache {
             return;
         }
         self.stamp = stamp;
-        self.journal = Journal::read(&self.dir);
-        self.state = State::fold(self.journal.events.clone());
+        let mut journal = Journal::read(&self.dir);
+        self.state = State::fold(std::mem::take(&mut journal.events));
         self.events = self
-            .journal
-            .events
+            .state
+            .events()
             .iter()
             .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
             .collect();
+        self.journal = journal;
     }
 
     pub fn journal(&mut self) -> &Journal {
         self.refresh();
         &self.journal
     }
+
+    pub fn raw_event(&mut self, id: u64) -> Option<Value> {
+        self.refresh();
+        self.state
+            .events()
+            .iter()
+            .find(|event| event.id == id)
+            .and_then(|event| serde_json::to_value(event).ok())
+    }
+
+    pub fn raw_task(&mut self, id: u64) -> Option<Value> {
+        self.refresh();
+        task_record(&self.state, id)
+    }
 }
 
 impl Journal {
     pub fn read(dir: &Path) -> Self {
         let path = dir.join("log.jsonl");
-        let raw = match fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Self {
-                    events: Vec::new(),
-                    error: None,
-                    torn: false,
-                };
-            }
-            Err(error) => {
-                return Self {
-                    events: Vec::new(),
-                    error: Some(error.to_string()),
-                    torn: false,
-                };
-            }
-        };
-        let ended = raw.ends_with('\n');
-        let mut lines: Vec<&str> = raw.split('\n').collect();
-        if lines.last() == Some(&"") {
-            lines.pop();
-        }
-        let mut events = Vec::new();
-        let mut errors = Vec::new();
-        let mut torn = false;
-        for (index, line) in lines.iter().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Event>(line) {
-                Ok(event) => events.push(event),
-                Err(error) => {
-                    if index + 1 == lines.len() && !ended {
-                        torn = true;
-                        break;
-                    }
-                    errors.push(format!("line {}: {error}", index + 1));
-                }
-            }
-        }
-        Self {
-            events,
-            error: (!errors.is_empty()).then(|| errors.join("; ")),
-            torn,
+        match inspect_journal(path) {
+            Ok(scan) => Self {
+                events: scan.events,
+                error: scan.error,
+                torn: scan.torn,
+            },
+            Err(error) => Self {
+                events: Vec::new(),
+                error: Some(error.to_string()),
+                torn: false,
+            },
         }
     }
 }
@@ -196,6 +179,7 @@ fn task_json(state: &State, task: &Task) -> Value {
         "created_at": task.created_at,
         "assigned_at": task.assigned_at,
         "reported_at": task.reported_at,
+        "digest_at": task.reported_at,
         "closed_at": task.closed_at,
         "close": task.close,
         "run": {
@@ -220,27 +204,19 @@ pub fn state_json(
     encounter: Option<Encounter>,
 ) -> Value {
     cache.refresh();
-    render_state(
-        &cache.state,
-        &cache.journal.events,
-        &cache.events,
-        after,
-        health,
-        busy,
-        encounter,
-    )
+    render_state(&cache.state, &cache.events, after, health, busy, encounter)
 }
 
 fn render_state(
     state: &State,
-    journal_events: &[Event],
     event_views: &[Value],
     after: u64,
     health: &Health,
     busy: bool,
     encounter: Option<Encounter>,
 ) -> Value {
-    let events: Vec<Value> = journal_events
+    let events: Vec<Value> = state
+        .events()
         .iter()
         .zip(event_views)
         .filter(|(event, _)| event.id > after)
@@ -278,28 +254,13 @@ fn render_state(
 /// eja's inner voice. An eja message belongs to the conversation only when the
 /// user was present in its turn.
 fn spoken(state: &State, bookmark: Encounter) -> Value {
-    let present: Vec<u64> = state
-        .events()
-        .iter()
-        .filter(|event| {
-            matches!(event.kind, Kind::User | Kind::Returned | Kind::Denial)
-                || (event.kind == Kind::Approval
-                    && event
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("source"))
-                        .and_then(Value::as_str)
-                        != Some("eja"))
-        })
-        .map(|event| event.turn)
-        .collect();
     Value::Array(
         state
             .events()
             .iter()
             .filter(|event| event.id > bookmark.anchor)
             .filter(|event| matches!(event.kind, Kind::User | Kind::Eja))
-            .filter(|event| event.kind == Kind::User || present.contains(&event.turn))
+            .filter(|event| event.kind == Kind::User || state.present(event.turn))
             .map(|event| {
                 json!({
                     "id": event.id,
@@ -473,24 +434,21 @@ fn in_encounter(item: &Value, state: &State, bookmark: Encounter) -> bool {
     }
 }
 
-pub fn journal_event(journal: &Journal, id: u64) -> Option<Value> {
-    journal
-        .events
-        .iter()
-        .find(|event| event.id == id)
-        .and_then(|event| serde_json::to_value(event).ok())
-}
-
+#[cfg(test)]
 pub fn journal_task(journal: &Journal, id: u64) -> Option<Value> {
     let state = State::fold(journal.events.clone());
+    task_record(&state, id)
+}
+
+fn task_record(state: &State, id: u64) -> Option<Value> {
     let task = state.task(id)?;
-    let events: Vec<Value> = journal
-        .events
+    let events: Vec<Value> = state
+        .events()
         .iter()
         .filter(|event| task.event_ids.contains(&event.id))
         .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
         .collect();
-    Some(json!({ "task": task_json(&state, task), "events": events }))
+    Some(json!({ "task": task_json(state, task), "events": events }))
 }
 
 #[cfg(test)]
@@ -534,7 +492,7 @@ mod tests {
             .iter()
             .map(|event| serde_json::to_value(event).unwrap())
             .collect();
-        render_state(&state, &journal.events, &views, 0, health, busy, encounter)
+        render_state(&state, &views, 0, health, busy, encounter)
     }
 
     #[test]
@@ -640,6 +598,54 @@ mod tests {
         let raw = journal_task(&journal, 2).expect("task");
         assert_eq!(raw["task"]["title"], "build");
         assert_eq!(raw["events"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn kernel_and_http_agree_on_the_committed_prefix_for_the_same_bytes() {
+        for (name, tail, expected, torn) in [
+            ("complete", "\n", 2, false),
+            ("missing-newline", "", 1, true),
+            ("truncated", "", 1, true),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "eja-committed-prefix-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            eja::Store::new(&dir).expect("initialize state");
+            let first = event(1, 1, "eja", Kind::User, "one", json!({}));
+            let bytes = if name == "truncated" {
+                format!("{}\n{{\"id\":2,", serde_json::to_string(&first).unwrap())
+            } else {
+                let second = event(2, 2, "eja", Kind::User, "two", json!({}));
+                format!(
+                    "{}\n{}{tail}",
+                    serde_json::to_string(&first).unwrap(),
+                    serde_json::to_string(&second).unwrap()
+                )
+            };
+            std::fs::write(dir.join("log.jsonl"), bytes).unwrap();
+
+            let http = Journal::read(&dir);
+            let mut cache = Cache::new(dir.clone());
+            assert_eq!(http.events.len(), expected, "{name}");
+            assert_eq!(http.torn, torn, "{name}");
+            assert!(cache.raw_event(1).is_some(), "{name}");
+            assert_eq!(cache.raw_event(2).is_some(), expected == 2, "{name}");
+
+            let kernel = eja::Store::new(&dir).expect("kernel store");
+            assert_eq!(
+                http.events.iter().map(|event| event.id).collect::<Vec<_>>(),
+                kernel
+                    .events()
+                    .expect("kernel events")
+                    .iter()
+                    .map(|event| event.id)
+                    .collect::<Vec<_>>(),
+                "{name}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

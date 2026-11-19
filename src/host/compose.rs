@@ -6,9 +6,11 @@ use super::{
     SettingsStore,
 };
 use eja::adapters::{
-    Checkpoints, Control, EnvironmentProvider, GitWorktrees, McpTools, NativeWorker, OpenAiModel,
-    SharedEnvironment, ToolProvider, ToolRegistry, WorkspaceEnvironments, WorkspaceTools,
+    Checkpoints, Control, EnvironmentProvider, GitWorktrees, McpTools, NativeWorker, OpenAiBrain,
+    OpenAiModel, Ports, RecordFiles, SharedEnvironment, ToolProvider, ToolRegistry,
+    WorkspaceEnvironments, WorkspaceTools,
 };
+use eja::{JournalLease, Store, TurnOptions, TurnOutcome, TurnRun};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -19,6 +21,9 @@ use std::{
 /// services consumed by the worker or exposed to the kernel through Ports.
 pub struct ComposedHost {
     pub effective: Effective,
+    /// One grant snapshot for this composition. Tool construction, the default
+    /// worker workspace and the turn's OPTIONS all derive from this vector.
+    pub grants: Vec<eja::WorkspaceGrant>,
     pub tools: Arc<ToolRegistry>,
     pub environments: Option<Arc<dyn EnvironmentProvider>>,
     pub diagnostics: Vec<String>,
@@ -47,6 +52,74 @@ impl ComposedHost {
         )?
         .with_limits(limits)
     }
+
+    /// The one turn assembly used by CLI, HTTP and the host's pulse. Limits and
+    /// grants come from this composition, not from a second settings read.
+    pub fn run_turn<'i>(
+        &self,
+        state_dir: &Path,
+        store: &Store,
+        input: &'i str,
+        base: &TurnOptions,
+        lease: Option<&JournalLease>,
+    ) -> eja::Result<TurnOutcome<'i>> {
+        let eja_role = self
+            .effective
+            .roles
+            .eja
+            .as_ref()
+            .filter(|role| role.configured())
+            .ok_or("settings need an EJA provider and model")?;
+        let aja_role = self
+            .effective
+            .roles
+            .aja
+            .as_ref()
+            .filter(|role| role.configured())
+            .ok_or("settings need an AJA provider and model")?;
+        let mut brain = OpenAiBrain::new(&eja_role.base_url, &eja_role.api_key, &eja_role.model)
+            .with_headers(header_pairs(eja_role));
+        if let Some(description) = &self.capability_description {
+            brain = brain.with_capability_description(description);
+        }
+        let model = OpenAiModel::new(&aja_role.base_url, &aja_role.api_key, &aja_role.model)
+            .with_headers(header_pairs(aja_role));
+        let mut aja_limits = eja::aja::Limits::default();
+        if self.effective.limits.aja_steps > 0 {
+            aja_limits.steps = Some(self.effective.limits.aja_steps);
+        }
+        if self.effective.limits.aja_timeout_ms > 0 {
+            aja_limits.timeout_ms = self.effective.limits.aja_timeout_ms;
+        }
+        let ajas = state_dir.join("ajas");
+        let worker = self.worker(&ajas, model, aja_limits)?;
+        let records = RecordFiles::with_checkpoints(&ajas, state_dir.join("checkpoints"));
+        let ports = Ports {
+            aja: Some(&records),
+            capabilities: Some(&*self.tools),
+            environments: self.environments.as_deref(),
+        };
+        let mut options = base.clone();
+        options.workspaces.clone_from(&self.grants);
+        options.limits.slots = self.effective.limits.slots.max(1);
+        if self.effective.limits.turn_timeout_ms > 0 {
+            options.limits.timeout_ms = self.effective.limits.turn_timeout_ms;
+        }
+        let run = TurnRun {
+            store,
+            input,
+            brain: &brain,
+            worker: &worker,
+            host: &ports,
+            now: eja::now_utc(),
+            options: &options,
+        };
+        if let Some(lease) = lease {
+            run.execute_under_lease(lease)
+        } else {
+            run.execute()
+        }
+    }
 }
 
 /// Read one deployment's settings and construct the capabilities shared by CLI
@@ -54,16 +127,16 @@ impl ComposedHost {
 pub fn compose(settings: &SettingsStore, startup: &Control) -> eja::Result<ComposedHost> {
     let mut diagnostics = Vec::new();
     let effective = settings.effective_current()?;
-    let capabilities = &effective.capabilities;
+    let capabilities = &effective.settings.capabilities;
 
-    let grant = effective.grants(settings);
+    let grants = effective.grants(settings);
 
     let private = settings.state_dir().canonicalize()?;
-    let workspace = settings
-        .project_dir()
-        .map(Path::to_path_buf)
-        .or_else(|| grant.first().map(|grant| PathBuf::from(&grant.root)));
-    let roots = grant
+    // The project directory is startup configuration, not an independent
+    // authority. A root reaches tools and workers only through this turn's
+    // capability-filtered grant snapshot.
+    let workspace = grants.first().map(|grant| PathBuf::from(&grant.root));
+    let roots = grants
         .iter()
         .map(|grant| PathBuf::from(&grant.root))
         .collect::<Vec<_>>();
@@ -122,17 +195,18 @@ pub fn compose(settings: &SettingsStore, startup: &Control) -> eja::Result<Compo
 
     let (environments, environment_diagnostics) = build_environments(
         &private,
-        &grant,
+        &grants,
         effective.limits.slots,
         capabilities.enabled(GIT_WORKTREES),
         startup,
     );
     diagnostics.extend(environment_diagnostics);
-    let snapshots = (capabilities.enabled(CHECKPOINTS) && !grant.is_empty())
+    let snapshots = (capabilities.enabled(CHECKPOINTS) && !grants.is_empty())
         .then(|| Checkpoints::new(private.join("checkpoints"), private.clone()));
 
     Ok(ComposedHost {
         effective,
+        grants,
         tools: Arc::new(tools),
         environments,
         diagnostics,
@@ -276,6 +350,14 @@ mod tests {
     }
 
     fn configure(settings: &SettingsStore, capabilities: &serde_json::Value) {
+        configure_with_workspaces(settings, capabilities, &json!({}));
+    }
+
+    fn configure_with_workspaces(
+        settings: &SettingsStore,
+        capabilities: &serde_json::Value,
+        workspaces: &serde_json::Value,
+    ) {
         settings
             .write(json!({
                 "providers": [],
@@ -290,9 +372,82 @@ mod tests {
                     "ajaSteps": 0,
                     "ajaTimeoutMs": 0
                 },
-                "workspaces": {}
+                "workspaces": workspaces
             }))
             .expect("settings");
+    }
+
+    #[test]
+    fn a_disabled_local_workspace_does_not_fall_back_to_the_project_directory() {
+        let root = Temp::new("no-local-workspace");
+        let project = root.0.join("project");
+        let state = root.0.join("state");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(project.join("note.txt"), "must not be read").unwrap();
+
+        let settings = SettingsStore::new(Some(project), state);
+        configure(
+            &settings,
+            &json!({
+                "local-workspace": {"enabled": false},
+                "files": {"enabled": true},
+                "shell": {"enabled": true},
+                "git-worktrees": {"enabled": true},
+                "checkpoints": {"enabled": true},
+                "mcp": {"enabled": false, "config": {"servers": []}},
+                "managed-plugins": {"enabled": false}
+            }),
+        );
+        let control = Control::new(Duration::from_secs(30), Arc::default());
+        let composed = compose(&settings, &control).expect("composition");
+
+        assert!(composed.grants.is_empty());
+        assert!(composed.workspace.is_none());
+        assert!(composed.environments.is_none());
+        assert!(composed.snapshots.is_none());
+        assert!(!definition_names(&composed.tools)
+            .iter()
+            .any(|name| name == "read_file"));
+    }
+
+    #[test]
+    fn an_extra_workspace_is_the_one_source_for_tools_and_the_default() {
+        let root = Temp::new("extra-workspace");
+        let extra = root.0.join("extra");
+        let state = root.0.join("state");
+        fs::create_dir_all(&extra).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(extra.join("note.txt"), "only the extra grant").unwrap();
+
+        let settings = SettingsStore::new(None, state);
+        configure_with_workspaces(
+            &settings,
+            &json!({
+                "local-workspace": {"enabled": true},
+                "files": {"enabled": true},
+                "shell": {"enabled": false},
+                "git-worktrees": {"enabled": false},
+                "checkpoints": {"enabled": true},
+                "mcp": {"enabled": false, "config": {"servers": []}},
+                "managed-plugins": {"enabled": false}
+            }),
+            &json!({"extra": extra}),
+        );
+        let control = Control::new(Duration::from_secs(30), Arc::default());
+        let composed = compose(&settings, &control).expect("composition");
+
+        assert_eq!(composed.grants.len(), 1);
+        assert_eq!(composed.grants[0].label, "extra");
+        assert_eq!(
+            composed.workspace.as_deref(),
+            Some(extra.canonicalize().unwrap().as_path())
+        );
+        let observed = composed
+            .tools
+            .observe("read_file", &json!({"path":"note.txt"}), &control)
+            .expect("the extra grant is readable");
+        assert!(observed.to_string().contains("only the extra grant"));
     }
 
     #[test]

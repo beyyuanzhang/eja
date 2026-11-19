@@ -31,7 +31,7 @@ impl Rendered {
 }
 
 impl Brain for Rendered {
-    fn decide(&self, context: &EjaContext<'_>, control: &eja::Control) -> Decision {
+    fn decide(&self, context: &EjaContext<'_>, control: &eja::Control) -> eja::Result<Decision> {
         self.views
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -59,6 +59,66 @@ impl RecordReader for Reader {
     fn slice(&self, path: &str, _: &Selector, _: &eja::Control) -> eja::Result<serde_json::Value> {
         Ok(serde_json::json!({"path":path,"text":format!("content of {path}"),"truncated":false}))
     }
+}
+
+struct ProviderFailure;
+
+impl Brain for ProviderFailure {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> eja::Result<Decision> {
+        Err("provider returned HTTP 503".into())
+    }
+}
+
+#[test]
+fn silence_speech_and_provider_failure_are_distinct_turns() {
+    let normal = State::new("turn-outcomes-normal");
+    let normal_store = normal.store();
+    let spoken = eja::turn(
+        &normal_store,
+        "hello",
+        &Script::new(vec![answer("hello back", vec![])]),
+        &Done::default(),
+        &Ports::default(),
+    )
+    .expect("normal turn");
+    assert_eq!(spoken.end, eja::TurnEnd::Complete);
+    assert_eq!(spoken.reply, "hello back");
+
+    let silent = State::new("turn-outcomes-silent");
+    let silent_store = silent.store();
+    let quiet = eja::turn(
+        &silent_store,
+        "listen",
+        &Script::new(vec![Decision::default()]),
+        &Done::default(),
+        &Ports::default(),
+    )
+    .expect("silent turn");
+    assert_eq!(quiet.end, eja::TurnEnd::Complete);
+    assert_eq!(quiet.reply, "");
+
+    let failed = State::new("turn-outcomes-failed");
+    let failed_store = failed.store();
+    let transport = eja::turn(
+        &failed_store,
+        "hello",
+        &ProviderFailure,
+        &Done::default(),
+        &Ports::default(),
+    )
+    .expect("failure is an outcome, not a thrown turn");
+    assert_eq!(transport.end, eja::TurnEnd::Failed);
+    assert!(transport.reply.is_empty());
+    assert!(transport
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("HTTP 503")));
+    let events = failed_store.events().unwrap();
+    assert_eq!(events.last().map(|event| event.kind), Some(Kind::Failure));
+    assert!(
+        events.iter().all(|event| event.kind != Kind::Eja),
+        "a provider failure is not Eja's speech"
+    );
 }
 
 /// One turn whose host reads records, as every scenario here does.

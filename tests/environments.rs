@@ -15,7 +15,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -116,7 +116,7 @@ fn project_with_one_commit(state: &State) -> PathBuf {
 }
 
 #[test]
-fn parallel_slots_run_at_once_and_the_log_keeps_action_order() {
+fn parallel_slots_run_at_once_and_each_completed_run_is_reported() {
     let state = State::new("parallel");
     let store = state.store();
     let overlap = Arc::new(Overlap::default());
@@ -146,19 +146,26 @@ fn parallel_slots_run_at_once_and_the_log_keeps_action_order() {
         &options,
     )
     .expect("turn");
-    assert_eq!(out.dispatched, vec![1, 2]);
+    let mut dispatched = out.dispatched;
+    dispatched.sort_unstable();
+    assert_eq!(dispatched, vec![1, 2]);
     assert_eq!(
         overlap.peak.load(Ordering::SeqCst),
         2,
         "both environments were live"
     );
-    let reports: Vec<u64> = state
+    let mut reports: Vec<u64> = state
         .events()
         .into_iter()
         .filter(|event| event.kind == Kind::WorkerReport)
         .filter_map(|event| event.scope.strip_prefix("task:")?.parse().ok())
         .collect();
-    assert_eq!(reports, vec![1, 2], "reports are recorded in action order");
+    reports.sort_unstable();
+    assert_eq!(
+        reports,
+        vec![1, 2],
+        "both completed runs leave their own report"
+    );
 }
 
 #[test]
@@ -186,6 +193,111 @@ fn one_slot_stays_sequential() {
     )
     .expect("turn");
     assert_eq!(overlap.peak.load(Ordering::SeqCst), 1);
+}
+
+struct PauseSlow {
+    started: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl Worker for PauseSlow {
+    fn execute(&self, assignment: &Assignment, _: &Control) -> String {
+        if assignment.task_id == 2 {
+            let (lock, signal) = &*self.started;
+            *lock.lock().unwrap() = true;
+            signal.notify_all();
+            let (lock, wait) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wait.wait(released).unwrap();
+            }
+            drop(released);
+        }
+        format!("ended: message\nfinished {}", assignment.task_id)
+    }
+}
+
+#[test]
+fn a_fast_worker_report_is_durable_while_a_slow_sibling_still_runs() {
+    let state = State::new("parallel-visible");
+    let store = state.store();
+    let started = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let worker = PauseSlow {
+        started: started.clone(),
+        release: release.clone(),
+    };
+    let brain = Script::once(vec![
+        open(1),
+        open(2),
+        Action::Dispatch { task_id: 1 },
+        Action::Dispatch { task_id: 2 },
+    ]);
+    let options = TurnOptions {
+        limits: eja::TurnLimits {
+            slots: 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let observer = store.clone();
+    let turn = std::thread::spawn(move || {
+        turn_at_with_options(
+            &store,
+            "run both",
+            &brain,
+            &worker,
+            &Ports::default(),
+            eja::now_utc(),
+            &options,
+        )
+        .expect("turn")
+    });
+
+    let (lock, signal) = &*started;
+    let mut did_start = lock.lock().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !*did_start {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "the slow worker did not start");
+        did_start = signal.wait_timeout(did_start, remaining).unwrap().0;
+    }
+    drop(did_start);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = observer.events().expect("events");
+        let fast = events
+            .iter()
+            .any(|event| event.kind == Kind::WorkerReport && event.scope == "task:1");
+        let slow = events
+            .iter()
+            .any(|event| event.kind == Kind::WorkerReport && event.scope == "task:2");
+        assert!(!slow, "the paused sibling has not reported");
+        if fast {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fast report was not committed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let (lock, wait) = &*release;
+    *lock.lock().unwrap() = true;
+    wait.notify_all();
+    let outcome = turn.join().expect("turn thread");
+    assert_eq!(outcome.dispatched, vec![1, 2]);
+    let mut reports: Vec<u64> = observer
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == Kind::WorkerReport)
+        .filter_map(|event| event.scope.strip_prefix("task:")?.parse().ok())
+        .collect();
+    reports.sort_unstable();
+    assert_eq!(reports, vec![1, 2]);
 }
 
 #[test]
@@ -223,6 +335,30 @@ fn a_worktree_environment_is_settled_and_reconciled_explicitly() {
         "reconciliation lands the run"
     );
     environments.release(&environment);
+}
+
+#[test]
+fn a_worktree_accepts_a_platform_alias_of_its_granted_root() {
+    let state = State::new("worktree-alias");
+    let project = state.path().join("project");
+    let state_dir = state.path().join("state");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    git(&project, &["init", "--quiet"]);
+    std::fs::write(project.join("base.txt"), "one\n").unwrap();
+    git(&project, &["add", "base.txt"]);
+    git(&project, &["commit", "--quiet", "-m", "base"]);
+    let environments = GitWorktrees::new(
+        &project,
+        state_dir.join("environments"),
+        &state_dir,
+        &control(),
+    )
+    .expect("worktrees");
+    let lease = environments
+        .reserve(1, Some(&project), &control())
+        .expect("the granted root is inside the project even when its spelling is aliased");
+    environments.release(&lease);
 }
 
 #[test]
@@ -671,7 +807,9 @@ fn two_granted_workspaces_hold_their_own_roots_at_once() {
         &options,
     )
     .expect("turn");
-    assert_eq!(out.dispatched, vec![1, 2]);
+    let mut dispatched = out.dispatched.clone();
+    dispatched.sort_unstable();
+    assert_eq!(dispatched, vec![1, 2]);
     assert!(
         alpha.join("marker-1.txt").exists(),
         "alpha holds its own run"

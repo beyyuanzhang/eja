@@ -8,10 +8,11 @@ mod support;
 use eja::{
     adapters::{
         Checkpoints, Control, ExecutionServices, FileTools, GitWorktrees, Model, NativeWorker,
-        OpenAiModel, SharedEnvironment, ToolContext, ToolProvider,
+        OpenAiModel, Ports, RecordFiles, RecordReader, SharedEnvironment, ToolContext,
+        ToolProvider,
     },
     aja::Limits,
-    Assignment, Result, Worker,
+    Action, Assignment, Decision, Result, TurnOptions, Worker,
 };
 use serde_json::{json, Value};
 use std::{
@@ -26,7 +27,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use support::{control, State};
+use support::{control, Script as BrainScript, State};
 
 // The worker is a child process and the tests read this process's children, so
 // one test at a time keeps that observation about this process alone.
@@ -1200,7 +1201,7 @@ impl Drop for TestRuntime {
     }
 }
 
-fn post_detached_turn(mut command: Command) -> String {
+fn post_turn(mut command: Command, body: &str) -> String {
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -1224,7 +1225,6 @@ fn post_detached_turn(mut command: Command) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    let body = r#"{"text":"run the MCP fixture"}"#;
     write!(
         stream,
         "POST /api/turn HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1232,6 +1232,11 @@ fn post_detached_turn(mut command: Command) -> String {
     ).unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn post_detached_turn(command: Command) -> String {
+    let response = post_turn(command, r#"{"text":"run the MCP fixture"}"#);
     assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
     response
 }
@@ -1330,6 +1335,52 @@ fn cli_and_http_complete_mcp_work_without_a_project_or_git() {
             .contains("fixture-returned"));
         assert!(!state.join("checkpoints").exists());
     }
+}
+
+#[test]
+fn an_http_provider_failure_is_502_and_never_an_eja_reply() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = workspace("http-model-failure");
+    let state = fixture.path().join(".eja");
+    configure_cli(
+        &fixture,
+        "http://127.0.0.1:9/v1",
+        &json!({
+            "local-workspace": {"enabled": false},
+            "files": {"enabled": false},
+            "shell": {"enabled": false},
+            "git-worktrees": {"enabled": false},
+            "checkpoints": {"enabled": false},
+            "mcp": {"enabled": false, "config": {"servers": []}},
+            "managed-plugins": {"enabled": false}
+        }),
+        &json!([]),
+        1,
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_eja"));
+    command.current_dir(fixture.path()).args([
+        "serve",
+        "--no-project",
+        "--dir",
+        state.to_str().unwrap(),
+    ]);
+    let response = post_turn(command, r#"{"text":"hello"}"#);
+    assert!(
+        response.starts_with("HTTP/1.1 502 "),
+        "a provider failure has its own HTTP status: {response}"
+    );
+    assert!(response.contains("model transport failed"), "{response}");
+    let events = eja::Store::new(&state).unwrap().events().unwrap();
+    assert!(
+        events.iter().all(|event| event.kind != eja::Kind::Eja),
+        "the failure is not a spoken reply: {events:#?}"
+    );
+    assert_eq!(
+        events.last().map(|event| event.kind),
+        Some(eja::Kind::Failure)
+    );
 }
 
 #[test]
@@ -1700,6 +1751,195 @@ fn checkpoint_whole_range_and_match_resolve_the_same_utf8_file() {
         )
         .unwrap();
     assert_eq!(found["matches"][0]["context"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn record_evidence_reads_the_frozen_run_not_the_later_workspace() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = workspace("record-evidence-frozen");
+    let model = Arc::new(Script::new(vec![
+        calls(vec![call(
+            "write_file",
+            json!({"path":"result.txt","text":"frozen result"}),
+        )]),
+        final_message(&[]),
+    ]));
+    let store = eja::Store::new(f.path().join(".eja")).expect("state");
+    let worker = worker_for(&f, model, Arc::new(FileTools), Limits::default());
+    let records = RecordFiles::with_checkpoints(
+        f.path().join(".eja/ajas"),
+        f.path().join(".eja/checkpoints"),
+    );
+    let ports = Ports {
+        aja: Some(&records),
+        ..Default::default()
+    };
+    let brain = BrainScript::new(vec![
+        Decision {
+            reply: "write it".to_owned(),
+            choices: Vec::new(),
+            actions: vec![Action::OpenTask {
+                title: "write result".to_owned(),
+                request: "write result.txt".to_owned(),
+                acceptance: "the frozen result exists".to_owned(),
+                workspace: None,
+                evidence: Some(json!({"source":"record","path":"result.txt"})),
+                run: true,
+            }],
+            refused: Vec::new(),
+        },
+        Decision {
+            reply: "recorded".to_owned(),
+            choices: Vec::new(),
+            actions: Vec::new(),
+            refused: Vec::new(),
+        },
+    ]);
+    let outcome = eja::turn_at_with_options(
+        &store,
+        "write and freeze result.txt",
+        &brain,
+        worker.as_ref(),
+        &ports,
+        eja::now_utc(),
+        &TurnOptions::default(),
+    )
+    .expect("turn");
+    let task = &outcome.context().tasks[0];
+    assert!(
+        task.run
+            .as_ref()
+            .and_then(|run| run.evidence_result.as_ref())
+            .is_some_and(|value| value["text"] == json!("frozen result")),
+        "the host witnesses the run's frozen record"
+    );
+
+    std::fs::write(f.path().join("result.txt"), "current workspace").unwrap();
+    let frozen = records
+        .slice("1/result.txt", &eja::Selector::Whole, &control())
+        .expect("frozen file");
+    assert_eq!(frozen["text"], json!("frozen result"));
+    assert_eq!(
+        std::fs::read_to_string(f.path().join("result.txt")).unwrap(),
+        "current workspace"
+    );
+}
+
+#[test]
+fn record_evidence_reads_an_unmerged_worktree_artifact() {
+    let _lock = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = workspace("record-evidence-worktree");
+    let state_dir = f.path().join(".eja");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(f.path().join("base.txt"), "base\n").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "base.txt"],
+        vec!["commit", "--quiet", "-m", "base"],
+    ] {
+        let status = Command::new("git")
+            .current_dir(f.path())
+            .args(["-c", "user.name=eja", "-c", "user.email=eja@local"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    let store = eja::Store::new(&state_dir).expect("state");
+    let control = control();
+    let environments = Arc::new(
+        GitWorktrees::new(
+            f.path(),
+            state_dir.join("environments"),
+            &state_dir,
+            &control,
+        )
+        .expect("worktrees"),
+    );
+    let model = Arc::new(Script::new(vec![
+        calls(vec![call(
+            "write_file",
+            json!({"path":"result.txt","text":"isolated result"}),
+        )]),
+        final_message(&["result.txt"]),
+    ]));
+    let worker = NativeWorker::with_services(
+        env!("CARGO_BIN_EXE_eja"),
+        state_dir.join("ajas"),
+        model,
+        Arc::new(FileTools),
+        ExecutionServices {
+            workspace: Some(f.path().to_path_buf()),
+            snapshots: Some(Checkpoints::new(
+                state_dir.join("checkpoints"),
+                state_dir.clone(),
+            )),
+            environments: Some(environments),
+        },
+    )
+    .expect("worker");
+    let records =
+        RecordFiles::with_checkpoints(state_dir.join("ajas"), state_dir.join("checkpoints"));
+    let ports = Ports {
+        aja: Some(&records),
+        ..Default::default()
+    };
+    let brain = BrainScript::new(vec![
+        Decision {
+            reply: "write it".to_owned(),
+            choices: Vec::new(),
+            actions: vec![Action::OpenTask {
+                title: "write isolated result".to_owned(),
+                request: "write result.txt".to_owned(),
+                acceptance: "the isolated result exists".to_owned(),
+                workspace: None,
+                evidence: Some(json!({"source":"record","path":"result.txt"})),
+                run: true,
+            }],
+            refused: Vec::new(),
+        },
+        Decision {
+            reply: "recorded".to_owned(),
+            choices: Vec::new(),
+            actions: Vec::new(),
+            refused: Vec::new(),
+        },
+    ]);
+    let outcome = eja::turn_at_with_options(
+        &store,
+        "write and freeze in an isolated worktree",
+        &brain,
+        &worker,
+        &ports,
+        eja::now_utc(),
+        &TurnOptions {
+            workspaces: vec![eja::WorkspaceGrant {
+                id: "workspace".to_owned(),
+                label: "default".to_owned(),
+                root: f.path().canonicalize().unwrap().display().to_string(),
+            }],
+            ..Default::default()
+        },
+    )
+    .expect("turn");
+
+    assert!(
+        !f.path().join("result.txt").exists(),
+        "the isolated artifact is not merged into the shared workspace"
+    );
+    let task = &outcome.context().tasks[0];
+    assert!(
+        task.run
+            .as_ref()
+            .and_then(|run| run.evidence_result.as_ref())
+            .is_some_and(|value| value["text"] == json!("isolated result")),
+        "the witness reads the run's frozen worktree record: {task:#?}"
+    );
 }
 
 #[test]

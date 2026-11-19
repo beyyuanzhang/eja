@@ -272,10 +272,7 @@ fn utc_time_is_one_source_for_turn_task_and_worker() {
     let task = &outcome.context().tasks[0];
     assert_eq!(task.status, TaskStatus::Done);
     assert_eq!(task.created_at, at.timestamp());
-    assert_eq!(
-        task.run.as_ref().and_then(|run| run.digest_at),
-        Some(at.timestamp())
-    );
+    assert_eq!(task.reported_at, Some(at.timestamp()));
     assert_eq!(task.closed_at, Some(at.timestamp()));
 
     let events = store.events().expect("events");

@@ -101,7 +101,7 @@ impl Script {
 }
 
 impl Brain for Script {
-    fn decide(&self, context: &EjaContext<'_>, _: &Control) -> Decision {
+    fn decide(&self, context: &EjaContext<'_>, _: &Control) -> eja::Result<Decision> {
         self.seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -125,7 +125,8 @@ impl Brain for Script {
                     .map(|text| (*text).to_string())
                     .collect(),
             });
-        self.queue
+        Ok(self
+            .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
@@ -134,7 +135,7 @@ impl Brain for Script {
                 choices: Vec::new(),
                 actions: Vec::new(),
                 refused: Vec::new(),
-            })
+            }))
     }
 }
 

@@ -176,6 +176,10 @@ Any number of separately hosted frontends may use the same runtime. See
   task can be judged. The host's observation is recorded as one `Observed` event
   scoped to the task. Acceptance needs that observation; a rejection does not,
   so a witness that never answers cannot strand a task in the index.
+- A workspace witness is bound to the task's fixed workspace root, so two
+  granted roots with the same filename cannot answer for each other. An
+  evidence request with `{"source":"record","path":"..."}` reads the task's
+  frozen run instead, even if the current workspace has since changed.
 - One address space covers every fact a view can read: `log:<target>`,
   `record:<aja>/<path>`, `environment:<path>`. Any other target is a host read
   tool. A folded region and a live one are read the same way.
@@ -183,6 +187,9 @@ Any number of separately hosted frontends may use the same runtime. See
   target then names the subject. Its kind is a typed field, not a reserved text,
   so a host tool may be named `witness` without becoming acceptance evidence.
   The projection's evidence is folded from the events that recorded it.
+- A model transport failure is a `failure` event and a failed turn, not EJA
+  speech. The HTTP endpoint answers it with 502; normal silence remains a
+  successful empty reply.
 
 ## Questions and alignment
 
@@ -312,27 +319,32 @@ per operation. The one exception is cleanup: releasing an environment runs after
 run's budget may have expired, so the backend declares that bound itself rather
 than inheriting a spent control.
 
-Dispatches run in action order. With one slot they also run one at a time in one
-shared environment; with more slots the host must reserve an isolated environment per run, and
-the journal still records reports in dispatch order. The turn owns how many runs a
-decision starts; the environment provider owns how many may exist at once, because it is
-the only thing that knows whether an environment is isolated. A refused environment refuses the
-run before it costs an aja id, and never reports itself as a budget stop. The host
-owns aja step and time limits; the disposable loop only manages its bounded
-message view.
+Dispatches are validated in action order. With one slot they also run one at a
+time in one shared environment; with more slots the host must reserve an
+isolated environment per run. Each completed run is reported and witnessed
+immediately, so report order is completion order. The turn owns how many runs a
+decision starts; the environment provider owns how many may exist at once,
+because it is the only thing that knows whether an environment is isolated. A
+refused environment refuses the run before it costs an aja id, and never reports
+itself as a budget stop. The host owns aja step and time limits; the disposable
+loop only manages its bounded message view.
 
 ## Recovery
 
 A newline commits an event. Appends are serialized, flushed and synced. An
 uncommitted final fragment is discarded under the writer lock before more
 appends; malformed committed records are errors. Stale Store instances refuse
-to append. The journal allows only one active turn, including across separate Store instances. These guards fail closed; they
-are not a distributed multi-writer system.
+to append. The journal allows only one active turn, including across separate
+Store instances. Pulse checks quiet and runs EJA under that same lease rather
+than acquiring it twice. These guards fail closed; they are not a distributed
+multi-writer system.
 
 Interrupted ajas are never dispatched again under the same id. Their task
 becomes waiting for judgment, and continuation uses a new id. Frozen records
 retain the complete safe prefix of an interrupted tool-call group. Damaged or
 missing predecessor records are explicit errors, never a silent fresh start.
+The kernel asks the host to prove a predecessor record and its complete
+ancestry can be read before it writes a continuation assignment.
 
 ## State format
 
@@ -409,8 +421,9 @@ cycles, host authorization, atomic confirmation, torn-tail recovery, UTF-8 byte
 budgets, deadlines and always-changing model states. Identity regressions add the
 protocol-only contract, self-before-index rendering and addressable folding.
 Acceptance regressions add one-turn approvals and witness-or-undecidable
-judgments; environment regressions add parallel slots with ordered reports, explicit
-reconciliation and conflict reporting. Native/MCP tests also cover
+judgments; environment regressions add parallel slots with durable
+completion-time reports, explicit reconciliation and conflict reporting.
+Native/MCP tests also cover
 real local HTTP, cancellation, process cleanup and frozen checkpoints, including
 a record repository that asks git for a hostile hook and a signature the run
 does not have.
@@ -423,5 +436,6 @@ Identity and task state can be replayed; environment effects are never replayed 
 folding the log. Past invalid relationships are not retroactively authorized, and
 dispatch refuses ambiguous ancestry.
 
-Historical, pre-0.11 model measurements are kept separately in
-[benchmark history](docs/BENCHMARKS.md); they are not measurements of this revision.
+Current kernel measurements, historical pre-0.11 model results and the protocol
+for a fresh model run are kept in [benchmarks](docs/BENCHMARKS.md). Current model
+task quality remains unmeasured in this revision.

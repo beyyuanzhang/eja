@@ -2,14 +2,14 @@
 //! Composition laws: these cross the boundaries that isolated feature tests miss.
 mod support;
 use eja::{
-    adapters::{render_context_within, Capabilities, Ports},
+    adapters::{render_context_within, Capabilities, Ports, RecordReader},
     *,
 };
 use serde_json::{json, Value};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -33,6 +33,35 @@ impl Worker for WorkerLog {
     fn execute(&self, a: &Assignment, _: &eja::Control) -> String {
         self.0.lock().unwrap().push(a.clone());
         "ended: message\nwork recorded".into()
+    }
+}
+
+/// The host's proof that a predecessor record can be read. The test is about
+/// which relation wins, not about the record adapter's own parsing.
+struct ReadyRecord;
+impl RecordReader for ReadyRecord {
+    fn slice(&self, _: &str, _: &Selector, _: &eja::Control) -> Result<Value> {
+        Err("this test does not read record contents".into())
+    }
+
+    fn continuation_ready(&self, _: u64, _: &eja::Control) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct CancelTogether {
+    cancelled: Arc<AtomicBool>,
+    together: Arc<Barrier>,
+}
+
+impl Worker for CancelTogether {
+    fn execute(&self, assignment: &Assignment, _: &eja::Control) -> String {
+        self.together.wait();
+        self.cancelled.store(true, Ordering::SeqCst);
+        format!(
+            "ended: cancelled\nunknown result for {}",
+            assignment.task_id
+        )
     }
 }
 
@@ -265,17 +294,24 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
         script(vec![aja("a"), aja("b"), task("next")]),
         &worker,
     );
-    let out = turn_with(
+    let out = turn_at_with_options(
         &store,
         "request",
-        script(vec![
+        &Script::new(script(vec![
             link(3, 1, RelationKind::Continues),
             link(3, 2, RelationKind::Continues),
             Action::Dispatch { task_id: 3 },
             link(3, 2, RelationKind::Continues),
-        ]),
+        ])),
         &worker,
-    );
+        &Ports {
+            aja: Some(&ReadyRecord),
+            ..Default::default()
+        },
+        eja::now_utc(),
+        &TurnOptions::default(),
+    )
+    .expect("turn");
     assert_eq!(
         out.context()
             .relations
@@ -286,6 +322,79 @@ fn continuation_has_one_predecessor_and_cannot_be_changed_after_dispatch() {
     );
     assert_eq!(worker.0.lock().unwrap().last().unwrap().resume, Some(1));
     assert_eq!(out.context().refused.len(), 2);
+}
+
+#[test]
+fn an_interrupted_predecessor_without_a_record_cannot_be_continued() {
+    let fixture = Fixture::new("convergence-continuation-record");
+    let store = fixture.store();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let interrupted = turn_at_with_options(
+        &store,
+        "run two jobs and prepare their continuation",
+        &Script::new(script(vec![
+            task("first"),
+            task("second"),
+            task("next"),
+            Action::Dispatch { task_id: 1 },
+            Action::Dispatch { task_id: 2 },
+        ])),
+        &CancelTogether {
+            cancelled: cancelled.clone(),
+            together: Arc::new(Barrier::new(2)),
+        },
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions {
+            cancelled,
+            limits: eja::TurnLimits {
+                slots: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("interrupted turn");
+    assert_eq!(interrupted.end, TurnEnd::Cancelled);
+    assert!(store
+        .events()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == Kind::WorkerReport)
+        .all(|event| event.text.contains("interrupted")));
+
+    let resumed = turn_at_with_options(
+        &store,
+        "continue the first job",
+        &Script::new(script(vec![
+            link(3, 1, RelationKind::Continues),
+            Action::Dispatch { task_id: 3 },
+        ])),
+        &Done::default(),
+        &Ports::default(),
+        eja::now_utc(),
+        &TurnOptions::default(),
+    )
+    .expect("recovery turn");
+    let events = store.events().unwrap();
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.kind == Kind::WorkerReport)
+            .any(|event| event.scope == "task:1" && event.text.contains("interrupted")),
+        "recovery leaves a readable unknown result"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == Kind::TaskAssigned && event.scope == "task:3"),
+        "a continuation is not dispatched without a readable predecessor record: {events:#?}"
+    );
+    assert!(resumed
+        .context()
+        .refused
+        .iter()
+        .any(|note| note.contains("no readable frozen record")));
 }
 
 struct EnvironmentLease;
@@ -335,11 +444,11 @@ fn unrelated_tasks_do_not_change_environment_capabilities() {
 
 struct Growing;
 impl Brain for Growing {
-    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
-        Decision {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Result<Decision> {
+        Ok(Decision {
             actions: vec![aja("another")],
             ..Decision::default()
-        }
+        })
     }
 }
 #[test]
@@ -375,11 +484,11 @@ fn endlessly_novel_states_stop_at_the_turn_budget_with_all_records_retained() {
 }
 struct Wait;
 impl Brain for Wait {
-    fn decide(&self, _: &EjaContext<'_>, control: &Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, control: &Control) -> Result<Decision> {
         while control.check().is_ok() {
             std::thread::sleep(Duration::from_millis(1));
         }
-        Decision::default()
+        Ok(Decision::default())
     }
 }
 #[test]
@@ -533,14 +642,14 @@ struct HeldBrain {
     release: Mutex<std::sync::mpsc::Receiver<()>>,
 }
 impl Brain for HeldBrain {
-    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Decision {
+    fn decide(&self, _: &EjaContext<'_>, _: &eja::Control) -> Result<Decision> {
         self.entered.send(()).unwrap();
         self.release
             .lock()
             .unwrap()
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
-        Decision::default()
+        Ok(Decision::default())
     }
 }
 #[test]
@@ -584,7 +693,7 @@ fn the_journal_lease_excludes_both_cloned_and_independent_stores() {
 
 struct ReceiptBrain(Mutex<usize>);
 impl Brain for ReceiptBrain {
-    fn decide(&self, context: &EjaContext<'_>, _: &eja::Control) -> Decision {
+    fn decide(&self, context: &EjaContext<'_>, _: &eja::Control) -> Result<Decision> {
         let mut step = self.0.lock().unwrap();
         let actions = match *step {
             0 => vec![task("allocated")],
@@ -595,11 +704,11 @@ impl Brain for ReceiptBrain {
             _ => panic!("unexpected decision"),
         };
         *step += 1;
-        Decision {
+        Ok(Decision {
             reply: "finished".into(),
             actions,
             ..Decision::default()
-        }
+        })
     }
 }
 #[test]

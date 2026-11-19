@@ -12,26 +12,32 @@ use chrono::{TimeZone, Utc};
 use eja::adapters::RecordFiles;
 use eja::adapters::{Ports, RecordReader};
 use eja::{
-    recover, turn_at, Action, Assignment, Brain, Decision, EjaContext, EventMeta, Kind, State,
-    Store, Worker,
+    inspect_journal, recover, turn_at, Action, Assignment, Brain, Decision, EjaContext, EventMeta,
+    Kind, State, Store, Worker,
 };
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[path = "../src/host/state.rs"]
+#[allow(dead_code)]
+mod host_state;
+
+use host_state::{state_json, Cache, Health};
+
 struct NoBrain;
 
 impl Brain for NoBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
-        Decision {
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> eja::Result<Decision> {
+        Ok(Decision {
             reply: "ok".to_string(),
             choices: Vec::new(),
             actions: Vec::new(),
             refused: Vec::new(),
-        }
+        })
     }
 }
 
@@ -48,8 +54,9 @@ impl QueueBrain {
 }
 
 impl Brain for QueueBrain {
-    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> Decision {
-        self.queue
+    fn decide(&self, _context: &EjaContext, _: &eja::Control) -> eja::Result<Decision> {
+        Ok(self
+            .queue
             .lock()
             .expect("brain")
             .pop_front()
@@ -58,7 +65,7 @@ impl Brain for QueueBrain {
                 choices: Vec::new(),
                 actions: Vec::new(),
                 refused: Vec::new(),
-            })
+            }))
     }
 }
 
@@ -100,7 +107,15 @@ fn pct(samples: &[Duration], percentile: f64) -> f64 {
 }
 
 fn write_commitments(path: &Path, count: usize) {
-    let mut file = File::create(path).expect("log");
+    let root = path.parent().expect("state directory");
+    fs::create_dir_all(root).expect("state directory");
+    let initial = Store::new(root).expect("initialize state");
+    assert!(initial.events().expect("events").is_empty());
+    drop(initial);
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("committed log");
     for id in 1..=count {
         let event = serde_json::json!({
             "id": id,
@@ -114,23 +129,86 @@ fn write_commitments(path: &Path, count: usize) {
         writeln!(file, "{event}").expect("write event");
     }
     file.sync_all().expect("sync");
+    let checked = Store::new(root).expect("reopen benchmark state");
+    assert_eq!(checked.events().expect("events").len(), count);
 }
 
-fn bench_project(root: &Path, events: usize, iterations: usize) -> (f64, f64, usize) {
+struct Scale {
+    read_p50: f64,
+    read_p95: f64,
+    fold_p50: f64,
+    fold_p95: f64,
+    http_p50: f64,
+    http_p95: f64,
+    size: usize,
+    peak_kib: u64,
+}
+
+fn peak_rss_kib() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` initializes the structure on success; its return value
+    // is checked before the value is read.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    // SAFETY: the successful call above initialized the structure.
+    let usage = unsafe { usage.assume_init() };
+    let peak = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    if cfg!(target_os = "macos") {
+        peak / 1024
+    } else {
+        peak
+    }
+}
+
+fn bench_scale(root: &Path, events: usize, iterations: usize) -> Scale {
     let dir = root.join(format!("project-{events}"));
     fs::create_dir_all(&dir).expect("dir");
     write_commitments(&dir.join("log.jsonl"), events);
     let store = Store::new(&dir).expect("store");
-    let mut samples = Vec::new();
+    let events = store.events().expect("events");
+    let health = Health {
+        model: false,
+        model_name: String::new(),
+        state: true,
+        tools: false,
+        journal: "ok",
+        journal_error: None,
+        torn: false,
+        turn_in_flight: false,
+        capability_errors: Vec::new(),
+    };
+    let mut read = Vec::new();
+    let mut fold = Vec::new();
+    let mut http = Vec::new();
     for _ in 0..iterations {
         let start = Instant::now();
-        let _context = State::load(&store)
-            .expect("state")
-            .project("benchmark", None, now());
-        samples.push(start.elapsed());
+        let scan = inspect_journal(&store.log_path).expect("scan");
+        std::hint::black_box(scan.events.len());
+        read.push(start.elapsed());
+
+        let start = Instant::now();
+        let state = State::fold(events.clone());
+        std::hint::black_box(state.events().len());
+        fold.push(start.elapsed());
+
+        let start = Instant::now();
+        let mut cache = Cache::new(dir.clone());
+        let view = state_json(&mut cache, 0, &health, false, None);
+        std::hint::black_box(view["lastEvent"].as_u64());
+        http.push(start.elapsed());
     }
     let size = fs::metadata(dir.join("log.jsonl")).expect("metadata").len() as usize;
-    (pct(&samples, 0.5), pct(&samples, 0.95), size)
+    Scale {
+        read_p50: pct(&read, 0.5),
+        read_p95: pct(&read, 0.95),
+        fold_p50: pct(&fold, 0.5),
+        fold_p95: pct(&fold, 0.95),
+        http_p50: pct(&http, 0.5),
+        http_p95: pct(&http, 0.95),
+        size,
+        peak_kib: peak_rss_kib(),
+    }
 }
 
 fn bench_append(root: &Path, count: usize) -> (f64, f64, f64) {
@@ -394,13 +472,33 @@ fn main() {
     );
     println!();
 
-    println!("## project (read + fold + projection)");
-    println!("| events | p50 ms | p95 ms | log bytes |");
-    println!("|---:|---:|---:|---:|");
+    println!("## history scale");
+    println!(
+        "| events | read p50/p95 ms | fold p50/p95 ms | http refresh p50/p95 ms | log bytes | peak RSS KiB |"
+    );
+    println!("|---:|---:|---:|---:|---:|---:|");
     for events in [1_000usize, 5_000, 10_000, 50_000] {
-        let (p50, p95, size) = bench_project(&root, events, 20);
-        println!("| {events} | {p50:.3} | {p95:.3} | {size} |");
+        let iterations = match events {
+            1_000 => 20,
+            5_000 => 10,
+            10_000 => 5,
+            _ => 3,
+        };
+        let scale = bench_scale(&root, events, iterations);
+        println!(
+            "| {events} | {:.3} / {:.3} | {:.3} / {:.3} | {:.3} / {:.3} | {} | {} |",
+            scale.read_p50,
+            scale.read_p95,
+            scale.fold_p50,
+            scale.fold_p95,
+            scale.http_p50,
+            scale.http_p95,
+            scale.size,
+            scale.peak_kib
+        );
     }
+    println!();
+    println!("Peak RSS is the process high-water mark after each row; it is monotonic.");
 
     println!();
     println!("## append + fsync");

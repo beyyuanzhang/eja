@@ -8,7 +8,12 @@ use support::{decision, Done, Script, State};
 /// Acceptance evidence is a host act, declared as one capability call.
 struct Checks;
 impl Capabilities for Checks {
-    fn witness(&self, request: &Value, _: &eja::Control) -> eja::Result<Value> {
+    fn witness(
+        &self,
+        request: &Value,
+        _: eja::WitnessContext<'_>,
+        _: &eja::Control,
+    ) -> eja::Result<Value> {
         Ok(json!({"tool": request["tool"], "passed": true}))
     }
 }
@@ -177,7 +182,12 @@ fn without_host_evidence_the_task_cannot_be_accepted_but_can_be_rejected() {
 fn a_host_that_cannot_answer_leaves_the_reason_in_the_log() {
     struct Broken;
     impl Capabilities for Broken {
-        fn witness(&self, _: &Value, _: &eja::Control) -> eja::Result<Value> {
+        fn witness(
+            &self,
+            _: &Value,
+            _: eja::WitnessContext<'_>,
+            _: &eja::Control,
+        ) -> eja::Result<Value> {
             Err("the checker is offline".into())
         }
     }

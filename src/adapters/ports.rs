@@ -1,11 +1,19 @@
 //! Host surface: one read over the three authorities, and the capabilities a
 //! host may add on top of it.
 use super::{EnvironmentProvider, EnvironmentRecord};
-use crate::{Address, Authority, Control, Event, Host, Result, Selector, TaskId, WorkspaceGrant};
+use crate::{
+    Address, Authority, Control, Event, Host, Result, Selector, TaskId, WitnessContext,
+    WorkspaceGrant,
+};
 use serde_json::Value;
 
 pub trait RecordReader {
     fn slice(&self, path: &str, selector: &Selector, control: &Control) -> Result<Value>;
+    /// Prove a frozen run and its ancestry can be read before a continuation is
+    /// dispatched. A report alone is not a record.
+    fn continuation_ready(&self, _aja: u64, _control: &Control) -> Result<()> {
+        Err("this record reader does not expose continuation readiness".into())
+    }
     /// The environment evidence a run recorded, when the record carries it. An
     /// old record without environment fields decodes as `Unknown`.
     fn environment(&self, _aja: u64) -> Result<Option<EnvironmentRecord>> {
@@ -22,7 +30,12 @@ pub trait Capabilities: Send + Sync {
         Err("this host observes no tools".into())
     }
 
-    fn witness(&self, _request: &Value, _control: &Control) -> Result<Value> {
+    fn witness(
+        &self,
+        _request: &Value,
+        _task: WitnessContext<'_>,
+        _control: &Control,
+    ) -> Result<Value> {
         Err("this host observes no acceptance evidence".into())
     }
 }
@@ -36,6 +49,12 @@ pub struct Ports<'a> {
 }
 
 impl Host for Ports<'_> {
+    fn continuation_ready(&self, aja: u64, control: &Control) -> Result<()> {
+        self.aja
+            .ok_or("no record reader is configured for continuation")?
+            .continuation_ready(aja, control)
+    }
+
     fn workspace_available(&self, workspace: &str, available: &[WorkspaceGrant]) -> bool {
         if workspace.is_empty() {
             return true;
@@ -91,10 +110,15 @@ impl Host for Ports<'_> {
         }
     }
 
-    fn witness(&self, request: &Value, control: &Control) -> Result<Value> {
+    fn witness(
+        &self,
+        request: &Value,
+        task: WitnessContext<'_>,
+        control: &Control,
+    ) -> Result<Value> {
         self.capabilities
             .ok_or("this host observes no acceptance evidence")?
-            .witness(request, control)
+            .witness(request, task, control)
     }
 
     fn reconcile(

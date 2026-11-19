@@ -1,6 +1,6 @@
 use eja::{
-    adapters::{self, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolProvider},
-    turn_at_with_options, Assignment, Result, State, Store, Task, TaskStatus, TurnEnd, TurnOptions,
+    adapters::{self, ToolProvider},
+    validate_turn_input, Assignment, Result, State, Store, Task, TaskStatus, TurnEnd, TurnOptions,
 };
 use std::{collections::VecDeque, path::PathBuf, process::ExitCode};
 
@@ -161,6 +161,7 @@ fn run() -> Result<()> {
     );
     match command {
         Command::Turn(input) => {
+            validate_turn_input(&input, &options)?;
             let limits = &mut options.limits;
             limits.decisions = env("EJA_TURN_DECISIONS", limits.decisions)?;
             limits.actions = env("EJA_TURN_ACTIONS", limits.actions)?;
@@ -173,70 +174,13 @@ fn run() -> Result<()> {
             let settings = host::SettingsStore::new(project, dir.clone());
             let composed = host::compose(&settings, &startup)?;
             report_capability_diagnostics(&composed.diagnostics);
-            options.limits.slots = composed.effective.limits.slots.max(1);
-            if composed.effective.limits.turn_timeout_ms > 0 {
-                options.limits.timeout_ms = composed.effective.limits.turn_timeout_ms;
+            let outcome = composed.run_turn(&dir, &store, &input, &options, None)?;
+            if outcome.end == TurnEnd::Failed {
+                return Err(outcome
+                    .reason
+                    .unwrap_or_else(|| "model transport failed".to_owned())
+                    .into());
             }
-            let grant = composed.effective.grants(&settings);
-            options.workspaces.clone_from(&grant);
-            let eja_role = composed
-                .effective
-                .roles
-                .eja
-                .as_ref()
-                .filter(|role| role.configured())
-                .ok_or("settings need an EJA provider and model")?;
-            let aja_role = composed
-                .effective
-                .roles
-                .aja
-                .as_ref()
-                .filter(|role| role.configured())
-                .ok_or("settings need an AJA provider and model")?;
-            let mut brain =
-                OpenAiBrain::new(&eja_role.base_url, &eja_role.api_key, &eja_role.model)
-                    .with_headers(
-                        eja_role
-                            .headers
-                            .iter()
-                            .map(|(name, value)| (name.clone(), value.clone()))
-                            .collect(),
-                    );
-            if let Some(description) = &composed.capability_description {
-                brain = brain.with_capability_description(description);
-            }
-            let model = OpenAiModel::new(&aja_role.base_url, &aja_role.api_key, &aja_role.model)
-                .with_headers(
-                    aja_role
-                        .headers
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect(),
-                );
-            let ajas = dir.join("ajas");
-            let mut aja_limits = eja::aja::Limits::default();
-            if composed.effective.limits.aja_steps > 0 {
-                aja_limits.steps = Some(composed.effective.limits.aja_steps);
-            }
-            if composed.effective.limits.aja_timeout_ms > 0 {
-                aja_limits.timeout_ms = composed.effective.limits.aja_timeout_ms;
-            }
-            let worker = composed.worker(&ajas, model, aja_limits)?;
-            let records = RecordFiles::with_checkpoints(&ajas, dir.join("checkpoints"));
-            let ports = Ports {
-                aja: Some(&records),
-                capabilities: Some(&*composed.tools),
-                environments: composed.environments.as_deref(),
-            };
-            let outcome = turn_at_with_options(
-                &store,
-                &input,
-                &brain,
-                &worker,
-                &ports,
-                eja::now_utc(),
-                &options,
-            )?;
             if eja::INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("interrupted; the aja was stopped and its run is recorded".into());
             }
@@ -493,7 +437,7 @@ fn print_task(task: &Task) {
         if let Some(digest) = &run.digest {
             println!(
                 "  record at: {}",
-                run.digest_at
+                task.reported_at
                     .map_or_else(|| "-".to_string(), eja::format_utc)
             );
             for line in digest.lines() {

@@ -7,7 +7,7 @@ struct APIError: LocalizedError {
 
 @MainActor
 final class APIClient {
-    var baseURL: URL
+    let baseURL: URL
     private let session: URLSession
 
     init(baseURL: URL) {

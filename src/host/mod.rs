@@ -26,8 +26,9 @@ use axum::{
     Json, Router,
 };
 use eja::{
-    adapters::{Control, McpTools, OpenAiBrain, OpenAiModel, Ports, RecordFiles, ToolProvider},
-    turn_at_with_options, Assignment, ChoiceSelection, Kind, Store, TurnOptions,
+    adapters::{Control, McpTools, RecordFiles, RecordReader, ToolProvider},
+    validate_turn_input, Assignment, ChoiceSelection, JournalLease, Kind, Selector, Store,
+    TurnOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -243,40 +244,17 @@ pub fn serve(options: Options) -> eja::Result<()> {
                 if pulse_host.turn_in_flight.swap(true, Ordering::SeqCst) {
                     continue;
                 }
-                // The quiet window is re-checked under the turn lock: a user
-                // turn may have landed between the read above and this claim.
-                let Ok(store) = Store::new(&pulse_host.state_dir) else {
-                    pulse_host.turn_in_flight.store(false, Ordering::SeqCst);
-                    continue;
-                };
-                let Ok(_lease) = store.lock_turn() else {
-                    pulse_host.turn_in_flight.store(false, Ordering::SeqCst);
-                    continue;
-                };
-                let quiet = store.events().ok().and_then(|events| {
-                    events.last().map(|last| {
-                        last.kind != Kind::Alone
-                            && eja::now_utc().timestamp() - last.at >= PULSE.quiet
-                    })
-                });
-                if quiet != Some(true) {
-                    pulse_host.turn_in_flight.store(false, Ordering::SeqCst);
-                    continue;
-                }
                 let pulse = pulse_host.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     let _reset = TurnFlag(&pulse.turn_in_flight);
-                    let _ = execute_turn(
-                        &pulse,
-                        "",
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                        Some(Kind::Alone),
-                        None,
-                    );
+                    pulse_once(&pulse)
                 })
                 .await;
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => eprintln!("pulse: {}", error.message),
+                    Err(error) => eprintln!("pulse task failed: {error}"),
+                }
             }
         });
         let app = Router::new()
@@ -322,7 +300,7 @@ fn state_json(
     after: u64,
 ) -> ApiResult<Value> {
     let effective = host.settings.effective_current()?;
-    let capabilities = &effective.capabilities;
+    let capabilities = &effective.settings.capabilities;
     let workspace_tools = (capabilities.enabled(FILES) || capabilities.enabled(SHELL))
         && !effective.grants(&host.settings).is_empty();
     let plugin_tools = effective.managed_code_enabled();
@@ -722,8 +700,8 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
     let body = read_json(request).await?;
     let turn: TurnRequest = serde_json::from_value(body)?;
     let text = turn.text.trim();
-    let approvals: Vec<u64> = turn.approvals.into_iter().filter(|id| *id > 0).collect();
-    let denials: Vec<u64> = turn.denials.into_iter().filter(|id| *id > 0).collect();
+    let approvals = turn.approvals;
+    let denials = turn.denials;
     let gesture = match turn.gesture.as_deref() {
         None | Some("") => None,
         Some("return") => Some(Kind::Returned),
@@ -731,28 +709,15 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
         Some("alone") => Some(Kind::Alone),
         Some(_) => return Err(ApiError::bad("unknown gesture")),
     };
-    if turn.selection.is_some()
-        && (!text.is_empty() || !approvals.is_empty() || !denials.is_empty() || gesture.is_some())
-    {
-        return Err(ApiError::bad("a choice answer is its own turn input"));
-    }
-    if text.is_empty()
-        && turn.selection.is_none()
-        && approvals.is_empty()
-        && denials.is_empty()
-        && gesture.is_none()
-    {
-        return Err(ApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: "a turn needs text, a choice, an approval, a denial or a situation".to_owned(),
-        });
-    }
-    if gesture.is_some() && !approvals.is_empty() {
-        return Err(ApiError::bad("a situation carries no approvals"));
-    }
-    if gesture.is_some() && !denials.is_empty() {
-        return Err(ApiError::bad("a situation carries no denials"));
-    }
+    let input_options = TurnOptions {
+        approvals: approvals.clone(),
+        denials: denials.clone(),
+        selection: turn.selection,
+        focus: turn.focus,
+        gesture,
+        ..TurnOptions::default()
+    };
+    validate_turn_input(text, &input_options).map_err(|error| ApiError::bad(error.to_string()))?;
     if text.chars().count() > MAX_TEXT {
         return Err(ApiError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -767,17 +732,22 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
     }
     let _reset = TurnFlag(&host.turn_in_flight);
     let started = Instant::now();
-    let text = text.to_owned();
+    let input = TurnInput {
+        text: text.to_owned(),
+        focus: turn.focus,
+        approvals,
+        denials,
+        gesture,
+        selection: turn.selection,
+    };
     let host_for_turn = host.clone();
     let reply = tokio::task::spawn_blocking(move || {
         execute_turn(
             &host_for_turn,
-            &text,
-            turn.focus.filter(|id| *id > 0),
-            approvals,
-            denials,
-            gesture,
-            turn.selection,
+            &Store::new(&host_for_turn.state_dir)
+                .map_err(|error| ApiError::internal(error.to_string()))?,
+            input,
+            None,
         )
     })
     .await
@@ -790,14 +760,20 @@ async fn run_turn(State(host): State<Arc<Host>>, request: Request) -> ApiResult<
     })))
 }
 
-fn execute_turn(
-    host: &Host,
-    text: &str,
+struct TurnInput {
+    text: String,
     focus: Option<u64>,
     approvals: Vec<u64>,
     denials: Vec<u64>,
     gesture: Option<Kind>,
     selection: Option<ChoiceSelection>,
+}
+
+fn execute_turn(
+    host: &Host,
+    store: &Store,
+    input: TurnInput,
+    lease: Option<&JournalLease>,
 ) -> ApiResult<String> {
     let startup = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
     let composed = compose(&host.settings, &startup)?;
@@ -820,74 +796,71 @@ fn execute_turn(
                     .to_owned(),
         });
     }
-    let eja_role = effective
-        .roles
-        .eja
-        .as_ref()
-        .ok_or_else(|| ApiError::internal("eja role is not configured"))?;
-    let aja_role = effective
-        .roles
-        .aja
-        .as_ref()
-        .ok_or_else(|| ApiError::internal("aja role is not configured"))?;
-    let mut brain = OpenAiBrain::new(
-        eja_role.base_url.as_str(),
-        eja_role.api_key.as_str(),
-        eja_role.model.as_str(),
-    )
-    .with_headers(compose::header_pairs(eja_role));
-    if let Some(description) = &composed.capability_description {
-        brain = brain.with_capability_description(description);
-    }
-    let model = OpenAiModel::new(
-        aja_role.base_url.as_str(),
-        aja_role.api_key.as_str(),
-        aja_role.model.as_str(),
-    )
-    .with_headers(compose::header_pairs(aja_role));
-    let grant = effective.grants(&host.settings);
-    let ajas = host.state_dir.join("ajas");
-    let mut aja_limits = eja::aja::Limits::default();
-    if effective.limits.aja_steps > 0 {
-        aja_limits.steps = Some(effective.limits.aja_steps);
-    }
-    if effective.limits.aja_timeout_ms > 0 {
-        aja_limits.timeout_ms = effective.limits.aja_timeout_ms;
-    }
-    let worker = composed.worker(&ajas, model, aja_limits)?;
-    // Reading a historical checkpoint is independent of creating new ones.
-    let records = RecordFiles::with_checkpoints(&ajas, host.state_dir.join("checkpoints"));
-    let ports = Ports {
-        aja: Some(&records),
-        capabilities: Some(&*composed.tools),
-        environments: composed.environments.as_deref(),
-    };
-    let store = Store::new(&host.state_dir)?;
-    let mut options = TurnOptions {
-        approvals,
-        denials,
-        selection,
-        focus,
-        gesture,
-        workspaces: grant,
+    let options = TurnOptions {
+        approvals: input.approvals,
+        denials: input.denials,
+        selection: input.selection,
+        focus: input.focus,
+        gesture: input.gesture,
         cancelled: host.cancelled.clone(),
         ..TurnOptions::default()
     };
-    options.limits.slots = effective.limits.slots.max(1);
-    if effective.limits.turn_timeout_ms > 0 {
-        options.limits.timeout_ms = effective.limits.turn_timeout_ms;
+    let outcome = composed
+        .run_turn(&host.state_dir, store, &input.text, &options, lease)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if outcome.end == eja::TurnEnd::Failed {
+        return Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            message: outcome
+                .reason
+                .unwrap_or_else(|| "model transport failed".to_owned()),
+        });
     }
-    let outcome = turn_at_with_options(
-        &store,
-        text,
-        &brain,
-        &worker,
-        &ports,
-        eja::now_utc(),
-        &options,
-    )
-    .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(outcome.reply)
+}
+
+/// Re-check the quiet window and enter EJA while holding one journal lease. The
+/// timer's earlier reads only avoid claiming a busy process; this is the check
+/// that decides whether the pulse may write.
+fn pulse_once(host: &Host) -> ApiResult<bool> {
+    let store = Store::new(&host.state_dir)?;
+    let Some(lease) = quiet_lease(&store, PULSE.quiet)? else {
+        return Ok(false);
+    };
+    execute_turn(
+        host,
+        &store,
+        TurnInput {
+            text: String::new(),
+            focus: None,
+            approvals: Vec::new(),
+            denials: Vec::new(),
+            gesture: Some(Kind::Alone),
+            selection: None,
+        },
+        Some(&lease),
+    )?;
+    Ok(true)
+}
+
+/// The one locking rule for a pulse: acquire first, then read the journal and
+/// decide whether quiet is still true. A busy journal is not a pulse error.
+fn quiet_lease(store: &Store, quiet: i64) -> eja::Result<Option<JournalLease>> {
+    let lease = match store.lock_turn() {
+        Ok(lease) => lease,
+        Err(error) if error.to_string() == "another turn already owns this journal" => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let events = store.events()?;
+    let Some(last) = events.last() else {
+        return Ok(None);
+    };
+    if last.kind == Kind::Alone || eja::now_utc().timestamp() - last.at < quiet {
+        return Ok(None);
+    }
+    Ok(Some(lease))
 }
 
 async fn get_raw(
@@ -895,11 +868,14 @@ async fn get_raw(
     Query(query): Query<RawQuery>,
 ) -> ApiResult<Json<Value>> {
     let address = query.address;
-    let journal = state::Journal::read(&host.state_dir);
     if let Some(raw) = address.strip_prefix("log:event:") {
         let id = raw.parse().map_err(|_| ApiError::bad("invalid event id"))?;
-        let event =
-            state::journal_event(&journal, id).ok_or_else(|| ApiError::missing("no such event"))?;
+        let event = host
+            .state_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .raw_event(id)
+            .ok_or_else(|| ApiError::missing("no such event"))?;
         return Ok(Json(json!({
             "address": address,
             "kind": "json",
@@ -908,8 +884,12 @@ async fn get_raw(
     }
     if let Some(raw) = address.strip_prefix("log:task:") {
         let id = raw.parse().map_err(|_| ApiError::bad("invalid task id"))?;
-        let task =
-            state::journal_task(&journal, id).ok_or_else(|| ApiError::missing("no such task"))?;
+        let task = host
+            .state_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .raw_task(id)
+            .ok_or_else(|| ApiError::missing("no such task"))?;
         return Ok(Json(json!({
             "address": address,
             "kind": "json",
@@ -924,8 +904,29 @@ async fn get_raw(
         if id == 0 {
             return Err(ApiError::bad("invalid aja id"));
         }
-        let root = host.state_dir.join("ajas").join(id.to_string());
-        let (content, bytes, truncated) = safe_file(&root, relative, MAX_RAW)?;
+        let reader = RecordFiles::with_checkpoints_and_limit(
+            host.state_dir.join("ajas"),
+            host.state_dir.join("checkpoints"),
+            MAX_RAW,
+        );
+        let control = Control::new(Duration::from_secs(10), Arc::new(AtomicBool::new(false)));
+        let view = reader
+            .slice(&format!("{id}/{relative}"), &Selector::Whole, &control)
+            .map_err(|error| ApiError::missing(error.to_string()))?;
+        let content = view
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = view
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or(content.len());
+        let truncated = view
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         return Ok(Json(json!({
             "address": address,
             "kind": "text",
@@ -1059,4 +1060,160 @@ async fn read_json(request: Request) -> ApiResult<Value> {
         return Ok(json!({}));
     }
     serde_json::from_slice(&bytes).map_err(|_| ApiError::bad("request body must be JSON"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quiet_lease;
+    use eja::adapters::Ports;
+    use eja::{Brain, Decision, EjaContext, Kind, Store, TurnEnd, TurnOptions, TurnRun, Worker};
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Barrier,
+        },
+    };
+
+    struct SilentBrain;
+
+    impl Brain for SilentBrain {
+        fn decide(&self, _: &EjaContext, _: &eja::Control) -> eja::Result<Decision> {
+            Ok(Decision::default())
+        }
+    }
+
+    struct SilentWorker;
+
+    impl Worker for SilentWorker {
+        fn execute(&self, _: &eja::Assignment, _: &eja::Control) -> String {
+            "no run".to_owned()
+        }
+    }
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "eja-pulse-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn run_alone(store: &Store, lease: &eja::JournalLease) -> eja::TurnOutcome<'static> {
+        let brain = SilentBrain;
+        let worker = SilentWorker;
+        let ports = Ports::default();
+        TurnRun {
+            store,
+            input: "",
+            brain: &brain,
+            worker: &worker,
+            host: &ports,
+            now: eja::now_utc(),
+            options: &TurnOptions {
+                gesture: Some(Kind::Alone),
+                ..TurnOptions::default()
+            },
+        }
+        .execute_under_lease(lease)
+        .expect("pulse turn")
+    }
+
+    #[test]
+    fn a_quiet_journal_runs_one_alone_turn_under_the_same_lease() {
+        let fixture = Fixture::new("quiet");
+        let store = Store::new(fixture.path()).expect("store");
+        store
+            .append_simple(Kind::User, "old", 1, eja::now_utc().timestamp() - 3_600)
+            .expect("old fact");
+        let lease = quiet_lease(&store, 60)
+            .expect("lease decision")
+            .expect("the journal is quiet");
+        let outcome = run_alone(&store, &lease);
+        assert_eq!(outcome.end, TurnEnd::Complete);
+        let events = store.events().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == Kind::Alone)
+                .count(),
+            1
+        );
+        assert_eq!(events.last().map(|event| event.kind), Some(Kind::Eja));
+    }
+
+    #[test]
+    fn a_new_input_before_the_lease_makes_the_pulse_stand_down() {
+        let fixture = Fixture::new("not-quiet");
+        let store = Store::new(fixture.path()).expect("store");
+        store
+            .append_simple(Kind::User, "just now", 1, eja::now_utc().timestamp())
+            .expect("new fact");
+        assert!(quiet_lease(&store, 60).expect("lease decision").is_none());
+        assert_eq!(
+            store
+                .events()
+                .expect("events")
+                .iter()
+                .filter(|event| event.kind == Kind::Alone)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_pulses_enter_at_most_one_turn() {
+        let fixture = Fixture::new("concurrent");
+        let store = Store::new(fixture.path()).expect("store");
+        store
+            .append_simple(Kind::User, "old", 1, eja::now_utc().timestamp() - 3_600)
+            .expect("old fact");
+        let together = Arc::new(Barrier::new(2));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let together = together.clone();
+            threads.push(std::thread::spawn(move || {
+                together.wait();
+                let Some(lease) = quiet_lease(&store, 60).expect("lease decision") else {
+                    return false;
+                };
+                let outcome = run_alone(&store, &lease);
+                assert_eq!(outcome.end, TurnEnd::Complete);
+                true
+            }));
+        }
+        let entered = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("pulse thread"))
+            .filter(|entered| *entered)
+            .count();
+        assert_eq!(entered, 1, "only one pulse owns the turn");
+        assert_eq!(
+            store
+                .events()
+                .expect("events")
+                .iter()
+                .filter(|event| event.kind == Kind::Alone)
+                .count(),
+            1
+        );
+    }
 }

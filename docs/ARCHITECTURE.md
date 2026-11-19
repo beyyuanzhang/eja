@@ -48,6 +48,9 @@ outlive its fold would be a second authority, so there is none.
    the host for one turn, and confirmation needs it plus a pending proposal from
    an earlier turn. One event applies and resolves the proposal. Goal/commitment
    replacement closes an active same-kind id; correction only withdraws one. A
+   correction against a pending proposal closes both the question and the
+   correction in one rejection event; against an existing fact it is one
+   correction event, with no redundant confirmation.
    turn is the unit of waiting: a proposal that needs an approval ends the turn
    and the next turn carries it, so no journal lease is held for a human.
    A judgment counts only on evidence the host observed, not on the runner's
@@ -114,7 +117,7 @@ Three properties are testable, and `tests/identity.rs` holds them:
 | Entity | Operation | Preconditions / result |
 |---|---|---|
 | Aja | open_task | Open, no execution yet; `evidence` fixes the observation its judgment needs |
-| Aja | dispatch | Open; depends_on targets Done; continues target has a frozen-run report; then Running |
+| Aja | dispatch | Open; depends_on targets Done; a continues target has a recorded report and its frozen record/ancestry is readable by the host; then Running |
 | Aja | worker report / recovery | Running -> Waiting |
 | Aja | close_task | Waiting -> Done or Failed, EJA's judgment; needs the witness evidence when `evidence` was declared |
 | Aja | reconcile | after a report; the host lands the run's environment or reports conflicts |
@@ -189,14 +192,25 @@ commit, so no adapter keeps a second copy of the record layout.
 Checkpoint failure is recorded explicitly; it cannot erase an already frozen
 transcript or manufacture an acceptance.
 
+One validator, `validate_turn_input`, defines the legal input shapes for the
+kernel, CLI and HTTP before any business event or recovery report is written.
+Text may carry focus, approvals and denials; a gesture, a selection, an approval
+or a denial is otherwise its own input. A gesture cannot combine with text,
+focus, selection, approval or denial; a selection cannot combine with text,
+focus, approval or denial. Zero ids, unknown gestures and the same proposal both
+approved and denied are refused. HTTP size and parsing limits remain a host
+concern.
+
 ## Composition
 
 `host::capability` is the one flat capability catalog. Built-ins and installed
 plugins publish the same card shape: id, title, description, service kind,
 default state and private config. `host::compose` is the single assembly root for
-CLI and HTTP. It reads `app-settings.json`, walks enabled cards, assembles their
-providers and returns one `ComposedHost` with record-store services and
-capability diagnostics. The kernel has no capability enum, plugin list or
+CLI, HTTP and the host's pulse. It reads `app-settings.json`, walks enabled
+cards, assembles their providers and returns one `ComposedHost` with record-store
+services and capability diagnostics. `ComposedHost::run_turn` is the one turn
+assembly: roles, model adapters, worker, records, ports, grants and limits all
+come from that result. The kernel has no capability enum, plugin list or
 workspace/Git/MCP variant.
 
 The catalog supplies services to existing contracts. A tool card contributes a
@@ -209,6 +223,12 @@ questions. `ToolProvider` declares callable actions and their names.
 `ToolRegistry` routes a name to the provider that owns it. Workspace files, shell,
 MCP servers and managed plugins are peers at that boundary. Each provider owns its
 protocol, path rules, grants and output bound.
+A workspace witness receives the judging task's fixed root in
+`WitnessContext`; a relative file path is resolved there, not by the first grant
+in a list, and a task with no fixed workspace cannot use a local file witness.
+Two granted roots with the same filename therefore cannot answer for one
+another. MCP and other proof-of-external-state tools retain the request form for
+their own observations.
 
 `EnvironmentProvider` owns the lifecycle of a mutable execution environment. It
 reserves exclusive access, measures changes at settlement, reconciles a recorded
@@ -226,6 +246,11 @@ durable branches. They are separate `checkpoints` and `git-worktrees` cards, so
 either service can run without the other. The kernel sees neither role directly
 and contains no repository topology.
 
+Checkpoint freezing serializes only `git add`, `commit` and reading the new
+`HEAD` over one shared checkpoint repository; worker execution remains
+parallel. This keeps a manifest's commit id and its staged contents in the same
+transaction.
+
 Managed plugins are external tool cards. Their manifest supplies card metadata
 and default config, the active pointer versions the code, and the manager stages,
 tests, activates and rolls back versions. A plugin receives its config through
@@ -235,20 +260,30 @@ authority. Third-party tools enter through MCP and therefore use the same
 
 The HTTP host keeps one `host::state::Cache` derived from the journal. It
 rechecks the file stamp, folds only after a change, and serves event tails after
-the caller's cursor. The cache is rebuildable and never becomes a second
-authority. MCP connector types and normalization remain an adapter-owned config
-detail behind the generic card storage.
+the caller's cursor. The cache's event list is the `State` it folds, not a second
+event table; only the serialized JSON is cached beside it. The HTTP reader and
+the kernel both call `inspect_journal`, so a record is committed only by its
+newline and a valid JSON tail without one remains torn for both. The cache is
+rebuildable and never becomes a second authority. MCP connector types and
+normalization remain an adapter-owned config detail behind the generic card
+storage.
 
 ## Port contracts
 
 - `Brain::decide`: return a decision under the supplied Control.
+- A model transport error returns `Err`; it becomes `TurnEnd::Failed` and a
+  `failure` diagnostic event. It is never stored as an `eja` utterance.
 - `Worker::execute`: own one run in its reserved environment; return its observed
-  digest. Runs execute in action order; each completed report is recorded
-  before the next.
+  digest. Executions may overlap, but each completed report and its evidence are
+  committed immediately, in completion order. A slow sibling cannot leave a
+  finished run looking `Running` after a host exit.
 - `Host::look`: read only, bound output, respect Control; one address space.
 - `Host::witness`: the host's own observation of declared acceptance evidence.
   A host that declares none is still complete: the default refuses, so an
   acceptance is unavailable and only a rejection is left open.
+  A file witness is bound to the task's stored workspace root. The separate
+  `{"source":"record","path":"..."}` evidence request reads the task's frozen
+  record and deliberately distinguishes it from the current workspace.
   `Host::reconcile`: land one run's environment, or report its conflicts as the
   recorded outcome.
 - `EnvironmentProvider`: reserve, settle, reconcile and release the environment one execution may
@@ -285,8 +320,9 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | No multiple predecessor, dangling id, self edge or combined dependency cycle | convergence |
 | Allocated ids are observable before subsequent actions address them | convergence |
 | Model confirmation without host approval cannot alter identity | convergence + proposals |
-| Confirmation has one atomic resolving event | convergence |
+| Confirmation has one atomic resolving event; both withdrawal branches are checked at every durable prefix | proposals |
 | Recovering a torn tail allows later appends; committed corruption errors | convergence + recovery |
+| A continuation without a readable predecessor record is refused before assignment | convergence + native_worker |
 | Cloned/independent Store instances cannot recover each other’s live turn | convergence |
 | New states cannot bypass a finite turn budget | convergence |
 | Rendered contexts respect exact UTF-8 byte bounds | convergence + projection |
@@ -297,7 +333,13 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | A repeated read states the same information, so a turn ends at its fixpoint | turn_steps |
 | The turn's evidence is folded from the journal, never supplied by a caller | projection |
 | A folded region names an address that reads it | fold + identity |
-| Parallel slots run at once and the log keeps action order | environments |
+| Parallel slots run at once; a fast report is durable while its slow sibling still runs | environments |
+| Kernel and HTTP expose the same committed event ids for the same bytes | host::state |
+| A file witness with two same-named roots reads the task's own root | observe |
+| A local file witness without a task workspace is refused rather than using the first grant | observe |
+| A record witness reads an unmerged worktree artifact from that run's checkpoint | native_worker |
+| Concurrent checkpoint freezes keep each commit and its contents together | adapters::records |
+| One capability-filtered grant snapshot drives the default, tools and environments | host::compose |
 | One shared environment, one owner: a second run is refused before it costs an aja id | environments |
 | A Git worktree environment settles and reconciles explicitly; conflicts are reported | environments |
 
@@ -321,7 +363,10 @@ once per turn and every derived table is a field of that value.
 Adapters never obtain a mutable identity handle. Store's low-level append API is
 for trusted host/admin code, including fixture construction. The journal-wide
 Unix turn lease is the sole turn exclusion guard. Append locking and stale-cursor
-checks protect the rebuildable cursor; they do not implement a distributed scheduler.
+checks protect the rebuildable cursor; they do not implement a distributed
+scheduler. `inspect_journal` is the one committed-prefix scanner: only a
+newline-terminated event is committed, and both kernel reads and HTTP views use
+its result.
 
 An initialized state directory contains `state.json` with
 `{"format":"eja","version":1}`. A non-empty directory without this marker, or

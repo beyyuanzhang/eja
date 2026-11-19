@@ -17,7 +17,9 @@ The view's snapshot. Query parameters:
   stays visible even after newer events.
 - `after=<event id>` returns only events newer than that committed id. The
   runtime keeps a rebuildable derived cache, so polling does not fold the whole
-  journal when the file is unchanged.
+  journal when the file is unchanged. Only newline-terminated records are
+  committed. A complete JSON object without its terminating newline is still a
+  torn tail and is not returned as an event; `health.torn` reports the bytes.
 
 Response:
 
@@ -67,10 +69,24 @@ A `Loop` is one thing that still asks for the user:
 }
 ```
 
-`gesture` is `return`, `leave` or `alone`, and stands alone (no text). A turn
-with text opens/continues an encounter; `focus` names the task under discussion.
-Text remains a valid answer to any question, including a free-form answer such
-as "the second one".
+`gesture` is `return`, `leave` or `alone`. A turn has one of these shapes:
+
+- text (with optional `focus`, `approvals` and/or `denials`);
+- a gesture by itself: no text, focus, selection, approvals or denials;
+- a selection by itself: no text, focus, approvals, denials or gesture;
+- an approval and/or denial, with optional text or focus. The same proposal id
+  cannot be both approved and denied, and ids must be positive.
+
+A turn with text opens/continues an encounter; `focus` names the task under
+discussion. Text remains a valid answer to any question, including a free-form
+answer such as "the second one". A mixed shape is rejected before any event or
+recovery report is written.
+
+A gesture request is exactly:
+
+```json
+{ "gesture": "return" }
+```
 
 A button answer uses the question's recorded option instead:
 
@@ -82,7 +98,18 @@ A button answer uses the question's recorded option instead:
 stands alone against text, approvals, denials and gestures. The runtime resolves
 `option` against the recorded question, so a client cannot substitute its own
 value. The answer becomes an ordinary user event carrying the exact value.
-Response: `{ "ok": true, "reply": "..." }`, or `{ "ok": false, "error": "..." }`.
+
+Success response:
+
+```json
+{ "ok": true, "elapsedMs": 120, "stdout": "...", "stderr": "" }
+```
+
+`stdout` is EJA's reply. Silence is a successful empty `stdout`. A provider or
+transport failure is HTTP `502` with the ordinary `{ "error": "..." }` shape; it
+records a `failure` event for diagnosis and never records the error text as an
+`eja` utterance. Other request, conflict, budget and configuration failures keep
+their 4xx/5xx statuses.
 
 ## GET /api/settings, POST /api/settings
 
@@ -101,7 +128,13 @@ managed plugins add `plugin:NAME` cards through the same catalog.
 ## GET /api/raw
 
 `address` is one documented address: `log:task:<id>`, `log:event:<id>`,
-`record:<id>/aja.json`, `record:<id>/context.jsonl`.
+`record:<id>/<path>`, or `environment:<path>` for a current granted workspace.
+`record:` uses the same record resolver as EJA and its ajas, so a frozen file in
+that run's checkpoint is read from the checkpoint even when the current
+workspace has changed. `record:<id>/aja.json` and
+`record:<id>/context.jsonl` remain the guaranteed metadata files. Raw reads are
+limited to 128 KiB and report `bytes` plus `truncated`; they do not enlarge a
+task's or worker's grants.
 
 ## POST /api/provider/discover, POST /api/capabilities/{id}/probe
 

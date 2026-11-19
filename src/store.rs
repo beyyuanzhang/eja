@@ -21,6 +21,13 @@ pub struct Store {
     file: Arc<File>,
 }
 
+/// Exclusive right to think one turn. Holding this value across the decision and
+/// its writes is the only turn-level exclusion guard.
+#[derive(Debug)]
+pub struct JournalLease {
+    _file: File,
+}
+
 #[derive(Debug)]
 struct Cursor {
     next_id: u64,
@@ -34,6 +41,25 @@ const LOCK_WAIT_MS: u32 = 100;
 const LOCK_POLL: Duration = Duration::from_millis(1);
 const STATE_FILE: &str = "state.json";
 const STATE_VERSION: u64 = 1;
+
+/// One scan of the committed journal prefix.
+///
+/// A record is committed by its terminating newline. The bytes after the last
+/// complete record are an uncommitted tail: they may be a complete JSON value
+/// that was never committed, or a torn write. Neither is a fact. Both the kernel
+/// and the HTTP view read this scan, so they cannot disagree about which event
+/// ids exist.
+#[derive(Debug, Clone, Default)]
+pub struct JournalScan {
+    pub events: Vec<Event>,
+    /// Bytes occupied by complete, newline-terminated records.
+    pub committed: u64,
+    /// A non-empty uncommitted tail follows the committed prefix.
+    pub torn: bool,
+    /// Corruption inside the committed prefix. Readers must not trust any event
+    /// after this point.
+    pub error: Option<String>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,44 +129,63 @@ fn lock_log(path: &Path, file: &File) -> Result<()> {
     }
 }
 
-/// A complete newline commits a record. Only an uncommitted final fragment is
-/// recoverable; corruption inside the committed prefix is always an error.
-fn scan_events(path: &Path) -> Result<(Vec<Event>, u64)> {
+/// Read the one committed prefix.
+///
+/// I/O failure is returned; corruption inside the prefix stops the scan at the
+/// offending record and is reported in `error`, so a diagnostic view can show
+/// the same prefix and explain the same bytes without inventing a different rule.
+pub fn inspect_journal(path: impl AsRef<Path>) -> Result<JournalScan> {
+    let path = path.as_ref();
     if !path.exists() {
-        return Ok((Vec::new(), 0));
+        return Ok(JournalScan::default());
     }
     let mut reader = BufReader::new(fs::File::open(path)?);
-    let mut events: Vec<Event> = Vec::new();
-    let mut committed = 0u64;
+    let mut scan = JournalScan::default();
     loop {
         let mut line = Vec::new();
         let count = reader.read_until(b'\n', &mut line)?;
-        if count == 0 || line.last() != Some(&b'\n') {
+        if count == 0 {
             break;
         }
-        committed += count as u64;
+        if line.last() != Some(&b'\n') {
+            scan.torn = true;
+            break;
+        }
+        let at = scan.committed;
+        scan.committed += count as u64;
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let event: Event = serde_json::from_slice(&line).map_err(|error| {
-            format!(
-                "corrupt committed log at byte {}: {error}",
-                committed - count as u64
-            )
-        })?;
-        if events
+        let event: Event = match serde_json::from_slice(&line) {
+            Ok(event) => event,
+            Err(error) => {
+                scan.error = Some(format!(
+                    "corrupt committed log at byte {at}: {error}; the reader stops before this record"
+                ));
+                break;
+            }
+        };
+        if scan
+            .events
             .last()
             .is_some_and(|previous| event.id <= previous.id)
         {
-            return Err("event ids must increase in append order".into());
+            scan.error = Some(format!(
+                "corrupt committed log at byte {at}: event ids must increase in append order"
+            ));
+            break;
         }
-        events.push(event);
+        scan.events.push(event);
     }
-    Ok((events, committed))
+    Ok(scan)
 }
 
 fn read_events(path: &Path) -> Result<Vec<Event>> {
-    Ok(scan_events(path)?.0)
+    let scan = inspect_journal(path)?;
+    if let Some(error) = scan.error {
+        return Err(error.into());
+    }
+    Ok(scan.events)
 }
 
 impl Store {
@@ -153,7 +198,13 @@ impl Store {
             .read(true)
             .open(&log_path)?;
         lock_log(&log_path, &file)?;
-        let (existing, committed) = scan_events(&log_path)?;
+        let scan = inspect_journal(&log_path)?;
+        if let Some(error) = scan.error {
+            let _ = file.unlock();
+            return Err(error.into());
+        }
+        let existing = scan.events;
+        let committed = scan.committed;
         if file.metadata()?.len() != committed {
             file.set_len(committed)?;
             file.sync_all()?;
@@ -187,13 +238,13 @@ impl Store {
 
     /// The journal lease for one turn: held by whoever is about to think, so a
     /// second thinker (or a heartbeat about to spend a turn) stands down.
-    pub fn lock_turn(&self) -> Result<fs::File> {
+    pub fn lock_turn(&self) -> Result<JournalLease> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.log_path.with_extension("turn.lock"))?;
         lock_log(&self.log_path, &file).map_err(|_| "another turn already owns this journal")?;
-        Ok(file)
+        Ok(JournalLease { _file: file })
     }
 
     pub fn events(&self) -> Result<Vec<Event>> {

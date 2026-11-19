@@ -2,7 +2,7 @@
 use crate::Control;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 /// The one error type of a port. `Send + Sync` because a worker runs on its own
 /// thread and its failure must be reportable from there.
@@ -51,6 +51,9 @@ pub enum Kind {
     /// The host rejected an action: the state did not allow it, or it could not
     /// be read as one of EJA's own actions. EJA reads these back in its projection.
     Refused,
+    /// Model transport failed before a decision existed. This is host
+    /// diagnostics, never EJA's speech.
+    Failure,
 }
 
 impl Kind {
@@ -84,6 +87,7 @@ impl Kind {
             Self::Alone => "alone",
             Self::Note => "note",
             Self::Refused => "refused",
+            Self::Failure => "failure",
         }
     }
 
@@ -298,6 +302,14 @@ pub struct TaskOpen<'a> {
     pub(crate) evidence: Option<Value>,
 }
 
+/// The task whose acceptance contract a witness answers. A relative workspace
+/// read is resolved against this task's fixed root, never the first grant.
+#[derive(Debug, Clone, Copy)]
+pub struct WitnessContext<'a> {
+    pub task_id: TaskId,
+    pub workspace: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseOutcome {
     pub accepted: bool,
@@ -324,8 +336,6 @@ pub struct Task {
     pub close: Option<CloseOutcome>,
     /// The facts of this task's own scope, in journal order.
     pub event_ids: Vec<u64>,
-    /// The assignment exactly as dispatched, once it ran.
-    pub assignment: Option<Value>,
     /// The facts of a task that executes. A group aggregates and never runs, so
     /// it has none of them and no reader has to ask whether a field means
     /// anything for the kind it is looking at.
@@ -338,7 +348,6 @@ pub struct Task {
 pub struct Run {
     /// The host's account of the run, from its report.
     pub digest: Option<String>,
-    pub digest_at: Option<i64>,
     /// The acceptance observation this run asked for, fixed at open.
     pub evidence: Option<Value>,
     /// The observation that answered it, when the host produced one.
@@ -393,6 +402,9 @@ pub struct EjaContext<'a> {
     /// The workspaces the host grants. The first is the default.
     pub workspaces: &'a [WorkspaceGrant],
     pub history: Vec<&'a Event>,
+    /// Turns in which the user was present: speech, a presence fact, a denial,
+    /// or an approval recorded by the host rather than by EJA itself.
+    pub present_turns: &'a HashSet<u64>,
     /// What EJA chose to remember: its open inner records, newest first.
     pub notes: Vec<&'a Event>,
     pub goal: Option<&'a Event>,
@@ -635,6 +647,12 @@ impl<'a> Observation<'a> {
 /// Every method inherits host control. A host that declares no environments and no
 /// acceptance evidence is still a complete host; the defaults say so.
 pub trait Host {
+    /// Whether a predecessor's frozen record and full ancestry can be read now.
+    /// This is checked before a continuation assignment is written.
+    fn continuation_ready(&self, _aja: TaskId, _control: &Control) -> Result<()> {
+        Err("this host exposes no continuation records".into())
+    }
+
     /// Resolve the workspace a task names. The host owns both the id table and
     /// the directories those ids refer to; the core only stores the answer.
     ///
@@ -673,7 +691,12 @@ pub trait Host {
     ) -> Result<Value>;
 
     /// Observe the acceptance evidence one task asked for, at the host's discretion.
-    fn witness(&self, _request: &Value, _control: &Control) -> Result<Value> {
+    fn witness(
+        &self,
+        _request: &Value,
+        _task: WitnessContext<'_>,
+        _control: &Control,
+    ) -> Result<Value> {
         Err("this host observes no acceptance evidence".into())
     }
 
@@ -691,7 +714,7 @@ pub trait Host {
 }
 
 pub trait Brain {
-    fn decide(&self, context: &EjaContext, control: &Control) -> Decision;
+    fn decide(&self, context: &EjaContext, control: &Control) -> Result<Decision>;
 }
 
 pub trait Worker: Send + Sync {
@@ -706,6 +729,7 @@ pub enum TurnEnd {
     Stalled,
     Budget,
     Cancelled,
+    Failed,
 }
 
 #[derive(Debug, Clone)]
@@ -850,6 +874,7 @@ mod tests {
             Kind::Alone,
             Kind::Note,
             Kind::Refused,
+            Kind::Failure,
         ] {
             let wire = serde_json::to_value(kind).expect("a unit variant serializes");
             assert_eq!(wire.as_str(), Some(kind.as_str()), "{kind:?}");

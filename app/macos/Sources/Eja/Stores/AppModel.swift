@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import SwiftUI
 
 struct ToastState {
     var text: String
@@ -25,7 +24,10 @@ final class AppModel {
     var fatal = ""
     var pending = false
     var encounter: Encounter? {
-        didSet { persistEncounter() }
+        didSet {
+            guard !loadingEncounter else { return }
+            persistEncounter()
+        }
     }
     var optimistic: OptimisticMessage?
     var draftSeed = ""
@@ -38,19 +40,17 @@ final class AppModel {
     private var fetching = false
     private var toastGeneration = 0
     private var restoredParked = false
+    private var loadingEncounter = false
+    private var serviceGeneration = 0
 
     private static let baseURLKey = "eja.baseURL"
-    private static let encounterKey = "eja.encounter"
 
     init() {
         let stored = UserDefaults.standard.string(forKey: Self.baseURLKey) ?? "http://127.0.0.1:8787"
         baseURLString = stored
-        client = APIClient(baseURL: URL(string: stored) ?? URL(string: "http://127.0.0.1:8787")!)
-        if let data = UserDefaults.standard.data(forKey: Self.encounterKey),
-           let parked = try? JSONDecoder().decode(Encounter.self, from: data) {
-            encounter = parked
-            restoredParked = true
-        }
+        let url = URL(string: stored) ?? URL(string: "http://127.0.0.1:8787")!
+        client = APIClient(baseURL: url)
+        restoreEncounter(for: url)
     }
 
     var busy: Bool { pending || (state?.health.turnInFlight ?? false) }
@@ -89,9 +89,29 @@ final class AppModel {
             toast("这个地址读不出来。", isError: true)
             return
         }
+        let previousService = Self.serviceIdentity(client.baseURL)
+        let nextService = Self.serviceIdentity(url)
         baseURLString = trimmed
-        client.baseURL = url
+        client = APIClient(baseURL: url)
+        guard previousService != nextService else {
+            refreshSoon()
+            return
+        }
+
+        serviceGeneration += 1
+        fetching = false
+        state = nil
+        initialLoading = true
+        fatal = ""
+        pending = false
+        optimistic = nil
+        draftSeed = ""
+        selectedTaskId = nil
+        raw = nil
+        toastState = nil
+        restoreEncounter(for: url)
         refreshSoon()
+        Task { await refresh(quiet: true) }
     }
 
     func refreshSoon() {
@@ -116,8 +136,13 @@ final class AppModel {
 
     func refresh(quiet: Bool = false) async {
         if fetching { return }
+        let generation = serviceGeneration
         fetching = true
-        defer { fetching = false }
+        defer {
+            if generation == serviceGeneration {
+                fetching = false
+            }
+        }
         do {
             let current = state
             var next = try await client.fetchState(
@@ -125,6 +150,7 @@ final class AppModel {
                 encounter: encounter,
                 after: current?.lastEvent ?? 0
             )
+            guard generation == serviceGeneration else { return }
             if let current, next.lastEvent >= current.lastEvent {
                 let received = Set(next.events.map(\.id))
                 next.events = current.events.filter { !received.contains($0.id) } + next.events
@@ -142,6 +168,7 @@ final class AppModel {
                 fatal = ""
             }
         } catch {
+            guard generation == serviceGeneration else { return }
             let message = friendlyError(error.localizedDescription)
             if state == nil {
                 fatal = message
@@ -149,7 +176,7 @@ final class AppModel {
                 toast(message, isError: true)
             }
         }
-        if initialLoading {
+        if generation == serviceGeneration, initialLoading {
             initialLoading = false
         }
     }
@@ -223,6 +250,8 @@ final class AppModel {
         showOptimistic: Bool
     ) async {
         guard !pending, let state else { return }
+        let generation = serviceGeneration
+        let requestClient = client
         let before = state.lastEvent
         let focus = gesture == nil ? encounter?.taskId : nil
         pending = true
@@ -233,11 +262,13 @@ final class AppModel {
             )
         }
         defer {
-            pending = false
-            optimistic = nil
+            if generation == serviceGeneration {
+                pending = false
+                optimistic = nil
+            }
         }
         do {
-            let result = try await client.sendTurn(
+            let result = try await requestClient.sendTurn(
                 text: text,
                 focus: focus,
                 approvals: approvals,
@@ -246,7 +277,9 @@ final class AppModel {
                 choiceQuestion: choiceQuestion,
                 choiceOption: choiceOption
             )
+            guard generation == serviceGeneration else { return }
             await refresh(quiet: true)
+            guard generation == serviceGeneration else { return }
             if !result.ok {
                 restoreIfUnsent(
                     text,
@@ -256,7 +289,9 @@ final class AppModel {
                 toast(result.error ?? result.stderr ?? "这一轮没有走完。", isError: true)
             }
         } catch {
+            guard generation == serviceGeneration else { return }
             await refresh(quiet: true)
+            guard generation == serviceGeneration else { return }
             restoreIfUnsent(
                 text,
                 after: before,
@@ -281,19 +316,50 @@ final class AppModel {
     }
 
     func openRaw(_ address: String) async {
+        let generation = serviceGeneration
+        let requestClient = client
         do {
-            raw = try await client.fetchRaw(address)
+            let record = try await requestClient.fetchRaw(address)
+            guard generation == serviceGeneration else { return }
+            raw = record
         } catch {
+            guard generation == serviceGeneration else { return }
             toast(error.localizedDescription, isError: true)
         }
     }
 
     private func persistEncounter() {
+        let key = Self.encounterKey(for: client.baseURL)
         if let encounter, let data = try? JSONEncoder().encode(encounter) {
-            UserDefaults.standard.set(data, forKey: Self.encounterKey)
+            UserDefaults.standard.set(data, forKey: key)
         } else {
-            UserDefaults.standard.removeObject(forKey: Self.encounterKey)
+            UserDefaults.standard.removeObject(forKey: key)
         }
+    }
+
+    private func restoreEncounter(for url: URL) {
+        loadingEncounter = true
+        defer { loadingEncounter = false }
+        if let data = UserDefaults.standard.data(forKey: Self.encounterKey(for: url)),
+           let parked = try? JSONDecoder().decode(Encounter.self, from: data) {
+            encounter = parked
+            restoredParked = true
+        } else {
+            encounter = nil
+            restoredParked = false
+        }
+    }
+
+    private static func serviceIdentity(_ url: URL) -> String {
+        var components = URLComponents()
+        components.scheme = url.scheme?.lowercased()
+        components.host = url.host?.lowercased()
+        components.port = url.port
+        return components.string ?? url.absoluteString
+    }
+
+    private static func encounterKey(for url: URL) -> String {
+        "eja.encounter.\(serviceIdentity(url))"
     }
 
     private func matches(_ loop: LoopItem, _ encounter: Encounter) -> Bool {

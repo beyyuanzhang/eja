@@ -237,6 +237,152 @@ fn the_host_reads_every_granted_workspace_and_nothing_else() {
 }
 
 #[test]
+fn a_private_state_reached_through_a_workspace_symlink_stays_unreadable() {
+    use eja::adapters::{ToolContext, ToolProvider, ToolRegistry, WorkspaceTools};
+    use std::os::unix::fs::symlink;
+
+    let fixture = State::new("observe-private-alias");
+    let project = fixture.path().join("project");
+    let link = fixture.path().join("project-link");
+    let private = project.join(".eja");
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::write(private.join("secret.txt"), "private").unwrap();
+    symlink(&project, &link).unwrap();
+
+    let canonical_private = private.canonicalize().unwrap();
+    let host = ToolRegistry::new(
+        &canonical_private,
+        vec![Box::new(WorkspaceTools::new(
+            true,
+            false,
+            Some(link.clone()),
+            vec![link.clone()],
+            &canonical_private,
+        ))],
+    )
+    .expect("tools");
+    let error = Capabilities::observe(
+        &host,
+        "read_file",
+        &serde_json::json!({"path":".eja/secret.txt"}),
+        &control(),
+    )
+    .expect_err("the private state is not readable through a workspace alias");
+    assert!(error.to_string().contains("private state"), "{error}");
+
+    let control = control();
+    let context = ToolContext {
+        aja_id: 1,
+        workspace: Some(&link),
+        private: &canonical_private,
+        control: &control,
+    };
+    let error = host
+        .call(
+            &context,
+            "write_file",
+            &serde_json::json!({"path":".eja/log.jsonl","text":"forged"}),
+        )
+        .expect_err("the private state is not writable through a workspace alias");
+    assert!(error.to_string().contains("private state"), "{error}");
+}
+
+#[test]
+fn a_witness_reads_the_workspace_of_the_task_it_answers() {
+    use eja::adapters::{ToolRegistry, WorkspaceTools};
+    let fixture = State::new("witness-root");
+    let alpha = fixture.path().join("alpha");
+    let beta = fixture.path().join("beta");
+    let private = fixture.path().join("state");
+    for dir in [&alpha, &beta, &private] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(alpha.join("result.txt"), "from alpha").unwrap();
+    std::fs::write(beta.join("result.txt"), "from beta").unwrap();
+    let host = ToolRegistry::new(
+        &private,
+        vec![Box::new(WorkspaceTools::new(
+            true,
+            false,
+            Some(alpha.clone()),
+            vec![alpha.clone(), beta.clone()],
+            &private,
+        ))],
+    )
+    .expect("tools");
+    let request = serde_json::json!({
+        "tool": "read_file",
+        "arguments": {"path": "result.txt"}
+    });
+    let alpha_value = Capabilities::witness(
+        &host,
+        &request,
+        eja::WitnessContext {
+            task_id: 1,
+            workspace: alpha.to_str().unwrap(),
+        },
+        &control(),
+    )
+    .expect("alpha witness");
+    let beta_value = Capabilities::witness(
+        &host,
+        &request,
+        eja::WitnessContext {
+            task_id: 2,
+            workspace: beta.to_str().unwrap(),
+        },
+        &control(),
+    )
+    .expect("beta witness");
+    assert!(
+        alpha_value.to_string().contains("from alpha"),
+        "{alpha_value}"
+    );
+    assert!(beta_value.to_string().contains("from beta"), "{beta_value}");
+    assert!(
+        !beta_value.to_string().contains("from alpha"),
+        "{beta_value}"
+    );
+}
+
+#[test]
+fn a_file_witness_without_a_task_workspace_does_not_fall_back_to_a_grant() {
+    use eja::adapters::{ToolRegistry, WorkspaceTools};
+    let fixture = State::new("witness-no-workspace");
+    let alpha = fixture.path().join("alpha");
+    let private = fixture.path().join("state");
+    for dir in [&alpha, &private] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(alpha.join("result.txt"), "not this task's output").unwrap();
+    let host = ToolRegistry::new(
+        &private,
+        vec![Box::new(WorkspaceTools::new(
+            true,
+            false,
+            Some(alpha.clone()),
+            vec![alpha],
+            &private,
+        ))],
+    )
+    .expect("tools");
+    let error = Capabilities::witness(
+        &host,
+        &serde_json::json!({
+            "tool": "read_file",
+            "arguments": {"path": "result.txt"}
+        }),
+        eja::WitnessContext {
+            task_id: 1,
+            workspace: "",
+        },
+        &control(),
+    )
+    .expect_err("a task without a workspace has no local file witness");
+    assert!(error.to_string().contains("fixed workspace"), "{error}");
+}
+
+#[test]
 fn the_workspace_grant_switches_off_every_entry() {
     use eja::adapters::{ToolProvider, ToolRegistry, WorkspaceTools};
     let fixture = State::new("observe-switch");
@@ -290,6 +436,10 @@ fn the_workspace_grant_switches_off_every_entry() {
     assert!(Capabilities::witness(
         &host,
         &serde_json::json!({"tool":"read_file","arguments":{"path":"note.txt"}}),
+        eja::WitnessContext {
+            task_id: 1,
+            workspace: project.to_str().unwrap(),
+        },
         &control()
     )
     .is_err());

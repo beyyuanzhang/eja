@@ -20,5 +20,9 @@ mod turn;
 pub use control::{Control, ControlError, INTERRUPTED};
 pub use domain::*;
 pub use state::{OpenProposal, State};
-pub use store::{format_utc, now_utc, read_journal, Store};
-pub use turn::{recover, turn, turn_at, turn_at_with_options, TurnOutcome};
+pub use store::{
+    format_utc, inspect_journal, now_utc, read_journal, JournalLease, JournalScan, Store,
+};
+pub use turn::{
+    recover, turn, turn_at, turn_at_with_options, validate_turn_input, TurnOutcome, TurnRun,
+};
