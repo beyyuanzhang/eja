@@ -47,7 +47,10 @@ struct SettingsScreen: View {
         }
         .background(Theme.paper)
         .tint(Theme.accent)
-        .task { await model.load(client: app.client, force: false) }
+        .task(id: app.serviceKey) {
+            saveError = ""
+            await model.load(client: app.client, service: app.serviceKey, force: false)
+        }
         .onExitCommand(perform: close)
     }
 
@@ -165,7 +168,9 @@ struct SettingsScreen: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 30)
                 Button("重试") {
-                    Task { await model.load(client: app.client, force: true) }
+                    let client = app.client
+                    let service = app.serviceKey
+                    Task { await model.load(client: client, service: service, force: true) }
                 }
                 .buttonStyle(.bordered)
                 .tint(Theme.accent)
@@ -195,8 +200,11 @@ struct SettingsScreen: View {
     private func save() {
         guard model.dirty, !model.saving else { return }
         saveError = ""
+        let client = app.client
+        let service = app.serviceKey
         Task {
-            let succeeded = await model.save(client: app.client)
+            let succeeded = await model.save(client: client, service: service)
+            guard service == app.serviceKey else { return }
             if succeeded {
                 app.refreshSoon()
             } else {

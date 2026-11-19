@@ -25,25 +25,48 @@ final class SettingsModel {
     var view: SettingsView?
 
     private var flashTask: Task<Void, Never>?
+    private var service = ""
+    private var serviceGeneration = 0
+    private var activeLoads = 0
+    private var loadingService: String?
 
-    func load(client: APIClient, force: Bool) async {
+    func load(client: APIClient, service: String, force: Bool) async {
+        if service != self.service {
+            switchService(to: service)
+        }
         if hydrated && !force { return }
-        if loading { return }
+        if loadingService == service { return }
+        loadingService = service
+        activeLoads += 1
         loading = true
         loadError = ""
-        defer { loading = false }
+        let generation = serviceGeneration
+        defer {
+            activeLoads -= 1
+            if loadingService == service {
+                loadingService = nil
+            }
+            loading = activeLoads > 0
+        }
         do {
             let fetched = try await client.fetchSettings()
+            guard generation == serviceGeneration, service == self.service else { return }
             hydrate(from: fetched)
         } catch {
+            guard generation == serviceGeneration, service == self.service else { return }
             loadError = friendlyError(error.localizedDescription)
         }
     }
 
-    func save(client: APIClient) async -> Bool {
-        if saving { return false }
+    func save(client: APIClient, service: String) async -> Bool {
+        guard hydrated, service == self.service, !saving else { return false }
+        let generation = serviceGeneration
         saving = true
-        defer { saving = false }
+        defer {
+            if generation == serviceGeneration {
+                saving = false
+            }
+        }
         let body = SettingsSaveBody(
             providers: providers,
             roles: roles,
@@ -53,6 +76,7 @@ final class SettingsModel {
         )
         do {
             let saved = try await client.saveSettings(body)
+            guard generation == serviceGeneration, service == self.service else { return false }
             reconcile(with: saved)
             dirty = false
             flashSaved()
@@ -60,6 +84,27 @@ final class SettingsModel {
         } catch {
             return false
         }
+    }
+
+    /// A settings model belongs to one service. Dropping the old drafts before a
+    /// load prevents an address change from turning A's providers or workspace
+    /// paths into a save against B.
+    private func switchService(to service: String) {
+        serviceGeneration += 1
+        self.service = service
+        hydrated = false
+        dirty = false
+        savedFlash = false
+        flashTask?.cancel()
+        saving = false
+        providers = []
+        roles = .empty
+        connectors = []
+        capabilities = []
+        limits = .fallback
+        workspaces = []
+        view = nil
+        loadError = ""
     }
 
     func markDirty() {

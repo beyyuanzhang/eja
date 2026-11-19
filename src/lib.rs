@@ -17,6 +17,11 @@ mod measure;
 mod state;
 mod store;
 mod turn;
+
+/// The one report a recovery writes when only the interruption is known. Old
+/// journals without the `recovered` marker still decode as unknown.
+pub(crate) const INTERRUPTED_REPORT: &str = "worker session interrupted; state unknown";
+
 pub use control::{Control, ControlError, INTERRUPTED};
 pub use domain::*;
 pub use state::{OpenProposal, State};

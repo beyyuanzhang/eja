@@ -481,6 +481,12 @@ impl State {
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
                     let run = task.run.get_or_insert_with(Run::default);
                     run.digest = Some(event.text.clone());
+                    run.recovered = event
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("recovered"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(event.text == crate::INTERRUPTED_REPORT);
                     task.reported_at = Some(event.at);
                     task.status = TaskStatus::Waiting;
                 }
@@ -507,15 +513,18 @@ impl State {
                     return;
                 };
                 // Acceptance evidence is one observation the host made. An
-                // observation that failed answers nothing.
-                if observation.kind != ObservationKind::Witness || observation.error.is_some() {
+                // observation that failed answers nothing, but it is still an
+                // attempt: recovery must not retry it as if no witness ran.
+                if observation.kind != ObservationKind::Witness {
                     return;
                 }
                 if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
                     let run = task.run.get_or_insert_with(Run::default);
-                    run.evidence_id = Some(event.id);
-                    run.evidence_result = Some(observation.result.clone());
                     run.witness_at = Some(event.at);
+                    if observation.error.is_none() {
+                        run.evidence_id = Some(event.id);
+                        run.evidence_result = Some(observation.result.clone());
+                    }
                 }
             }
             Kind::TaskClosed => {

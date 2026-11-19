@@ -15,6 +15,9 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct Store {
     pub log_path: PathBuf,
+    /// The one journal this Store owns, independent of spelling. A lease names
+    /// this identity so it cannot authorize a turn against another log.
+    journal_id: PathBuf,
     writer: Arc<Mutex<Cursor>>,
     /// The append handle, opened once. A file has no user-space buffer, so a
     /// durable append is `sync_all`; there is no flush that reaches the disk.
@@ -26,6 +29,15 @@ pub struct Store {
 #[derive(Debug)]
 pub struct JournalLease {
     _file: File,
+    journal_id: PathBuf,
+}
+
+impl JournalLease {
+    /// A lease authorizes one turn on the journal it locked, not on every Store
+    /// a caller happens to hold.
+    pub(crate) fn belongs_to(&self, store: &Store) -> bool {
+        self.journal_id == store.journal_id
+    }
 }
 
 #[derive(Debug)]
@@ -111,17 +123,25 @@ fn prepare_state(root: &Path) -> Result<()> {
 /// lock alive until the child execs; that is not a second writer, so a short wait
 /// tells the two apart instead of failing a turn.
 fn lock_log(path: &Path, file: &File) -> Result<()> {
+    if try_lock_log(path, file, true)? {
+        Ok(())
+    } else {
+        Err(format!("log {} already has an active writer", path.display()).into())
+    }
+}
+
+/// Try to take one file lock. `wait` gives a duplicated descriptor held by a
+/// freshly started child a short grace period; a second writer still loses.
+fn try_lock_log(path: &Path, file: &File, wait: bool) -> Result<bool> {
     let mut waited = 0;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(()),
-            Err(TryLockError::WouldBlock) if waited < LOCK_WAIT_MS => {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::WouldBlock) if wait && waited < LOCK_WAIT_MS => {
                 std::thread::sleep(LOCK_POLL);
                 waited += 1;
             }
-            Err(TryLockError::WouldBlock) => {
-                return Err(format!("log {} already has an active writer", path.display()).into())
-            }
+            Err(TryLockError::WouldBlock) => return Ok(false),
             Err(TryLockError::Error(error)) => {
                 return Err(format!("log {} cannot be locked: {error}", path.display()).into())
             }
@@ -225,8 +245,10 @@ impl Store {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("turn id space exhausted")?;
+        let journal_id = fs::canonicalize(&log_path).unwrap_or_else(|_| log_path.clone());
         Ok(Self {
             log_path,
+            journal_id,
             writer: Arc::new(Mutex::new(Cursor {
                 next_id,
                 next_turn,
@@ -239,12 +261,28 @@ impl Store {
     /// The journal lease for one turn: held by whoever is about to think, so a
     /// second thinker (or a heartbeat about to spend a turn) stands down.
     pub fn lock_turn(&self) -> Result<JournalLease> {
+        self.acquire_turn(true)?
+            .ok_or_else(|| "another turn already owns this journal".into())
+    }
+
+    /// A non-blocking lease attempt. A busy journal is an ordinary answer, not
+    /// an error whose wording another layer has to parse.
+    pub fn try_lock_turn(&self) -> Result<Option<JournalLease>> {
+        self.acquire_turn(false)
+    }
+
+    fn acquire_turn(&self, wait: bool) -> Result<Option<JournalLease>> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.log_path.with_extension("turn.lock"))?;
-        lock_log(&self.log_path, &file).map_err(|_| "another turn already owns this journal")?;
-        Ok(JournalLease { _file: file })
+        if !try_lock_log(&self.log_path, &file, wait)? {
+            return Ok(None);
+        }
+        Ok(Some(JournalLease {
+            _file: file,
+            journal_id: self.journal_id.clone(),
+        }))
     }
 
     pub fn events(&self) -> Result<Vec<Event>> {

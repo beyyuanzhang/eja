@@ -1,7 +1,10 @@
 mod support;
 
 use eja::adapters::{Capabilities, Ports};
-use eja::{Action, Decision, Host, Kind, Store, TaskStatus, TurnOptions, TurnOutcome};
+use eja::{
+    Action, Assignment, Decision, EventMeta, Host, Kind, Store, TaskStatus, TurnOptions,
+    TurnOutcome,
+};
 use serde_json::{json, Value};
 use support::{decision, Done, Script, State};
 
@@ -208,6 +211,145 @@ fn a_host_that_cannot_answer_leaves_the_reason_in_the_log() {
     let data = observation.data.expect("data");
     assert_eq!(data["error"], json!("the checker is offline"));
     assert!(data["result"].is_null());
+}
+
+#[test]
+fn record_evidence_without_a_path_is_refused_before_a_task_exists() {
+    let fixture = State::new("accept-invalid-evidence");
+    let store = fixture.store();
+    let out = turn(
+        &store,
+        "open",
+        vec![
+            decision(vec![Action::OpenTask {
+                title: "unreadable".into(),
+                request: "do it".into(),
+                acceptance: "done".into(),
+                workspace: None,
+                evidence: Some(json!({"source": "record"})),
+                run: false,
+            }]),
+            decision(vec![]),
+        ],
+        &Ports::default(),
+    );
+    assert!(out.context().tasks.is_empty());
+    assert!(out
+        .context()
+        .refused
+        .iter()
+        .any(|note| note.contains("record evidence needs a non-empty path")));
+}
+
+#[test]
+fn a_reported_run_recovers_a_missing_witness_before_judgment() {
+    let full = State::new("accept-recovery-full");
+    let full_store = full.store();
+    let checks = Checks;
+    let ports = Ports {
+        capabilities: Some(&checks),
+        ..Default::default()
+    };
+    turn(&full_store, "do it", run_steps(), &ports);
+    let events = full_store.events().expect("events");
+    let cut = events
+        .iter()
+        .position(|event| event.kind == Kind::WorkerReport)
+        .expect("worker report");
+
+    // Simulate a host exit after the report is durable but before its witness.
+    let restarted = State::new("accept-recovery-restart");
+    let _ = restarted.store();
+    let mut prefix = String::new();
+    for event in &events[..=cut] {
+        prefix.push_str(&serde_json::to_string(event).expect("event"));
+        prefix.push('\n');
+    }
+    std::fs::write(restarted.path().join("log.jsonl"), prefix).expect("prefix");
+    let store = restarted.reopen();
+    let out = turn(
+        &store,
+        "continue",
+        vec![decision(vec![Action::CloseTask {
+            task_id: 1,
+            accepted: true,
+            note: "witness recovered".into(),
+        }])],
+        &ports,
+    );
+    let task = &out.context().tasks[0];
+    assert_eq!(task.status, TaskStatus::Done);
+    assert!(
+        task.evidence_id().is_some(),
+        "the missing witness is completed before the judgment"
+    );
+}
+
+#[test]
+fn an_interrupted_report_stays_unknown_instead_of_gaining_a_later_witness() {
+    let fixture = State::new("accept-recovered-evidence");
+    let store = fixture.store();
+    store
+        .append(Kind::User, "eja", "run", 1, EventMeta::new(100))
+        .expect("user");
+    store
+        .append(
+            Kind::TaskOpened,
+            "task:1",
+            "interrupted",
+            1,
+            EventMeta::data(
+                100,
+                json!({
+                    "title": "interrupted",
+                    "request": "do it",
+                    "origin": "do it",
+                    "acceptance": "done",
+                    "evidence": {"tool": "checks", "arguments": {}},
+                }),
+            ),
+        )
+        .expect("open");
+    let assignment = Assignment {
+        task_id: 1,
+        objective: "do it".into(),
+        issued_at: 100,
+        workspace: String::new(),
+        acceptance: "done".into(),
+        input: "run".into(),
+        resume: None,
+    };
+    store
+        .append(
+            Kind::TaskAssigned,
+            "task:1",
+            "",
+            1,
+            EventMeta::data(100, serde_json::to_value(&assignment).expect("assignment")),
+        )
+        .expect("assign");
+
+    let checks = Checks;
+    let ports = Ports {
+        capabilities: Some(&checks),
+        ..Default::default()
+    };
+    let out = turn(&store, "continue", vec![decision(vec![])], &ports);
+    let task = &out.context().tasks[0];
+    assert_eq!(task.status, TaskStatus::Waiting);
+    assert!(
+        task.run.as_ref().is_some_and(|run| run.recovered),
+        "recovery marks the result unknown"
+    );
+    assert!(task.evidence_id().is_none());
+    assert!(
+        !store
+            .events()
+            .expect("events")
+            .iter()
+            .any(|event| event.kind == Kind::Observed && event.scope == "task:1"),
+        "an interrupted run is not witnessed as if it completed"
+    );
 }
 
 #[test]

@@ -773,7 +773,7 @@ fn execute_turn(
     host: &Host,
     store: &Store,
     input: TurnInput,
-    lease: Option<&JournalLease>,
+    lease: Option<JournalLease>,
 ) -> ApiResult<String> {
     let startup = Control::new(Duration::from_secs(300), Arc::new(AtomicBool::new(false)));
     let composed = compose(&host.settings, &startup)?;
@@ -838,7 +838,7 @@ fn pulse_once(host: &Host) -> ApiResult<bool> {
             gesture: Some(Kind::Alone),
             selection: None,
         },
-        Some(&lease),
+        Some(lease),
     )?;
     Ok(true)
 }
@@ -846,12 +846,8 @@ fn pulse_once(host: &Host) -> ApiResult<bool> {
 /// The one locking rule for a pulse: acquire first, then read the journal and
 /// decide whether quiet is still true. A busy journal is not a pulse error.
 fn quiet_lease(store: &Store, quiet: i64) -> eja::Result<Option<JournalLease>> {
-    let lease = match store.lock_turn() {
-        Ok(lease) => lease,
-        Err(error) if error.to_string() == "another turn already owns this journal" => {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
+    let Some(lease) = store.try_lock_turn()? else {
+        return Ok(None);
     };
     let events = store.events()?;
     let Some(last) = events.last() else {
@@ -1116,7 +1112,7 @@ mod tests {
         }
     }
 
-    fn run_alone(store: &Store, lease: &eja::JournalLease) -> eja::TurnOutcome<'static> {
+    fn run_alone(store: &Store, lease: eja::JournalLease) -> eja::TurnOutcome<'static> {
         let brain = SilentBrain;
         let worker = SilentWorker;
         let ports = Ports::default();
@@ -1146,7 +1142,7 @@ mod tests {
         let lease = quiet_lease(&store, 60)
             .expect("lease decision")
             .expect("the journal is quiet");
-        let outcome = run_alone(&store, &lease);
+        let outcome = run_alone(&store, lease);
         assert_eq!(outcome.end, TurnEnd::Complete);
         let events = store.events().expect("events");
         assert_eq!(
@@ -1157,6 +1153,28 @@ mod tests {
             1
         );
         assert_eq!(events.last().map(|event| event.kind), Some(Kind::Eja));
+    }
+
+    #[test]
+    fn a_busy_journal_is_not_a_pulse_error() {
+        let fixture = Fixture::new("busy");
+        let first = Store::new(fixture.path()).expect("store");
+        let second = Store::new(fixture.path()).expect("second store");
+        second
+            .append_simple(Kind::User, "old", 1, eja::now_utc().timestamp() - 3_600)
+            .expect("old fact");
+        let held = first.lock_turn().expect("first turn");
+        assert!(
+            quiet_lease(&second, 60)
+                .expect("a busy journal is an answer")
+                .is_none(),
+            "the pulse stands down instead of turning a busy lock into an error"
+        );
+        drop(held);
+        assert!(
+            quiet_lease(&second, 60).expect("lease decision").is_some(),
+            "the same journal is quiet once the other turn leaves"
+        );
     }
 
     #[test]
@@ -1188,14 +1206,15 @@ mod tests {
         let together = Arc::new(Barrier::new(2));
         let mut threads = Vec::new();
         for _ in 0..2 {
-            let store = store.clone();
+            let path = fixture.path().to_path_buf();
             let together = together.clone();
             threads.push(std::thread::spawn(move || {
+                let store = Store::new(&path).expect("store");
                 together.wait();
                 let Some(lease) = quiet_lease(&store, 60).expect("lease decision") else {
                     return false;
                 };
-                let outcome = run_alone(&store, &lease);
+                let outcome = run_alone(&store, lease);
                 assert_eq!(outcome.end, TurnEnd::Complete);
                 true
             }));

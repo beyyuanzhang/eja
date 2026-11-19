@@ -64,8 +64,7 @@ A `Loop` is one thing that still asks for the user:
   "text": "...",
   "focus": 7,
   "approvals": [],
-  "denials": [],
-  "gesture": "return"
+  "denials": []
 }
 ```
 

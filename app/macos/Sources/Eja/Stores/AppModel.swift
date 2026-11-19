@@ -55,6 +55,7 @@ final class AppModel {
 
     var busy: Bool { pending || (state?.health.turnInFlight ?? false) }
     var pollDelay: Duration { busy ? .seconds(2) : .seconds(5) }
+    var serviceKey: String { Self.serviceIdentity(client.baseURL) }
 
     var presence: ChatMessage? {
         guard let state, encounter == nil else { return nil }
@@ -253,7 +254,7 @@ final class AppModel {
         let generation = serviceGeneration
         let requestClient = client
         let before = state.lastEvent
-        let focus = gesture == nil ? encounter?.taskId : nil
+        let focus = gesture == nil && choiceQuestion == nil ? encounter?.taskId : nil
         pending = true
         if showOptimistic {
             optimistic = OptimisticMessage(

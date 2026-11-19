@@ -353,7 +353,13 @@ pub struct Run {
     /// The observation that answered it, when the host produced one.
     pub evidence_id: Option<u64>,
     pub evidence_result: Option<Value>,
+    /// When the host attempted the witness. A failed attempt still counts here,
+    /// so recovery does not repeat an observation that already answered nothing.
     pub witness_at: Option<i64>,
+    /// True when the journal only knows the run was cut off, not what it
+    /// finished. Such a report stays judgeable by rejection, never by an
+    /// automatic witness of the later workspace.
+    pub recovered: bool,
     /// The host's account of one explicit reconciliation, when it happened.
     pub reconcile: Option<Value>,
 }

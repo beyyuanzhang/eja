@@ -248,8 +248,10 @@ and contains no repository topology.
 
 Checkpoint freezing serializes only `git add`, `commit` and reading the new
 `HEAD` over one shared checkpoint repository; worker execution remains
-parallel. This keeps a manifest's commit id and its staged contents in the same
-transaction.
+parallel. The lock is a repository file, so independently constructed
+`Checkpoints` values and separate processes share it; a process-local mutex
+would only serialize clones. This keeps a manifest's commit id and its staged
+contents in the same transaction.
 
 Managed plugins are external tool cards. Their manifest supplies card metadata
 and default config, the active pointer versions the code, and the manager stages,
@@ -275,8 +277,13 @@ storage.
   `failure` diagnostic event. It is never stored as an `eja` utterance.
 - `Worker::execute`: own one run in its reserved environment; return its observed
   digest. Executions may overlap, but each completed report and its evidence are
-  committed immediately, in completion order. A slow sibling cannot leave a
-  finished run looking `Running` after a host exit.
+  committed immediately, in completion order. Cancellation stops new runs and
+  witness attempts but never discards a report a worker already returned. A
+  completed report that outlived its witness is completed from the same host
+  port before the next projection; a failed witness attempt is recorded and not
+  retried as if it never happened. A recovery report says the result is unknown:
+  it is never given an automatic witness for the later workspace. A slow sibling
+  cannot leave a finished run looking `Running` after a host exit.
 - `Host::look`: read only, bound output, respect Control; one address space.
 - `Host::witness`: the host's own observation of declared acceptance evidence.
   A host that declares none is still complete: the default refuses, so an
@@ -324,6 +331,7 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | Recovering a torn tail allows later appends; committed corruption errors | convergence + recovery |
 | A continuation without a readable predecessor record is refused before assignment | convergence + native_worker |
 | Cloned/independent Store instances cannot recover each other’s live turn | convergence |
+| A journal lease names one journal and is consumed by one turn | convergence |
 | New states cannot bypass a finite turn budget | convergence |
 | Rendered contexts respect exact UTF-8 byte bounds | convergence + projection |
 | The contract states no character, and goal/identity render before indexes | identity |
@@ -338,7 +346,9 @@ windows are derived from ordered hit positions, not a second pending-hit state.
 | A file witness with two same-named roots reads the task's own root | observe |
 | A local file witness without a task workspace is refused rather than using the first grant | observe |
 | A record witness reads an unmerged worktree artifact from that run's checkpoint | native_worker |
-| Concurrent checkpoint freezes keep each commit and its contents together | adapters::records |
+| Record evidence without a path is refused before a task exists | acceptance |
+| A durable report without its witness is completed before judgment after restart | acceptance |
+| Concurrent freezes, including independent Checkpoints values, keep each commit and its contents together | adapters::records |
 | One capability-filtered grant snapshot drives the default, tools and environments | host::compose |
 | One shared environment, one owner: a second run is refused before it costs an aja id | environments |
 | A Git worktree environment settles and reconciles explicitly; conflicts are reported | environments |

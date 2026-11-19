@@ -11,15 +11,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashSet, VecDeque},
-    fs,
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Stdio},
-    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 /// The tool a aja uses to read a passage of its own or an inherited record.
 pub const READ_TOOL: &str = "eja_read_record";
+
+const FREEZE_LOCK: &str = "eja-freeze.lock";
+const FREEZE_POLL: Duration = Duration::from_millis(2);
 
 pub fn definition() -> Value {
     json!({"type":"function","function":{"name":READ_TOOL,"description":"Read a bounded byte passage of a full tool result in this aja's record or an inherited record. Use the record aja/entry address from a tool result. Offsets address UTF-8 bytes.","parameters":{"type":"object","properties":{"aja":{"type":"integer"},"entry":{"type":"integer"},"offset":{"type":"integer","default":0},"bytes":{"type":"integer","default":1024}},"required":["aja","entry"],"additionalProperties":false}}})
@@ -36,19 +39,46 @@ pub struct Checkpoints {
     git_dir: PathBuf,
     /// The host's private state, excluded from every frozen tree.
     private: PathBuf,
-    /// `add`, `commit` and reading `HEAD` form one transaction in the shared
-    /// checkpoint repository. Executions stay parallel; only the freeze is
-    /// serialized.
-    freeze_lock: Arc<Mutex<()>>,
+    /// One repository-wide lock file. A process-local mutex would only
+    /// serialize clones of this value, not the CLI, HTTP host or a restarted
+    /// process that opens the same checkpoint repository.
+    lock_path: PathBuf,
 }
 
 impl Checkpoints {
     #[must_use]
-    pub fn new(git_dir: PathBuf, private: impl AsRef<Path>) -> Self {
+    pub fn new(git_dir: impl AsRef<Path>, private: impl AsRef<Path>) -> Self {
+        let git_dir = super::environments::canonical_boundary(git_dir.as_ref());
         Self {
+            lock_path: git_dir.join(FREEZE_LOCK),
             git_dir,
             private: super::environments::canonical_boundary(private.as_ref()),
-            freeze_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Hold the repository lock for one whole freeze. The file is closed when
+    /// the returned guard drops; the kernel releases its lock then.
+    fn lock(&self, control: &Control) -> Result<File> {
+        fs::create_dir_all(&self.git_dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&self.lock_path)?;
+        loop {
+            control.check()?;
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) => std::thread::sleep(FREEZE_POLL),
+                Err(TryLockError::Error(error)) => {
+                    return Err(format!(
+                        "checkpoint freeze lock {} cannot be held: {error}",
+                        self.lock_path.display()
+                    )
+                    .into())
+                }
+            }
         }
     }
 
@@ -60,10 +90,7 @@ impl Checkpoints {
         environment: &Path,
         control: &Control,
     ) -> Result<String> {
-        let _freeze = self
-            .freeze_lock
-            .lock()
-            .map_err(|_| "checkpoint freeze lock is unavailable")?;
+        let _freeze = self.lock(control)?;
         let git = |args: &[&str]| {
             super::environments::git_at(Some(&self.git_dir), environment, args, control)
         };
@@ -688,15 +715,14 @@ mod tests {
         fs::create_dir_all(&beta).unwrap();
         fs::write(alpha.join("result.txt"), "alpha result\n").unwrap();
         fs::write(beta.join("result.txt"), "beta result\n").unwrap();
-        let checkpoints = Checkpoints::new(root.join("checkpoints"), root.clone());
         let together = std::sync::Arc::new(std::sync::Barrier::new(2));
         let mut threads = Vec::new();
         for (task, tree, expected) in [(1, alpha, "alpha result"), (2, beta, "beta result")] {
-            let checkpoints = checkpoints.clone();
             let together = together.clone();
             let git_dir = root.join("checkpoints");
             let tree_root = root.clone();
             threads.push(std::thread::spawn(move || {
+                let checkpoints = Checkpoints::new(git_dir.clone(), tree_root.clone());
                 together.wait();
                 let commit = checkpoints
                     .freeze(task, i64::try_from(task).unwrap(), &tree, &control())
@@ -719,6 +745,41 @@ mod tests {
         for (_, expected, shown) in frozen {
             assert_eq!(shown, expected);
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn independent_checkpoint_owners_share_one_freeze_lock() {
+        let root =
+            std::env::temp_dir().join(format!("eja-freeze-independent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let tree = root.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("result.txt"), "serialized\n").unwrap();
+        let git_dir = root.join("checkpoints");
+        let first = Checkpoints::new(&git_dir, root.clone());
+        let held = first.lock(&control()).expect("repository lock");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_root = root.clone();
+        let worker_tree = tree;
+        let worker = std::thread::spawn(move || {
+            let second = Checkpoints::new(worker_root.join("checkpoints"), worker_root);
+            sender
+                .send(second.freeze(1, 1, &worker_tree, &control()))
+                .expect("freeze result");
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(250)).is_err(),
+            "another Checkpoints value cannot enter the same freeze"
+        );
+        drop(held);
+        let commit = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("freeze after the lock is released")
+            .expect("freeze");
+        worker.join().expect("freeze thread");
+        assert_eq!(commit.len(), 40);
         let _ = fs::remove_dir_all(&root);
     }
 }

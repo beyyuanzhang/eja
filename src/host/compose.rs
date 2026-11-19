@@ -61,7 +61,7 @@ impl ComposedHost {
         store: &Store,
         input: &'i str,
         base: &TurnOptions,
-        lease: Option<&JournalLease>,
+        lease: Option<JournalLease>,
     ) -> eja::Result<TurnOutcome<'i>> {
         let eja_role = self
             .effective

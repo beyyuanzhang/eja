@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::{
     collections::HashSet,
+    path::{Component, Path},
     time::{Duration, Instant},
 };
 
@@ -148,9 +149,9 @@ fn recover_state(store: &Store, state: &mut State, turn: u64, at: i64) -> Result
             state,
             Kind::WorkerReport,
             &task_scope(id),
-            "worker session interrupted; state unknown",
+            crate::INTERRUPTED_REPORT,
             turn,
-            EventMeta::new(at),
+            EventMeta::data(at, serde_json::json!({"recovered": true})),
         )?;
         recovered.push(id);
     }
@@ -370,6 +371,58 @@ fn open_task(ctx: &ActionCtx<'_>, state: &mut State, input: &TaskOpen<'_>) -> Re
         EventMeta::data(ctx.at, serde_json::to_value(input)?),
     )?;
     Ok(id)
+}
+
+/// A task's evidence contract is fixed when it opens. Reject shapes that no
+/// host can witness here, before a run can report and leave the task waiting on
+/// an observation that was never possible.
+fn validate_evidence_contract(request: &Value) -> Result<()> {
+    let object = request
+        .as_object()
+        .ok_or("evidence must be a JSON object")?;
+    let source = match object.get("source") {
+        None => "workspace",
+        Some(value) => value.as_str().ok_or("evidence source must be a string")?,
+    };
+    match source {
+        "record" => {
+            let path = object
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .ok_or("record evidence needs a non-empty path")?;
+            let path = Path::new(path);
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| !matches!(part, Component::Normal(_)))
+            {
+                return Err("record evidence path must be relative without traversal".into());
+            }
+        }
+        "workspace" => {
+            object
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
+                .ok_or("workspace evidence needs a non-empty tool name")?;
+            if object
+                .get("arguments")
+                .is_some_and(|arguments| !arguments.is_object())
+            {
+                return Err("evidence arguments must be a JSON object".into());
+            }
+        }
+        other => {
+            return Err(format!(
+                "unknown evidence source {other:?}; use \"workspace\" or \"record\""
+            )
+            .into())
+        }
+    }
+    Ok(())
 }
 
 fn link_tasks(
@@ -632,6 +685,9 @@ fn run_dispatches(
             let control = &control;
             let sender = sender.clone();
             scope.spawn(move || loop {
+                if control.check().is_err() {
+                    break;
+                }
                 let next = queue.lock().ok().and_then(|mut queue| queue.pop_front());
                 let Some((index, assignment)) = next else {
                     break;
@@ -646,14 +702,19 @@ fn run_dispatches(
         let mut completions = 0;
         for (_index, assignment, digest) in receiver {
             completions += 1;
-            ctx.control.check()?;
             let task_id = assignment.task_id;
+            // A worker that already returned is a fact even when the turn has
+            // been cancelled. Persist it; cancellation stops further execution
+            // and witness attempts, not the account of completed work.
             record_dispatch(ctx, state, progress, &assignment, &digest)?;
-            observe_evidence(ctx, state, task_id)?;
+            if ctx.control.check().is_ok() {
+                observe_evidence(ctx, state, task_id)?;
+            }
         }
         if completions != expected {
             return Err("dispatch results are unavailable".into());
         }
+        ctx.control.check()?;
         Ok(())
     });
     progress.worker_ms += started.elapsed().as_millis();
@@ -688,15 +749,22 @@ fn observe_evidence(ctx: &ActionCtx<'_>, state: &mut State, task_id: TaskId) -> 
             .unwrap_or("workspace");
         let (target, arguments, result, error) = match source {
             "record" => {
-                let Some(path) = request.get("path").and_then(Value::as_str) else {
-                    return Ok(());
-                };
-                let target = format!("record:{task_id}/{path}");
+                let path = request
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty());
+                let target = path.map_or_else(
+                    || format!("record:{task_id}"),
+                    |path| format!("record:{task_id}/{path}"),
+                );
                 let arguments = serde_json::json!({"path": path});
-                let error = if ctx.host.continuation_ready(task_id, ctx.control).is_err() {
-                    Some("the task left no readable frozen record; reconcile it or witness the current workspace explicitly".to_string())
-                } else {
-                    None
+                let error = match path {
+                    None => Some("record evidence needs a non-empty path".to_string()),
+                    Some(_) if ctx.host.continuation_ready(task_id, ctx.control).is_err() => {
+                        Some("the task left no readable frozen record; reconcile it or witness the current workspace explicitly".to_string())
+                    }
+                    Some(_) => None,
                 };
                 let (result, error) = error.map_or_else(
                     || match ctx.host.look(
@@ -757,6 +825,30 @@ fn observe_evidence(ctx: &ActionCtx<'_>, state: &mut State, task_id: TaskId) -> 
         ctx.turn,
         EventMeta::data(ctx.at, data),
     )
+}
+
+/// A report can be durable before its witness is. Recovery completes that gap
+/// before the next projection, but never retries a witness that already ran and
+/// failed: `witness_at` records the attempt even when `evidence_id` stays empty.
+fn observe_missing_evidence(ctx: &ActionCtx<'_>, state: &mut State) -> Result<()> {
+    let pending: Vec<TaskId> = state
+        .tasks()
+        .iter()
+        .filter(|task| task.kind == TaskKind::Aja && task.status == TaskStatus::Waiting)
+        .filter(|task| {
+            task.evidence().is_some()
+                && task.evidence_id().is_none()
+                && task
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| !run.recovered && run.witness_at.is_none())
+        })
+        .map(|task| task.id)
+        .collect();
+    for id in pending {
+        observe_evidence(ctx, state, id)?;
+    }
+    Ok(())
 }
 
 /// Reconciling an environment is the host's act and its account is evidence. Conflicts
@@ -976,6 +1068,13 @@ fn apply_actions(
                 evidence,
                 run,
             } => {
+                if let Some(evidence) = evidence {
+                    if let Err(note) = validate_evidence_contract(evidence) {
+                        let told = refuse(ctx.store, state, ctx, &format!("open refused: {note}"))?;
+                        effect.noted(told);
+                        continue;
+                    }
+                }
                 let workspace = match ctx
                     .host
                     .resolve_workspace(workspace.as_deref(), &ctx.options.workspaces)
@@ -1302,10 +1401,16 @@ pub struct TurnRun<'a, 'i> {
 impl<'i> TurnRun<'_, 'i> {
     pub fn execute(self) -> Result<TurnOutcome<'i>> {
         let lease = self.store.lock_turn()?;
-        self.execute_under_lease(&lease)
+        self.execute_under_lease(lease)
     }
 
-    pub fn execute_under_lease(self, _journal_lease: &JournalLease) -> Result<TurnOutcome<'i>> {
+    /// Enter a turn with a lease that is both for this journal and used exactly
+    /// once: the lease is moved into the call, not borrowed for repeated use.
+    #[allow(clippy::needless_pass_by_value)] // Ownership is the exclusion guard.
+    pub fn execute_under_lease(self, journal_lease: JournalLease) -> Result<TurnOutcome<'i>> {
+        if !journal_lease.belongs_to(self.store) {
+            return Err("journal lease belongs to another journal".into());
+        }
         let TurnRun {
             store,
             input,
@@ -1336,6 +1441,19 @@ impl<'i> TurnRun<'_, 'i> {
             .transpose()?;
         // Recovery is a business write. Only a fully valid input may reach it.
         recover_state(store, &mut state, turn_no, at)?;
+        if control.check().is_ok() {
+            let recovery = ActionCtx {
+                store,
+                input,
+                turn: turn_no,
+                at,
+                worker,
+                host,
+                control: &control,
+                options,
+            };
+            observe_missing_evidence(&recovery, &mut state)?;
+        }
         if situation.is_none() {
             if let Some(answer) = &answer {
                 commit(
@@ -1480,8 +1598,15 @@ impl<'i> TurnRun<'_, 'i> {
                 match brain.decide(&context, &control) {
                     Ok(decision) => decision,
                     Err(error) => {
-                        end = TurnEnd::Failed;
-                        reason = Some(format!("model transport failed: {error}"));
+                        // A brain that stopped because the turn was cancelled or
+                        // timed out is not a provider failure, even if its
+                        // transport reports the stop as an error.
+                        if let Err(stopped) = control.check() {
+                            stop(&mut end, &mut reason, stopped);
+                        } else {
+                            end = TurnEnd::Failed;
+                            reason = Some(format!("model transport failed: {error}"));
+                        }
                         break;
                     }
                 }

@@ -356,12 +356,21 @@ fn an_interrupted_predecessor_without_a_record_cannot_be_continued() {
     )
     .expect("interrupted turn");
     assert_eq!(interrupted.end, TurnEnd::Cancelled);
-    assert!(store
-        .events()
-        .unwrap()
+    let mut dispatched = interrupted.dispatched.clone();
+    dispatched.sort_unstable();
+    assert_eq!(dispatched, vec![1, 2]);
+    for task in interrupted
+        .context()
+        .tasks
         .iter()
-        .filter(|event| event.kind == Kind::WorkerReport)
-        .all(|event| event.text.contains("interrupted")));
+        .filter(|task| task.id <= 2)
+    {
+        assert_eq!(
+            task.digest().map(str::to_owned),
+            Some(format!("ended: cancelled\nunknown result for {}", task.id)),
+            "a completed worker report survives cancellation"
+        );
+    }
 
     let resumed = turn_at_with_options(
         &store,
@@ -377,13 +386,6 @@ fn an_interrupted_predecessor_without_a_record_cannot_be_continued() {
     )
     .expect("recovery turn");
     let events = store.events().unwrap();
-    assert!(
-        events
-            .iter()
-            .filter(|event| event.kind == Kind::WorkerReport)
-            .any(|event| event.scope == "task:1" && event.text.contains("interrupted")),
-        "recovery leaves a readable unknown result"
-    );
     assert!(
         !events
             .iter()
@@ -543,6 +545,86 @@ fn turn_deadline_and_cancellation_cross_the_brain_boundary() {
     .unwrap();
     assert_eq!(out.end, TurnEnd::Cancelled);
     assert_eq!(out.decisions, 0);
+}
+
+struct CancelThenFail(Arc<AtomicBool>);
+impl Brain for CancelThenFail {
+    fn decide(&self, _: &EjaContext<'_>, _: &Control) -> Result<Decision> {
+        self.0.store(true, Ordering::SeqCst);
+        Err("the transport reported the cancelled call as an error".into())
+    }
+}
+
+#[test]
+fn a_cancelled_model_call_is_not_recorded_as_a_provider_failure() {
+    let fixture = Fixture::new("convergence-cancel-brain");
+    let store = fixture.store();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let out = turn_at_with_options(
+        &store,
+        "stop this",
+        &CancelThenFail(cancelled.clone()),
+        &Done::default(),
+        &Ports::default(),
+        now_utc(),
+        &TurnOptions {
+            cancelled,
+            ..Default::default()
+        },
+    )
+    .expect("turn");
+    assert_eq!(out.end, TurnEnd::Cancelled);
+    assert!(out
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("cancelled")));
+    assert!(
+        !store
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == Kind::Failure),
+        "a cancelled call is not a model transport failure"
+    );
+}
+
+#[test]
+fn a_journal_lease_cannot_enter_another_journal() {
+    let first = Fixture::new("lease-owner");
+    let second = Fixture::new("lease-other");
+    let first_store = first.store();
+    let second_store = second.store();
+    let options = TurnOptions::default();
+    let brain = Script::new(vec![Decision::default()]);
+    let worker = Done::default();
+    let lease = first_store.lock_turn().expect("first lease");
+    let blocked = TurnRun {
+        store: &second_store,
+        input: "",
+        brain: &brain,
+        worker: &worker,
+        host: &Ports::default(),
+        now: now_utc(),
+        options: &options,
+    }
+    .execute_under_lease(lease)
+    .expect_err("a lease names one journal");
+    assert!(blocked.to_string().contains("another journal"));
+    assert!(second_store.events().unwrap().is_empty());
+
+    let reopened = Store::new(first.path()).expect("same journal");
+    let lease = first_store.lock_turn().expect("second lease");
+    TurnRun {
+        store: &reopened,
+        input: "continue",
+        brain: &brain,
+        worker: &worker,
+        host: &Ports::default(),
+        now: now_utc(),
+        options: &options,
+    }
+    .execute_under_lease(lease)
+    .expect("a second handle on the same journal is the same authority");
 }
 
 #[test]
