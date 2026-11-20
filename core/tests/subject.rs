@@ -5,6 +5,60 @@ fn judgment(basis: i64, choice: Choice) -> Judgment {
     Judgment { basis, choice }
 }
 
+#[test]
+fn a_judge_can_follow_a_concerns_current_basis_before_acting() -> Result<()> {
+    let eja = Eja::open(":memory:")?;
+    let old = eja.notice(Source::Person, "我喜欢沿河散步")?;
+    eja.decide(old, judgment(old, keep(None, "周末的去处")), &[])?;
+    let concern = eja.view()?.concerns[0].id;
+    let change = eja.notice(Source::Person, "这阵子更想去山里")?;
+    eja.decide(
+        change,
+        judgment(change, keep(Some(concern), "周末的去处")),
+        &[],
+    )?;
+    for _ in 0..PAGE {
+        eja.notice(Source::Clock, "tick")?;
+    }
+    eja.notice(Source::Person, "明天想出去透口气")?;
+    let mut steps = 0;
+    let stop = eja.turn(&[], 2, |v| {
+        steps += 1;
+        let basis = v.concerns[0].basis;
+        assert_eq!(basis, change);
+        assert!(!v.recent.iter().any(|e| e.id == change));
+        if steps == 1 {
+            assert!(v.recalled.is_none());
+            return Ok(judgment(basis, Choice::Recall));
+        }
+        let memory = v.recalled.as_ref().unwrap();
+        assert_eq!(memory.id, change);
+        assert!(matches!(&memory.fact, Fact::Noticed { source: Source::Person, text } if text == "这阵子更想去山里"));
+        Ok(judgment(memory.id, Choice::Rest))
+    }, |_| unreachable!())?;
+    assert_eq!(stop, eja_core::Stop::Rest);
+    assert_eq!(steps, 2);
+    assert!(eja.view()?.recalled.is_none());
+    Ok(())
+}
+
+#[test]
+fn recalling_a_recent_fact_keeps_one_copy_and_uses_one_step() -> Result<()> {
+    let eja = Eja::open(":memory:")?;
+    let basis = eja.notice(Source::Person, "在这里")?;
+    let stop = eja.turn(
+        &[],
+        1,
+        |_| Ok(judgment(basis, Choice::Recall)),
+        |_| unreachable!(),
+    )?;
+    assert_eq!(stop, eja_core::Stop::StepLimit);
+    let v = eja.view()?;
+    assert!(v.recalled.is_none());
+    assert!(v.recent.iter().any(|entry| entry.id == basis));
+    Ok(())
+}
+
 fn keep(concern: Option<i64>, text: &str) -> Choice {
     Choice::Keep {
         concern,

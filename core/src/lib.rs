@@ -1,7 +1,13 @@
 //! One subject per journal. Hosts supply observations, model judgments and effect outcomes.
+mod encoder;
+pub use encoder::{Encoder, InputKind};
 mod journal;
+mod memory;
+#[cfg(feature = "onnx")]
+mod onnx;
+pub use memory::Match;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -37,6 +43,8 @@ pub enum Choice {
         capability: String,
         input: Value,
     },
+    /// Read the fact named by Judgment::basis before deciding again.
+    Recall,
     Rest,
 }
 
@@ -74,14 +82,21 @@ pub struct Entry {
 pub struct Concern {
     pub id: Id,
     pub latest: Id,
+    /// The evidence named by the latest keep judgment.
+    pub basis: Id,
     pub text: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct View {
     pub revision: Id,
+    /// Semantic matches from history outside the recent page, when a model is installed.
+    pub related: Option<Vec<Match>>,
     /// Newest first. Older entries are readable by id or page.
     pub recent: Vec<Entry>,
+    /// One fact selected by the model, when it is outside the recent page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recalled: Option<Entry>,
     /// Most recently changed first. The stable id survives a revision.
     pub concerns: Vec<Concern>,
 }
@@ -100,12 +115,33 @@ pub enum Stop {
     StepLimit,
 }
 
-pub struct Eja(Connection);
+pub struct Eja(Connection, Option<memory::Memory>);
 
 impl Eja {
     /// Open or resume one subject. Opening a journal never initiates a call.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::initialize(Connection::open(path)?)
+        #[cfg(feature = "onnx")]
+        let encoder = onnx::configured()?;
+        #[cfg(not(feature = "onnx"))]
+        let encoder = None;
+        Self::open_inner(path.as_ref(), encoder)
+    }
+
+    /// Supply an encoder independently of ONNX, the model language, or the application UI.
+    pub fn open_with_encoder(
+        path: impl AsRef<Path>,
+        encoder: impl Encoder + 'static,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), Some(Box::new(encoder)))
+    }
+
+    fn open_inner(path: &Path, encoder: Option<Box<dyn Encoder>>) -> Result<Self> {
+        memory::register_vectors()?;
+        let mut eja = Self::initialize(Connection::open(path)?)?;
+        eja.1 = encoder
+            .map(|model| memory::Memory::attach(&eja.0, model))
+            .transpose()?;
+        Ok(eja)
     }
 
     pub fn notice(&self, source: Source, text: impl Into<String>) -> Result<Id> {
@@ -118,9 +154,42 @@ impl Eja {
 
     pub fn view(&self) -> Result<View> {
         let revision = self.head()?;
+        let recent = self.history(revision)?;
+        let recalled = match recent.first().map(|entry| &entry.fact) {
+            Some(Fact::Judged {
+                judgment:
+                    Judgment {
+                        choice: Choice::Recall,
+                        basis,
+                    },
+            }) if !recent.iter().any(|entry| entry.id == *basis) => Some(self.read(*basis)?),
+            _ => None,
+        };
+        let related = if let (Some(memory), Some(oldest)) = (&self.1, recent.last()) {
+            let cue: Option<String> = self
+                .0
+                .query_row(
+                    "SELECT json_extract(body,'$.text') FROM facts
+                 WHERE id <= ?1 AND json_extract(body,'$.kind')='noticed'
+                 ORDER BY id DESC LIMIT 1",
+                    [revision],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match cue {
+                Some(text) if oldest.id > 1 && !text.trim().is_empty() => {
+                    Some(memory.search(self, &text, oldest.id - 1, revision)?)
+                }
+                _ => Some(vec![]),
+            }
+        } else {
+            self.1.as_ref().map(|_| vec![])
+        };
         Ok(View {
             revision,
-            recent: self.history(revision)?,
+            related,
+            recent,
+            recalled,
             concerns: self.concerns(revision, revision)?,
         })
     }
@@ -186,7 +255,7 @@ impl Eja {
                 });
                 None
             }
-            Choice::Rest => None,
+            Choice::Recall | Choice::Rest => None,
         };
         self.append(&Fact::Judged { judgment }, Some(revision), edit, None)?;
         Ok(call)

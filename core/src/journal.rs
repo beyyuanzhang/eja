@@ -12,9 +12,11 @@ impl Eja {
                  live INTEGER,
                  receipt_for INTEGER UNIQUE
              );
+             CREATE INDEX IF NOT EXISTS notices ON facts(id) WHERE json_extract(body,'$.kind')='noticed';
+             CREATE INDEX IF NOT EXISTS keep_events ON facts(id) WHERE live=1;
              CREATE INDEX IF NOT EXISTS concern_edits ON facts(concern, id DESC);",
         )?;
-        Ok(Self(db))
+        Ok(Self(db, None))
     }
 
     pub(super) fn head(&self) -> Result<Id> {
@@ -113,7 +115,8 @@ impl Eja {
     /// Concerns as of a fixed view. Page with the last returned latest id minus one.
     pub fn concerns(&self, revision: Id, through: Id) -> Result<Vec<Concern>> {
         let mut stmt = self.0.prepare(
-            "SELECT f.concern, f.id, json_extract(f.body, '$.judgment.choice.text')
+            "SELECT f.concern, f.id, json_extract(f.body, '$.judgment.choice.text'),
+                    json_extract(f.body, '$.judgment.basis')
              FROM facts f WHERE f.live = 1 AND f.id <= min(?1, ?2)
                AND NOT EXISTS (
                    SELECT 1 FROM facts later WHERE later.concern = f.concern
@@ -126,6 +129,7 @@ impl Eja {
                 id: r.get(0)?,
                 latest: r.get(1)?,
                 text: r.get(2)?,
+                basis: r.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
