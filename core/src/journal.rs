@@ -2,7 +2,7 @@ use crate::{
     Call, Concern, Consolidation, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Step,
     Timestamp, FACT_BYTES, PAGE, REPLAY_PAGE,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 fn head_on(conn: &Connection) -> Result<Id> {
@@ -27,6 +27,28 @@ fn read_on(conn: &Connection, id: Id) -> Result<Entry> {
         at: Timestamp(at),
         fact: serde_json::from_str(&body)?,
     })
+}
+
+fn read_entry_row(row: &Row<'_>) -> rusqlite::Result<(Id, Timestamp, String)> {
+    Ok((
+        row.get::<_, Id>(0)?,
+        Timestamp(row.get::<_, i64>(1)?),
+        row.get::<_, String>(2)?,
+    ))
+}
+
+fn decode_entries(
+    rows: impl Iterator<Item = rusqlite::Result<(Id, Timestamp, String)>>,
+) -> Result<Vec<Entry>> {
+    rows.map(|row| {
+        let (id, at, body) = row?;
+        Ok(Entry {
+            id,
+            at,
+            fact: serde_json::from_str(&body)?,
+        })
+    })
+    .collect()
 }
 
 fn require_open_on(conn: &Connection, concern: Id) -> Result<()> {
@@ -233,23 +255,8 @@ impl Eja {
              WHERE id > ?1 AND id <= ?2 AND json_extract(body,'$.kind') != 'consolidated'
              ORDER BY id ASC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![floor, revision, REPLAY_PAGE], |row| {
-            Ok((
-                row.get::<_, Id>(0)?,
-                Timestamp(row.get::<_, i64>(1)?),
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let entries: Vec<Entry> = rows
-            .map(|row| {
-                let (id, at, body) = row?;
-                Ok(Entry {
-                    id,
-                    at,
-                    fact: serde_json::from_str(&body)?,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let entries =
+            decode_entries(stmt.query_map(params![floor, revision, REPLAY_PAGE], read_entry_row)?)?;
         let Some(last) = entries.last() else {
             return Ok(None);
         };
@@ -263,10 +270,12 @@ impl Eja {
         }))
     }
 
-    /// Atomically commit one consolidated memory covering `(prev_through, through]` against `revision`.
+    /// Atomically commit one consolidated memory covering `(prev_through, through]`.
+    /// CAS checks that no concurrent consolidation superseded `previous`, so unrelated new
+    /// notices arriving mid-consolidation do not starve slow memory folding.
     pub fn commit_consolidation(
         &self,
-        revision: Id,
+        previous: Option<Id>,
         through: Id,
         text: impl Into<String>,
     ) -> Result<Id> {
@@ -275,14 +284,16 @@ impl Eja {
             return Err(Error::invalid("consolidation needs text"));
         }
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        if head_on(&tx)? != revision {
+        let head = head_on(&tx)?;
+        let current = consolidated_at_on(&tx, head)?;
+        if current.as_ref().map(|entry| entry.id) != previous {
             return Err(Error::Conflict);
         }
-        let floor = match consolidated_at_on(&tx, revision)?.map(|entry| entry.fact) {
-            Some(Fact::Consolidated { through: prev, .. }) => prev,
+        let floor = match current.as_ref().map(|entry| &entry.fact) {
+            Some(Fact::Consolidated { through: prev, .. }) => *prev,
             _ => 0,
         };
-        if through <= floor || through > revision {
+        if through <= floor || through > head {
             return Err(Error::invalid(
                 "consolidation through must advance within the committed view",
             ));
@@ -401,22 +412,8 @@ impl Eja {
         let mut stmt = self
             .db
             .prepare("SELECT id, at, body FROM facts WHERE id <= ?1 ORDER BY id DESC LIMIT ?2")?;
-        let rows = stmt.query_map(params![through, PAGE], |row| {
-            Ok((
-                row.get::<_, Id>(0)?,
-                Timestamp(row.get::<_, i64>(1)?),
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (id, at, body) = row?;
-            Ok(Entry {
-                id,
-                at,
-                fact: serde_json::from_str(&body)?,
-            })
-        })
-        .collect()
+        let rows = stmt.query_map(params![through, PAGE], read_entry_row)?;
+        decode_entries(rows)
     }
 
     /// Concerns as of a fixed view. Page with the last returned latest id minus one.

@@ -165,10 +165,13 @@ fn consolidated_memory_is_indexed_and_links_to_latest_consolidation() -> Result<
     let subject = Eja::open_with_encoder(":memory:", Fixture { id: "v1", dims: 2 })?;
     let first = subject.notice(Source::World, "α routine event 1")?;
     let first_consolidation =
-        subject.commit_consolidation(first, first, "β venue accessibility synthesis v1")?;
+        subject.commit_consolidation(None, first, "β venue accessibility synthesis v1")?;
     let next = subject.notice(Source::World, "α routine event 2")?;
-    let second_consolidation =
-        subject.commit_consolidation(next, next, "α updated general summary v2")?;
+    let second_consolidation = subject.commit_consolidation(
+        Some(first_consolidation),
+        next,
+        "α updated general summary v2",
+    )?;
     for idx in 0..PAGE + 2 {
         subject.notice(Source::World, format!("α noise {idx}"))?;
     }

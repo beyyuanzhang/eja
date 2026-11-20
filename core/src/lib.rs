@@ -300,7 +300,8 @@ impl Eja {
                 break;
             };
             let text = distill(&window).map_err(Error::External)?;
-            latest = Some(self.commit_consolidation(window.revision, window.through, text)?);
+            let previous = window.previous.as_ref().map(|entry| entry.id);
+            latest = Some(self.commit_consolidation(previous, window.through, text)?);
         }
         Ok(latest)
     }

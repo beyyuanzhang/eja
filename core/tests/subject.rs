@@ -574,15 +574,15 @@ fn slow_consolidation_replays_chronologically_and_enforces_monotonic_watermark()
 
     // Reject invalid consolidation bounds, empty text, and stale CAS revisions.
     assert!(matches!(
-        eja.commit_consolidation(rev, rev + 1, "future"),
+        eja.commit_consolidation(None, rev + 1, "future"),
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        eja.commit_consolidation(rev - 1, rev, "stale"),
+        eja.commit_consolidation(Some(999), rev, "stale"),
         Err(Error::Conflict)
     ));
     assert!(matches!(
-        eja.commit_consolidation(rev, rev, "   "),
+        eja.commit_consolidation(None, rev, "   "),
         Err(Error::Invalid(_))
     ));
     assert_eq!(eja.view()?.revision, rev);
@@ -636,12 +636,60 @@ fn slow_consolidation_replays_chronologically_and_enforces_monotonic_watermark()
 
     // Cannot re-consolidate backwards or consolidate only consolidation entries with no new facts.
     assert!(matches!(
-        eja.commit_consolidation(view.revision, rev, "duplicate"),
+        eja.commit_consolidation(Some(second_id), rev, "duplicate"),
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        eja.commit_consolidation(view.revision, view.revision, "only consolidations"),
+        eja.commit_consolidation(Some(second_id), view.revision, "only consolidations"),
         Err(Error::Invalid(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn consolidation_tolerates_concurrent_notices_and_blocks_competing_consolidators() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("subject.db");
+    let writer = Eja::open(&path)?;
+    let first = writer.notice(Source::World, "event 1")?;
+    let second = writer.notice(Source::World, "event 2")?;
+
+    // A new notice arriving while distillation is in flight must not starve consolidation.
+    let consolidator = Eja::open(&path)?;
+    let window = consolidator.unconsolidated()?.unwrap();
+    assert_eq!(window.through, second);
+    assert!(window.previous.is_none());
+    let arrived_during_sleep = writer.notice(Source::Person, "event 3 arrived mid-sleep")?;
+    let c1 = consolidator.commit_consolidation(None, window.through, "distilled 1..=2")?;
+    assert!(c1 > arrived_during_sleep);
+
+    // The newly arrived notice is picked up cleanly by the next window.
+    let next_window = consolidator.unconsolidated()?.unwrap();
+    assert_eq!(next_window.previous.as_ref().unwrap().id, c1);
+    assert_eq!(next_window.entries.len(), 1);
+    assert_eq!(next_window.entries[0].id, arrived_during_sleep);
+    assert_eq!(next_window.through, arrived_during_sleep);
+    drop((writer, consolidator));
+
+    // Two competing consolidators racing on the same `previous` yield exactly one winner.
+    let left = Eja::open(&path)?;
+    let right = Eja::open(&path)?;
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let race = |eja: Eja, label: &str| {
+            barrier.wait();
+            match eja.commit_consolidation(Some(c1), arrived_during_sleep, label) {
+                Ok(_) => true,
+                Err(Error::Conflict) => false,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        };
+        let a = scope.spawn(move || race(left, "winner A"));
+        let b = scope.spawn(move || race(right, "winner B"));
+        assert_ne!(a.join().unwrap(), b.join().unwrap());
+    });
+    let check = Eja::open(&path)?;
+    assert!(check.unconsolidated()?.is_none());
+    assert!(check.read(first).is_ok());
     Ok(())
 }
