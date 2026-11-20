@@ -1,7 +1,9 @@
-//! Reproducible full-journal retrieval evaluation with a pretrained Chinese encoder.
-use eja_core::{Eja, Result, Source};
+//! Reproducible full-journal retrieval evaluation with an explicit local ONNX encoder.
+use eja_core::{Eja, OnnxEncoder, Source};
 use rusqlite::Connection;
-use std::time::Instant;
+use std::{error::Error, path::PathBuf, time::Instant};
+
+type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const PROBES: [(&str, &str); 6] = [
     (
@@ -40,7 +42,18 @@ const DISTRACTORS: [&str; 8] = [
     "周五的仓库门换了闭门器。",
 ];
 
-fn main() -> Result<()> {
+fn load_encoder() -> AppResult<OnnxEncoder> {
+    let dir = std::env::var_os("EJA_MEMORY_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(".models")
+                .join("multilingual-e5-small")
+        });
+    Ok(OnnxEncoder::load(dir)?)
+}
+
+fn main() -> AppResult<()> {
     let args: Vec<_> = std::env::args()
         .skip(1)
         .map(|s| s.parse::<usize>())
@@ -50,9 +63,10 @@ fn main() -> Result<()> {
     if n < 100 || variety == 0 {
         return Err("use at least 100 events and one background passage".into());
     }
+    let encoder = load_encoder()?;
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
-    let eja = Eja::open(&path)?;
+    let eja = Eja::open_with_encoder(&path, encoder.clone())?;
     let mut db = Connection::open(&path)?;
     let tx = db.transaction()?;
     let mut insert = tx.prepare(
@@ -117,10 +131,13 @@ fn main() -> Result<()> {
     println!(
         "history={n} background_variety={variety} first_view_ms={:.1} automatic_first_ids={:?}",
         cold.as_secs_f64() * 1e3,
-        related.iter().map(|m| m.entry.id).collect::<Vec<_>>()
+        related
+            .iter()
+            .map(|hit| hit.evidence.entry.id)
+            .collect::<Vec<_>>()
     );
     drop(eja);
-    let eja = Eja::open(&path)?;
+    let eja = Eja::open_with_encoder(&path, encoder)?;
     let mut top1 = 0;
     let mut top4 = 0;
     let mut times = Vec::new();
@@ -132,7 +149,7 @@ fn main() -> Result<()> {
         times.push(start.elapsed().as_secs_f64() * 1e3);
         let rank = hits
             .iter()
-            .position(|m| m.entry.id == *target as i64)
+            .position(|hit| hit.evidence.entry.id == *target as i64)
             .map(|i| i + 1);
         top1 += usize::from(rank == Some(1));
         top4 += usize::from(rank.is_some());

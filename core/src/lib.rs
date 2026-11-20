@@ -1,4 +1,5 @@
-//! One subject per journal. Hosts supply observations, model judgments and effect outcomes.
+//! Minimal continuing-subject kernel.
+//! One subject per journal. Hosts supply observations, model judgments, and effect outcomes.
 mod encoder;
 pub use encoder::{Encoder, InputKind};
 mod journal;
@@ -6,18 +7,69 @@ mod memory;
 #[cfg(feature = "onnx")]
 mod onnx;
 pub use memory::Match;
+#[cfg(feature = "onnx")]
+pub use onnx::OnnxEncoder;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::{fmt, path::Path};
 
 pub type Id = i64;
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-/// Each view contains at most one page of recent entries and one page of concerns.
+pub type Result<T> = std::result::Result<T, Error>;
+/// Each view contains at most one page of recent entries and one page of open concerns.
 pub const PAGE: usize = 8;
 /// Bound one serialized fact before it enters a model-facing history.
 pub const FACT_BYTES: usize = 8192;
+
+#[derive(Debug)]
+pub enum Error {
+    /// The journal advanced before this judgment was committed.
+    Conflict,
+    /// A judgment, receipt, or argument violated a kernel invariant.
+    Invalid(String),
+    /// Storage or serialization failure.
+    Storage(String),
+    /// Judge callback or encoder failure.
+    External(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl Error {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Conflict => formatter.write_str("view changed before judgment was committed"),
+            Self::Invalid(message) | Self::Storage(message) => formatter.write_str(message),
+            Self::External(err) => fmt::Display::fmt(err, formatter),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::External(err) => Some(err.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Storage(err.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Storage(err.to_string())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,8 +83,9 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Choice {
-    /// Keep something in mind. Supply its original id to revise it.
+    /// Carry a concern forward. Supply its original id to revise it.
     Keep {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         concern: Option<Id>,
         text: String,
     },
@@ -43,12 +96,18 @@ pub enum Choice {
         capability: String,
         input: Value,
     },
-    /// Read the fact named by Judgment::basis before deciding again.
-    Recall,
+    /// Inspect one recorded fact by ID, paired with its latest update if any.
+    Read {
+        fact: Id,
+    },
+    /// Search older history by semantic meaning when an encoder is attached.
+    Search {
+        cue: String,
+    },
     Rest,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Judgment {
     /// An existing fact that grounds this judgment.
@@ -56,7 +115,7 @@ pub struct Judgment {
     pub choice: Choice,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "detail", rename_all = "snake_case")]
 pub enum Outcome {
     Observed(String),
@@ -64,7 +123,7 @@ pub enum Outcome {
     Unknown(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fact {
     Noticed { source: Source, text: String },
@@ -72,13 +131,23 @@ pub enum Fact {
     Returned { action: Id, outcome: Outcome },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// One immutable record in the subject's journal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: Id,
     pub fact: Fact,
 }
 
-#[derive(Debug, Serialize)]
+/// A retrieved fact paired with its latest superseding update (receipt or concern edit), if any.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Evidence {
+    #[serde(flatten)]
+    pub entry: Entry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<Entry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Concern {
     pub id: Id,
     pub latest: Id,
@@ -90,26 +159,27 @@ pub struct Concern {
 #[derive(Debug, Serialize)]
 pub struct View {
     pub revision: Id,
-    /// Semantic matches from history outside the recent page, when a model is installed.
-    pub related: Option<Vec<Match>>,
+    /// Most recently changed open concerns first.
+    pub concerns: Vec<Concern>,
     /// Newest first. Older entries are readable by id or page.
     pub recent: Vec<Entry>,
-    /// One fact selected by the model, when it is outside the recent page.
+    /// Evidence returned by an explicit `Choice::Read` on the latest step.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub recalled: Option<Entry>,
-    /// Most recently changed first. The stable id survives a revision.
-    pub concerns: Vec<Concern>,
+    pub read: Option<Evidence>,
+    /// Semantic matches from history outside `recent`, when an encoder is attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related: Option<Vec<Match>>,
 }
 
 /// Delivered once, after the corresponding judgment is durable.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Call {
     pub id: Id,
     pub capability: String,
     pub input: Value,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
     Rest,
     StepLimit,
@@ -118,29 +188,19 @@ pub enum Stop {
 pub struct Eja(Connection, Option<memory::Memory>);
 
 impl Eja {
-    /// Open or resume one subject. Opening a journal never initiates a call.
+    /// Open or resume one subject without semantic memory. Never initiates a call.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        #[cfg(feature = "onnx")]
-        let encoder = onnx::configured()?;
-        #[cfg(not(feature = "onnx"))]
-        let encoder = None;
-        Self::open_inner(path.as_ref(), encoder)
+        Self::initialize(Connection::open(path.as_ref())?)
     }
 
-    /// Supply an encoder independently of ONNX, the model language, or the application UI.
+    /// Open or resume one subject with an explicit encoder for full-history semantic retrieval.
     pub fn open_with_encoder(
         path: impl AsRef<Path>,
         encoder: impl Encoder + 'static,
     ) -> Result<Self> {
-        Self::open_inner(path.as_ref(), Some(Box::new(encoder)))
-    }
-
-    fn open_inner(path: &Path, encoder: Option<Box<dyn Encoder>>) -> Result<Self> {
         memory::register_vectors()?;
-        let mut eja = Self::initialize(Connection::open(path)?)?;
-        eja.1 = encoder
-            .map(|model| memory::Memory::attach(&eja.0, model))
-            .transpose()?;
+        let mut eja = Self::initialize(Connection::open(path.as_ref())?)?;
+        eja.1 = Some(memory::Memory::attach(&eja.0, Box::new(encoder))?);
         Ok(eja)
     }
 
@@ -149,48 +209,57 @@ impl Eja {
             source,
             text: text.into(),
         };
-        self.append(&fact, None, None, None)
+        self.append_notice(&fact)
     }
 
     pub fn view(&self) -> Result<View> {
         let revision = self.head()?;
         let recent = self.history(revision)?;
-        let recalled = match recent.first().map(|entry| &entry.fact) {
+        let read = match recent.first().map(|entry| &entry.fact) {
             Some(Fact::Judged {
                 judgment:
                     Judgment {
-                        choice: Choice::Recall,
-                        basis,
+                        choice: Choice::Read { fact },
+                        ..
                     },
-            }) if !recent.iter().any(|entry| entry.id == *basis) => Some(self.read(*basis)?),
+            }) => Some(self.evidence(*fact, revision)?),
             _ => None,
         };
-        let related = if let (Some(memory), Some(oldest)) = (&self.1, recent.last()) {
-            let cue: Option<String> = self
-                .0
-                .query_row(
-                    "SELECT json_extract(body,'$.text') FROM facts
-                 WHERE id <= ?1 AND json_extract(body,'$.kind')='noticed'
-                 ORDER BY id DESC LIMIT 1",
-                    [revision],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            match cue {
-                Some(text) if oldest.id > 1 && !text.trim().is_empty() => {
-                    Some(memory.search(self, &text, oldest.id - 1, revision)?)
+        let related = match (&self.1, recent.last()) {
+            (Some(memory), Some(oldest)) if oldest.id > 1 => {
+                let cue = match recent.first().map(|entry| &entry.fact) {
+                    Some(Fact::Judged {
+                        judgment:
+                            Judgment {
+                                choice: Choice::Search { cue },
+                                ..
+                            },
+                    }) => Some(cue.clone()),
+                    Some(Fact::Judged {
+                        judgment:
+                            Judgment {
+                                choice: Choice::Read { .. },
+                                ..
+                            },
+                    }) => None,
+                    _ => self.latest_notice_text(revision)?,
+                };
+                match cue {
+                    Some(text) if !text.trim().is_empty() => {
+                        Some(memory.search(self, &text, oldest.id - 1, revision)?)
+                    }
+                    _ => Some(Vec::new()),
                 }
-                _ => Some(vec![]),
             }
-        } else {
-            self.1.as_ref().map(|_| vec![])
+            (Some(_), _) => Some(Vec::new()),
+            (None, _) => None,
         };
         Ok(View {
             revision,
-            related,
-            recent,
-            recalled,
             concerns: self.concerns(revision, revision)?,
+            recent,
+            read,
+            related,
         })
     }
 
@@ -200,12 +269,18 @@ impl Eja {
         &self,
         grants: &[&str],
         steps: usize,
-        mut judge: impl FnMut(&View) -> Result<Judgment>,
+        mut judge: impl FnMut(
+            &View,
+        )
+            -> std::result::Result<Judgment, Box<dyn std::error::Error + Send + Sync>>,
         mut perform: impl FnMut(Call) -> Outcome,
     ) -> Result<Stop> {
         for _ in 0..steps {
             let view = self.view()?;
-            let judgment = judge(&view)?;
+            if view.revision == 0 {
+                return Ok(Stop::Rest);
+            }
+            let judgment = judge(&view).map_err(Error::External)?;
             let rests = matches!(judgment.choice, Choice::Rest);
             if let Some(call) = self.decide(view.revision, judgment, grants)? {
                 let id = call.id;
@@ -218,62 +293,13 @@ impl Eja {
         Ok(Stop::StepLimit)
     }
 
-    /// The host supplies the current grants. The model supplies only the judgment.
+    /// Commit one judgment against an exact view revision.
     pub fn decide(
         &self,
         revision: Id,
         judgment: Judgment,
         grants: &[&str],
     ) -> Result<Option<Call>> {
-        if judgment.basis < 1 || judgment.basis > revision || revision != self.head()? {
-            return Err("judgment needs a current view and a recorded basis".into());
-        }
-        let next = revision.checked_add(1).ok_or("journal id exhausted")?;
-        let mut call = None;
-        let edit = match &judgment.choice {
-            Choice::Keep { concern, text } => {
-                if text.trim().is_empty() {
-                    return Err("a concern needs text".into());
-                }
-                if let Some(id) = concern {
-                    self.require_open(*id, revision)?;
-                }
-                Some((concern.unwrap_or(next), true))
-            }
-            Choice::Release { concern } => {
-                self.require_open(*concern, revision)?;
-                Some((*concern, false))
-            }
-            Choice::Act { capability, input } => {
-                if capability.is_empty() || !grants.contains(&capability.as_str()) {
-                    return Err("capability is not granted".into());
-                }
-                call = Some(Call {
-                    id: next,
-                    capability: capability.clone(),
-                    input: input.clone(),
-                });
-                None
-            }
-            Choice::Recall | Choice::Rest => None,
-        };
-        self.append(&Fact::Judged { judgment }, Some(revision), edit, None)?;
-        Ok(call)
-    }
-
-    /// A host receipt establishes what the host observed about a particular call.
-    pub fn finish(&self, action: Id, outcome: Outcome) -> Result<Id> {
-        match self.read(action)?.fact {
-            Fact::Judged {
-                judgment:
-                    Judgment {
-                        choice: Choice::Act { .. },
-                        ..
-                    },
-            } => {}
-            _ => return Err("outcome needs an action id".into()),
-        }
-        let fact = Fact::Returned { action, outcome };
-        self.append(&fact, None, None, Some(action))
+        self.commit_judgment(revision, judgment, grants)
     }
 }

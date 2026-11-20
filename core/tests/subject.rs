@@ -1,5 +1,7 @@
-use eja_core::{Choice, Eja, Fact, Judgment, Outcome, Result, Source, FACT_BYTES, PAGE};
+use eja_core::{Choice, Eja, Error, Fact, Judgment, Outcome, Source, FACT_BYTES, PAGE};
 use serde_json::json;
+
+type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn judgment(basis: i64, choice: Choice) -> Judgment {
     Judgment { basis, choice }
@@ -20,7 +22,7 @@ fn a_judge_can_follow_a_concerns_current_basis_before_acting() -> Result<()> {
     for _ in 0..PAGE {
         eja.notice(Source::Clock, "tick")?;
     }
-    eja.notice(Source::Person, "明天想出去透口气")?;
+    let trigger = eja.notice(Source::Person, "明天想出去透口气")?;
     let mut steps = 0;
     let stop = eja.turn(&[], 2, |v| {
         steps += 1;
@@ -28,33 +30,42 @@ fn a_judge_can_follow_a_concerns_current_basis_before_acting() -> Result<()> {
         assert_eq!(basis, change);
         assert!(!v.recent.iter().any(|e| e.id == change));
         if steps == 1 {
-            assert!(v.recalled.is_none());
-            return Ok(judgment(basis, Choice::Recall));
+            assert!(v.read.is_none());
+            return Ok(judgment(trigger, Choice::Read { fact: basis }));
         }
-        let memory = v.recalled.as_ref().unwrap();
-        assert_eq!(memory.id, change);
-        assert!(matches!(&memory.fact, Fact::Noticed { source: Source::Person, text } if text == "这阵子更想去山里"));
-        Ok(judgment(memory.id, Choice::Rest))
+        let memory = v.read.as_ref().unwrap();
+        assert_eq!(memory.entry.id, change);
+        assert!(memory.latest.is_none());
+        assert!(matches!(&memory.entry.fact, Fact::Noticed { source: Source::Person, text } if text == "这阵子更想去山里"));
+        Ok(judgment(memory.entry.id, Choice::Rest))
     }, |_| unreachable!())?;
     assert_eq!(stop, eja_core::Stop::Rest);
     assert_eq!(steps, 2);
-    assert!(eja.view()?.recalled.is_none());
+    assert!(eja.view()?.read.is_none());
     Ok(())
 }
 
 #[test]
-fn recalling_a_recent_fact_keeps_one_copy_and_uses_one_step() -> Result<()> {
+fn reading_any_fact_returns_evidence_and_rejects_unknown_targets() -> Result<()> {
     let eja = Eja::open(":memory:")?;
     let basis = eja.notice(Source::Person, "在这里")?;
+    assert!(matches!(
+        eja.decide(
+            basis,
+            judgment(basis, Choice::Read { fact: basis + 1 }),
+            &[]
+        ),
+        Err(Error::Invalid(_))
+    ));
     let stop = eja.turn(
         &[],
         1,
-        |_| Ok(judgment(basis, Choice::Recall)),
+        |_| Ok(judgment(basis, Choice::Read { fact: basis })),
         |_| unreachable!(),
     )?;
     assert_eq!(stop, eja_core::Stop::StepLimit);
     let v = eja.view()?;
-    assert!(v.recalled.is_none());
+    assert_eq!(v.read.as_ref().unwrap().entry.id, basis);
     assert!(v.recent.iter().any(|entry| entry.id == basis));
     Ok(())
 }
@@ -105,9 +116,10 @@ fn a_correction_changes_later_attention_and_preserves_both_sources() -> Result<(
     eja.decide(head, judgment(revision, Choice::Release { concern }), &[])?;
     assert!(eja.view()?.concerns.is_empty());
     let head = eja.view()?.revision;
-    assert!(eja
-        .decide(head, judgment(head, keep(Some(concern), "再次修改")), &[])
-        .is_err());
+    assert!(matches!(
+        eja.decide(head, judgment(head, keep(Some(concern), "再次修改")), &[]),
+        Err(Error::Invalid(_))
+    ));
     assert_eq!(eja.concerns(tick, tick)?[0].text, "先听完");
     Ok(())
 }
@@ -121,18 +133,29 @@ fn only_a_fresh_granted_decision_can_issue_a_call() -> Result<()> {
     let basis = first.notice(Source::World, "an observation")?;
     let wire = json!({"basis":basis,"choice":{"op":"act","capability":"new.tool","input":{"x":1}}});
     let decide = || serde_json::from_value::<Judgment>(wire.clone()).unwrap();
-    assert!(first.decide(basis, decide(), &[]).is_err());
-    assert!(first
-        .decide(basis, judgment(basis + 1, Choice::Rest), &[])
-        .is_err());
+    assert!(matches!(
+        first.decide(basis, decide(), &[]),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        first.decide(basis, judgment(basis + 1, Choice::Rest), &[]),
+        Err(Error::Invalid(_))
+    ));
     let rev = second.notice(Source::Person, "one more thing")?;
-    assert!(first.decide(basis, decide(), &["new.tool"]).is_err());
+    assert!(matches!(
+        first.decide(basis, decide(), &["new.tool"]),
+        Err(Error::Conflict)
+    ));
     let call = first.decide(rev, decide(), &["new.tool"])?.unwrap();
     assert_eq!(call.input, json!({"x":1}));
-    assert!(second.decide(rev, decide(), &["new.tool"]).is_err());
-    assert!(second
-        .finish(basis, Outcome::Observed("wrong target".into()))
-        .is_err());
+    assert!(matches!(
+        second.decide(rev, decide(), &["new.tool"]),
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(
+        second.finish(basis, Outcome::Observed("wrong target".into())),
+        Err(Error::Invalid(_))
+    ));
     // Simulate the host disappearing after dispatch and before observing the result.
     drop(first);
     drop(second);
@@ -141,10 +164,18 @@ fn only_a_fresh_granted_decision_can_issue_a_call() -> Result<()> {
     let unknown = || Outcome::Unknown("host stopped".into());
     let receipt = resumed.finish(call.id, unknown())?;
     assert_eq!(resumed.finish(call.id, unknown())?, receipt);
-    assert!(resumed
-        .finish(call.id, Outcome::Observed("assumed success".into()))
-        .is_err());
-    assert_eq!(resumed.view()?.revision, receipt);
+    let settled = resumed.finish(call.id, Outcome::Observed("verified later".into()))?;
+    assert!(settled > receipt);
+    assert_eq!(resumed.finish(call.id, unknown())?, receipt);
+    assert_eq!(
+        resumed.finish(call.id, Outcome::Observed("verified later".into()))?,
+        settled
+    );
+    assert!(matches!(
+        resumed.finish(call.id, Outcome::Failed("contradiction".into())),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(resumed.view()?.revision, settled);
     Ok(())
 }
 
@@ -185,7 +216,7 @@ fn simultaneous_decisions_issue_only_one_call() -> Result<()> {
     std::thread::scope(|scope| {
         let run = |eja: Eja| {
             barrier.wait();
-            eja.decide(
+            match eja.decide(
                 revision,
                 judgment(
                     revision,
@@ -195,8 +226,11 @@ fn simultaneous_decisions_issue_only_one_call() -> Result<()> {
                     },
                 ),
                 &["one"],
-            )
-            .is_ok()
+            ) {
+                Ok(Some(_)) => true,
+                Err(Error::Conflict) => false,
+                other => panic!("unexpected result: {other:?}"),
+            }
         };
         let a = scope.spawn(move || run(first));
         let b = scope.spawn(move || run(second));
@@ -244,5 +278,146 @@ fn one_turn_reconsiders_a_real_receipt_and_stops_at_the_step_budget() -> Result<
         |_| unreachable!(),
     )?;
     assert_eq!(stop, eja_core::Stop::Rest);
+    Ok(())
+}
+
+#[test]
+fn identical_actions_require_distinct_basis_evidence() -> Result<()> {
+    let e = Eja::open(":memory:")?;
+    let act = |basis| {
+        judgment(
+            basis,
+            Choice::Act {
+                capability: "write".into(),
+                input: json!({"text": "\n雪"}),
+            },
+        )
+    };
+    let first = e.notice(Source::Person, "first")?;
+    let call = e.decide(first, act(first), &["write"])?.unwrap();
+    let receipt = e.finish(call.id, Outcome::Observed("ok".into()))?;
+    assert!(matches!(
+        e.decide(receipt, act(first), &["write"]),
+        Err(Error::Invalid(_))
+    ));
+    let second = e.notice(Source::Person, "again")?;
+    assert!(matches!(
+        e.decide(second, act(first), &["write"]),
+        Err(Error::Invalid(_))
+    ));
+    assert!(e.decide(second, act(second), &["write"])?.is_some());
+    Ok(())
+}
+
+#[test]
+fn empty_subject_rests_and_an_oversized_receipt_closes_its_call() -> Result<()> {
+    let e = Eja::open(":memory:")?;
+    assert_eq!(
+        e.turn(&[], 2, |_| unreachable!(), |_| unreachable!())?,
+        eja_core::Stop::Rest
+    );
+    let basis = e.notice(Source::Person, "test")?;
+    let detail = "雨\0\"".repeat(FACT_BYTES);
+    e.turn(
+        &["read"],
+        1,
+        |_| {
+            Ok(judgment(
+                basis,
+                Choice::Act {
+                    capability: "read".into(),
+                    input: json!(null),
+                },
+            ))
+        },
+        |_| Outcome::Observed(detail.clone()),
+    )?;
+    let receipt = e.read(basis + 2)?;
+    assert!(serde_json::to_vec(&receipt.fact)?.len() <= FACT_BYTES);
+    assert!(
+        matches!(receipt.fact, Fact::Returned { outcome: Outcome::Observed(ref s), .. } if s.contains("truncated") && s.contains("sha256:"))
+    );
+    assert_eq!(
+        e.finish(basis + 1, Outcome::Observed(detail.clone()))?,
+        receipt.id
+    );
+    assert!(e
+        .finish(basis + 1, Outcome::Observed(detail + "!"))
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn an_unknown_receipt_can_be_settled_only_once_by_competing_hosts() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("subject.db");
+    let seed = Eja::open(&db)?;
+    let notice = seed.notice(Source::World, "tick")?;
+    let call = seed
+        .decide(
+            notice,
+            judgment(
+                notice,
+                Choice::Act {
+                    capability: "read".into(),
+                    input: json!(null),
+                },
+            ),
+            &["read"],
+        )?
+        .unwrap();
+    let unknown = seed.finish(call.id, Outcome::Unknown("lost".into()))?;
+    drop(seed);
+    let a = Eja::open(&db)?;
+    let b = Eja::open(&db)?;
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        let settle = |host: Eja, outcome| {
+            barrier.wait();
+            host.finish(call.id, outcome).is_ok()
+        };
+        let left = s.spawn(move || settle(a, Outcome::Observed("yes".into())));
+        let right = s.spawn(move || settle(b, Outcome::Failed("no".into())));
+        assert_ne!(left.join().unwrap(), right.join().unwrap());
+    });
+    let e = Eja::open(db)?;
+    assert_eq!(e.finish(call.id, Outcome::Unknown("lost".into()))?, unknown);
+    assert_eq!(e.view()?.revision, unknown + 1);
+    Ok(())
+}
+
+#[test]
+fn decide_commits_meaningful_judgments_without_silent_drops_and_search_needs_encoder() -> Result<()>
+{
+    let e = Eja::open(":memory:")?;
+    let basis = e.notice(Source::Person, "remember aurora and refine if needed")?;
+    assert!(e.view()?.related.is_none());
+    assert!(matches!(
+        e.decide(
+            basis,
+            judgment(
+                basis,
+                Choice::Search {
+                    cue: "aurora".into()
+                }
+            ),
+            &[]
+        ),
+        Err(Error::Invalid(_))
+    ));
+    e.decide(basis, judgment(basis, keep(None, "aurora")), &[])?;
+    let concern = e.view()?.concerns[0].id;
+    // Revising with the same basis or releasing is committed explicitly rather than swallowed.
+    e.decide(
+        concern,
+        judgment(basis, keep(Some(concern), "aurora (refined)")),
+        &[],
+    )?;
+    assert_eq!(e.view()?.revision, concern + 1);
+    assert_eq!(e.view()?.concerns.len(), 1);
+    assert_eq!(e.view()?.concerns[0].text, "aurora (refined)");
+    let head = e.view()?.revision;
+    e.decide(head, judgment(basis, Choice::Release { concern }), &[])?;
+    assert!(e.view()?.concerns.is_empty());
     Ok(())
 }

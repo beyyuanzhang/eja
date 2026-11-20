@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [features]
-default = ["onnx"]
+default = []
 onnx = ["dep:fastembed"]
 
 [dependencies]
@@ -19,5 +19,13 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "semantic_recall"
+required-features = ["onnx"]
+
+[[example]]
+name = "live_continuity"
+required-features = ["onnx"]
 
 [workspace]

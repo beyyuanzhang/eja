@@ -1,11 +1,13 @@
 //! Offline application: a scripted judge and one host-owned file capability.
-use eja_core::{Call, Choice, Eja, Fact, Judgment, Outcome, Result, Source, Stop, View};
+use eja_core::{Call, Choice, Eja, Fact, Judgment, Outcome, Source, Stop, View};
 use serde_json::Value;
-use std::{fs, path::Path};
+use std::{error::Error, fs, path::Path};
+
+type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const REQUEST: &str = "下次复看时，帮我看看草稿有几行";
 
-fn judge(view: &View) -> Result<Judgment> {
+fn judge(view: &View) -> AppResult<Judgment> {
     let newest = view.recent.first().ok_or("expected an observation")?;
     let choice = match &newest.fact {
         Fact::Noticed {
@@ -40,7 +42,7 @@ fn perform(call: Call, draft: &Path) -> Outcome {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> AppResult<()> {
     let dir = tempfile::tempdir()?;
     let journal = dir.path().join("subject.db");
     let draft = dir.path().join("draft.txt");
