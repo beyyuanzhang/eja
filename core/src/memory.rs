@@ -68,8 +68,9 @@ fn passages(text: &str) -> Vec<&str> {
 
 fn content(fact: Fact) -> Option<String> {
     match fact {
-        Fact::Noticed { text, .. } => Some(text),
-        Fact::Kept { text, .. } => Some(text),
+        Fact::Noticed { text, .. } | Fact::Kept { text, .. } | Fact::Consolidated { text, .. } => {
+            Some(text)
+        }
         Fact::Acted { capability, input } => Some(format!("{capability} {input}")),
         Fact::Returned {
             outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
@@ -93,7 +94,7 @@ impl Eja {
     /// Search all text-bearing history, including events never marked as concerns.
     pub fn search(&self, cue: &str) -> Result<Vec<Match>> {
         let memory = self
-            .1
+            .memory
             .as_ref()
             .ok_or_else(|| Error::invalid("no semantic encoder configured"))?;
         let head = self.head()?;
@@ -256,17 +257,17 @@ impl Memory {
         if cue.len() > crate::FACT_BYTES {
             return Err(Error::invalid("memory query exceeds fact budget"));
         }
-        self.catch_up(&eja.0, through)?;
+        self.catch_up(&eja.db, through)?;
         let chunks = passages(cue);
         let queries = self.encode(InputKind::Query, &chunks)?;
         // One fact fits in at most this many chunks. Collect enough keys for TOP distinct facts.
         let limit = TOP * (crate::FACT_BYTES / STRIDE + 2);
         let mut scores: BTreeMap<Id, f64> = BTreeMap::new();
-        let mut stmt = eja.0.prepare_cached(
+        let mut stmt = eja.db.prepare_cached(
             "SELECT rowid,distance FROM memory_vectors
              WHERE embedding MATCH ?1 AND k=?2 AND first_event<=?3 ORDER BY distance",
         )?;
-        let mut origin = eja.0.prepare_cached(
+        let mut origin = eja.db.prepare_cached(
             "SELECT fact FROM memory_refs WHERE key=?1 AND fact<=?2 ORDER BY fact DESC LIMIT 1",
         )?;
         for query in queries {

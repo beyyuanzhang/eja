@@ -6,9 +6,11 @@ mod journal;
 mod memory;
 #[cfg(feature = "onnx")]
 mod onnx;
+mod time;
 pub use memory::Match;
 #[cfg(feature = "onnx")]
 pub use onnx::OnnxEncoder;
+pub use time::Timestamp;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,8 @@ pub type Id = i64;
 pub type Result<T> = std::result::Result<T, Error>;
 /// Each view contains at most one page of recent entries and one page of open concerns.
 pub const PAGE: usize = 8;
+/// Each chronological replay request returns at most this many entries.
+pub const REPLAY_PAGE: usize = 32;
 /// Bound one serialized fact before it enters a model-facing history.
 pub const FACT_BYTES: usize = 8192;
 
@@ -138,6 +142,7 @@ pub enum Fact {
     Noticed { source: Source, text: String },
     Kept { concern: Id, text: String },
     Released { concern: Id },
+    Consolidated { through: Id, text: String },
     Acted { capability: String, input: Value },
     Returned { action: Id, outcome: Outcome },
 }
@@ -146,6 +151,7 @@ pub enum Fact {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     pub id: Id,
+    pub at: Timestamp,
     pub fact: Fact,
 }
 
@@ -168,14 +174,19 @@ pub struct SearchHits {
 pub struct Concern {
     pub id: Id,
     pub latest: Id,
+    pub at: Timestamp,
     pub text: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct View {
     pub revision: Id,
+    pub now: Timestamp,
     /// Most recently changed open concerns first.
     pub concerns: Vec<Concern>,
+    /// Latest consolidated long-term memory, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consolidated: Option<Entry>,
     /// Newest first. Older entries are readable by id or page.
     pub recent: Vec<Entry>,
     /// Evidence returned for `step.read` from the previous step of this turn.
@@ -184,6 +195,19 @@ pub struct View {
     /// Results returned for `step.search` from the previous step of this turn.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub searches: Vec<SearchHits>,
+}
+
+/// One bounded chronological replay window for slow memory consolidation.
+#[derive(Debug, Serialize)]
+pub struct Consolidation {
+    pub revision: Id,
+    pub now: Timestamp,
+    pub concerns: Vec<Concern>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<Entry>,
+    /// Chronological unconsolidated entries ending at `through`.
+    pub entries: Vec<Entry>,
+    pub through: Id,
 }
 
 /// Delivered once, after the corresponding `Fact::Acted` is durable.
@@ -200,7 +224,11 @@ pub enum Stop {
     StepLimit,
 }
 
-pub struct Eja(Connection, Option<memory::Memory>);
+pub struct Eja {
+    pub(crate) db: Connection,
+    pub(crate) memory: Option<memory::Memory>,
+    clock: Box<dyn Fn() -> Timestamp + Send>,
+}
 
 impl Eja {
     /// Open or resume one subject without semantic memory. Never initiates a call.
@@ -215,12 +243,22 @@ impl Eja {
     ) -> Result<Self> {
         memory::register_vectors()?;
         let mut eja = Self::initialize(Connection::open(path.as_ref())?)?;
-        eja.1 = Some(memory::Memory::attach(&eja.0, Box::new(encoder))?);
+        eja.memory = Some(memory::Memory::attach(&eja.db, Box::new(encoder))?);
         Ok(eja)
     }
 
+    /// Override the physical clock (defaults to system wall time).
+    pub fn with_clock(mut self, clock: impl Fn() -> Timestamp + Send + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
     pub fn has_encoder(&self) -> bool {
-        self.1.is_some()
+        self.memory.is_some()
+    }
+
+    pub(crate) fn clock_now(&self) -> Timestamp {
+        (self.clock)()
     }
 
     pub fn notice(&self, source: Source, text: impl Into<String>) -> Result<Id> {
@@ -236,11 +274,35 @@ impl Eja {
         let revision = self.head()?;
         Ok(View {
             revision,
+            now: self.now_at(&self.db)?,
             concerns: self.concerns(revision, revision)?,
+            consolidated: self.consolidated(revision)?,
             recent: self.history(revision)?,
             reads: Vec::new(),
             searches: Vec::new(),
         })
+    }
+
+    /// Slow memory consolidation loop: replays unconsolidated history in bounded chronological
+    /// windows (`REPLAY_PAGE`) and commits each fold atomically as `Fact::Consolidated`.
+    /// Returns the newest committed consolidation entry ID, or `None` when already caught up.
+    pub fn consolidate(
+        &self,
+        windows: usize,
+        mut distill: impl FnMut(
+            &Consolidation,
+        )
+            -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Result<Option<Id>> {
+        let mut latest = None;
+        for _ in 0..windows {
+            let Some(window) = self.unconsolidated()? else {
+                break;
+            };
+            let text = distill(&window).map_err(Error::External)?;
+            latest = Some(self.commit_consolidation(window.revision, window.through, text)?);
+        }
+        Ok(latest)
     }
 
     /// Closed-loop turn: commits mutations before external effects, feeds back query results
@@ -270,7 +332,7 @@ impl Eja {
                     return Err(Error::invalid("read target must reference a recorded fact"));
                 }
             }
-            if !step.search.is_empty() && self.1.is_none() {
+            if !step.search.is_empty() && self.memory.is_none() {
                 return Err(Error::invalid("search requires an attached encoder"));
             }
             for cue in &step.search {
@@ -279,7 +341,7 @@ impl Eja {
                 }
             }
             let calls = if step.has_mutations() {
-                self.commit(view.revision, &step.keep, &step.release, &step.act, grants)?
+                self.commit(view.revision, &step, grants)?
             } else {
                 Vec::new()
             };
@@ -294,7 +356,7 @@ impl Eja {
             for fact_id in step.read {
                 reads.push(self.evidence(fact_id, head)?);
             }
-            if let Some(memory) = &self.1 {
+            if let Some(memory) = &self.memory {
                 let older = head.saturating_sub(PAGE as Id);
                 for cue in step.search {
                     let matches = memory.search(self, &cue, older, head)?;
@@ -305,15 +367,8 @@ impl Eja {
         Ok(Stop::StepLimit)
     }
 
-    /// Atomically commit concern updates and authorized actions against an exact view revision.
-    pub fn commit(
-        &self,
-        revision: Id,
-        keep: &[Keep],
-        release: &[Id],
-        act: &[Act],
-        grants: &[&str],
-    ) -> Result<Vec<Call>> {
-        self.commit_step(revision, keep, release, act, grants)
+    /// Atomically commit state updates and authorized actions against an exact view revision.
+    pub fn commit(&self, revision: Id, step: &Step, grants: &[&str]) -> Result<Vec<Call>> {
+        self.commit_step(revision, step, grants)
     }
 }

@@ -95,12 +95,13 @@ fn turn_search_and_read_present_settled_evidence_without_polluting_journal() -> 
     let call = subject
         .commit(
             basis,
-            &[],
-            &[],
-            &[Act {
-                capability: "scan".into(),
-                input: Value::Null,
-            }],
+            &Step {
+                act: vec![Act {
+                    capability: "scan".into(),
+                    input: Value::Null,
+                }],
+                ..Step::default()
+            },
             &["scan"],
         )?
         .remove(0);
@@ -156,6 +157,27 @@ fn turn_search_and_read_present_settled_evidence_without_polluting_journal() -> 
     assert_eq!(stop, Stop::Done);
     assert_eq!(steps, 2);
     assert_eq!(subject.view()?.revision, trigger);
+    Ok(())
+}
+
+#[test]
+fn consolidated_memory_is_indexed_and_links_to_latest_consolidation() -> Result<()> {
+    let subject = Eja::open_with_encoder(":memory:", Fixture { id: "v1", dims: 2 })?;
+    let first = subject.notice(Source::World, "α routine event 1")?;
+    let first_consolidation =
+        subject.commit_consolidation(first, first, "β venue accessibility synthesis v1")?;
+    let next = subject.notice(Source::World, "α routine event 2")?;
+    let second_consolidation =
+        subject.commit_consolidation(next, next, "α updated general summary v2")?;
+    for idx in 0..PAGE + 2 {
+        subject.notice(Source::World, format!("α noise {idx}"))?;
+    }
+    let hits = subject.search("β accessibility")?;
+    assert_eq!(hits[0].evidence.entry.id, first_consolidation);
+    assert_eq!(
+        hits[0].evidence.latest.as_ref().unwrap().id,
+        second_consolidation
+    );
     Ok(())
 }
 
@@ -246,16 +268,24 @@ mod onnx_tests {
         let text = "以后坐地铁回家";
         a.commit(
             first,
-            &[Keep {
-                concern: None,
-                text: text.into(),
-            }],
-            &[],
-            &[],
+            &Step {
+                keep: vec![Keep {
+                    concern: None,
+                    text: text.into(),
+                }],
+                ..Step::default()
+            },
             &[],
         )?;
         let note = first + 1;
-        a.commit(note, &[], &[note], &[], &[])?;
+        a.commit(
+            note,
+            &Step {
+                release: vec![note],
+                ..Step::default()
+            },
+            &[],
+        )?;
         let barrier = Barrier::new(2);
         std::thread::scope(|scope| {
             let run = |subject: Eja| -> Result<()> {
@@ -332,12 +362,13 @@ mod onnx_tests {
         let call = subject
             .commit(
                 basis,
-                &[],
-                &[],
-                &[Act {
-                    capability: "scan".into(),
-                    input: serde_json::Value::Null,
-                }],
+                &Step {
+                    act: vec![Act {
+                        capability: "scan".into(),
+                        input: serde_json::Value::Null,
+                    }],
+                    ..Step::default()
+                },
                 &["scan"],
             )?
             .remove(0);

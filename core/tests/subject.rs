@@ -1,5 +1,12 @@
-use eja_core::{Act, Eja, Error, Fact, Keep, Outcome, Source, Step, Stop, FACT_BYTES, PAGE};
+use eja_core::{
+    Act, Eja, Error, Fact, Keep, Outcome, Source, Step, Stop, Timestamp, FACT_BYTES, PAGE,
+    REPLAY_PAGE,
+};
 use serde_json::json;
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc,
+};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -10,18 +17,37 @@ fn keep(concern: Option<i64>, text: &str) -> Keep {
     }
 }
 
+fn step_keep(items: Vec<Keep>) -> Step {
+    Step {
+        keep: items,
+        ..Step::default()
+    }
+}
+
+fn step_release(ids: Vec<i64>) -> Step {
+    Step {
+        release: ids,
+        ..Step::default()
+    }
+}
+
+fn step_act(items: Vec<Act>) -> Step {
+    Step {
+        act: items,
+        ..Step::default()
+    }
+}
+
 #[test]
 fn turn_feeds_read_evidence_and_stops_naturally_without_rest() -> Result<()> {
     let eja = Eja::open(":memory:")?;
     let first = eja.notice(Source::Person, "我喜欢沿河散步")?;
-    eja.commit(first, &[keep(None, "周末的去处")], &[], &[], &[])?;
+    eja.commit(first, &step_keep(vec![keep(None, "周末的去处")]), &[])?;
     let concern = eja.view()?.concerns[0].id;
     let change = eja.notice(Source::Person, "这阵子更想去山里")?;
     eja.commit(
         change,
-        &[keep(Some(concern), "周末想去山里")],
-        &[],
-        &[],
+        &step_keep(vec![keep(Some(concern), "周末想去山里")]),
         &[],
     )?;
     for _ in 0..PAGE {
@@ -100,9 +126,7 @@ fn batch_commit_is_atomic_and_rolls_back_on_partial_failure() -> Result<()> {
     let start = eja.notice(Source::Person, "开始")?;
     let calls = eja.commit(
         start,
-        &[keep(None, "第一件事"), keep(None, "第二件事")],
-        &[],
-        &[],
+        &step_keep(vec![keep(None, "第一件事"), keep(None, "第二件事")]),
         &[],
     )?;
     assert!(calls.is_empty());
@@ -112,17 +136,13 @@ fn batch_commit_is_atomic_and_rolls_back_on_partial_failure() -> Result<()> {
     let second_concern = view.concerns[0].id;
 
     assert!(matches!(
-        eja.commit(view.revision, &[keep(None, "回滚")], &[999], &[], &[],),
-        Err(Error::Invalid(_))
-    ));
-    assert_eq!(eja.view()?.revision, view.revision);
-
-    assert!(matches!(
         eja.commit(
             view.revision,
-            &[],
-            &[first_concern, first_concern],
-            &[],
+            &Step {
+                keep: vec![keep(None, "回滚")],
+                release: vec![999],
+                ..Step::default()
+            },
             &[],
         ),
         Err(Error::Invalid(_))
@@ -132,12 +152,25 @@ fn batch_commit_is_atomic_and_rolls_back_on_partial_failure() -> Result<()> {
     assert!(matches!(
         eja.commit(
             view.revision,
-            &[keep(Some(first_concern), "已更新")],
-            &[second_concern],
-            &[Act {
-                capability: "denied".into(),
-                input: json!({}),
-            }],
+            &step_release(vec![first_concern, first_concern]),
+            &[],
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(eja.view()?.revision, view.revision);
+
+    assert!(matches!(
+        eja.commit(
+            view.revision,
+            &Step {
+                keep: vec![keep(Some(first_concern), "已更新")],
+                release: vec![second_concern],
+                act: vec![Act {
+                    capability: "denied".into(),
+                    input: json!({}),
+                }],
+                ..Step::default()
+            },
             &["allowed"],
         ),
         Err(Error::Invalid(_))
@@ -146,12 +179,15 @@ fn batch_commit_is_atomic_and_rolls_back_on_partial_failure() -> Result<()> {
 
     let calls = eja.commit(
         view.revision,
-        &[keep(Some(first_concern), "已更新")],
-        &[second_concern],
-        &[Act {
-            capability: "allowed".into(),
-            input: json!({"ok": true}),
-        }],
+        &Step {
+            keep: vec![keep(Some(first_concern), "已更新")],
+            release: vec![second_concern],
+            act: vec![Act {
+                capability: "allowed".into(),
+                input: json!({"ok": true}),
+            }],
+            ..Step::default()
+        },
         &["allowed"],
     )?;
     assert_eq!(calls.len(), 1);
@@ -169,12 +205,16 @@ fn a_correction_changes_later_attention_and_preserves_both_sources() -> Result<(
     let path = dir.path().join("subject.db");
     let eja = Eja::open(&path)?;
     let first = eja.notice(Source::Person, "评审让我有点累")?;
-    eja.commit(first, &[keep(None, "也许想讨论评审")], &[], &[], &[])?;
+    eja.commit(first, &step_keep(vec![keep(None, "也许想讨论评审")]), &[])?;
     let concern = eja.view()?.concerns[0].id;
     drop(eja);
     let eja = Eja::open(&path)?;
     let correction = eja.notice(Source::Person, "下次听我说完就好")?;
-    eja.commit(correction, &[keep(Some(concern), "先听完")], &[], &[], &[])?;
+    eja.commit(
+        correction,
+        &step_keep(vec![keep(Some(concern), "先听完")]),
+        &[],
+    )?;
     let tick = eja.notice(Source::Clock, "第二天")?;
     let view = eja.view()?;
     assert_eq!(view.concerns.len(), 1);
@@ -190,11 +230,11 @@ fn a_correction_changes_later_attention_and_preserves_both_sources() -> Result<(
             ..
         }
     ));
-    eja.commit(tick, &[], &[concern], &[], &[])?;
+    eja.commit(tick, &step_release(vec![concern]), &[])?;
     assert!(eja.view()?.concerns.is_empty());
     let head = eja.view()?.revision;
     assert!(matches!(
-        eja.commit(head, &[keep(Some(concern), "再次修改")], &[], &[], &[]),
+        eja.commit(head, &step_keep(vec![keep(Some(concern), "再次修改")]), &[]),
         Err(Error::Invalid(_))
     ));
     assert_eq!(eja.concerns(tick, tick)?[0].text, "先听完");
@@ -213,20 +253,20 @@ fn only_a_fresh_granted_commit_can_issue_a_call() -> Result<()> {
         input: json!({"x": 1}),
     };
     assert!(matches!(
-        first.commit(basis, &[], &[], std::slice::from_ref(&act), &[]),
+        first.commit(basis, &step_act(vec![act.clone()]), &[]),
         Err(Error::Invalid(_))
     ));
     let rev = second.notice(Source::Person, "one more thing")?;
     assert!(matches!(
-        first.commit(basis, &[], &[], std::slice::from_ref(&act), &["new.tool"]),
+        first.commit(basis, &step_act(vec![act.clone()]), &["new.tool"]),
         Err(Error::Conflict)
     ));
-    let calls = first.commit(rev, &[], &[], std::slice::from_ref(&act), &["new.tool"])?;
+    let calls = first.commit(rev, &step_act(vec![act.clone()]), &["new.tool"])?;
     assert_eq!(calls.len(), 1);
     let call = &calls[0];
     assert_eq!(call.input, json!({"x":1}));
     assert!(matches!(
-        second.commit(rev, &[], &[], &[act], &["new.tool"]),
+        second.commit(rev, &step_act(vec![act]), &["new.tool"]),
         Err(Error::Conflict)
     ));
     assert!(matches!(
@@ -262,7 +302,7 @@ fn attention_is_bounded_and_older_facts_and_concerns_remain_addressable() -> Res
     let first = eja.notice(Source::Person, "initial")?;
     for n in 0..(PAGE + 1) {
         let head = eja.view()?.revision;
-        eja.commit(head, &[keep(None, &n.to_string())], &[], &[], &[])?;
+        eja.commit(head, &step_keep(vec![keep(None, &n.to_string())]), &[])?;
     }
     let view = eja.view()?;
     assert_eq!(view.concerns.len(), PAGE);
@@ -295,12 +335,10 @@ fn simultaneous_commits_issue_only_one_call() -> Result<()> {
             barrier.wait();
             match eja.commit(
                 revision,
-                &[],
-                &[],
-                &[Act {
+                &step_act(vec![Act {
                     capability: "one".into(),
                     input: json!(null),
-                }],
+                }]),
                 &["one"],
             ) {
                 Ok(calls) if calls.len() == 1 => true,
@@ -415,12 +453,10 @@ fn an_unknown_receipt_can_be_settled_only_once_by_competing_hosts() -> Result<()
     let call = seed
         .commit(
             notice,
-            &[],
-            &[],
-            &[Act {
+            &step_act(vec![Act {
                 capability: "read".into(),
                 input: json!(null),
-            }],
+            }]),
             &["read"],
         )?
         .remove(0);
@@ -450,20 +486,162 @@ fn commit_records_revisions_and_releases_explicitly() -> Result<()> {
     let basis = eja.notice(Source::Person, "remember aurora and refine if needed")?;
     assert!(!eja.has_encoder());
     assert!(matches!(eja.search("aurora"), Err(Error::Invalid(_))));
-    eja.commit(basis, &[keep(None, "aurora")], &[], &[], &[])?;
+    eja.commit(basis, &step_keep(vec![keep(None, "aurora")]), &[])?;
     let concern = eja.view()?.concerns[0].id;
     eja.commit(
         concern,
-        &[keep(Some(concern), "aurora (refined)")],
-        &[],
-        &[],
+        &step_keep(vec![keep(Some(concern), "aurora (refined)")]),
         &[],
     )?;
     assert_eq!(eja.view()?.revision, concern + 1);
     assert_eq!(eja.view()?.concerns.len(), 1);
     assert_eq!(eja.view()?.concerns[0].text, "aurora (refined)");
     let head = eja.view()?.revision;
-    eja.commit(head, &[], &[concern], &[], &[])?;
+    eja.commit(head, &step_release(vec![concern]), &[])?;
     assert!(eja.view()?.concerns.is_empty());
+    Ok(())
+}
+
+#[test]
+fn physical_time_is_rfc3339_monotonic_and_visible_across_reopen() -> Result<()> {
+    for sample in [
+        "1970-01-01T00:00:00Z",
+        "2000-02-29T12:34:56Z",
+        "2024-02-29T23:59:59Z",
+        "2026-11-20T11:20:39Z",
+    ] {
+        let parsed = Timestamp::parse_rfc3339(sample)?;
+        assert_eq!(parsed.to_string(), sample);
+        let encoded = serde_json::to_string(&parsed)?;
+        assert_eq!(encoded, format!("\"{sample}\""));
+        assert_eq!(serde_json::from_str::<Timestamp>(&encoded)?, parsed);
+    }
+    assert!(Timestamp::parse_rfc3339("2026-02-29T00:00:00Z").is_err());
+    assert!(Timestamp::parse_rfc3339("2026-13-01T00:00:00Z").is_err());
+
+    let t0 = Timestamp::parse_rfc3339("2026-11-01T09:00:00Z")?;
+    let clock = Arc::new(AtomicI64::new(t0.as_unix()));
+    let make_clock = |clock: &Arc<AtomicI64>| {
+        let shared = Arc::clone(clock);
+        move || Timestamp::from_unix(shared.load(Ordering::SeqCst))
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("subject.db");
+    let eja = Eja::open(&path)?.with_clock(make_clock(&clock));
+    let first = eja.notice(Source::Person, "feeling tired")?;
+    assert_eq!(eja.read(first)?.at, t0);
+
+    // Backward wall-clock jump is clamped so physical time never contradicts causal order.
+    clock.store(t0.as_unix() - 3600, Ordering::SeqCst);
+    let second = eja.notice(Source::World, "skewed tick")?;
+    assert_eq!(eja.read(second)?.at, t0);
+
+    let t1 = Timestamp::parse_rfc3339("2026-11-02T15:30:00Z")?;
+    clock.store(t1.as_unix(), Ordering::SeqCst);
+    eja.commit(second, &step_keep(vec![keep(None, "check tomorrow")]), &[])?;
+    let view = eja.view()?;
+    assert_eq!(view.now, t1);
+    assert_eq!(view.concerns[0].at, t1);
+    drop(eja);
+
+    // Reopen three weeks later with no new write: View.now still reflects elapsed physical time.
+    let t2 = Timestamp::parse_rfc3339("2026-11-23T09:00:00Z")?;
+    clock.store(t2.as_unix(), Ordering::SeqCst);
+    let reopened = Eja::open(&path)?.with_clock(make_clock(&clock));
+    let view = reopened.view()?;
+    assert_eq!(view.now, t2);
+    assert_eq!(view.concerns[0].at, t1);
+    assert_eq!(reopened.read(first)?.at, t0);
+    Ok(())
+}
+
+#[test]
+fn slow_consolidation_replays_chronologically_and_enforces_monotonic_watermark() -> Result<()> {
+    let t0 = Timestamp::parse_rfc3339("2026-11-01T08:00:00Z")?.as_unix();
+    let clock = Arc::new(AtomicI64::new(t0));
+    let shared = Arc::clone(&clock);
+    let eja = Eja::open(":memory:")?
+        .with_clock(move || Timestamp::from_unix(shared.load(Ordering::SeqCst)));
+
+    let total = REPLAY_PAGE + 5;
+    for idx in 1..=total {
+        clock.store(t0 + (idx as i64) * 3_600, Ordering::SeqCst);
+        eja.notice(Source::World, format!("episode {idx}"))?;
+    }
+    let rev = eja.view()?.revision;
+    assert_eq!(rev as usize, total);
+    assert!(eja.view()?.consolidated.is_none());
+
+    // Reject invalid consolidation bounds, empty text, and stale CAS revisions.
+    assert!(matches!(
+        eja.commit_consolidation(rev, rev + 1, "future"),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        eja.commit_consolidation(rev - 1, rev, "stale"),
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(
+        eja.commit_consolidation(rev, rev, "   "),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(eja.view()?.revision, rev);
+
+    // Run the slow consolidation loop across two bounded chronological replay windows.
+    let mut windows = 0;
+    let latest = eja.consolidate(5, |window| {
+        windows += 1;
+        match windows {
+            1 => {
+                assert!(window.previous.is_none());
+                assert_eq!(window.entries.len(), REPLAY_PAGE);
+                assert_eq!(window.entries.first().unwrap().id, 1);
+                assert_eq!(window.through as usize, REPLAY_PAGE);
+                Ok("distilled window 1".into())
+            }
+            2 => {
+                assert!(matches!(
+                    &window.previous.as_ref().unwrap().fact,
+                    Fact::Consolidated { through, text }
+                        if *through as usize == REPLAY_PAGE && text == "distilled window 1"
+                ));
+                // Window 2 excludes the consolidation fact itself and ends cleanly at `rev`.
+                assert_eq!(window.entries.len(), 5);
+                assert_eq!(window.entries.first().unwrap().id as usize, REPLAY_PAGE + 1);
+                assert_eq!(window.through, rev);
+                Ok("distilled window 1 + 2".into())
+            }
+            _ => panic!("expected loop to terminate once caught up"),
+        }
+    })?;
+    assert_eq!(windows, 2);
+
+    let view = eja.view()?;
+    let second_id = view.consolidated.as_ref().unwrap().id;
+    assert_eq!(latest, Some(second_id));
+    let first_id = second_id - 1;
+    assert!(matches!(
+        &view.consolidated.as_ref().unwrap().fact,
+        Fact::Consolidated { through, text }
+            if *through == rev && text == "distilled window 1 + 2"
+    ));
+
+    // Evidence on an older consolidation carries `latest` pointing to the newest consolidation.
+    let evidence = eja.evidence(first_id, view.revision)?;
+    assert_eq!(evidence.latest.as_ref().unwrap().id, second_id);
+
+    // Once caught up, `consolidate` performs zero work and returns `None`.
+    assert!(eja.unconsolidated()?.is_none());
+    assert_eq!(eja.consolidate(3, |_| panic!("already caught up"))?, None);
+
+    // Cannot re-consolidate backwards or consolidate only consolidation entries with no new facts.
+    assert!(matches!(
+        eja.commit_consolidation(view.revision, rev, "duplicate"),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        eja.commit_consolidation(view.revision, view.revision, "only consolidations"),
+        Err(Error::Invalid(_))
+    ));
     Ok(())
 }

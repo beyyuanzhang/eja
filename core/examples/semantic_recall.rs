@@ -70,7 +70,7 @@ fn main() -> AppResult<()> {
     let mut db = Connection::open(&path)?;
     let tx = db.transaction()?;
     let mut insert = tx.prepare(
-        "INSERT INTO facts(body) VALUES(json_object('kind','noticed','source','person','text',?1))",
+        "INSERT INTO facts(at, body) VALUES(?1, json_object('kind','noticed','source','person','text',?2))",
     )?;
     let targets: Vec<usize> = (0..PROBES.len()).map(|i| 1 + i * (n / 8)).collect();
     let domains = [
@@ -109,7 +109,7 @@ fn main() -> AppResult<()> {
                 events[(i / domains.len()) % events.len()]
             )
         };
-        insert.execute([text])?;
+        insert.execute(rusqlite::params![1_700_000_000i64 + id as i64, text])?;
     }
     drop(insert);
     tx.commit()?;
