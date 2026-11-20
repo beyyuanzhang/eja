@@ -1,5 +1,5 @@
 //! Offline application: a scripted judge and one host-owned file capability.
-use eja_core::{Call, Choice, Eja, Fact, Judgment, Outcome, Source, Stop, View};
+use eja_core::{Act, Call, Eja, Fact, Keep, Outcome, Source, Step, Stop, View};
 use serde_json::Value;
 use std::{error::Error, fs, path::Path};
 
@@ -7,29 +7,38 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const REQUEST: &str = "下次复看时，帮我看看草稿有几行";
 
-fn judge(view: &View) -> AppResult<Judgment> {
+fn judge(view: &View) -> AppResult<Step> {
     let newest = view.recent.first().ok_or("expected an observation")?;
-    let choice = match &newest.fact {
+    let step = match &newest.fact {
         Fact::Noticed {
             source: Source::Person,
             text,
-        } => Choice::Keep {
-            concern: view.concerns.first().map(|c| c.id),
-            text: text.clone(),
+        } => Step {
+            keep: vec![Keep {
+                concern: view.concerns.first().map(|concern| concern.id),
+                text: text.clone(),
+            }],
+            ..Step::default()
         },
         Fact::Noticed {
             source: Source::Clock,
             ..
-        } if view.concerns.first().is_some_and(|c| c.text == REQUEST) => Choice::Act {
-            capability: "draft.lines".into(),
-            input: Value::Null,
-        },
-        _ => Choice::Rest,
+        } if view
+            .concerns
+            .first()
+            .is_some_and(|concern| concern.text == REQUEST) =>
+        {
+            Step {
+                act: vec![Act {
+                    capability: "draft.lines".into(),
+                    input: Value::Null,
+                }],
+                ..Step::default()
+            }
+        }
+        _ => Step::default(),
     };
-    Ok(Judgment {
-        basis: newest.id,
-        choice,
-    })
+    Ok(step)
 }
 
 fn perform(call: Call, draft: &Path) -> Outcome {
@@ -49,20 +58,20 @@ fn main() -> AppResult<()> {
     fs::write(&draft, "first line\nsecond line\n")?;
     let eja = Eja::open(&journal)?;
     eja.notice(Source::Person, REQUEST)?;
-    assert_eq!(eja.turn(&[], 3, judge, |_| unreachable!())?, Stop::Rest);
+    assert_eq!(eja.turn(&[], 3, judge, |_| unreachable!())?, Stop::Done);
     drop(eja);
 
     let eja = Eja::open(&journal)?;
     eja.notice(Source::Clock, "到了约定的复看时间")?;
-    let stop = eja.turn(&["draft.lines"], 3, judge, |c| perform(c, &draft))?;
-    assert_eq!(stop, Stop::Rest);
+    let stop = eja.turn(&["draft.lines"], 3, judge, |call| perform(call, &draft))?;
+    assert_eq!(stop, Stop::Done);
     let view = eja.view()?;
     let receipt = view
         .recent
         .iter()
-        .find(|e| {
-            matches!(&e.fact,
-                Fact::Returned { outcome: Outcome::Observed(s), .. } if s == "2 lines"
+        .find(|entry| {
+            matches!(&entry.fact,
+                Fact::Returned { outcome: Outcome::Observed(text), .. } if text == "2 lines"
             )
         })
         .ok_or("missing host observation")?;
@@ -74,7 +83,7 @@ fn main() -> AppResult<()> {
     let stop = eja.turn(&["draft.lines"], 3, judge, |_| {
         panic!("unexpected call after correction")
     })?;
-    assert_eq!(stop, Stop::Rest);
+    assert_eq!(stop, Stop::Done);
     let view = eja.view()?;
     println!("{} → {:?}", view.concerns[0].text, stop);
     Ok(())

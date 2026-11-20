@@ -1,5 +1,5 @@
 //! Derived dense passage index over the subject's journal. Only returned matches are bounded.
-use crate::{Choice, Eja, Encoder, Error, Evidence, Fact, Id, InputKind, Outcome, Result};
+use crate::{Eja, Encoder, Error, Evidence, Fact, Id, InputKind, Outcome, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::{cell::RefCell, collections::BTreeMap, sync::OnceLock};
@@ -69,15 +69,13 @@ fn passages(text: &str) -> Vec<&str> {
 fn content(fact: Fact) -> Option<String> {
     match fact {
         Fact::Noticed { text, .. } => Some(text),
-        Fact::Judged { judgment } => match judgment.choice {
-            Choice::Keep { text, .. } => Some(text),
-            Choice::Act { capability, input } => Some(format!("{capability} {input}")),
-            _ => None,
-        },
+        Fact::Kept { text, .. } => Some(text),
+        Fact::Acted { capability, input } => Some(format!("{capability} {input}")),
         Fact::Returned {
             outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
             ..
         } => Some(text),
+        Fact::Released { .. } => None,
     }
 }
 
@@ -252,7 +250,7 @@ impl Memory {
         through: Id,
         revision: Id,
     ) -> Result<Vec<Match>> {
-        if cue.trim().is_empty() {
+        if through <= 0 || cue.trim().is_empty() {
             return Ok(Vec::new());
         }
         if cue.len() > crate::FACT_BYTES {

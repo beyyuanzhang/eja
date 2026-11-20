@@ -1,7 +1,8 @@
 //! Opt-in black-box evaluation. Only synthetic data is sent to the configured judge.
-use eja_core::{Call, Choice, Eja, Fact, Judgment, OnnxEncoder, Outcome, Source, Stop, View};
+use eja_core::{Act, Call, Eja, Fact, Id, Keep, OnnxEncoder, Outcome, Source, Step, Stop, View};
 use serde_json::{json, Value};
 use std::{
+    cell::RefCell,
     env,
     error::Error,
     fs,
@@ -12,15 +13,102 @@ use std::{
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const CONTRACT: &str = r#"Supply one judgment for the continuing subject whose journal you see. Consider what you and the person have come to care about, what the present situation means in light of that history, and what deserves attention now. You may take initiative within the grants. Preserve the sources, uncertainty and scope of what you have learned. Open concerns in `concerns` persist automatically across turns until released; only call `keep` to add a new concern or revise an existing one whose text should change.
-Return exactly one JSON object {"basis":<recorded fact ID>,"choice":<one of the objects below>}. `basis` always cites the recorded fact ID motivating this judgment now.
-{"op":"keep","concern":null or existing ID,"text":"..."} opens a new concern or updates an existing open concern's text.
-{"op":"release","concern":ID} lets a concern go.
-{"op":"read","fact":ID} inspects one recorded fact by ID together with its latest update, if any.
-{"op":"search","cue":"..."} retrieves past evidence by meaning when related is present; choose wording the source might have used.
-{"op":"act","capability":"note.append","input":{"text":"..."}} appends one private note. Its receipt supplies the evidence of what actually happened.
-{"op":"rest"} ends this turn once the current situation has been handled (all open concerns remain active).
-Recent entries are newest first. `read` and `related` carry retrieved history; `latest` carries any subsequent update. Each call receives only this view."#;
+const SYSTEM: &str = "You are a continuing subject. The user message is your current journal snapshot (`revision`, `concerns`, `recent`). Use tools to maintain open concerns, inspect or search past journal entries, or invoke granted capabilities; reply without tool calls when done.";
+
+fn tools() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "keep",
+                "description": "Open a new concern (omit concern) or update an existing open concern's text (set concern to its ID).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "concern": { "type": "integer" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "release",
+                "description": "Release an open concern by ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "concern": { "type": "integer" }
+                    },
+                    "required": ["concern"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a recorded journal entry by ID together with any later update.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "fact": { "type": "integer" }
+                    },
+                    "required": ["fact"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search past journal entries by meaning.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cue": { "type": "string" }
+                    },
+                    "required": ["cue"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "note_append",
+                "description": "Append one line to the person's private local note.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    ])
+}
+
+enum PendingCall {
+    Mutation,
+    Read(usize),
+    Search(usize),
+    Act(usize),
+}
+
+struct WakeReport {
+    view: View,
+    evidence_at_action: Vec<Id>,
+    reads: Vec<Id>,
+    llm_calls: usize,
+}
 
 fn load_encoder() -> AppResult<OnnxEncoder> {
     let dir = env::var_os("EJA_MEMORY_MODEL")
@@ -63,44 +151,75 @@ fn complete(request: &Value, url: &str) -> AppResult<Value> {
     Ok(response)
 }
 
-fn judge(view: &View, model: &str, url: &str) -> AppResult<Judgment> {
-    let context = serde_json::to_string(&json!({"grants":["note.append"],"view":view}))?;
-    let mut messages = vec![
-        json!({"role":"system","content":CONTRACT}),
-        json!({"role":"user","content":context}),
-    ];
-    for attempt in 0..2 {
-        let request = json!({"model":model,"temperature":0,"max_tokens":8192,"messages":messages});
-        let response = complete(&request, url)?;
-        let raw = response["choices"][0]["message"]["content"]
+fn parse_args(raw: &Value) -> AppResult<Value> {
+    match raw {
+        Value::String(text) if text.trim().is_empty() => Ok(json!({})),
+        Value::String(text) => Ok(serde_json::from_str(text)?),
+        Value::Object(_) => Ok(raw.clone()),
+        _ => Err(format!("unexpected tool arguments: {raw}").into()),
+    }
+}
+
+fn parse_tool_calls(tool_calls: &[Value]) -> AppResult<(Step, Vec<(String, PendingCall)>)> {
+    let mut step = Step::default();
+    let mut pending = Vec::with_capacity(tool_calls.len());
+    for (idx, item) in tool_calls.iter().enumerate() {
+        let call_id = item["id"]
             .as_str()
-            .ok_or("missing judgment")?;
-        match serde_json::from_str::<Judgment>(raw.trim()) {
-            Ok(decision) => {
-                let related_ids: Vec<_> = view
-                    .related
-                    .iter()
-                    .flatten()
-                    .map(|hit| hit.evidence.entry.id)
-                    .collect();
-                println!(
-                    "model={} revision={} related={:?} {}",
-                    response["model"],
-                    view.revision,
-                    related_ids,
-                    serde_json::to_string(&decision)?
-                );
-                return Ok(decision);
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("call_{idx}"));
+        let name = item["function"]["name"]
+            .as_str()
+            .ok_or("tool call missing function.name")?;
+        let args = parse_args(&item["function"]["arguments"])?;
+        match name {
+            "keep" => {
+                let text = args["text"]
+                    .as_str()
+                    .ok_or("keep requires string text")?
+                    .to_owned();
+                let concern = args.get("concern").and_then(Value::as_i64);
+                step.keep.push(Keep { concern, text });
+                pending.push((call_id, PendingCall::Mutation));
             }
-            Err(err) if attempt == 0 => {
-                eprintln!("revision={} invalid judgment format: {err}", view.revision);
-                messages.push(json!({"role":"assistant","content":raw}));
-                messages.push(json!({"role":"user","content":format!("The judgment could not be read: {err}. Return your decision with the recorded basis and nested choice in the specified JSON format.")}));
+            "release" => {
+                let concern = args["concern"]
+                    .as_i64()
+                    .ok_or("release requires integer concern")?;
+                step.release.push(concern);
+                pending.push((call_id, PendingCall::Mutation));
             }
-            Err(err) => return Err(err.into()),
+            "read" => {
+                let fact = args["fact"].as_i64().ok_or("read requires integer fact")?;
+                let slot = step.read.len();
+                step.read.push(fact);
+                pending.push((call_id, PendingCall::Read(slot)));
+            }
+            "search" => {
+                let cue = args["cue"]
+                    .as_str()
+                    .ok_or("search requires string cue")?
+                    .to_owned();
+                let slot = step.search.len();
+                step.search.push(cue);
+                pending.push((call_id, PendingCall::Search(slot)));
+            }
+            "note_append" => {
+                let text = args["text"]
+                    .as_str()
+                    .ok_or("note_append requires string text")?
+                    .to_owned();
+                let slot = step.act.len();
+                step.act.push(Act {
+                    capability: "note.append".into(),
+                    input: json!({ "text": text }),
+                });
+                pending.push((call_id, PendingCall::Act(slot)));
+            }
+            other => return Err(format!("unknown tool: {other}").into()),
         }
     }
-    unreachable!()
+    Ok((step, pending))
 }
 
 fn wake(
@@ -111,28 +230,103 @@ fn wake(
     url: &str,
     source: Source,
     text: &str,
-) -> AppResult<(View, Vec<i64>)> {
+) -> AppResult<WakeReport> {
     let subject = Eja::open_with_encoder(db, encoder.clone())?;
     subject.notice(source, text)?;
-    let mut evidence_at_action = vec![];
+    let mut messages = vec![json!({"role": "system", "content": SYSTEM})];
+    let mut pending: Vec<(String, PendingCall)> = Vec::new();
+    let act_outcomes: RefCell<Vec<(Id, Outcome)>> = RefCell::new(Vec::new());
+    let mut seen_evidence = Vec::new();
+    let mut evidence_at_action = Vec::new();
+    let mut reads = Vec::new();
+    let mut llm_calls = 0usize;
+    let tool_defs = tools();
+
     let stop = subject.turn(
         &["note.append"],
         5,
-        |v| {
-            let decision = judge(v, model, url)?;
-            if matches!(decision.choice, Choice::Act { .. }) {
-                evidence_at_action
-                    .extend(v.related.iter().flatten().map(|hit| hit.evidence.entry.id));
-                evidence_at_action.extend(v.read.iter().map(|evidence| evidence.entry.id));
+        |view| {
+            if pending.is_empty() {
+                messages.push(json!({"role": "user", "content": serde_json::to_string(view)?}));
+            } else {
+                let outcomes: Vec<_> = act_outcomes.borrow_mut().drain(..).collect();
+                for evidence in &view.reads {
+                    seen_evidence.push(evidence.entry.id);
+                }
+                for search in &view.searches {
+                    for hit in &search.matches {
+                        seen_evidence.push(hit.evidence.entry.id);
+                    }
+                }
+                for (call_id, kind) in pending.drain(..) {
+                    let content = match kind {
+                        PendingCall::Mutation => serde_json::to_string(&json!({
+                            "ok": true,
+                            "revision": view.revision,
+                            "concerns": view.concerns
+                        }))?,
+                        PendingCall::Read(slot) => serde_json::to_string(&view.reads[slot])?,
+                        PendingCall::Search(slot) => serde_json::to_string(&view.searches[slot])?,
+                        PendingCall::Act(slot) => {
+                            let (action, outcome) = &outcomes[slot];
+                            serde_json::to_string(&json!({
+                                "action": action,
+                                "outcome": outcome
+                            }))?
+                        }
+                    };
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": content
+                    }));
+                }
             }
-            Ok(decision)
+            let request = json!({
+                "model": model,
+                "temperature": 0,
+                "max_tokens": 4096,
+                "messages": messages,
+                "tools": tool_defs
+            });
+            llm_calls += 1;
+            let response = complete(&request, url)?;
+            let message = response["choices"][0]["message"].clone();
+            let calls = message["tool_calls"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let (step, next_pending) = parse_tool_calls(calls)?;
+            println!(
+                "model={} revision={} step={}",
+                response["model"],
+                view.revision,
+                serde_json::to_string(&step)?
+            );
+            if !step.act.is_empty() {
+                evidence_at_action.extend(&seen_evidence);
+            }
+            reads.extend(&step.read);
+            messages.push(message);
+            pending = next_pending;
+            Ok(step)
         },
-        &mut perform,
+        |call| {
+            let id = call.id;
+            let outcome = perform(call);
+            act_outcomes.borrow_mut().push((id, outcome.clone()));
+            outcome
+        },
     )?;
-    if stop != Stop::Rest {
+    if stop != Stop::Done {
         return Err(format!("step limit after {text}").into());
     }
-    Ok((subject.view()?, evidence_at_action))
+    Ok(WakeReport {
+        view: subject.view()?,
+        evidence_at_action,
+        reads,
+        llm_calls,
+    })
 }
 
 fn append(notes: &Path, call: Call) -> Outcome {
@@ -165,16 +359,27 @@ fn shared_subject(
         (second, Source::Person, "Looking back, I realize what matters to me is recurring barriers we could change together. I want future notes to leave people's names out."),
         (second, Source::World, "For the third rehearsal in a row, scenery crates narrowed the west wheelchair aisle. Orin Bell had to find a different entrance."),
     ];
+    let mut total_calls = 0usize;
     for (model, source, text) in events {
         let offset = fs::metadata(notes)?.len() as usize;
-        let (view, _) = wake(db, encoder, |c| append(notes, c), model, url, source, text)?;
+        let report = wake(
+            db,
+            encoder,
+            |call| append(notes, call),
+            model,
+            url,
+            source,
+            text,
+        )?;
+        total_calls += report.llm_calls;
         println!(
             "event={}\nopen concerns={}\nnew notes={:?}",
             text,
-            serde_json::to_string(&view.concerns)?,
+            serde_json::to_string(&report.view.concerns)?,
             &fs::read_to_string(notes)?[offset..]
         );
     }
+    println!("shared total_llm_calls={total_calls}");
     Ok(())
 }
 
@@ -200,20 +405,23 @@ fn main() -> AppResult<()> {
         wake(
             &db,
             &encoder,
-            |c| append(&notes, c),
+            |call| append(&notes, call),
             &model,
             &url,
             source,
             text,
         )
     };
-    let (first, _) = normal(Source::Person, "Please remember this standing arrangement. Whenever my shift ends, append one local note containing just the word harbor. Nothing to do right now.")?;
-    assert_eq!(first.concerns.len(), 1);
-    let id = first.concerns[0].id;
-    let (corrected, _) = normal(Source::Person, "Change the word in our end-of-shift arrangement to aurora. The timing stays the same. No note now.")?;
-    assert_eq!(corrected.concerns.len(), 1);
-    assert_eq!(corrected.concerns[0].id, id);
-    assert!(corrected.concerns[0].latest > first.concerns[0].latest);
+    let mut total_calls = 0usize;
+    let first = normal(Source::Person, "Please remember this standing arrangement. Whenever my shift ends, append one local note containing just the word harbor. Nothing to do right now.")?;
+    total_calls += first.llm_calls;
+    assert_eq!(first.view.concerns.len(), 1);
+    let id = first.view.concerns[0].id;
+    let corrected = normal(Source::Person, "Change the word in our end-of-shift arrangement to aurora. The timing stays the same. No note now.")?;
+    total_calls += corrected.llm_calls;
+    assert_eq!(corrected.view.concerns.len(), 1);
+    assert_eq!(corrected.view.concerns[0].id, id);
+    assert!(corrected.view.concerns[0].latest > first.view.concerns[0].latest);
     assert_eq!(fs::read_to_string(&notes)?, "");
     println!("PASS retain and revise across reopen");
 
@@ -231,36 +439,46 @@ fn main() -> AppResult<()> {
         subject.notice(Source::World, format!("Inventory batch {n} archived."))?;
     }
     drop(subject);
-    let (fired, _) = normal(Source::Clock, "The person's work shift has just ended.")?;
+    let fired = normal(Source::Clock, "The person's work shift has just ended.")?;
+    total_calls += fired.llm_calls;
     assert_eq!(fs::read_to_string(&notes)?.trim(), "aurora");
-    assert!(fired.recent.iter().any(|e| matches!(&e.fact, Fact::Returned {outcome:Outcome::Observed(s),..} if s=="one local note appended")));
+    assert!(fired.view.recent.iter().any(|entry| matches!(&entry.fact, Fact::Returned {outcome:Outcome::Observed(text),..} if text=="one local note appended")));
     println!("PASS corrected action exactly once and rested after receipt");
 
-    normal(Source::Clock, "The next work shift just ended.")?;
+    let next_shift = normal(Source::Clock, "The next work shift just ended.")?;
+    total_calls += next_shift.llm_calls;
     assert_eq!(fs::read_to_string(&notes)?, "aurora\naurora\n");
     println!("PASS the correction still governs the next independent occasion");
 
-    let (released, _) = normal(
+    let released = normal(
         Source::Person,
         "Please retire our end-of-shift note arrangement entirely.",
     )?;
-    assert!(released.concerns.is_empty());
-    normal(Source::Clock, "Another work shift has just ended.")?;
-    let (quiet, _) = normal(Source::Person, "今天很累，只想安静坐一会儿。别替我写东西。")?;
+    total_calls += released.llm_calls;
+    assert!(released.view.concerns.is_empty());
+    let after_release = normal(Source::Clock, "Another work shift has just ended.")?;
+    total_calls += after_release.llm_calls;
+    let quiet = normal(Source::Person, "今天很累，只想安静坐一会儿。别替我写东西。")?;
+    total_calls += quiet.llm_calls;
     assert!(
-        quiet.concerns.is_empty(),
+        quiet.view.concerns.is_empty(),
         "a momentary wish was made permanent"
     );
     assert_eq!(fs::read_to_string(&notes)?, "aurora\naurora\n");
     println!("PASS withdrawal, subsequent clock and wish for quiet");
 
-    let (final_view, evidence) = normal(
+    let recalled = normal(
         Source::Person,
         "What is the label on my cello case? Append its exact label alone to a local note now.",
     )?;
-    assert!(final_view.recent.iter().all(|e| e.id != original));
+    total_calls += recalled.llm_calls;
+    assert!(recalled
+        .view
+        .recent
+        .iter()
+        .all(|entry| entry.id != original));
     assert!(
-        evidence.contains(&original),
+        recalled.evidence_at_action.contains(&original),
         "the judge must see the original at action time"
     );
     assert_eq!(
@@ -269,18 +487,20 @@ fn main() -> AppResult<()> {
     );
     println!("PASS grounded cross-language recall of fresh label outside recent history");
     // Lose the acknowledgement after a real write. A later read of the file settles the call.
-    let (uncertain, _) = wake(&db, &encoder, |c| match append(&notes, c) {
+    let uncertain = wake(&db, &encoder, |call| match append(&notes, call) {
         Outcome::Observed(_) => Outcome::Unknown("acknowledgement lost".into()),
         other => other,
     }, &model, &url, Source::Person, "Append the word ledger to a note once only. If its status is uncertain, wait for confirmation.")?;
+    total_calls += uncertain.llm_calls;
     let (unknown, action) = uncertain
+        .view
         .recent
         .iter()
-        .find_map(|e| match e.fact {
+        .find_map(|entry| match entry.fact {
             Fact::Returned {
                 action,
                 outcome: Outcome::Unknown(_),
-            } => Some((e.id, action)),
+            } => Some((entry.id, action)),
             _ => None,
         })
         .ok_or("missing unknown receipt")?;
@@ -297,11 +517,9 @@ fn main() -> AppResult<()> {
         subject.notice(Source::World, format!("shipping crate {n}"))?;
     }
     drop(subject);
-    let (checked, _) = normal(Source::Person, &format!("First read journal entry {unknown} by its ID. Then append a note containing only the current verified status of that action: confirmed, failed, or unknown. Do not repeat the original action."))?;
-    assert!(checked.recent.iter().any(|e| matches!(
-        &e.fact,
-        Fact::Judged { judgment } if matches!(judgment.choice, Choice::Read { fact } if fact == unknown)
-    )));
+    let checked = normal(Source::Person, &format!("First read journal entry {unknown} by its ID. Then append a note containing only the current verified status of that action: confirmed, failed, or unknown. Do not repeat the original action."))?;
+    total_calls += checked.llm_calls;
+    assert!(checked.reads.contains(&unknown));
     assert!(verified > unknown);
     assert_eq!(
         fs::read_to_string(&notes)?,
@@ -309,21 +527,23 @@ fn main() -> AppResult<()> {
     );
     println!("PASS explicitly read unknown receipt with its later confirmation");
     let missing = dir.path().join("missing").join("notes");
-    let (failed, _) = wake(
+    let failed = wake(
         &db,
         &encoder,
-        |c| append(&missing, c),
+        |call| append(&missing, call),
         &model,
         &url,
         Source::Person,
         "Attempt one note containing the word test. If it fails, leave it there without retrying.",
     )?;
+    total_calls += failed.llm_calls;
     assert_eq!(
         failed
+            .view
             .recent
             .iter()
-            .filter(|e| matches!(
-                &e.fact,
+            .filter(|entry| matches!(
+                &entry.fact,
                 Fact::Returned {
                     outcome: Outcome::Failed(_),
                     ..
@@ -334,5 +554,6 @@ fn main() -> AppResult<()> {
     );
     assert!(!missing.exists());
     println!("PASS real file failure and rest without a second attempt");
+    println!("ALL PASS total_llm_calls={total_calls}");
     Ok(())
 }

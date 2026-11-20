@@ -1,5 +1,5 @@
 //! Minimal continuing-subject kernel.
-//! One subject per journal. Hosts supply observations, model judgments, and effect outcomes.
+//! One subject per journal. Hosts supply observations, intelligence steps, and effect outcomes.
 mod encoder;
 pub use encoder::{Encoder, InputKind};
 mod journal;
@@ -24,9 +24,9 @@ pub const FACT_BYTES: usize = 8192;
 
 #[derive(Debug)]
 pub enum Error {
-    /// The journal advanced before this judgment was committed.
+    /// The journal advanced before this step was committed.
     Conflict,
-    /// A judgment, receipt, or argument violated a kernel invariant.
+    /// A step, receipt, or argument violated a kernel invariant.
     Invalid(String),
     /// Storage or serialization failure.
     Storage(String),
@@ -43,7 +43,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Conflict => formatter.write_str("view changed before judgment was committed"),
+            Self::Conflict => formatter.write_str("view changed before step was committed"),
             Self::Invalid(message) | Self::Storage(message) => formatter.write_str(message),
             Self::External(err) => fmt::Display::fmt(err, formatter),
         }
@@ -79,42 +79,6 @@ pub enum Source {
     Clock,
 }
 
-/// The model proposes exactly one choice per view.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Choice {
-    /// Carry a concern forward. Supply its original id to revise it.
-    Keep {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        concern: Option<Id>,
-        text: String,
-    },
-    Release {
-        concern: Id,
-    },
-    Act {
-        capability: String,
-        input: Value,
-    },
-    /// Inspect one recorded fact by ID, paired with its latest update if any.
-    Read {
-        fact: Id,
-    },
-    /// Search older history by semantic meaning when an encoder is attached.
-    Search {
-        cue: String,
-    },
-    Rest,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Judgment {
-    /// An existing fact that grounds this judgment.
-    pub basis: Id,
-    pub choice: Choice,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "detail", rename_all = "snake_case")]
 pub enum Outcome {
@@ -123,11 +87,58 @@ pub enum Outcome {
     Unknown(String),
 }
 
+/// Open a new concern (`concern: None`) or revise an existing open concern (`concern: Some(id)`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Keep {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concern: Option<Id>,
+    pub text: String,
+}
+
+/// Request one authorized host capability.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Act {
+    pub capability: String,
+    pub input: Value,
+}
+
+/// One step returned by the intelligence.
+/// Requests (`read`, `search`, `act`) feed new evidence back into the loop;
+/// pure state updates (`keep`, `release`) or an empty step close the turn naturally.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    #[serde(default)]
+    pub keep: Vec<Keep>,
+    #[serde(default)]
+    pub release: Vec<Id>,
+    #[serde(default)]
+    pub read: Vec<Id>,
+    #[serde(default)]
+    pub search: Vec<String>,
+    #[serde(default)]
+    pub act: Vec<Act>,
+}
+
+impl Step {
+    pub fn has_mutations(&self) -> bool {
+        !self.keep.is_empty() || !self.release.is_empty() || !self.act.is_empty()
+    }
+
+    pub fn needs_followup(&self) -> bool {
+        !self.read.is_empty() || !self.search.is_empty() || !self.act.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fact {
     Noticed { source: Source, text: String },
-    Judged { judgment: Judgment },
+    Kept { concern: Id, text: String },
+    Released { concern: Id },
+    Acted { capability: String, input: Value },
     Returned { action: Id, outcome: Outcome },
 }
 
@@ -148,11 +159,15 @@ pub struct Evidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SearchHits {
+    pub cue: String,
+    pub matches: Vec<Match>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Concern {
     pub id: Id,
     pub latest: Id,
-    /// The evidence named by the latest keep judgment.
-    pub basis: Id,
     pub text: String,
 }
 
@@ -163,15 +178,15 @@ pub struct View {
     pub concerns: Vec<Concern>,
     /// Newest first. Older entries are readable by id or page.
     pub recent: Vec<Entry>,
-    /// Evidence returned by an explicit `Choice::Read` on the latest step.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub read: Option<Evidence>,
-    /// Semantic matches from history outside `recent`, when an encoder is attached.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub related: Option<Vec<Match>>,
+    /// Evidence returned for `step.read` from the previous step of this turn.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<Evidence>,
+    /// Results returned for `step.search` from the previous step of this turn.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub searches: Vec<SearchHits>,
 }
 
-/// Delivered once, after the corresponding judgment is durable.
+/// Delivered once, after the corresponding `Fact::Acted` is durable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
     pub id: Id,
@@ -181,7 +196,7 @@ pub struct Call {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
-    Rest,
+    Done,
     StepLimit,
 }
 
@@ -204,6 +219,10 @@ impl Eja {
         Ok(eja)
     }
 
+    pub fn has_encoder(&self) -> bool {
+        self.1.is_some()
+    }
+
     pub fn notice(&self, source: Source, text: impl Into<String>) -> Result<Id> {
         let fact = Fact::Noticed {
             source,
@@ -212,59 +231,20 @@ impl Eja {
         self.append_notice(&fact)
     }
 
+    /// Pure read-only snapshot of the journal at its current revision.
     pub fn view(&self) -> Result<View> {
         let revision = self.head()?;
-        let recent = self.history(revision)?;
-        let read = match recent.first().map(|entry| &entry.fact) {
-            Some(Fact::Judged {
-                judgment:
-                    Judgment {
-                        choice: Choice::Read { fact },
-                        ..
-                    },
-            }) => Some(self.evidence(*fact, revision)?),
-            _ => None,
-        };
-        let related = match (&self.1, recent.last()) {
-            (Some(memory), Some(oldest)) if oldest.id > 1 => {
-                let cue = match recent.first().map(|entry| &entry.fact) {
-                    Some(Fact::Judged {
-                        judgment:
-                            Judgment {
-                                choice: Choice::Search { cue },
-                                ..
-                            },
-                    }) => Some(cue.clone()),
-                    Some(Fact::Judged {
-                        judgment:
-                            Judgment {
-                                choice: Choice::Read { .. },
-                                ..
-                            },
-                    }) => None,
-                    _ => self.latest_notice_text(revision)?,
-                };
-                match cue {
-                    Some(text) if !text.trim().is_empty() => {
-                        Some(memory.search(self, &text, oldest.id - 1, revision)?)
-                    }
-                    _ => Some(Vec::new()),
-                }
-            }
-            (Some(_), _) => Some(Vec::new()),
-            (None, _) => None,
-        };
         Ok(View {
             revision,
             concerns: self.concerns(revision, revision)?,
-            recent,
-            read,
-            related,
+            recent: self.history(revision)?,
+            reads: Vec::new(),
+            searches: Vec::new(),
         })
     }
 
-    /// Reconsider after every fact or receipt, until rest or the host's step limit.
-    /// Model and capability callbacks run outside journal transactions.
+    /// Closed-loop turn: commits mutations before external effects, feeds back query results
+    /// and receipts, and terminates naturally when a step requests no new evidence or effects.
     pub fn turn(
         &self,
         grants: &[&str],
@@ -272,34 +252,68 @@ impl Eja {
         mut judge: impl FnMut(
             &View,
         )
-            -> std::result::Result<Judgment, Box<dyn std::error::Error + Send + Sync>>,
+            -> std::result::Result<Step, Box<dyn std::error::Error + Send + Sync>>,
         mut perform: impl FnMut(Call) -> Outcome,
     ) -> Result<Stop> {
+        let mut reads = Vec::new();
+        let mut searches = Vec::new();
         for _ in 0..steps {
-            let view = self.view()?;
+            let mut view = self.view()?;
             if view.revision == 0 {
-                return Ok(Stop::Rest);
+                return Ok(Stop::Done);
             }
-            let judgment = judge(&view).map_err(Error::External)?;
-            let rests = matches!(judgment.choice, Choice::Rest);
-            if let Some(call) = self.decide(view.revision, judgment, grants)? {
+            view.reads = std::mem::take(&mut reads);
+            view.searches = std::mem::take(&mut searches);
+            let step = judge(&view).map_err(Error::External)?;
+            for &fact_id in &step.read {
+                if fact_id < 1 || fact_id > view.revision {
+                    return Err(Error::invalid("read target must reference a recorded fact"));
+                }
+            }
+            if !step.search.is_empty() && self.1.is_none() {
+                return Err(Error::invalid("search requires an attached encoder"));
+            }
+            for cue in &step.search {
+                if cue.trim().is_empty() || cue.len() > FACT_BYTES {
+                    return Err(Error::invalid("search requires a bounded non-empty cue"));
+                }
+            }
+            let calls = if step.has_mutations() {
+                self.commit(view.revision, &step.keep, &step.release, &step.act, grants)?
+            } else {
+                Vec::new()
+            };
+            for call in calls {
                 let id = call.id;
                 self.finish(id, perform(call))?;
             }
-            if rests {
-                return Ok(Stop::Rest);
+            if !step.needs_followup() {
+                return Ok(Stop::Done);
+            }
+            let head = self.head()?;
+            for fact_id in step.read {
+                reads.push(self.evidence(fact_id, head)?);
+            }
+            if let Some(memory) = &self.1 {
+                let older = head.saturating_sub(PAGE as Id);
+                for cue in step.search {
+                    let matches = memory.search(self, &cue, older, head)?;
+                    searches.push(SearchHits { cue, matches });
+                }
             }
         }
         Ok(Stop::StepLimit)
     }
 
-    /// Commit one judgment against an exact view revision.
-    pub fn decide(
+    /// Atomically commit concern updates and authorized actions against an exact view revision.
+    pub fn commit(
         &self,
         revision: Id,
-        judgment: Judgment,
+        keep: &[Keep],
+        release: &[Id],
+        act: &[Act],
         grants: &[&str],
-    ) -> Result<Option<Call>> {
-        self.commit_judgment(revision, judgment, grants)
+    ) -> Result<Vec<Call>> {
+        self.commit_step(revision, keep, release, act, grants)
     }
 }

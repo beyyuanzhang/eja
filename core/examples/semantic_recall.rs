@@ -1,5 +1,5 @@
 //! Reproducible full-journal retrieval evaluation with an explicit local ONNX encoder.
-use eja_core::{Eja, OnnxEncoder, Source};
+use eja_core::{Eja, OnnxEncoder};
 use rusqlite::Connection;
 use std::{error::Error, path::PathBuf, time::Instant};
 
@@ -114,22 +114,18 @@ fn main() -> AppResult<()> {
     drop(insert);
     tx.commit()?;
     let start = Instant::now();
-    eja.notice(Source::Person, PROBES[0].1)?;
     let view = eja.view()?;
-    let related = view
-        .related
-        .as_ref()
-        .ok_or("configure a semantic encoder first")?;
+    let related = eja.search(PROBES[0].1)?;
     assert!(
         view.concerns.is_empty()
             && !view
                 .recent
                 .iter()
-                .any(|e| targets.contains(&(e.id as usize)))
+                .any(|entry| targets.contains(&(entry.id as usize)))
     );
     let cold = start.elapsed();
     println!(
-        "history={n} background_variety={variety} first_view_ms={:.1} automatic_first_ids={:?}",
+        "history={n} background_variety={variety} first_search_ms={:.1} first_ids={:?}",
         cold.as_secs_f64() * 1e3,
         related
             .iter()
@@ -141,16 +137,14 @@ fn main() -> AppResult<()> {
     let mut top1 = 0;
     let mut top4 = 0;
     let mut times = Vec::new();
-    // Exercise the normal view path each time. Later queries stay in the recent page.
     for ((_, cue), target) in PROBES.iter().zip(&targets) {
-        eja.notice(Source::Person, *cue)?;
         let start = Instant::now();
-        let hits = eja.view()?.related.unwrap();
+        let hits = eja.search(cue)?;
         times.push(start.elapsed().as_secs_f64() * 1e3);
         let rank = hits
             .iter()
             .position(|hit| hit.evidence.entry.id == *target as i64)
-            .map(|i| i + 1);
+            .map(|idx| idx + 1);
         top1 += usize::from(rank == Some(1));
         top4 += usize::from(rank.is_some());
         println!("target={target} rank={rank:?} {cue}");
@@ -158,7 +152,7 @@ fn main() -> AppResult<()> {
     let keys: i64 = db.query_row("SELECT count(*) FROM memory_keys", [], |r| r.get(0))?;
     times.sort_by(f64::total_cmp);
     println!(
-        "keys={keys} top1={top1}/6 top4={top4}/6 warm_view_median_ms={:.2} database_MiB={:.1}",
+        "keys={keys} top1={top1}/6 top4={top4}/6 warm_search_median_ms={:.2} database_MiB={:.1}",
         (times[2] + times[3]) / 2.,
         std::fs::metadata(&path)?.len() as f64 / 1048576.
     );

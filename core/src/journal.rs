@@ -1,6 +1,6 @@
 use crate::{
-    Call, Choice, Concern, Eja, Entry, Error, Evidence, Fact, Id, Judgment, Outcome, Result,
-    FACT_BYTES, PAGE,
+    Act, Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Keep, Outcome, Result, FACT_BYTES,
+    PAGE,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -28,11 +28,11 @@ fn read_on(conn: &Connection, id: Id) -> Result<Entry> {
     })
 }
 
-fn require_open_on(conn: &Connection, concern: Id, revision: Id) -> Result<()> {
+fn require_open_on(conn: &Connection, concern: Id) -> Result<()> {
     let live = conn
         .query_row(
-            "SELECT live FROM facts WHERE concern = ?1 AND id <= ?2 ORDER BY id DESC LIMIT 1",
-            params![concern, revision],
+            "SELECT live FROM facts WHERE concern = ?1 ORDER BY id DESC LIMIT 1",
+            [concern],
             |row| row.get::<_, bool>(0),
         )
         .optional()?;
@@ -53,23 +53,6 @@ fn receipt_at_on(conn: &Connection, action: Id, through: Id) -> Result<Option<En
         )
         .optional()?;
     latest.map(|id| read_on(conn, id)).transpose()
-}
-
-fn require_new_action_on(conn: &Connection, proposed: &Judgment) -> Result<()> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT body FROM facts WHERE json_extract(body,'$.judgment.choice.op')='act'
-         AND json_extract(body,'$.judgment.basis')=?1",
-    )?;
-    let candidates = stmt.query_map([proposed.basis], |row| row.get::<_, String>(0))?;
-    for body in candidates {
-        if matches!(serde_json::from_str::<Fact>(&body?)?, Fact::Judged { judgment } if judgment == *proposed)
-        {
-            return Err(Error::invalid(
-                "identical action already issued on this basis",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn insert_fact(conn: &Connection, fact: &Fact, edit: Option<(Id, bool)>) -> Result<Id> {
@@ -98,11 +81,8 @@ impl Eja {
                  concern INTEGER,
                  live INTEGER
              );
-             CREATE INDEX IF NOT EXISTS notices ON facts(id) WHERE json_extract(body,'$.kind')='noticed';
              CREATE INDEX IF NOT EXISTS keep_events ON facts(id) WHERE live=1;
              CREATE INDEX IF NOT EXISTS concern_edits ON facts(concern, id DESC);
-             CREATE INDEX IF NOT EXISTS issued_calls ON facts(json_extract(body,'$.judgment.basis'))
-                 WHERE json_extract(body,'$.judgment.choice.op')='act';
              CREATE INDEX IF NOT EXISTS action_receipts ON facts(json_extract(body,'$.action'), id)
                  WHERE json_extract(body,'$.kind')='returned';",
         )?;
@@ -117,101 +97,96 @@ impl Eja {
         insert_fact(&self.0, fact, None)
     }
 
-    pub(super) fn latest_notice_text(&self, revision: Id) -> Result<Option<String>> {
-        Ok(self
-            .0
-            .query_row(
-                "SELECT json_extract(body,'$.text') FROM facts
-                 WHERE id <= ?1 AND json_extract(body,'$.kind')='noticed'
-                 ORDER BY id DESC LIMIT 1",
-                [revision],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?)
-    }
-
-    /// All invariant checks and the insert run inside one IMMEDIATE SQLite transaction.
-    pub(super) fn commit_judgment(
+    /// All invariant checks and writes for one step run inside one IMMEDIATE SQLite transaction.
+    pub(super) fn commit_step(
         &self,
         revision: Id,
-        judgment: Judgment,
+        keep: &[Keep],
+        release: &[Id],
+        act: &[Act],
         grants: &[&str],
-    ) -> Result<Option<Call>> {
+    ) -> Result<Vec<Call>> {
         let tx = Transaction::new_unchecked(&self.0, TransactionBehavior::Immediate)?;
         if head_on(&tx)? != revision {
             return Err(Error::Conflict);
         }
-        if judgment.basis < 1 || judgment.basis > revision {
-            return Err(Error::invalid("basis must reference a recorded fact"));
+        let mut next = revision;
+        for item in keep {
+            if item.text.trim().is_empty() {
+                return Err(Error::invalid("a concern needs text"));
+            }
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| Error::Storage("journal id exhausted".into()))?;
+            let concern = match item.concern {
+                Some(id) => {
+                    require_open_on(&tx, id)?;
+                    id
+                }
+                None => next,
+            };
+            let id = insert_fact(
+                &tx,
+                &Fact::Kept {
+                    concern,
+                    text: item.text.clone(),
+                },
+                Some((concern, true)),
+            )?;
+            debug_assert_eq!(id, next);
         }
-        let next = revision
-            .checked_add(1)
-            .ok_or_else(|| Error::Storage("journal id exhausted".into()))?;
-        let mut call = None;
-        let edit = match &judgment.choice {
-            Choice::Keep { concern, text } => {
-                if text.trim().is_empty() {
-                    return Err(Error::invalid("a concern needs text"));
-                }
-                if let Some(id) = concern {
-                    require_open_on(&tx, *id, revision)?;
-                }
-                Some((concern.unwrap_or(next), true))
+        for &concern in release {
+            require_open_on(&tx, concern)?;
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| Error::Storage("journal id exhausted".into()))?;
+            let id = insert_fact(&tx, &Fact::Released { concern }, Some((concern, false)))?;
+            debug_assert_eq!(id, next);
+        }
+        let mut calls = Vec::with_capacity(act.len());
+        for item in act {
+            if item.capability.is_empty() || !grants.contains(&item.capability.as_str()) {
+                return Err(Error::invalid("capability is not granted"));
             }
-            Choice::Release { concern } => {
-                require_open_on(&tx, *concern, revision)?;
-                Some((*concern, false))
-            }
-            Choice::Act { capability, input } => {
-                if capability.is_empty() || !grants.contains(&capability.as_str()) {
-                    return Err(Error::invalid("capability is not granted"));
-                }
-                require_new_action_on(&tx, &judgment)?;
-                call = Some(Call {
-                    id: next,
-                    capability: capability.clone(),
-                    input: input.clone(),
-                });
-                None
-            }
-            Choice::Read { fact } => {
-                if *fact < 1 || *fact > revision {
-                    return Err(Error::invalid("read target must reference a recorded fact"));
-                }
-                None
-            }
-            Choice::Search { cue } => {
-                if self.1.is_none() || cue.trim().is_empty() {
-                    return Err(Error::invalid(
-                        "search requires an attached encoder and a non-empty cue",
-                    ));
-                }
-                None
-            }
-            Choice::Rest => None,
-        };
-        let id = insert_fact(&tx, &Fact::Judged { judgment }, edit)?;
-        debug_assert_eq!(id, next);
+            next = next
+                .checked_add(1)
+                .ok_or_else(|| Error::Storage("journal id exhausted".into()))?;
+            let id = insert_fact(
+                &tx,
+                &Fact::Acted {
+                    capability: item.capability.clone(),
+                    input: item.input.clone(),
+                },
+                None,
+            )?;
+            debug_assert_eq!(id, next);
+            calls.push(Call {
+                id,
+                capability: item.capability.clone(),
+                input: item.input.clone(),
+            });
+        }
         tx.commit()?;
-        Ok(call)
+        Ok(calls)
     }
 
-    pub(super) fn evidence(&self, id: Id, revision: Id) -> Result<Evidence> {
+    pub fn evidence(&self, id: Id, revision: Id) -> Result<Evidence> {
         let entry = self.read(id)?;
         let latest = match &entry.fact {
             Fact::Returned { action, .. } => receipt_at_on(&self.0, *action, revision)?,
-            Fact::Judged { judgment } => match judgment.choice {
-                Choice::Act { .. } => receipt_at_on(&self.0, id, revision)?,
-                Choice::Keep { concern, .. } => {
-                    let later = self.0.query_row(
+            Fact::Acted { .. } => receipt_at_on(&self.0, id, revision)?,
+            Fact::Kept { concern, .. } => {
+                let later = self
+                    .0
+                    .query_row(
                         "SELECT id FROM facts WHERE concern=?1 AND id>?2 AND id<=?3 ORDER BY id DESC LIMIT 1",
-                        params![concern.unwrap_or(id), id, revision], |r| r.get(0),
-                    ).optional()?;
-                    later.map(|later_id| self.read(later_id)).transpose()?
-                }
-                _ => None,
-            },
-            Fact::Noticed { .. } => None,
+                        params![concern, id, revision],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                later.map(|later_id| self.read(later_id)).transpose()?
+            }
+            Fact::Noticed { .. } | Fact::Released { .. } => None,
         };
         Ok(Evidence {
             latest: latest.filter(|later| later.id > id),
@@ -240,10 +215,7 @@ impl Eja {
             text.push_str(&suffix);
         }
         let tx = Transaction::new_unchecked(&self.0, TransactionBehavior::Immediate)?;
-        if !matches!(
-            read_on(&tx, action)?.fact,
-            Fact::Judged { judgment } if matches!(judgment.choice, Choice::Act { .. })
-        ) {
+        if !matches!(read_on(&tx, action)?.fact, Fact::Acted { .. }) {
             return Err(Error::invalid("outcome needs an action id"));
         }
         // At most two immutable receipts: the first report and its definitive resolution.
@@ -307,8 +279,7 @@ impl Eja {
     /// Concerns as of a fixed view. Page with the last returned latest id minus one.
     pub fn concerns(&self, revision: Id, through: Id) -> Result<Vec<Concern>> {
         let mut stmt = self.0.prepare(
-            "SELECT f.concern, f.id, json_extract(f.body, '$.judgment.choice.text'),
-                    json_extract(f.body, '$.judgment.basis')
+            "SELECT f.concern, f.id, json_extract(f.body, '$.text')
              FROM facts f WHERE f.live = 1 AND f.id <= min(?1, ?2)
                AND NOT EXISTS (
                    SELECT 1 FROM facts later WHERE later.concern = f.concern
@@ -321,7 +292,6 @@ impl Eja {
                 id: row.get(0)?,
                 latest: row.get(1)?,
                 text: row.get(2)?,
-                basis: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

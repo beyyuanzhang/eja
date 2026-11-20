@@ -1,5 +1,5 @@
 //! Semantic retrieval tests: pure fixture tests run by default; local ONNX tests require `--features onnx`.
-use eja_core::{Choice, Eja, Encoder, Error, InputKind, Judgment, Outcome, Source, PAGE};
+use eja_core::{Act, Eja, Encoder, Error, InputKind, Outcome, Source, Step, Stop, PAGE};
 use serde_json::Value;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -66,75 +66,103 @@ fn repeated_passages_occupy_at_most_one_slot_in_top_results() -> Result<()> {
 }
 
 #[test]
-fn search_choice_queries_history_and_read_choice_skips_auto_search() -> Result<()> {
+fn view_is_pure_read_only_and_search_requires_encoder() -> Result<()> {
+    let subject = Eja::open(":memory:")?;
+    assert!(!subject.has_encoder());
+    let notice = subject.notice(Source::Person, "hello")?;
+    assert!(matches!(subject.search("hello"), Err(Error::Invalid(_))));
+    assert!(matches!(
+        subject.turn(
+            &[],
+            2,
+            |_| Ok(Step {
+                search: vec!["hello".into()],
+                ..Step::default()
+            }),
+            |_| unreachable!(),
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(subject.view()?.revision, notice);
+    Ok(())
+}
+
+#[test]
+fn turn_search_and_read_present_settled_evidence_without_polluting_journal() -> Result<()> {
     let subject = Eja::open_with_encoder(":memory:", Fixture { id: "v1", dims: 2 })?;
+    assert!(subject.has_encoder());
     let basis = subject.notice(Source::Person, "scan β")?;
     let call = subject
-        .decide(
+        .commit(
             basis,
-            Judgment {
-                basis,
-                choice: Choice::Act {
-                    capability: "scan".into(),
-                    input: Value::Null,
-                },
-            },
+            &[],
+            &[],
+            &[Act {
+                capability: "scan".into(),
+                input: Value::Null,
+            }],
             &["scan"],
         )?
-        .unwrap();
+        .remove(0);
     let unknown = subject.finish(call.id, Outcome::Unknown("β lost connection".into()))?;
     let settled = subject.finish(call.id, Outcome::Observed("barcode accepted".into()))?;
     for n in 0..PAGE + 1 {
         subject.notice(Source::World, format!("α unrelated event {n}"))?;
     }
     let trigger = subject.notice(Source::Person, "α what happened?")?;
+    let pure_view = subject.view()?;
+    assert!(pure_view.reads.is_empty());
+    assert!(pure_view.searches.is_empty());
     assert!(matches!(
-        subject.decide(
-            trigger,
-            Judgment {
-                basis: trigger,
-                choice: Choice::Search { cue: "  ".into() },
-            },
-            &[]
+        subject.turn(
+            &[],
+            2,
+            |_| Ok(Step {
+                search: vec!["  ".into()],
+                ..Step::default()
+            }),
+            |_| unreachable!(),
         ),
         Err(Error::Invalid(_))
     ));
-    subject.decide(
-        trigger,
-        Judgment {
-            basis: trigger,
-            choice: Choice::Search { cue: "β".into() },
-        },
+    let mut steps = 0;
+    let stop = subject.turn(
         &[],
-    )?;
-    let view = subject.view()?;
-    let hits = view.related.unwrap();
-    let hit = hits
-        .iter()
-        .find(|item| item.evidence.entry.id == unknown)
-        .expect("unknown receipt matched by search");
-    assert_eq!(hit.evidence.latest.as_ref().unwrap().id, settled);
-
-    subject.decide(
-        view.revision,
-        Judgment {
-            basis: trigger,
-            choice: Choice::Read { fact: unknown },
+        3,
+        |view| {
+            steps += 1;
+            if steps == 1 {
+                return Ok(Step {
+                    read: vec![unknown],
+                    search: vec!["β".into()],
+                    ..Step::default()
+                });
+            }
+            assert_eq!(view.reads.len(), 1);
+            assert_eq!(view.reads[0].entry.id, unknown);
+            assert_eq!(view.reads[0].latest.as_ref().unwrap().id, settled);
+            assert_eq!(view.searches.len(), 1);
+            assert_eq!(view.searches[0].cue, "β");
+            let hit = view.searches[0]
+                .matches
+                .iter()
+                .find(|item| item.evidence.entry.id == unknown)
+                .expect("unknown receipt matched by search");
+            assert_eq!(hit.evidence.latest.as_ref().unwrap().id, settled);
+            Ok(Step::default())
         },
-        &[],
+        |_| unreachable!(),
     )?;
-    let view = subject.view()?;
-    let read = view.read.unwrap();
-    assert_eq!(read.entry.id, unknown);
-    assert_eq!(read.latest.unwrap().id, settled);
-    assert!(view.related.unwrap().is_empty());
+    assert_eq!(stop, Stop::Done);
+    assert_eq!(steps, 2);
+    assert_eq!(subject.view()?.revision, trigger);
     Ok(())
 }
 
 #[cfg(feature = "onnx")]
 mod onnx_tests {
     use super::Result;
-    use eja_core::{Choice, Eja, Fact, Judgment, OnnxEncoder, Outcome, Source, PAGE};
+    use eja_core::{Act, Eja, Fact, Keep, OnnxEncoder, Outcome, Source, Step, Stop, PAGE};
     use std::{path::PathBuf, sync::Barrier};
 
     fn load_encoder() -> Result<OnnxEncoder> {
@@ -150,25 +178,32 @@ mod onnx_tests {
 
     #[test]
     #[ignore = "requires core/scripts/install-memory-model.sh"]
-    fn an_unseen_fact_returns_on_a_paraphrase_without_a_basis_or_concern() -> Result<()> {
+    fn an_unseen_fact_returns_on_a_paraphrase_without_a_concern() -> Result<()> {
         let encoder = load_encoder()?;
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("subject.db");
-        let e = Eja::open_with_encoder(&path, encoder.clone())?;
-        let old = e.notice(Source::Person, "备用钥匙在楼下花盆底部。")?;
-        for i in 0..300 {
-            e.notice(Source::World, format!("仓库盘点第{i}批单据。"))?;
+        let subject = Eja::open_with_encoder(&path, encoder.clone())?;
+        let old = subject.notice(Source::Person, "备用钥匙在楼下花盆底部。")?;
+        for idx in 0..300 {
+            subject.notice(Source::World, format!("仓库盘点第{idx}批单据。"))?;
         }
         let cue = "被锁在屋外进不了家，哪里有开门的东西？";
-        e.notice(Source::Person, cue)?;
-        assert!(e.view()?.recent.iter().all(|f| f.id != old));
-        assert!(e.view()?.concerns.is_empty());
-        let stop = e.turn(
+        subject.notice(Source::Person, cue)?;
+        assert!(subject.view()?.recent.iter().all(|entry| entry.id != old));
+        assert!(subject.view()?.concerns.is_empty());
+        let mut steps = 0;
+        let stop = subject.turn(
             &[],
-            1,
-            |v| {
-                let matches = v.related.as_ref().expect("test requires an encoder");
-                let recalled = &matches[0].evidence.entry;
+            2,
+            |view| {
+                steps += 1;
+                if steps == 1 {
+                    return Ok(Step {
+                        search: vec![cue.into()],
+                        ..Step::default()
+                    });
+                }
+                let recalled = &view.searches[0].matches[0].evidence.entry;
                 assert_eq!(recalled.id, old);
                 assert!(matches!(
                     &recalled.fact,
@@ -177,20 +212,23 @@ mod onnx_tests {
                         ..
                     }
                 ));
-                Ok(Judgment {
-                    basis: recalled.id,
-                    choice: Choice::Rest,
-                })
+                Ok(Step::default())
             },
             |_| unreachable!(),
         )?;
-        assert_eq!(stop, eja_core::Stop::Rest);
-        drop(e);
-        let e = Eja::open_with_encoder(path, encoder)?;
-        assert_eq!(e.view()?.related.unwrap()[0].evidence.entry.id, old);
-        let newest = e.notice(Source::Person, "备用钥匙在楼下花盆底部。")?;
+        assert_eq!(stop, Stop::Done);
+        drop(subject);
+        let subject = Eja::open_with_encoder(path, encoder)?;
+        assert!(subject
+            .search(cue)?
+            .iter()
+            .any(|hit| hit.evidence.entry.id == old));
+        let newest = subject.notice(Source::Person, "备用钥匙在楼下花盆底部。")?;
         assert_eq!(
-            e.search("备用钥匙在楼下花盆底部。")?[0].evidence.entry.id,
+            subject.search("备用钥匙在楼下花盆底部。")?[0]
+                .evidence
+                .entry
+                .id,
             newest
         );
         Ok(())
@@ -206,34 +244,26 @@ mod onnx_tests {
         let b = Eja::open_with_encoder(&path, encoder)?;
         let first = a.notice(Source::Person, "我们来谈谈通勤")?;
         let text = "以后坐地铁回家";
-        a.decide(
+        a.commit(
             first,
-            Judgment {
-                basis: first,
-                choice: Choice::Keep {
-                    concern: None,
-                    text: text.into(),
-                },
-            },
+            &[Keep {
+                concern: None,
+                text: text.into(),
+            }],
+            &[],
+            &[],
             &[],
         )?;
         let note = first + 1;
-        a.decide(
-            note,
-            Judgment {
-                basis: note,
-                choice: Choice::Release { concern: note },
-            },
-            &[],
-        )?;
+        a.commit(note, &[], &[note], &[], &[])?;
         let barrier = Barrier::new(2);
         std::thread::scope(|scope| {
-            let run = |e: Eja| -> Result<()> {
+            let run = |subject: Eja| -> Result<()> {
                 barrier.wait();
-                let hits = e.search(text)?;
+                let hits = subject.search(text)?;
                 let hit = hits
                     .iter()
-                    .find(|h| h.evidence.entry.id == note)
+                    .find(|item| item.evidence.entry.id == note)
                     .expect("old keep");
                 assert_eq!(hit.evidence.latest.as_ref().unwrap().id, note + 1);
                 Ok(())
@@ -277,8 +307,8 @@ mod onnx_tests {
         for ((text, cue), target) in examples.into_iter().zip(targets) {
             eja.notice(Source::Person, cue)?;
             let view = eja.view()?;
-            assert!(view.recent.iter().all(|e| e.id != target));
-            let hits = view.related.expect("test requires a multilingual encoder");
+            assert!(view.recent.iter().all(|entry| entry.id != target));
+            let hits = eja.search(cue)?;
             let rank = hits
                 .iter()
                 .position(|hit| hit.evidence.entry.id == target)
@@ -300,51 +330,56 @@ mod onnx_tests {
         let subject = Eja::open_with_encoder(&path, encoder.clone())?;
         let basis = subject.notice(Source::Person, "Scan the parcel.")?;
         let call = subject
-            .decide(
+            .commit(
                 basis,
-                Judgment {
-                    basis,
-                    choice: Choice::Act {
-                        capability: "scan".into(),
-                        input: serde_json::Value::Null,
-                    },
-                },
+                &[],
+                &[],
+                &[Act {
+                    capability: "scan".into(),
+                    input: serde_json::Value::Null,
+                }],
                 &["scan"],
             )?
-            .unwrap();
+            .remove(0);
         let query = "Parcel delivery scanner lost its network connection.";
         let missing = subject.finish(call.id, Outcome::Unknown(query.into()))?;
         drop(subject);
         let subject = Eja::open_with_encoder(&path, encoder)?;
         let resolved = subject.finish(call.id, Outcome::Observed("barcode accepted".into()))?;
-        for n in 0..PAGE + 1 {
-            subject.notice(Source::World, format!("unrelated event {n}"))?;
+        for idx in 0..PAGE + 1 {
+            subject.notice(Source::World, format!("unrelated event {idx}"))?;
         }
-        let trigger = subject.notice(Source::Person, "What happened earlier?")?;
-        subject.decide(
-            trigger,
-            Judgment {
-                basis: trigger,
-                choice: Choice::Search { cue: query.into() },
-            },
+        subject.notice(Source::Person, "What happened earlier?")?;
+        let mut steps = 0;
+        let stop = subject.turn(
             &[],
-        )?;
-        let view = subject.view()?;
-        let hits = view.related.unwrap();
-        assert_eq!(hits[0].evidence.entry.id, missing);
-        assert_eq!(hits[0].evidence.latest.as_ref().unwrap().id, resolved);
-        subject.decide(
-            view.revision,
-            Judgment {
-                basis: trigger,
-                choice: Choice::Read { fact: missing },
+            2,
+            |view| {
+                steps += 1;
+                if steps == 1 {
+                    return Ok(Step {
+                        read: vec![missing],
+                        search: vec![query.into()],
+                        ..Step::default()
+                    });
+                }
+                assert_eq!(view.searches[0].matches[0].evidence.entry.id, missing);
+                assert_eq!(
+                    view.searches[0].matches[0]
+                        .evidence
+                        .latest
+                        .as_ref()
+                        .unwrap()
+                        .id,
+                    resolved
+                );
+                assert_eq!(view.reads[0].entry.id, missing);
+                assert_eq!(view.reads[0].latest.as_ref().unwrap().id, resolved);
+                Ok(Step::default())
             },
-            &[],
+            |_| unreachable!(),
         )?;
-        let view = subject.view()?;
-        let read = view.read.unwrap();
-        assert_eq!(read.entry.id, missing);
-        assert_eq!(read.latest.unwrap().id, resolved);
+        assert_eq!(stop, Stop::Done);
         Ok(())
     }
 }
