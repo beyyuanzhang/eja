@@ -30,6 +30,5 @@ cargo build --release -p eja-host
 
 数据默认保存在 `~/Library/Application Support/Eja/`：
 - `subject.db`：`eja-core` 永久主体日志
-- `extensions/`：EJA 自主生长的扩展 Git 仓库
-- `settings.json`：LLM 配置（`0600` 权限）
+- `config.json`：LLM 与 MCP 连接器配置
 - `wakes.json`：EJA 自设的定时唤醒

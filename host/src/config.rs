@@ -124,18 +124,6 @@ impl Default for HostConfig {
     }
 }
 
-#[derive(Deserialize)]
-struct LegacySettings {
-    #[serde(default)]
-    base_url: String,
-    #[serde(default)]
-    api_key: String,
-    #[serde(default)]
-    model: String,
-    #[serde(default)]
-    consolidate_model: String,
-}
-
 impl HostConfig {
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join("config.json")
@@ -146,53 +134,6 @@ impl HostConfig {
         if let Ok(bytes) = fs::read(&cfg_path) {
             if let Ok(cfg) = serde_json::from_slice::<Self>(&bytes) {
                 return cfg;
-            }
-        }
-        let legacy_path = data_dir.join("settings.json");
-        if let Ok(bytes) = fs::read(&legacy_path) {
-            if let Ok(legacy) = serde_json::from_slice::<LegacySettings>(&bytes) {
-                let model = if legacy.model.trim().is_empty() {
-                    "gpt-4o".to_string()
-                } else {
-                    legacy.model.trim().to_string()
-                };
-                let mut models = vec![model.clone()];
-                let consolidate = if !legacy.consolidate_model.trim().is_empty() {
-                    let cm = legacy.consolidate_model.trim().to_string();
-                    if !models.contains(&cm) {
-                        models.push(cm.clone());
-                    }
-                    Some(ModelRef {
-                        provider_id: "default".into(),
-                        model: cm,
-                    })
-                } else {
-                    None
-                };
-                let migrated = Self {
-                    providers: vec![ProviderConfig {
-                        id: "default".into(),
-                        name: "Default".into(),
-                        kind: ProviderKind::OpenAi,
-                        base_url: if legacy.base_url.trim().is_empty() {
-                            "https://api.openai.com/v1".into()
-                        } else {
-                            legacy.base_url.trim().to_string()
-                        },
-                        api_key: legacy.api_key.trim().to_string(),
-                        models,
-                    }],
-                    assignments: Assignments {
-                        judge: ModelRef {
-                            provider_id: "default".into(),
-                            model,
-                        },
-                        consolidate,
-                    },
-                    connectors: Vec::new(),
-                };
-                let _ = migrated.save(data_dir);
-                return migrated;
             }
         }
         Self::default()
