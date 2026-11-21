@@ -27,5 +27,3 @@ required-features = ["onnx"]
 [[example]]
 name = "live_continuity"
 required-features = ["onnx"]
-
-[workspace]

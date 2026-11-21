@@ -20,11 +20,11 @@ struct OriginTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        for rel in ["host/target/release/eja-host", "host/target/debug/eja-host"] {
+        for rel in ["target/release/eja-host", "target/debug/eja-host"] {
             let candidate = repoRoot.appendingPathComponent(rel)
             if FileManager.default.isExecutableFile(atPath: candidate.path) { return candidate }
         }
-        return repoRoot.appendingPathComponent("host/target/release/eja-host")
+        return repoRoot.appendingPathComponent("target/release/eja-host")
     }
 
     @MainActor

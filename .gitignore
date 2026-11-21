@@ -2,5 +2,3 @@
 .eja/
 __pycache__/
 .agents/
-.archify/
-app/settings.json

@@ -342,7 +342,7 @@ public final class HostClient: ObservableObject {
             if FileManager.default.isExecutableFile(atPath: sibling.path) { return sibling }
         }
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        for rel in ["host/target/release/eja-host", "../host/target/release/eja-host", "host/target/debug/eja-host", "../host/target/debug/eja-host"] {
+        for rel in ["target/release/eja-host", "../target/release/eja-host", "target/debug/eja-host", "../target/debug/eja-host"] {
             let candidate = cwd.appendingPathComponent(rel).standardized
             if FileManager.default.isExecutableFile(atPath: candidate.path) { return candidate }
         }

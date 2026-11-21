@@ -17,8 +17,12 @@ use std::time::Duration;
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 enum Command {
-    Send { text: String },
-    SaveConfig { config: HostConfig },
+    Send {
+        text: String,
+    },
+    SaveConfig {
+        config: HostConfig,
+    },
     TestProvider {
         id: String,
         provider: ProviderConfig,

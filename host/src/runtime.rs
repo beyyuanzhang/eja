@@ -316,7 +316,7 @@ impl HostRuntime {
                             &now_local,
                             &data_dir_str,
                         )
-                        .map_err(|err| Box::<dyn std::error::Error + Send + Sync>::from(err))?;
+                        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
                     let only_terminal = step.read.is_empty()
                         && step.search.is_empty()
                         && !step.act.is_empty()
@@ -371,7 +371,7 @@ impl HostRuntime {
         let res = self.eja.lock().unwrap().consolidate(2, |window| {
             self.brain
                 .distill(&provider, &model, window)
-                .map_err(|err| Box::<dyn std::error::Error + Send + Sync>::from(err))
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
         });
         if let Err(err) = res {
             self.emit_error(format!("整理记忆失败: {err}"));
@@ -527,7 +527,9 @@ fn open_subject(db_path: &Path) -> Result<Eja, String> {
 }
 
 fn load_recent_entries(eja: &Eja, limit: usize) -> Vec<Entry> {
-    let Ok(view) = eja.view() else { return Vec::new() };
+    let Ok(view) = eja.view() else {
+        return Vec::new();
+    };
     if view.revision == 0 {
         return Vec::new();
     }
@@ -538,7 +540,10 @@ fn load_recent_entries(eja: &Eja, limit: usize) -> Vec<Entry> {
         if page.is_empty() {
             break;
         }
-        cursor = page.last().map(|entry| entry.id.saturating_sub(1)).unwrap_or(0);
+        cursor = page
+            .last()
+            .map(|entry| entry.id.saturating_sub(1))
+            .unwrap_or(0);
         collected.extend(page);
     }
     collected.truncate(limit);
@@ -737,10 +742,17 @@ mod tests {
             window: &Consolidation,
         ) -> Result<String, String> {
             self.distill_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(format!("已整理 {} 条记录，用户叫 bey", window.entries.len()))
+            Ok(format!(
+                "已整理 {} 条记录，用户叫 bey",
+                window.entries.len()
+            ))
         }
 
-        fn test_connection(&self, _provider: &ProviderConfig, model: &str) -> Result<String, String> {
+        fn test_connection(
+            &self,
+            _provider: &ProviderConfig,
+            model: &str,
+        ) -> Result<String, String> {
             Ok(format!("ok:{model}"))
         }
     }
@@ -774,12 +786,9 @@ mod tests {
             distill_calls: AtomicUsize::new(0),
             mode: "say",
         });
-        let rt = HostRuntime::open_with_brain(
-            dir.path().to_path_buf(),
-            brain.clone(),
-            Arc::new(|_| {}),
-        )
-        .unwrap();
+        let rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
         rt.save_config(configured(vec![]));
 
         rt.handle_user_message("我叫 bey");
@@ -821,12 +830,9 @@ for line in sys.stdin:
             distill_calls: AtomicUsize::new(0),
             mode: "mcp",
         });
-        let rt = HostRuntime::open_with_brain(
-            dir.path().to_path_buf(),
-            brain.clone(),
-            Arc::new(|_| {}),
-        )
-        .unwrap();
+        let rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
         rt.save_config(configured(vec![ConnectorConfig {
             id: "demo".into(),
             name: "Demo MCP".into(),
@@ -842,7 +848,10 @@ for line in sys.stdin:
         assert_eq!(snap.connector_statuses.len(), 1);
         assert!(snap.connector_statuses[0].connected);
         assert_eq!(snap.connector_statuses[0].tools.len(), 1);
-        assert_eq!(snap.connector_statuses[0].tools[0].capability, "mcp.demo.echo");
+        assert_eq!(
+            snap.connector_statuses[0].tools[0].capability,
+            "mcp.demo.echo"
+        );
 
         rt.handle_user_message("ping mcp");
         let after = rt.snapshot();

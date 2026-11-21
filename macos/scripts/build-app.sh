@@ -7,13 +7,13 @@ REPO_DIR="$(cd "${MACOS_DIR}/.." && pwd)"
 APP_DIR="${MACOS_DIR}/build/Eja.app"
 
 echo "[1/3] Building eja-host (Rust release)..."
-(cd "${REPO_DIR}/host" && MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release)
+(cd "${REPO_DIR}" && MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release -p eja-host)
 
 echo "[2/3] Building EjaApp (SwiftPM release)..."
 (cd "${MACOS_DIR}" && swift build -c release -debug-info-format none --product EjaApp --disable-sandbox)
 
 APP_BIN="${MACOS_DIR}/.build/release/EjaApp"
-HOST_BIN="${REPO_DIR}/host/target/release/eja-host"
+HOST_BIN="${REPO_DIR}/target/release/eja-host"
 
 echo "[3/3] Assembling ${APP_DIR}..."
 rm -rf "${APP_DIR}"

@@ -7,6 +7,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 pub trait Brain: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn judge(
         &self,
         provider: &ProviderConfig,
@@ -164,9 +165,7 @@ impl Brain for HttpBrain {
 
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String> {
         let (text, _) = match provider.kind {
-            ProviderKind::OpenAi => {
-                call_openai(provider, model, "Reply with OK.", "ping", None)?
-            }
+            ProviderKind::OpenAi => call_openai(provider, model, "Reply with OK.", "ping", None)?,
             ProviderKind::Anthropic => {
                 call_anthropic(provider, model, "Reply with OK.", "ping", None)?
             }
@@ -255,7 +254,8 @@ fn build_tool_specs(
         },
         ToolSpec {
             name: "shell".into(),
-            description: "在本地 macOS 上执行 shell 命令（可用于读写文件、编写 MCP Server 等）。".into(),
+            description: "在本地 macOS 上执行 shell 命令（可用于读写文件、编写 MCP Server 等）。"
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -329,9 +329,12 @@ fn call_openai(
         ));
     }
     let resp = post_json(&url, &headers, &body)?;
-    let msg = resp
-        .pointer("/choices/0/message")
-        .ok_or_else(|| format!("LLM 响应缺少 choices[0].message: {}", truncate_utf8(&resp.to_string(), 240)))?;
+    let msg = resp.pointer("/choices/0/message").ok_or_else(|| {
+        format!(
+            "LLM 响应缺少 choices[0].message: {}",
+            truncate_utf8(&resp.to_string(), 240)
+        )
+    })?;
     let text = msg
         .get("content")
         .and_then(|v| v.as_str())
@@ -400,7 +403,12 @@ fn call_anthropic(
     let blocks = resp
         .get("content")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| format!("Anthropic 响应缺少 content: {}", truncate_utf8(&resp.to_string(), 240)))?;
+        .ok_or_else(|| {
+            format!(
+                "Anthropic 响应缺少 content: {}",
+                truncate_utf8(&resp.to_string(), 240)
+            )
+        })?;
     let mut texts = Vec::new();
     let mut calls = Vec::new();
     for block in blocks {
@@ -425,7 +433,15 @@ fn call_anthropic(
 fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
     let mut cmd = Command::new("/usr/bin/curl");
-    cmd.args(["-sS", "-X", "POST", "--max-time", "90", "-w", "\n%{http_code}"]);
+    cmd.args([
+        "-sS",
+        "-X",
+        "POST",
+        "--max-time",
+        "90",
+        "-w",
+        "\n%{http_code}",
+    ]);
     for (k, v) in headers {
         cmd.arg("-H").arg(format!("{k}: {v}"));
     }
@@ -433,7 +449,9 @@ fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Va
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|err| format!("启动 curl 失败: {err}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("启动 curl 失败: {err}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(&bytes)
@@ -451,7 +469,8 @@ fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Va
     let raw = String::from_utf8_lossy(&output.stdout);
     let (resp_body, code_str) = raw.rsplit_once('\n').unwrap_or((&raw, "0"));
     let status: u16 = code_str.trim().parse().unwrap_or(0);
-    let parsed: Value = serde_json::from_str(resp_body).unwrap_or_else(|_| json!({ "raw": resp_body }));
+    let parsed: Value =
+        serde_json::from_str(resp_body).unwrap_or_else(|_| json!({ "raw": resp_body }));
     if !(200..300).contains(&status) {
         let detail = parsed
             .pointer("/error/message")

@@ -3,19 +3,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    #[default]
     #[serde(rename = "openai")]
     OpenAi,
     #[serde(rename = "anthropic")]
     Anthropic,
-}
-
-impl Default for ProviderKind {
-    fn default() -> Self {
-        Self::OpenAi
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

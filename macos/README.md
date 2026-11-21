@@ -22,8 +22,8 @@ open macos/build/Eja.app
 或直接用 SwiftPM 开发运行与测试：
 
 ```sh
-(cd host && cargo test)
-(cd host && cargo build --release)
+cargo test --workspace
+cargo build --release -p eja-host
 (cd macos && swift test)
 (cd macos && swift run EjaApp)
 ```
