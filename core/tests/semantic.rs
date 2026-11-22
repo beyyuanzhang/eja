@@ -49,6 +49,69 @@ fn switching_encoder_rebuilds_derived_index_without_touching_journal() -> Result
     Ok(())
 }
 
+struct FlippedFixture {
+    id: &'static str,
+    invert: bool,
+}
+
+impl Encoder for FlippedFixture {
+    fn identity(&self) -> &str {
+        self.id
+    }
+    fn dimensions(&self) -> usize {
+        2
+    }
+    fn encode(
+        &mut self,
+        _: InputKind,
+        inputs: &[&str],
+    ) -> std::result::Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(inputs
+            .iter()
+            .map(|text| {
+                let is_blue = text.contains("blue");
+                let slot = usize::from(if self.invert { !is_blue } else { is_blue });
+                let mut vector = vec![0.0; 2];
+                vector[slot] = 1.0;
+                vector
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn stale_connection_rejects_search_and_indexing_after_encoder_switch() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("subject.db");
+    let old_conn = Eja::open_with_encoder(
+        &db,
+        FlippedFixture {
+            id: "space-a",
+            invert: false,
+        },
+    )?;
+    let blue = old_conn.notice(Source::Person, "blue")?;
+    let red = old_conn.notice(Source::Person, "red")?;
+    assert_eq!(old_conn.search("blue")?[0].evidence.entry.id, blue);
+
+    let new_conn = Eja::open_with_encoder(
+        &db,
+        FlippedFixture {
+            id: "space-b",
+            invert: true,
+        },
+    )?;
+    assert_eq!(new_conn.search("blue")?[0].evidence.entry.id, blue);
+    assert_eq!(new_conn.search("red")?[0].evidence.entry.id, red);
+
+    assert!(matches!(old_conn.search("blue"), Err(Error::Conflict)));
+
+    old_conn.notice(Source::Person, "blue follow-up")?;
+    assert!(matches!(old_conn.search("blue"), Err(Error::Conflict)));
+    assert_eq!(new_conn.search("red")?[0].evidence.entry.id, red);
+    Ok(())
+}
+
 #[test]
 fn repeated_passages_occupy_at_most_one_slot_in_top_results() -> Result<()> {
     let subject = Eja::open_with_encoder(":memory:", Fixture { id: "v1", dims: 2 })?;

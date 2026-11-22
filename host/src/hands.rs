@@ -30,15 +30,15 @@ pub struct Hands {
 impl Hands {
     pub fn open(data_dir: PathBuf, sandbox: Sandbox, connectors: &[ConnectorConfig]) -> Self {
         let mut pool = ConnectorPool::new(sandbox);
-        pool.reload(connectors);
+        pool.reload(connectors, false);
         Self {
             data_dir,
             connectors: pool,
         }
     }
 
-    pub fn reload(&mut self, connectors: &[ConnectorConfig]) {
-        self.connectors.reload(connectors);
+    pub fn reload(&mut self, connectors: &[ConnectorConfig], force: bool) {
+        self.connectors.reload(connectors, force);
     }
 
     pub fn connector_statuses(&self) -> Vec<ConnectorStatus> {

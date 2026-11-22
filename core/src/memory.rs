@@ -20,6 +20,7 @@ pub struct Match {
 pub(super) struct Memory {
     encoder: RefCell<Box<dyn Encoder>>,
     dimensions: usize,
+    signature: String,
 }
 
 pub(super) fn register_vectors() -> Result<()> {
@@ -228,6 +229,7 @@ impl Memory {
         Ok(Self {
             encoder: RefCell::new(encoder),
             dimensions,
+            signature,
         })
     }
 
@@ -248,10 +250,33 @@ impl Memory {
         Ok(vectors)
     }
 
+    fn require_signature(&self, conn: &Connection) -> Result<()> {
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT signature FROM memory_meta WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(self.signature.as_str()) {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+
     fn catch_up(&self, db: &Connection, through: Id) -> Result<()> {
         loop {
-            let cursor: Id =
-                db.query_row("SELECT through_id FROM memory_meta", [], |row| row.get(0))?;
+            let (stored_signature, cursor): (String, Id) = db
+                .query_row(
+                    "SELECT signature, through_id FROM memory_meta WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or(Error::Conflict)?;
+            if stored_signature != self.signature {
+                return Err(Error::Conflict);
+            }
             if cursor >= through {
                 return Ok(());
             }
@@ -285,9 +310,10 @@ impl Memory {
             let vectors = self.encode(InputKind::Passage, &unknown)?;
             // Encoding is outside the write transaction. A racing indexer can win this batch.
             let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+            self.require_signature(&tx)?;
             if tx.execute(
-                "UPDATE memory_meta SET through_id=?1 WHERE through_id=?2",
-                params![last, cursor],
+                "UPDATE memory_meta SET through_id=?1 WHERE singleton=1 AND signature=?2 AND through_id=?3",
+                params![last, &self.signature, cursor],
             )? == 0
             {
                 continue;
@@ -325,28 +351,33 @@ impl Memory {
         // One fact fits in at most this many chunks. Collect enough keys for TOP distinct facts.
         let limit = (TOP * 32).min(256);
         let mut scores: BTreeMap<Id, f64> = BTreeMap::new();
-        let mut stmt = eja.db.prepare_cached(
-            "SELECT rowid,distance FROM memory_vectors
-             WHERE embedding MATCH ?1 AND k=?2 AND first_event<=?3 ORDER BY distance",
-        )?;
-        let mut origin = eja.db.prepare_cached(
-            "SELECT fact FROM memory_refs WHERE key=?1 AND fact<=?2 ORDER BY fact DESC LIMIT 1",
-        )?;
-        for query in queries {
-            let rows = stmt.query_map(
-                params![bytes(query, self.dimensions)?, limit, head],
-                |row| Ok((row.get::<_, Id>(0)?, row.get::<_, f64>(1)?)),
+        let tx = Transaction::new_unchecked(&eja.db, TransactionBehavior::Deferred)?;
+        self.require_signature(&tx)?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "SELECT rowid,distance FROM memory_vectors
+                 WHERE embedding MATCH ?1 AND k=?2 AND first_event<=?3 ORDER BY distance",
             )?;
-            for row in rows {
-                let (key, distance) = row?;
-                let score = 1.0 - distance;
-                let id: Id = origin.query_row(params![key, head], |row| row.get(0))?;
-                scores
-                    .entry(id)
-                    .and_modify(|best| *best = best.max(score))
-                    .or_insert(score);
+            let mut origin = tx.prepare_cached(
+                "SELECT fact FROM memory_refs WHERE key=?1 AND fact<=?2 ORDER BY fact DESC LIMIT 1",
+            )?;
+            for query in queries {
+                let rows = stmt.query_map(
+                    params![bytes(query, self.dimensions)?, limit, head],
+                    |row| Ok((row.get::<_, Id>(0)?, row.get::<_, f64>(1)?)),
+                )?;
+                for row in rows {
+                    let (key, distance) = row?;
+                    let score = 1.0 - distance;
+                    let id: Id = origin.query_row(params![key, head], |row| row.get(0))?;
+                    scores
+                        .entry(id)
+                        .and_modify(|best| *best = best.max(score))
+                        .or_insert(score);
+                }
             }
         }
+        drop(tx);
         let mut ranked: Vec<_> = scores.into_iter().collect();
         ranked.sort_unstable_by(|(left_id, left_score), (right_id, right_score)| {
             right_score

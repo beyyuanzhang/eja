@@ -346,7 +346,10 @@ impl HostRuntime {
             if connectors != self.config.connectors {
                 let path = HostConfig::connectors_path(&self.data_dir);
                 match write_json_atomic(&path, &connectors) {
-                    Ok(()) => self.reload_connectors(),
+                    Ok(()) => {
+                        self.refresh_connectors(false);
+                        self.emit_state();
+                    }
                     Err(err) => {
                         self.emit_error(format!("保存连接器失败: {err}"));
                         self.emit_state();
@@ -434,7 +437,7 @@ impl HostRuntime {
         self.connectors_bytes = bytes;
         match HostConfig::parse_connectors(self.connectors_bytes.as_deref()) {
             Ok(connectors) if force || self.config.connectors != connectors => {
-                self.hands.reload(&connectors);
+                self.hands.reload(&connectors, force);
                 self.config.connectors = connectors;
             }
             Ok(_) => {}

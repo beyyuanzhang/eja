@@ -65,6 +65,7 @@ struct StdioConnection {
     rx: Receiver<String>,
     stderr: Arc<Mutex<String>>,
     next_id: u64,
+    broken: bool,
 }
 
 impl StdioConnection {
@@ -124,6 +125,7 @@ impl StdioConnection {
             rx,
             stderr,
             next_id: 1,
+            broken: false,
         };
         conn.request(
             "initialize",
@@ -162,25 +164,30 @@ impl StdioConnection {
         });
         let line =
             serde_json::to_string(&msg).map_err(|err| RequestError::Failed(err.to_string()))?;
-        writeln!(self.stdin, "{line}")
-            .map_err(|err| RequestError::Failed(format!("写入 MCP 失败: {err}")))?;
-        self.stdin
-            .flush()
-            .map_err(|err| RequestError::Unknown(format!("刷新 MCP 请求失败: {err}")))?;
+        if let Err(err) = writeln!(self.stdin, "{line}") {
+            self.broken = true;
+            return Err(RequestError::Failed(format!("写入 MCP 失败: {err}")));
+        }
+        if let Err(err) = self.stdin.flush() {
+            self.broken = true;
+            return Err(RequestError::Unknown(format!("刷新 MCP 请求失败: {err}")));
+        }
 
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
+                self.broken = true;
                 return Err(RequestError::Unknown(
                     self.with_stderr(format!("MCP 请求超时 ({method})")),
                 ));
             }
-            let raw = self.rx.recv_timeout(remaining).map_err(|_| {
-                RequestError::Unknown(
+            let Ok(raw) = self.rx.recv_timeout(remaining) else {
+                self.broken = true;
+                return Err(RequestError::Unknown(
                     self.with_stderr(format!("MCP 响应超时或进程退出 ({method})")),
-                )
-            })?;
+                ));
+            };
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
@@ -429,11 +436,25 @@ impl ActiveConnection {
             Self::Http(conn) => conn.request(method, params, timeout),
         }
     }
+
+    fn is_alive(&mut self) -> bool {
+        match self {
+            Self::Stdio(conn) => !conn.broken && matches!(conn.child.try_wait(), Ok(None)),
+            Self::Http(_) => true,
+        }
+    }
+}
+
+struct ConnectedEntry {
+    transport: ConnectorTransport,
+    connection: ActiveConnection,
+    summaries: Vec<McpToolSummary>,
+    tools: Vec<McpTool>,
 }
 
 pub struct ConnectorPool {
     sandbox: Sandbox,
-    connections: HashMap<String, ActiveConnection>,
+    connections: HashMap<String, ConnectedEntry>,
     statuses: Vec<ConnectorStatus>,
     tools: Vec<McpTool>,
 }
@@ -448,13 +469,19 @@ impl ConnectorPool {
         }
     }
 
-    pub fn reload(&mut self, configs: &[ConnectorConfig]) {
-        self.connections.clear();
+    pub fn reload(&mut self, configs: &[ConnectorConfig], force: bool) {
+        let mut previous = if force {
+            self.connections.clear();
+            HashMap::new()
+        } else {
+            std::mem::take(&mut self.connections)
+        };
         self.statuses.clear();
         self.tools.clear();
 
         for cfg in configs {
             if !cfg.enabled {
+                previous.remove(&cfg.id);
                 self.statuses.push(ConnectorStatus {
                     id: cfg.id.clone(),
                     name: cfg.name.clone(),
@@ -464,6 +491,22 @@ impl ConnectorPool {
                     tools: Vec::new(),
                 });
                 continue;
+            }
+
+            if let Some(mut entry) = previous.remove(&cfg.id) {
+                if entry.transport == cfg.transport && entry.connection.is_alive() {
+                    self.tools.extend(entry.tools.iter().cloned());
+                    self.statuses.push(ConnectorStatus {
+                        id: cfg.id.clone(),
+                        name: cfg.name.clone(),
+                        enabled: true,
+                        connected: true,
+                        error: None,
+                        tools: entry.summaries.clone(),
+                    });
+                    self.connections.insert(cfg.id.clone(), entry);
+                    continue;
+                }
             }
 
             let connected = match &cfg.transport {
@@ -488,6 +531,7 @@ impl ConnectorPool {
                             .cloned()
                             .unwrap_or_default();
                         let mut summaries = Vec::new();
+                        let mut entry_tools = Vec::new();
                         let safe_id = sanitize_id(&cfg.id);
                         for item in raw_tools {
                             let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
@@ -509,7 +553,7 @@ impl ConnectorPool {
                                 description: description.clone(),
                                 capability: capability.clone(),
                             });
-                            self.tools.push(McpTool {
+                            entry_tools.push(McpTool {
                                 connector_id: cfg.id.clone(),
                                 name: name.to_string(),
                                 description,
@@ -517,7 +561,16 @@ impl ConnectorPool {
                                 capability,
                             });
                         }
-                        self.connections.insert(cfg.id.clone(), conn);
+                        self.tools.extend(entry_tools.iter().cloned());
+                        self.connections.insert(
+                            cfg.id.clone(),
+                            ConnectedEntry {
+                                transport: cfg.transport.clone(),
+                                connection: conn,
+                                summaries: summaries.clone(),
+                                tools: entry_tools,
+                            },
+                        );
                         self.statuses.push(ConnectorStatus {
                             id: cfg.id.clone(),
                             name: cfg.name.clone(),
@@ -569,7 +622,7 @@ impl ConnectorPool {
         else {
             return Outcome::Failed(format!("未找到 MCP 工具: {capability}"));
         };
-        let Some(conn) = self.connections.get_mut(&tool.connector_id) else {
+        let Some(entry) = self.connections.get_mut(&tool.connector_id) else {
             return Outcome::Failed(format!("MCP 连接器未连接: {}", tool.connector_id));
         };
         let args = if input.is_object() {
@@ -577,7 +630,7 @@ impl ConnectorPool {
         } else {
             json!({})
         };
-        match conn.request(
+        match entry.connection.request(
             "tools/call",
             json!({ "name": tool.name, "arguments": args }),
             TOOL_TIMEOUT,
@@ -709,16 +762,19 @@ for line in sys.stdin:
         .unwrap();
 
         let mut pool = ConnectorPool::new(Sandbox::new(&core_dir).unwrap());
-        pool.reload(&[ConnectorConfig {
-            id: "flaky".into(),
-            name: "Flaky".into(),
-            enabled: true,
-            transport: ConnectorTransport::Stdio {
-                command: "/usr/bin/python3".into(),
-                args: vec![script.display().to_string()],
-                env: BTreeMap::new(),
-            },
-        }]);
+        pool.reload(
+            &[ConnectorConfig {
+                id: "flaky".into(),
+                name: "Flaky".into(),
+                enabled: true,
+                transport: ConnectorTransport::Stdio {
+                    command: "/usr/bin/python3".into(),
+                    args: vec![script.display().to_string()],
+                    env: BTreeMap::new(),
+                },
+            }],
+            false,
+        );
 
         assert_eq!(
             pool.call("mcp.flaky.op", &json!({ "mode": "err" })),
@@ -728,5 +784,78 @@ for line in sys.stdin:
             pool.call("mcp.flaky.op", &json!({ "mode": "drop" })),
             Outcome::Unknown(ref msg) if msg.contains("MCP 响应超时或进程退出")
         ));
+    }
+
+    #[test]
+    fn incremental_reload_reuses_unchanged_connections_and_force_restarts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = dir.path().join("core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let script = dir.path().join("pid_mcp.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"pid","version":"1"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"pid","description":"Pid","inputSchema":{"type":"object"}}]}}), flush=True)
+    elif method == "tools/call":
+        if msg.get("params", {}).get("arguments", {}).get("exit"):
+            sys.exit(0)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":str(os.getpid())}]}}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let make_cfg = |id: &str, name: &str, enabled: bool| ConnectorConfig {
+            id: id.into(),
+            name: name.into(),
+            enabled,
+            transport: ConnectorTransport::Stdio {
+                command: "/usr/bin/python3".into(),
+                args: vec![script.display().to_string()],
+                env: BTreeMap::new(),
+            },
+        };
+
+        let mut pool = ConnectorPool::new(Sandbox::new(&core_dir).unwrap());
+        let first = make_cfg("a", "A", true);
+        let second = make_cfg("b", "B", true);
+        pool.reload(std::slice::from_ref(&first), false);
+        let Outcome::Observed(pid_before) = pool.call("mcp.a.pid", &json!({})) else {
+            panic!("expected observed pid");
+        };
+
+        let mut renamed_first = first.clone();
+        renamed_first.name = "A Renamed".into();
+        pool.reload(&[renamed_first.clone(), second.clone()], false);
+        assert_eq!(
+            pool.call("mcp.a.pid", &json!({})),
+            Outcome::Observed(pid_before.clone())
+        );
+        assert!(matches!(
+            pool.call("mcp.b.pid", &json!({})),
+            Outcome::Observed(_)
+        ));
+
+        pool.reload(std::slice::from_ref(&renamed_first), true);
+        let Outcome::Observed(pid_after_force) = pool.call("mcp.a.pid", &json!({})) else {
+            panic!("expected observed pid after force reload");
+        };
+        assert_ne!(pid_after_force, pid_before);
+
+        assert!(matches!(
+            pool.call("mcp.a.pid", &json!({ "exit": true })),
+            Outcome::Unknown(_)
+        ));
+        pool.reload(std::slice::from_ref(&renamed_first), false);
+        let Outcome::Observed(pid_after_crash) = pool.call("mcp.a.pid", &json!({})) else {
+            panic!("expected observed pid after dead process reload");
+        };
+        assert_ne!(pid_after_crash, pid_after_force);
     }
 }
