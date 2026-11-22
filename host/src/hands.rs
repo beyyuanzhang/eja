@@ -1,6 +1,6 @@
 use crate::config::ConnectorConfig;
 use crate::mcp::{truncate_utf8, ConnectorPool, ConnectorStatus};
-use crate::sandbox::{kill_process_group, kill_process_tree, Sandbox};
+use crate::sandbox::{kill_process_tree, Sandbox};
 use eja_core::{Call, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,7 +9,6 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -239,24 +238,21 @@ fn run_shell(
         Ok(c) => c,
         Err(err) => return Outcome::Failed(format!("启动 shell 失败: {err}")),
     };
-    let pgid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let (out_tx, out_rx) = mpsc::channel();
-    let (err_tx, err_rx) = mpsc::channel();
-    thread::spawn(move || {
+    let out_handle = thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut r) = stdout {
             let _ = r.read_to_end(&mut buf);
         }
-        let _ = out_tx.send(String::from_utf8_lossy(&buf).to_string());
+        String::from_utf8_lossy(&buf).to_string()
     });
-    thread::spawn(move || {
+    let err_handle = thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut r) = stderr {
             let _ = r.read_to_end(&mut buf);
         }
-        let _ = err_tx.send(String::from_utf8_lossy(&buf).to_string());
+        String::from_utf8_lossy(&buf).to_string()
     });
 
     let deadline = Instant::now() + timeout;
@@ -274,18 +270,8 @@ fn run_shell(
             }
         }
     };
-    let collect = |rx: mpsc::Receiver<String>| -> String {
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(text) => text,
-            Err(_) => {
-                kill_process_group(pgid);
-                rx.recv_timeout(Duration::from_millis(500))
-                    .unwrap_or_default()
-            }
-        }
-    };
-    let out = collect(out_rx);
-    let err = collect(err_rx);
+    let out = out_handle.join().unwrap_or_default();
+    let err = err_handle.join().unwrap_or_default();
     let combined = match (out.trim(), err.trim()) {
         ("", "") => "(no output)".to_string(),
         (o, "") => o.to_string(),

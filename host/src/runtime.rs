@@ -451,6 +451,12 @@ impl HostRuntime {
     }
 }
 
+impl Drop for HostRuntime {
+    fn drop(&mut self) {
+        let _ = self._instance_lock.unlock();
+    }
+}
+
 fn reconcile_unfinished_actions(eja: &Eja) {
     let Ok(rev) = eja.revision() else { return };
     if rev == 0 {

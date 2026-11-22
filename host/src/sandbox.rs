@@ -75,28 +75,18 @@ impl Sandbox {
     }
 }
 
-#[cfg(unix)]
-extern "C" {
-    fn kill(pid: i32, sig: i32) -> i32;
-}
-
-pub fn kill_process_group(pgid: u32) {
+pub fn kill_process_tree(child: &mut Child) {
     #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(pgid) {
+    if let Ok(pid) = i32::try_from(child.id()) {
         if pid > 0 {
-            const SIGKILL: i32 = 9;
-            // Negative PID targets the entire process group created via process_group(0).
+            extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
             unsafe {
-                let _ = kill(-pid, SIGKILL);
+                let _ = kill(-pid, 9);
             }
         }
     }
-    #[cfg(not(unix))]
-    let _ = pgid;
-}
-
-pub fn kill_process_tree(child: &mut Child) {
-    kill_process_group(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }

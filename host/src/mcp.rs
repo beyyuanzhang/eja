@@ -1,5 +1,4 @@
 use crate::config::{ConnectorConfig, ConnectorTransport};
-use crate::llm::TempPayload;
 use crate::sandbox::{kill_process_tree, Sandbox};
 use eja_core::Outcome;
 use serde::{Deserialize, Serialize};
@@ -256,7 +255,6 @@ impl HttpConnection {
 
     fn post_raw(&self, payload: &Value, timeout: Duration) -> Result<(String, String), String> {
         let body_bytes = serde_json::to_vec(payload).map_err(|err| err.to_string())?;
-        let body_file = TempPayload::write(&body_bytes)?;
         let mut cmd = Command::new("/usr/bin/curl");
         cmd.args([
             "-sS",
@@ -276,15 +274,21 @@ impl HttpConnection {
         for (key, value) in &self.headers {
             cmd.arg("-H").arg(format!("{key}: {value}"));
         }
-        cmd.arg("--data-binary")
-            .arg(body_file.curl_arg())
-            .arg(&self.url)
-            .stdin(Stdio::null())
+        cmd.args(["--data-binary", "@-", &self.url])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| format!("调用 curl 失败: {err}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            thread::spawn(move || {
+                let _ = stdin.write_all(&body_bytes);
+            });
+        }
+        let output = child
+            .wait_with_output()
             .map_err(|err| format!("等待 MCP HTTP 响应失败: {err}"))?;
         if !output.status.success() {
             let err_text = String::from_utf8_lossy(&output.stderr);
