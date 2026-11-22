@@ -6,6 +6,7 @@ final class ContentUIState: ObservableObject {
     @Published var draftText: String = ""
     @Published var showSettingsSheet: Bool = false
     @Published var baselineId: Int64 = -1
+    @Published var sendHovered: Bool = false
 
     func captureBaselineIfNeeded(isReady: Bool, from stream: [StreamItemDTO]) {
         guard isReady, baselineId < 0 else { return }
@@ -19,116 +20,117 @@ struct ContentView: View {
     @FocusState private var composerFocused: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
-            if client.isReady && !client.isConfigured {
-                HStack(spacing: 10) {
-                    Image(systemName: "key.fill").foregroundStyle(.orange)
-                    Text("请先在设置中配置 LLM Provider 与主模型。").font(.callout)
-                    Spacer()
-                    Button("打开设置") { ui.showSettingsSheet = true }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(.orange.opacity(0.08))
-            }
+        ZStack(alignment: .topTrailing) {
+            EjaTheme.canvas.ignoresSafeArea()
 
-            if let err = client.errorBanner {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-                    Text(err).font(.callout).textSelection(.enabled)
-                    Spacer()
-                    Button { client.errorBanner = nil } label: { Image(systemName: "xmark").font(.caption) }
-                        .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(.red.opacity(0.08))
-            }
-
-            ZStack(alignment: .top) {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 12) {
-                            ForEach(visibleItems) { item in
-                                streamRow(item).id(item.id)
+            VStack(spacing: 0) {
+                ZStack(alignment: .top) {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 18) {
+                                ForEach(visibleItems) { item in
+                                    streamRow(item)
+                                        .id(item.id)
+                                        .transition(.opacity.combined(with: .offset(y: 4)))
+                                }
+                                if client.status != "idle" {
+                                    BusyDots()
+                                        .padding(.leading, 2)
+                                        .id("eja-busy")
+                                }
                             }
-                            if client.status != "idle" {
-                                BusyDots()
-                                    .padding(.horizontal, 14)
-                                    .id("eja-busy")
-                            }
+                            .frame(maxWidth: 640, alignment: .leading)
+                            .frame(maxWidth: .infinity)
+                            .padding(.horizontal, 28)
+                            .padding(.top, 16)
+                            .padding(.bottom, 24)
+                            .animation(.easeOut(duration: 0.18), value: visibleItems.count)
                         }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 16)
-                    }
-                    .contentMargins(.top, 34, for: .scrollContent)
-                    .scrollIndicators(.never)
-                    .mask(
-                        LinearGradient(
-                            stops: [
-                                .init(color: .clear, location: 0.0),
-                                .init(color: .black, location: 0.10),
-                                .init(color: .black, location: 1.0),
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
+                        .contentMargins(.top, 38, for: .scrollContent)
+                        .scrollIndicators(.never)
+                        .mask(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .clear, location: 0.0),
+                                    .init(color: .black, location: 0.09),
+                                    .init(color: .black, location: 1.0),
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
                         )
-                    )
-                    .onChange(of: visibleItems.last?.id) { _, lastId in
-                        if let lastId {
-                            withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(lastId, anchor: .bottom) }
+                        .onChange(of: visibleItems.last?.id) { _, lastId in
+                            if let lastId {
+                                withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(lastId, anchor: .bottom) }
+                            }
+                        }
+                        .onChange(of: client.status) { _, newStatus in
+                            if newStatus != "idle" {
+                                withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo("eja-busy", anchor: .bottom) }
+                            }
                         }
                     }
-                    .onChange(of: client.status) { _, newStatus in
-                        if newStatus != "idle" {
-                            withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("eja-busy", anchor: .bottom) }
+
+                    topFade
+                }
+
+                VStack(spacing: 8) {
+                    if let err = client.errorBanner {
+                        HStack(spacing: 8) {
+                            Text(err)
+                                .font(.system(size: 12))
+                                .foregroundStyle(EjaTheme.danger)
+                                .textSelection(.enabled)
+                            Spacer(minLength: 8)
+                            Button { client.errorBanner = nil } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 10, weight: .medium))
+                            }
+                            .buttonStyle(EjaIconButtonStyle(size: 20))
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(EjaTheme.dangerTint)
+                        )
+                        .transition(.opacity.combined(with: .offset(y: 4)))
                     }
-                }
 
-                topFade
+                    if client.isReady && !client.isConfigured {
+                        HStack(spacing: 6) {
+                            Text("尚未配置模型")
+                                .font(.system(size: 12))
+                                .foregroundStyle(EjaTheme.inkSecondary)
+                            Button("前往设置") { ui.showSettingsSheet = true }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(EjaTheme.ink)
+                        }
+                        .transition(.opacity)
+                    }
+
+                    composer
+                }
+                .frame(maxWidth: 640)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
+                .padding(.top, 4)
+                .padding(.bottom, 18)
+                .animation(.easeOut(duration: 0.16), value: client.errorBanner != nil)
             }
 
-            Divider()
-
-            HStack(alignment: .bottom, spacing: 10) {
-                TextField("对 EJA 说点什么…", text: $ui.draftText, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...6)
-                    .focused($composerFocused)
-                    .onSubmit { sendDraft() }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(Color(nsColor: .textBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.1), lineWidth: 1))
-
-                Button { sendDraft() } label: {
-                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(canSend ? Color.accentColor : Color.secondary.opacity(0.4))
-                .disabled(!canSend)
+            Button { ui.showSettingsSheet = true } label: {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 13, weight: .regular))
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
+            .buttonStyle(EjaIconButtonStyle(size: 28))
+            .help("设置")
+            .padding(.top, 10)
+            .padding(.trailing, 14)
+            .ignoresSafeArea(edges: .top)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button { ui.showSettingsSheet = true } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "slider.horizontal.3")
-                        if client.connectedToolCount > 0 {
-                            Text("\(client.connectedToolCount)").font(.caption2.monospacedDigit())
-                        }
-                    }
-                }
-                .help("LLM 与 MCP 连接器设置")
-            }
-        }
+        .tint(EjaTheme.ink)
         .sheet(isPresented: $ui.showSettingsSheet) {
             SettingsView(client: client)
         }
@@ -144,9 +146,9 @@ struct ContentView: View {
     private var topFade: some View {
         LinearGradient(
             stops: [
-                .init(color: Color(nsColor: .windowBackgroundColor), location: 0.0),
-                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.92), location: 0.45),
-                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.0), location: 1.0),
+                .init(color: EjaTheme.canvas, location: 0.0),
+                .init(color: EjaTheme.canvas.opacity(0.92), location: 0.48),
+                .init(color: EjaTheme.canvas.opacity(0.0), location: 1.0),
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -155,6 +157,52 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: .top)
         .ignoresSafeArea(edges: .top)
         .allowsHitTesting(false)
+    }
+
+    private var composer: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            TextField(
+                "",
+                text: $ui.draftText,
+                prompt: Text("对 EJA 说点什么…").foregroundStyle(EjaTheme.inkMuted),
+                axis: .vertical
+            )
+            .font(.system(size: 13.5))
+            .foregroundStyle(EjaTheme.ink)
+            .textFieldStyle(.plain)
+            .lineLimit(1...6)
+            .focused($composerFocused)
+            .onSubmit { sendDraft() }
+            .padding(.leading, 8)
+            .padding(.vertical, 5)
+
+            Button { sendDraft() } label: {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(canSend ? EjaTheme.canvas : EjaTheme.inkMuted)
+                    .frame(width: 26, height: 26)
+                    .background(
+                        Circle()
+                            .fill(canSend ? EjaTheme.ink.opacity(ui.sendHovered ? 0.86 : 1.0) : EjaTheme.surfaceSubtle)
+                    )
+            }
+            .buttonStyle(SendScaleButtonStyle())
+            .disabled(!canSend)
+            .onHover { ui.sendHovered = $0 }
+            .animation(.easeOut(duration: 0.15), value: canSend)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .fill(EjaTheme.surface)
+                .shadow(color: EjaTheme.subtleShadow, radius: 8, x: 0, y: 2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(composerFocused ? EjaTheme.hairlineStrong : EjaTheme.hairline, lineWidth: 1)
+        )
+        .animation(.easeOut(duration: 0.16), value: composerFocused)
     }
 
     private var visibleItems: [StreamItemDTO] {
@@ -182,29 +230,31 @@ struct ContentView: View {
             HStack {
                 Spacer(minLength: 64)
                 Text(item.text)
+                    .font(.system(size: 13.5))
+                    .lineSpacing(3)
+                    .foregroundStyle(EjaTheme.ink)
                     .textSelection(.enabled)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(Color.accentColor.opacity(0.14))
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 8.5)
+                    .background(EjaTheme.surfaceSubtle)
+                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
         default:
             HStack {
                 VStack(alignment: .leading, spacing: 6) {
                     if item.proactive == true {
-                        Label("主动唤醒", systemImage: "sparkles")
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(Color.accentColor)
+                        Text("主动唤醒")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(EjaTheme.inkMuted)
                     }
                     markdownText(item.text)
+                        .font(.system(size: 13.5))
+                        .lineSpacing(4.5)
+                        .foregroundStyle(EjaTheme.ink)
                         .textSelection(.enabled)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
-                .background(Color(nsColor: .controlBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.06), lineWidth: 1))
-                Spacer(minLength: 48)
+                .padding(.leading, 2)
+                Spacer(minLength: 36)
             }
         }
     }
@@ -217,6 +267,14 @@ struct ContentView: View {
             return Text(attributed)
         }
         return Text(source)
+    }
+}
+
+private struct SendScaleButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.92 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 
@@ -242,7 +300,7 @@ private struct BusyDots: View {
         HStack(spacing: 5) {
             ForEach(0..<3, id: \.self) { i in
                 Circle()
-                    .fill(Color.secondary)
+                    .fill(EjaTheme.inkMuted)
                     .frame(width: 4, height: 4)
                     .opacity(model.visible ? (model.lit ? 0.7 : 0.2) : 0)
                     .animation(
