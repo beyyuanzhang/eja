@@ -50,10 +50,6 @@ struct EjaApp: App {
                 openWindow(id: "main")
             }
             .keyboardShortcut("o")
-            Button("立即整理记忆") {
-                client.consolidateNow()
-            }
-            .disabled(!client.isConfigured)
             Divider()
             Button("退出 EJA") {
                 client.shutdown()
@@ -61,7 +57,7 @@ struct EjaApp: App {
             }
             .keyboardShortcut("q")
         } label: {
-            Image(systemName: client.status == "thinking" ? "sparkles" : (client.status == "consolidating" ? "moon.stars" : "circle.inset.filled"))
+            Image(systemName: client.status == "thinking" ? "sparkles" : "circle.inset.filled")
                 .accessibilityLabel("EJA")
         }
     }

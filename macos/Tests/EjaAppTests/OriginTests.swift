@@ -73,10 +73,7 @@ for line in sys.stdin:
                 ProviderConfigDTO(id: "deepseek", name: "DeepSeek", kind: "openai", baseUrl: "https://api.deepseek.com/v1", apiKey: "sk-demo", models: ["deepseek-chat"]),
                 ProviderConfigDTO(id: "anthropic", name: "Anthropic", kind: "anthropic", baseUrl: "https://api.anthropic.com", apiKey: "sk-ant-demo", models: ["claude-sonnet-4-5"]),
             ],
-            assignments: AssignmentsDTO(
-                judge: ModelRefDTO(providerId: "anthropic", model: "claude-sonnet-4-5"),
-                consolidate: ModelRefDTO(providerId: "deepseek", model: "deepseek-chat")
-            ),
+            judge: ModelRefDTO(providerId: "anthropic", model: "claude-sonnet-4-5"),
             connectors: [
                 ConnectorConfigDTO(
                     id: "echo",

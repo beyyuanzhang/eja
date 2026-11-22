@@ -5,7 +5,7 @@ import SwiftUI
 final class ContentUIState: ObservableObject {
     @Published var draftText: String = ""
     @Published var showSettingsSheet: Bool = false
-    @Published var showMemoryPopover: Bool = false
+    @Published var showSubjectState: Bool = false
     @Published var expandedEvents: Set<Int64> = []
 
     func toggleEvent(_ id: Int64) {
@@ -121,22 +121,22 @@ struct ContentView: View {
             ToolbarItem(placement: .navigation) {
                 HStack(spacing: 6) {
                     Circle()
-                        .fill(client.status == "thinking" ? .blue : (client.status == "consolidating" ? .purple : (client.isConfigured ? .green : .secondary)))
+                        .fill(client.status == "thinking" ? .blue : (client.isConfigured ? .green : .secondary))
                         .frame(width: 8, height: 8)
                     Text(client.statusDetail).font(.subheadline).foregroundStyle(.secondary)
                 }
             }
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { ui.showMemoryPopover.toggle() } label: {
+                Button { ui.showSubjectState.toggle() } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "brain")
                         let count = client.concerns.count + client.wakes.count
                         if count > 0 { Text("\(count)").font(.caption2.monospacedDigit()) }
                     }
                 }
-                .help("记忆、挂念与定时唤醒")
-                .popover(isPresented: $ui.showMemoryPopover, arrowEdge: .bottom) {
-                    MemoryPopoverView(client: client)
+                .help("挂念与定时唤醒")
+                .popover(isPresented: $ui.showSubjectState, arrowEdge: .bottom) {
+                    SubjectStatePopoverView(client: client)
                 }
 
                 Button { ui.showSettingsSheet = true } label: {
@@ -244,19 +244,12 @@ struct ContentView: View {
     }
 }
 
-private struct MemoryPopoverView: View {
+private struct SubjectStatePopoverView: View {
     @ObservedObject var client: HostClient
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("主体状态与记忆").font(.headline)
-                Spacer()
-                Button("立即整理") { client.consolidateNow() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(!client.isConfigured || client.status != "idle")
-            }
+            Text("主体状态").font(.headline)
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     GroupBox("挂念 (\(client.concerns.count))") {
@@ -278,13 +271,6 @@ private struct MemoryPopoverView: View {
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                    }
-                    GroupBox("长期记忆摘要") {
-                        Text(client.consolidated?.isEmpty == false ? client.consolidated! : "对话累积后自动整理")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
             }

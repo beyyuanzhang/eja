@@ -1,6 +1,6 @@
 use crate::{
-    Call, Concern, Consolidation, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Step,
-    Timestamp, FACT_BYTES, PAGE, REPLAY_PAGE,
+    Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Step, Timestamp,
+    FACT_BYTES, PAGE,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -78,18 +78,6 @@ fn receipt_at_on(conn: &Connection, action: Id, through: Id) -> Result<Option<En
     latest.map(|id| read_on(conn, id)).transpose()
 }
 
-fn consolidated_at_on(conn: &Connection, through: Id) -> Result<Option<Entry>> {
-    let latest = conn
-        .query_row(
-            "SELECT id FROM facts WHERE json_extract(body,'$.kind')='consolidated'
-             AND id<=?1 ORDER BY id DESC LIMIT 1",
-            [through],
-            |row| row.get(0),
-        )
-        .optional()?;
-    latest.map(|id| read_on(conn, id)).transpose()
-}
-
 fn insert_fact(
     conn: &Connection,
     at: Timestamp,
@@ -125,9 +113,7 @@ impl Eja {
              CREATE INDEX IF NOT EXISTS keep_events ON facts(id) WHERE live=1;
              CREATE INDEX IF NOT EXISTS concern_edits ON facts(concern, id DESC);
              CREATE INDEX IF NOT EXISTS action_receipts ON facts(json_extract(body,'$.action'), id)
-                 WHERE json_extract(body,'$.kind')='returned';
-             CREATE INDEX IF NOT EXISTS consolidations ON facts(id DESC)
-                 WHERE json_extract(body,'$.kind')='consolidated';",
+                 WHERE json_extract(body,'$.kind')='returned';",
         )?;
         Ok(Self {
             db,
@@ -235,88 +221,6 @@ impl Eja {
         Ok(calls)
     }
 
-    pub fn consolidated(&self, revision: Id) -> Result<Option<Entry>> {
-        consolidated_at_on(&self.db, revision)
-    }
-
-    /// Pure read-only next chronological batch of unconsolidated non-consolidation facts.
-    pub fn unconsolidated(&self) -> Result<Option<Consolidation>> {
-        let revision = self.head()?;
-        if revision == 0 {
-            return Ok(None);
-        }
-        let previous = self.consolidated(revision)?;
-        let floor = match previous.as_ref().map(|entry| &entry.fact) {
-            Some(Fact::Consolidated { through, .. }) => *through,
-            _ => 0,
-        };
-        let mut stmt = self.db.prepare(
-            "SELECT id, at, body FROM facts
-             WHERE id > ?1 AND id <= ?2 AND json_extract(body,'$.kind') != 'consolidated'
-             ORDER BY id ASC LIMIT ?3",
-        )?;
-        let entries =
-            decode_entries(stmt.query_map(params![floor, revision, REPLAY_PAGE], read_entry_row)?)?;
-        let Some(last) = entries.last() else {
-            return Ok(None);
-        };
-        Ok(Some(Consolidation {
-            revision,
-            now: self.now_at(&self.db)?,
-            concerns: self.concerns(revision, revision)?,
-            previous,
-            through: last.id,
-            entries,
-        }))
-    }
-
-    /// Atomically commit one consolidated memory covering `(prev_through, through]`.
-    /// CAS checks that no concurrent consolidation superseded `previous`, so unrelated new
-    /// notices arriving mid-consolidation do not starve slow memory folding.
-    pub fn commit_consolidation(
-        &self,
-        previous: Option<Id>,
-        through: Id,
-        text: impl Into<String>,
-    ) -> Result<Id> {
-        let text = text.into();
-        if text.trim().is_empty() {
-            return Err(Error::invalid("consolidation needs text"));
-        }
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let head = head_on(&tx)?;
-        let current = consolidated_at_on(&tx, head)?;
-        if current.as_ref().map(|entry| entry.id) != previous {
-            return Err(Error::Conflict);
-        }
-        let floor = match current.as_ref().map(|entry| &entry.fact) {
-            Some(Fact::Consolidated { through: prev, .. }) => *prev,
-            _ => 0,
-        };
-        if through <= floor || through > head {
-            return Err(Error::invalid(
-                "consolidation through must advance within the committed view",
-            ));
-        }
-        let has_new: bool = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM facts
-                 WHERE id > ?1 AND id <= ?2 AND json_extract(body,'$.kind') != 'consolidated'
-             )",
-            params![floor, through],
-            |row| row.get(0),
-        )?;
-        if !has_new {
-            return Err(Error::invalid(
-                "consolidation range must include at least one unconsolidated fact",
-            ));
-        }
-        let at = self.now_at(&tx)?;
-        let id = insert_fact(&tx, at, &Fact::Consolidated { through, text }, None)?;
-        tx.commit()?;
-        Ok(id)
-    }
-
     pub fn evidence(&self, id: Id, revision: Id) -> Result<Evidence> {
         let entry = self.read(id)?;
         let latest = match &entry.fact {
@@ -333,7 +237,6 @@ impl Eja {
                     .optional()?;
                 later.map(|later_id| self.read(later_id)).transpose()?
             }
-            Fact::Consolidated { .. } => consolidated_at_on(&self.db, revision)?,
             Fact::Noticed { .. } | Fact::Released { .. } => None,
         };
         Ok(Evidence {

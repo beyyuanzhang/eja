@@ -1,4 +1,4 @@
-//! Derived dense passage index over the subject's journal. Only returned matches are bounded.
+//! Search the subject's journal, with an optional derived dense passage index.
 use crate::{Eja, Encoder, Error, Evidence, Fact, Id, InputKind, Outcome, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
@@ -13,6 +13,7 @@ const STRIDE: usize = 320;
 pub struct Match {
     #[serde(flatten)]
     pub evidence: Evidence,
+    /// Vector similarity, or 1.0 for a literal match.
     pub similarity: f64,
 }
 
@@ -68,9 +69,7 @@ fn passages(text: &str) -> Vec<&str> {
 
 fn content(fact: Fact) -> Option<String> {
     match fact {
-        Fact::Noticed { text, .. } | Fact::Kept { text, .. } | Fact::Consolidated { text, .. } => {
-            Some(text)
-        }
+        Fact::Noticed { text, .. } | Fact::Kept { text, .. } => Some(text),
         Fact::Acted { capability, input } => Some(format!("{capability} {input}")),
         Fact::Returned {
             outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
@@ -90,15 +89,59 @@ fn bytes(vector: Vec<f32>, dimensions: usize) -> Result<Vec<u8>> {
     Ok(vector.into_iter().flat_map(f32::to_le_bytes).collect())
 }
 
+pub(super) fn validate_cue(cue: &str) -> Result<()> {
+    if cue.trim().is_empty() || cue.len() > crate::FACT_BYTES {
+        return Err(Error::invalid("search requires a bounded non-empty cue"));
+    }
+    Ok(())
+}
+
 impl Eja {
-    /// Search all text-bearing history, including events never marked as concerns.
+    /// Search all text-bearing history. Without an encoder, match literal keywords.
     pub fn search(&self, cue: &str) -> Result<Vec<Match>> {
-        let memory = self
-            .memory
-            .as_ref()
-            .ok_or_else(|| Error::invalid("no semantic encoder configured"))?;
+        validate_cue(cue)?;
         let head = self.head()?;
-        memory.search(self, cue, head, head)
+        self.search_at(cue, head, head)
+    }
+
+    pub(super) fn search_at(&self, cue: &str, through: Id, revision: Id) -> Result<Vec<Match>> {
+        if through <= 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(memory) = &self.memory {
+            return memory.search(self, cue, through, revision);
+        }
+
+        let words: Vec<_> = cue
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let words = serde_json::to_string(&words)?;
+        let mut stmt = self.db.prepare_cached(
+            "SELECT id FROM (
+                 SELECT id, json_extract(body,'$.kind') AS kind,
+                        lower(coalesce(
+                            json_extract(body,'$.text'),
+                            json_extract(body,'$.outcome.detail'),
+                            json_extract(body,'$.capability') || ' ' || json_extract(body,'$.input'),
+                            ''
+                        )) AS text
+                 FROM facts WHERE id <= ?1
+             )
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM json_each(?2) WHERE instr(text, value) = 0
+             )
+             ORDER BY CASE WHEN kind IN ('noticed','returned') THEN 0 ELSE 1 END, id DESC
+             LIMIT ?3",
+        )?;
+        let ids = stmt.query_map(params![through, words, TOP], |row| row.get(0))?;
+        ids.map(|id| {
+            Ok(Match {
+                evidence: self.evidence(id?, revision)?,
+                similarity: 1.0,
+            })
+        })
+        .collect()
     }
 }
 
@@ -251,12 +294,6 @@ impl Memory {
         through: Id,
         revision: Id,
     ) -> Result<Vec<Match>> {
-        if through <= 0 || cue.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        if cue.len() > crate::FACT_BYTES {
-            return Err(Error::invalid("memory query exceeds fact budget"));
-        }
         self.catch_up(&eja.db, through)?;
         let chunks = passages(cue);
         let queries = self.encode(InputKind::Query, &chunks)?;

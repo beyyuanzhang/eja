@@ -1,28 +1,22 @@
 use crate::config::{HostConfig, ProviderConfig};
-use crate::llm::{Brain, HttpBrain};
-use crate::mcp::{truncate_utf8, ConnectorPool, ConnectorStatus};
-use eja_core::{Call, Eja, Entry, Fact, Id, Outcome, Source, Step, PAGE};
+use crate::hands::{Hands, WakeAlarm};
+use crate::llm::{
+    entries_since, project_window, render_window, window_bytes, Brain, HttpBrain, StepFeedback,
+    TurnContext, TurnSession, WINDOW_MAX_BYTES,
+};
+use crate::mcp::{truncate_utf8, ConnectorStatus};
+use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, Step};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::cell::Cell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WakeAlarm {
-    pub id: String,
-    pub fire_at_unix: i64,
-    pub fire_at_display: String,
-    pub reason: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamItem {
@@ -46,14 +40,17 @@ pub struct HostState {
     pub status: String,
     pub status_detail: String,
     pub data_dir: String,
-    pub has_encoder: bool,
     pub configured: bool,
     pub config: HostConfig,
     pub connector_statuses: Vec<ConnectorStatus>,
     pub stream: Vec<StreamItem>,
     pub concerns: Vec<ConcernDto>,
-    pub consolidated: Option<String>,
     pub wakes: Vec<WakeAlarm>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct WindowState {
+    anchor: Id,
 }
 
 pub struct HostRuntime {
@@ -61,8 +58,10 @@ pub struct HostRuntime {
     eja: Mutex<Eja>,
     config: Mutex<HostConfig>,
     config_mtime: Mutex<Option<SystemTime>>,
-    connectors: Mutex<ConnectorPool>,
-    wakes: Mutex<Vec<WakeAlarm>>,
+    hands: Mutex<Hands>,
+    anchor: Mutex<Id>,
+    window_max_bytes: usize,
+    local_tz: String,
     status: Mutex<(String, String)>,
     busy: Mutex<()>,
     brain: Arc<dyn Brain>,
@@ -83,16 +82,24 @@ impl HostRuntime {
         let eja = open_subject(&data_dir.join("subject.db"))?;
         let config = HostConfig::load(&data_dir);
         let mtime = file_mtime(&HostConfig::path(&data_dir));
-        let mut pool = ConnectorPool::default();
-        pool.reload(&config.connectors);
-        let wakes = load_wakes(&data_dir);
+        let notify_emit = Arc::clone(&emit);
+        let hands = Hands::open(
+            data_dir.clone(),
+            &config.connectors,
+            Arc::new(move |title, body| {
+                notify_emit(json!({ "event": "notify", "title": title, "body": body }));
+            }),
+        );
+        let anchor = load_anchor(&data_dir);
         Ok(Self {
             data_dir,
             eja: Mutex::new(eja),
             config: Mutex::new(config),
             config_mtime: Mutex::new(mtime),
-            connectors: Mutex::new(pool),
-            wakes: Mutex::new(wakes),
+            hands: Mutex::new(hands),
+            anchor: Mutex::new(anchor),
+            window_max_bytes: WINDOW_MAX_BYTES,
+            local_tz: detect_local_tz(),
             status: Mutex::new(("idle".into(), "在线".into())),
             busy: Mutex::new(()),
             brain,
@@ -103,10 +110,11 @@ impl HostRuntime {
     pub fn snapshot(&self) -> HostState {
         let config = self.config.lock().unwrap().clone();
         let (status, status_detail) = self.status.lock().unwrap().clone();
-        let connector_statuses = self.connectors.lock().unwrap().statuses();
-        let wakes = self.wakes.lock().unwrap().clone();
+        let (connector_statuses, wakes) = {
+            let hands = self.hands.lock().unwrap();
+            (hands.connector_statuses(), hands.wakes())
+        };
         let eja = self.eja.lock().unwrap();
-        let has_encoder = eja.has_encoder();
         let view = eja.view().ok();
         let entries = load_recent_entries(&eja, 80);
         let concerns = view
@@ -121,23 +129,15 @@ impl HostRuntime {
                     .collect()
             })
             .unwrap_or_default();
-        let consolidated = view.and_then(|v| {
-            v.consolidated.and_then(|entry| match entry.fact {
-                Fact::Consolidated { text, .. } => Some(text),
-                _ => None,
-            })
-        });
         HostState {
             status,
             status_detail,
             data_dir: self.data_dir.display().to_string(),
-            has_encoder,
             configured: config.is_configured(),
             config,
             connector_statuses,
             stream: build_stream(&entries),
             concerns,
-            consolidated,
             wakes,
         }
     }
@@ -153,10 +153,6 @@ impl HostRuntime {
         (self.emit)(json!({ "event": "error", "message": message.into() }));
     }
 
-    pub fn emit_notify(&self, title: &str, body: &str) {
-        (self.emit)(json!({ "event": "notify", "title": title, "body": body }));
-    }
-
     pub fn save_config(&self, updated: HostConfig) {
         if let Err(err) = updated.save(&self.data_dir) {
             self.emit_error(format!("保存配置失败: {err}"));
@@ -170,7 +166,7 @@ impl HostRuntime {
         };
         *self.config_mtime.lock().unwrap() = file_mtime(&HostConfig::path(&self.data_dir));
         if connectors_changed {
-            self.connectors.lock().unwrap().reload(&updated.connectors);
+            self.hands.lock().unwrap().reload(&updated.connectors);
         }
         self.emit_state();
     }
@@ -179,7 +175,7 @@ impl HostRuntime {
         let config = HostConfig::load(&self.data_dir);
         *self.config.lock().unwrap() = config.clone();
         *self.config_mtime.lock().unwrap() = file_mtime(&HostConfig::path(&self.data_dir));
-        self.connectors.lock().unwrap().reload(&config.connectors);
+        self.hands.lock().unwrap().reload(&config.connectors);
         self.emit_state();
     }
 
@@ -216,23 +212,7 @@ impl HostRuntime {
     }
 
     pub fn check_due_wakes(&self) {
-        let now = unix_now();
-        let due: Vec<WakeAlarm> = {
-            let mut wakes = self.wakes.lock().unwrap();
-            let mut fired = Vec::new();
-            wakes.retain(|alarm| {
-                if alarm.fire_at_unix <= now {
-                    fired.push(alarm.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            if !fired.is_empty() {
-                save_wakes(&self.data_dir, &wakes);
-            }
-            fired
-        };
+        let due = self.hands.lock().unwrap().drain_due_wakes();
         if due.is_empty() {
             return;
         }
@@ -243,11 +223,6 @@ impl HostRuntime {
         }
         self.emit_state();
         self.run_turn_locked(true);
-    }
-
-    pub fn consolidate_now(&self, force: bool) {
-        let _guard = self.busy.lock().unwrap();
-        self.consolidate_locked(force);
     }
 
     fn sync_config_if_changed(&self) {
@@ -270,7 +245,7 @@ impl HostRuntime {
                 diff
             };
             if connectors_changed {
-                self.connectors.lock().unwrap().reload(&loaded.connectors);
+                self.hands.lock().unwrap().reload(&loaded.connectors);
             }
         }
     }
@@ -284,37 +259,70 @@ impl HostRuntime {
         };
         let provider = provider.clone();
         let model = model.to_string();
-        let mcp_tools = self.connectors.lock().unwrap().tools();
-        let mut grant_names: Vec<String> = vec!["say".into(), "wake".into(), "shell".into()];
-        grant_names.extend(mcp_tools.iter().map(|t| t.capability.clone()));
-        let grant_refs: Vec<&str> = grant_names.iter().map(|s| s.as_str()).collect();
+        let tools = self.hands.lock().unwrap().tools();
+        let grant_refs: Vec<&str> = tools.iter().map(|t| t.capability.as_str()).collect();
+        let terminal_caps: HashSet<&str> = tools
+            .iter()
+            .filter(|t| t.terminal)
+            .map(|t| t.capability.as_str())
+            .collect();
 
         self.set_status("thinking", "思考中…");
-        let terminal_done = Cell::new(false);
-        let pending_terminal = Cell::new(false);
         let data_dir_str = self.data_dir.display().to_string();
-
         let turn_result = {
             let eja = self.eja.lock().unwrap();
-            let has_encoder = eja.has_encoder();
-            eja.turn(
+            let mut anchor = self.anchor.lock().unwrap();
+            let initial_anchor = *anchor;
+            let window = match project_window(&eja, &mut anchor, self.window_max_bytes) {
+                Ok(w) => w,
+                Err(err) => {
+                    drop(anchor);
+                    drop(eja);
+                    self.emit_error(format!("构建日志窗口失败: {err}"));
+                    self.set_status("idle", "在线");
+                    return;
+                }
+            };
+            if *anchor != initial_anchor {
+                save_anchor(&self.data_dir, *anchor);
+            }
+
+            let ctx = TurnContext {
+                provider: &provider,
+                model: &model,
+                tools: &tools,
+                data_dir: &data_dir_str,
+                local_tz: &self.local_tz,
+                window: &window,
+                triggered_by_person: !proactive,
+            };
+            let mut turn = TurnSession::default();
+            let mut previous_revision: Option<Id> = None;
+            let actions = RefCell::new(Vec::new());
+            let terminal = Cell::new(false);
+
+            let result = eja.turn(
                 &grant_refs,
                 10,
                 |view| {
-                    if terminal_done.get() {
+                    if terminal.get() {
                         return Ok(Step::default());
                     }
-                    let now_local = current_local_time();
+                    let entries = match previous_revision.replace(view.revision) {
+                        Some(previous) => entries_since(&eja, previous, view.revision)?,
+                        None => Vec::new(),
+                    };
+                    let step_actions = actions.take();
                     let step = self
                         .brain
                         .judge(
-                            &provider,
-                            &model,
+                            &ctx,
                             view,
-                            &mcp_tools,
-                            has_encoder,
-                            &now_local,
-                            &data_dir_str,
+                            &mut turn,
+                            StepFeedback {
+                                entries: &entries,
+                                actions: &step_actions,
+                            },
                         )
                         .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
                     let only_terminal = step.read.is_empty()
@@ -323,194 +331,42 @@ impl HostRuntime {
                         && step
                             .act
                             .iter()
-                            .all(|act| act.capability == "say" || act.capability == "wake");
-                    pending_terminal.set(only_terminal);
+                            .all(|act| terminal_caps.contains(act.capability.as_str()));
+                    terminal.set(only_terminal);
                     Ok(step)
                 },
                 |call| {
-                    let outcome = self.perform_call(&call, proactive);
-                    if pending_terminal.get() {
-                        if matches!(outcome, Outcome::Observed(_)) {
-                            terminal_done.set(true);
-                        } else {
-                            pending_terminal.set(false);
-                            terminal_done.set(false);
-                        }
+                    actions.borrow_mut().push(call.id);
+                    let outcome = self.hands.lock().unwrap().execute(&call, proactive);
+                    if !matches!(outcome, Outcome::Observed(_)) {
+                        terminal.set(false);
                     }
                     outcome
                 },
-            )
+            );
+
+            if let Ok(head) = eja.view().map(|v| v.revision) {
+                if render_window(&eja, *anchor, head)
+                    .map(|rendered| window_bytes(&rendered) > self.window_max_bytes)
+                    .unwrap_or(false)
+                {
+                    *anchor = head;
+                    save_anchor(&self.data_dir, *anchor);
+                }
+            }
+            result
         };
 
         if let Err(err) = turn_result {
             self.emit_error(format!("执行回合失败: {err}"));
         }
         self.sync_config_if_changed();
-        self.consolidate_locked(false);
         self.set_status("idle", "在线");
-    }
-
-    fn consolidate_locked(&self, force: bool) {
-        let config = self.config.lock().unwrap().clone();
-        let Some((provider, model)) = config.resolve_consolidate() else {
-            return;
-        };
-        let provider = provider.clone();
-        let model = model.to_string();
-        let should_run = {
-            let eja = self.eja.lock().unwrap();
-            match eja.unconsolidated() {
-                Ok(Some(window)) => force || window.entries.len() >= PAGE,
-                _ => false,
-            }
-        };
-        if !should_run {
-            return;
-        }
-        self.set_status("consolidating", "整理记忆…");
-        let res = self.eja.lock().unwrap().consolidate(2, |window| {
-            self.brain
-                .distill(&provider, &model, window)
-                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
-        });
-        if let Err(err) = res {
-            self.emit_error(format!("整理记忆失败: {err}"));
-        }
-        self.set_status("idle", "在线");
-    }
-
-    fn perform_call(&self, call: &Call, proactive: bool) -> Outcome {
-        match call.capability.as_str() {
-            "say" => {
-                let text = call
-                    .input
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                if text.is_empty() {
-                    return Outcome::Failed("say 需要非空 text".into());
-                }
-                if proactive {
-                    self.emit_notify("EJA", text);
-                }
-                Outcome::Observed("delivered".into())
-            }
-            "wake" => {
-                let delay = call
-                    .input
-                    .get("delay_seconds")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let reason = call
-                    .input
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                if delay < 5 || reason.is_empty() {
-                    return Outcome::Failed("wake 需要 delay_seconds >= 5 且非空 reason".into());
-                }
-                let fire_at = unix_now() + delay;
-                let display = format_local_unix(fire_at);
-                let alarm = WakeAlarm {
-                    id: format!("w-{fire_at}-{}", call.id),
-                    fire_at_unix: fire_at,
-                    fire_at_display: display.clone(),
-                    reason: reason.to_string(),
-                };
-                let mut wakes = self.wakes.lock().unwrap();
-                wakes.push(alarm);
-                wakes.sort_by_key(|a| a.fire_at_unix);
-                save_wakes(&self.data_dir, &wakes);
-                Outcome::Observed(format!("scheduled at {display} ({reason})"))
-            }
-            "shell" => {
-                let command = call
-                    .input
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                if command.is_empty() {
-                    return Outcome::Failed("shell 需要非空 command".into());
-                }
-                let cwd = call
-                    .input
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.trim().is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| self.data_dir.clone());
-                run_shell(command, &cwd)
-            }
-            other if other.starts_with("mcp.") => {
-                self.connectors.lock().unwrap().call(other, &call.input)
-            }
-            other => Outcome::Failed(format!("未知能力: {other}")),
-        }
     }
 
     fn set_status(&self, status: &str, detail: &str) {
         *self.status.lock().unwrap() = (status.to_string(), detail.to_string());
         self.emit_state();
-    }
-}
-
-fn run_shell(command: &str, cwd: &Path) -> Outcome {
-    let mut child = match Command::new("/bin/sh")
-        .args(["-c", command])
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(err) => return Outcome::Failed(format!("启动 shell 失败: {err}")),
-    };
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(ref mut r) = stdout {
-            let _ = r.read_to_end(&mut buf);
-        }
-        String::from_utf8_lossy(&buf).to_string()
-    });
-    let err_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(ref mut r) = stderr {
-            let _ = r.read_to_end(&mut buf);
-        }
-        String::from_utf8_lossy(&buf).to_string()
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(_) => break None,
-        }
-    };
-    let out = out_handle.join().unwrap_or_default();
-    let err = err_handle.join().unwrap_or_default();
-    let combined = match (out.trim(), err.trim()) {
-        ("", "") => "(no output)".to_string(),
-        (o, "") => o.to_string(),
-        ("", e) => e.to_string(),
-        (o, e) => format!("{o}\n[stderr]\n{e}"),
-    };
-    let bounded = truncate_utf8(&combined, 6000);
-    match status {
-        Some(st) if st.success() => Outcome::Observed(bounded),
-        Some(st) => Outcome::Failed(format!("exit {}: {bounded}", st.code().unwrap_or(-1))),
-        None => Outcome::Failed(format!("命令超时 (30s): {bounded}")),
     }
 }
 
@@ -637,71 +493,52 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-fn load_wakes(data_dir: &Path) -> Vec<WakeAlarm> {
-    fs::read(data_dir.join("wakes.json"))
+fn load_anchor(data_dir: &Path) -> Id {
+    fs::read(data_dir.join("window.json"))
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn save_wakes(data_dir: &Path, wakes: &[WakeAlarm]) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(wakes) {
-        let _ = fs::write(data_dir.join("wakes.json"), bytes);
-    }
-}
-
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .and_then(|bytes| serde_json::from_slice::<WindowState>(&bytes).ok())
+        .map(|state| state.anchor.max(0))
         .unwrap_or(0)
 }
 
-fn current_local_time() -> String {
-    Command::new("/bin/date")
-        .arg("+%Y-%m-%d %H:%M:%S %Z")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| format!("unix:{}", unix_now()))
+fn save_anchor(data_dir: &Path, anchor: Id) {
+    let state = WindowState { anchor };
+    if let Ok(bytes) = serde_json::to_vec(&state) {
+        let _ = fs::write(data_dir.join("window.json"), bytes);
+    }
 }
 
-fn format_local_unix(secs: i64) -> String {
+fn detect_local_tz() -> String {
     Command::new("/bin/date")
-        .args(["-r", &secs.to_string(), "+%H:%M:%S"])
+        .arg("+%Z (%z)")
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| secs.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "UTC (+0000)".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Assignments, ConnectorConfig, ConnectorTransport, ModelRef, ProviderKind};
-    use crate::mcp::McpTool;
-    use eja_core::{Act, Consolidation, View};
+    use crate::config::{ConnectorConfig, ConnectorTransport, ModelRef, ProviderKind};
+    use eja_core::{Act, Keep, View};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockBrain {
         judge_calls: AtomicUsize,
-        distill_calls: AtomicUsize,
         mode: &'static str,
     }
 
     impl Brain for MockBrain {
         fn judge(
             &self,
-            _provider: &ProviderConfig,
-            _model: &str,
+            ctx: &TurnContext<'_>,
             view: &View,
-            mcp_tools: &[McpTool],
-            _has_encoder: bool,
-            _local_time: &str,
-            _data_dir: &str,
+            _turn: &mut TurnSession,
+            _feedback: StepFeedback<'_>,
         ) -> Result<Step, String> {
             self.judge_calls.fetch_add(1, Ordering::SeqCst);
             if self.mode == "mcp" {
@@ -709,7 +546,13 @@ mod tests {
                     matches!(&e.fact, Fact::Returned { outcome: Outcome::Observed(s), .. } if s.contains("pong:hello"))
                 });
                 if !already_called {
-                    let cap = mcp_tools[0].capability.clone();
+                    let cap = ctx
+                        .tools
+                        .iter()
+                        .find(|t| t.capability.starts_with("mcp."))
+                        .unwrap()
+                        .capability
+                        .clone();
                     return Ok(Step {
                         act: vec![Act {
                             capability: cap,
@@ -729,23 +572,10 @@ mod tests {
             Ok(Step {
                 act: vec![Act {
                     capability: "say".into(),
-                    input: json!({ "text": "收到" }),
+                    input: json!({ "text": "你好，我在。" }),
                 }],
                 ..Step::default()
             })
-        }
-
-        fn distill(
-            &self,
-            _provider: &ProviderConfig,
-            _model: &str,
-            window: &Consolidation,
-        ) -> Result<String, String> {
-            self.distill_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(format!(
-                "已整理 {} 条记录，用户叫 bey",
-                window.entries.len()
-            ))
         }
 
         fn test_connection(
@@ -763,44 +593,46 @@ mod tests {
                 id: "local".into(),
                 name: "Local".into(),
                 kind: ProviderKind::OpenAi,
-                base_url: "http://127.0.0.1:11434/v1".into(),
+                base_url: "http://127.0.0.1:9999/v1".into(),
                 api_key: String::new(),
-                models: vec!["mock-model".into()],
+                models: vec!["demo".into()],
             }],
-            assignments: Assignments {
-                judge: ModelRef {
-                    provider_id: "local".into(),
-                    model: "mock-model".into(),
-                },
-                consolidate: None,
+            judge: ModelRef {
+                provider_id: "local".into(),
+                model: "demo".into(),
             },
             connectors,
         }
     }
 
     #[test]
-    fn direct_core_turn_single_call_and_auto_consolidate() {
+    fn user_turn_records_stream_and_runs_multiple_turns() {
         let dir = tempfile::tempdir().unwrap();
         let brain = Arc::new(MockBrain {
             judge_calls: AtomicUsize::new(0),
-            distill_calls: AtomicUsize::new(0),
-            mode: "say",
+            mode: "chat",
         });
         let rt =
             HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
+        rt.handle_user_message("你好");
 
-        rt.handle_user_message("我叫 bey");
+        let snap = rt.snapshot();
+        assert!(snap.configured);
+        assert!(snap
+            .stream
+            .iter()
+            .any(|item| item.kind == "person" && item.text == "你好"));
+        assert!(snap
+            .stream
+            .iter()
+            .any(|item| item.kind == "eja" && item.text == "你好，我在。"));
         assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 1);
 
         rt.handle_user_message("第 2 轮");
         rt.handle_user_message("第 3 轮");
         assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 3);
-        assert!(brain.distill_calls.load(Ordering::SeqCst) >= 1);
-
-        let snap = rt.snapshot();
-        assert!(snap.consolidated.unwrap_or_default().contains("bey"));
     }
 
     #[test]
@@ -827,7 +659,6 @@ for line in sys.stdin:
 
         let brain = Arc::new(MockBrain {
             judge_calls: AtomicUsize::new(0),
-            distill_calls: AtomicUsize::new(0),
             mode: "mcp",
         });
         let rt =
@@ -863,5 +694,83 @@ for line in sys.stdin:
             .stream
             .iter()
             .any(|item| item.kind == "eja" && item.text == "mcp ok"));
+    }
+
+    struct WindowRecordingBrain {
+        windows: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Brain for WindowRecordingBrain {
+        fn judge(
+            &self,
+            ctx: &TurnContext<'_>,
+            _view: &View,
+            _turn: &mut TurnSession,
+            _feedback: StepFeedback<'_>,
+        ) -> Result<Step, String> {
+            let mut windows = self.windows.lock().unwrap();
+            let first_turn = windows.is_empty();
+            windows.push(ctx.window.to_vec());
+            let mut step = Step {
+                act: vec![Act {
+                    capability: "say".into(),
+                    input: json!({ "text": "收到" }),
+                }],
+                ..Step::default()
+            };
+            if first_turn {
+                step.keep.push(Keep {
+                    concern: None,
+                    text: "长期挂念".into(),
+                });
+            }
+            Ok(step)
+        }
+
+        fn test_connection(
+            &self,
+            _provider: &ProviderConfig,
+            model: &str,
+        ) -> Result<String, String> {
+            Ok(format!("ok:{model}"))
+        }
+    }
+
+    #[test]
+    fn window_stays_append_only_across_turns_and_persists_anchor_on_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(WindowRecordingBrain {
+            windows: Mutex::new(Vec::new()),
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
+        rt.window_max_bytes = 900;
+        rt.save_config(configured(vec![]));
+
+        rt.handle_user_message("第一轮");
+        rt.handle_user_message("第二轮");
+
+        {
+            let windows = brain.windows.lock().unwrap();
+            assert_eq!(windows.len(), 2);
+            assert!(windows[1].starts_with(&windows[0]));
+        }
+
+        // Exceed the window budget so anchor advances and persists to window.json.
+        rt.handle_user_message(&"长消息".repeat(120));
+        drop(rt);
+
+        // Reopen runtime and verify persisted anchor starts cleanly with the open concern snapshot.
+        let restarted =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
+        restarted.handle_user_message("重启后第一轮");
+
+        let windows = brain.windows.lock().unwrap();
+        let last = windows.last().unwrap();
+        let first_line: Value = serde_json::from_str(&last[0]).unwrap();
+        assert!(first_line["anchor"].as_i64().unwrap() > 0);
+        assert_eq!(first_line["concerns"][0]["text"], "长期挂念");
     }
 }

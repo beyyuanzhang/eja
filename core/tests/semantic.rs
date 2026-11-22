@@ -66,24 +66,38 @@ fn repeated_passages_occupy_at_most_one_slot_in_top_results() -> Result<()> {
 }
 
 #[test]
-fn view_is_pure_read_only_and_search_requires_encoder() -> Result<()> {
+fn keyword_search_finds_older_evidence_without_writing_to_the_journal() -> Result<()> {
     let subject = Eja::open(":memory:")?;
     assert!(!subject.has_encoder());
-    let notice = subject.notice(Source::Person, "hello")?;
-    assert!(matches!(subject.search("hello"), Err(Error::Invalid(_))));
-    assert!(matches!(
-        subject.turn(
-            &[],
-            2,
-            |_| Ok(Step {
-                search: vec!["hello".into()],
-                ..Step::default()
-            }),
-            |_| unreachable!(),
-        ),
-        Err(Error::Invalid(_))
-    ));
-    assert_eq!(subject.view()?.revision, notice);
+    let notice = subject.notice(Source::World, "首次交班，纸质封签短码 BLUE-74")?;
+    for _ in 0..eja_core::PAGE {
+        subject.notice(Source::World, "日常记录")?;
+    }
+    let head = subject.view()?.revision;
+    assert_eq!(
+        subject.search("纸质封签 blue-74")?[0].evidence.entry.id,
+        notice
+    );
+    assert!(subject.search("纸质封签 次日")?.is_empty());
+    assert!(matches!(subject.search(" "), Err(Error::Invalid(_))));
+    let mut first_step = true;
+    subject.turn(
+        &[],
+        2,
+        |view| {
+            if std::mem::take(&mut first_step) {
+                Ok(Step {
+                    search: vec!["纸质封签 短码".into()],
+                    ..Step::default()
+                })
+            } else {
+                assert_eq!(view.searches[0].matches[0].evidence.entry.id, notice);
+                Ok(Step::default())
+            }
+        },
+        |_| unreachable!(),
+    )?;
+    assert_eq!(subject.view()?.revision, head);
     Ok(())
 }
 
@@ -157,30 +171,6 @@ fn turn_search_and_read_present_settled_evidence_without_polluting_journal() -> 
     assert_eq!(stop, Stop::Done);
     assert_eq!(steps, 2);
     assert_eq!(subject.view()?.revision, trigger);
-    Ok(())
-}
-
-#[test]
-fn consolidated_memory_is_indexed_and_links_to_latest_consolidation() -> Result<()> {
-    let subject = Eja::open_with_encoder(":memory:", Fixture { id: "v1", dims: 2 })?;
-    let first = subject.notice(Source::World, "α routine event 1")?;
-    let first_consolidation =
-        subject.commit_consolidation(None, first, "β venue accessibility synthesis v1")?;
-    let next = subject.notice(Source::World, "α routine event 2")?;
-    let second_consolidation = subject.commit_consolidation(
-        Some(first_consolidation),
-        next,
-        "α updated general summary v2",
-    )?;
-    for idx in 0..PAGE + 2 {
-        subject.notice(Source::World, format!("α noise {idx}"))?;
-    }
-    let hits = subject.search("β accessibility")?;
-    assert_eq!(hits[0].evidence.entry.id, first_consolidation);
-    assert_eq!(
-        hits[0].evidence.latest.as_ref().unwrap().id,
-        second_consolidation
-    );
     Ok(())
 }
 

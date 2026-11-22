@@ -21,8 +21,6 @@ pub type Id = i64;
 pub type Result<T> = std::result::Result<T, Error>;
 /// Each view contains at most one page of recent entries and one page of open concerns.
 pub const PAGE: usize = 8;
-/// Each chronological replay request returns at most this many entries.
-pub const REPLAY_PAGE: usize = 32;
 /// Bound one serialized fact before it enters a model-facing history.
 pub const FACT_BYTES: usize = 8192;
 
@@ -142,7 +140,6 @@ pub enum Fact {
     Noticed { source: Source, text: String },
     Kept { concern: Id, text: String },
     Released { concern: Id },
-    Consolidated { through: Id, text: String },
     Acted { capability: String, input: Value },
     Returned { action: Id, outcome: Outcome },
 }
@@ -184,9 +181,6 @@ pub struct View {
     pub now: Timestamp,
     /// Most recently changed open concerns first.
     pub concerns: Vec<Concern>,
-    /// Latest consolidated long-term memory, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub consolidated: Option<Entry>,
     /// Newest first. Older entries are readable by id or page.
     pub recent: Vec<Entry>,
     /// Evidence returned for `step.read` from the previous step of this turn.
@@ -195,19 +189,6 @@ pub struct View {
     /// Results returned for `step.search` from the previous step of this turn.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub searches: Vec<SearchHits>,
-}
-
-/// One bounded chronological replay window for slow memory consolidation.
-#[derive(Debug, Serialize)]
-pub struct Consolidation {
-    pub revision: Id,
-    pub now: Timestamp,
-    pub concerns: Vec<Concern>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous: Option<Entry>,
-    /// Chronological unconsolidated entries ending at `through`.
-    pub entries: Vec<Entry>,
-    pub through: Id,
 }
 
 /// Delivered once, after the corresponding `Fact::Acted` is durable.
@@ -276,34 +257,10 @@ impl Eja {
             revision,
             now: self.now_at(&self.db)?,
             concerns: self.concerns(revision, revision)?,
-            consolidated: self.consolidated(revision)?,
             recent: self.history(revision)?,
             reads: Vec::new(),
             searches: Vec::new(),
         })
-    }
-
-    /// Slow memory consolidation loop: replays unconsolidated history in bounded chronological
-    /// windows (`REPLAY_PAGE`) and commits each fold atomically as `Fact::Consolidated`.
-    /// Returns the newest committed consolidation entry ID, or `None` when already caught up.
-    pub fn consolidate(
-        &self,
-        windows: usize,
-        mut distill: impl FnMut(
-            &Consolidation,
-        )
-            -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>,
-    ) -> Result<Option<Id>> {
-        let mut latest = None;
-        for _ in 0..windows {
-            let Some(window) = self.unconsolidated()? else {
-                break;
-            };
-            let text = distill(&window).map_err(Error::External)?;
-            let previous = window.previous.as_ref().map(|entry| entry.id);
-            latest = Some(self.commit_consolidation(previous, window.through, text)?);
-        }
-        Ok(latest)
     }
 
     /// Closed-loop turn: commits mutations before external effects, feeds back query results
@@ -333,13 +290,8 @@ impl Eja {
                     return Err(Error::invalid("read target must reference a recorded fact"));
                 }
             }
-            if !step.search.is_empty() && self.memory.is_none() {
-                return Err(Error::invalid("search requires an attached encoder"));
-            }
             for cue in &step.search {
-                if cue.trim().is_empty() || cue.len() > FACT_BYTES {
-                    return Err(Error::invalid("search requires a bounded non-empty cue"));
-                }
+                memory::validate_cue(cue)?;
             }
             let calls = if step.has_mutations() {
                 self.commit(view.revision, &step, grants)?
@@ -357,12 +309,10 @@ impl Eja {
             for fact_id in step.read {
                 reads.push(self.evidence(fact_id, head)?);
             }
-            if let Some(memory) = &self.memory {
-                let older = head.saturating_sub(PAGE as Id);
-                for cue in step.search {
-                    let matches = memory.search(self, &cue, older, head)?;
-                    searches.push(SearchHits { cue, matches });
-                }
+            let older = head.saturating_sub(PAGE as Id);
+            for cue in step.search {
+                let matches = self.search_at(&cue, older, head)?;
+                searches.push(SearchHits { cue, matches });
             }
         }
         Ok(Stop::StepLimit)

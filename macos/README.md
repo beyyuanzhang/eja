@@ -1,14 +1,12 @@
-# EJA macOS Origin
-
-基于 `core/`（`eja-core`，一行不改）的三层极简原点：
+# EJA macOS
 
 ## 结构
 
-- `../core/`（`eja-core`）：不可动内核，负责主体账本、状态机、挂念与记忆巩固。
-- `../host/`（`eja-host`）：极简 Rust 运行时与能力层，直接驱动 `eja.turn()` / `eja.consolidate()`，仅包含两个核心能力模块：
-  - **LLM Provider 管理与模型分配**（支持多 Provider、OpenAI 兼容与 Anthropic 协议、主思考/记忆整理角色分配与连通测试）。
-  - **统一标准 MCP 连接器**（`stdio` + `HTTP`，统一接入外部 MCP Server 与 EJA 自建 MCP，修改 `config.json` 自动热加载），外加 3 个最小内置原语（`say` / `wake` / `shell`）。
-- `Sources/EjaClient/` + `Sources/EjaApp/`：纯薄 macOS 原生交互壳（对话、记忆查看、LLM 与 MCP 设置、菜单栏常驻），零核心业务逻辑。
+- `../core/`（`eja-core`）：不可动内核，负责主体账本、状态机与挂念。
+- `../host/`（`eja-host`）：极简 Rust 驱动循环与统一能力层，直接驱动 `eja.turn()`。
+  - **确定性日志投影与模型适配**（`llm.rs`，基于 `anchor` 的只追加日志窗口，支持 OpenAI 兼容与 Anthropic 协议及连通测试）。
+  - **统一能力面**（`hands.rs` + `mcp.rs`，将 `say` / `wake` / `shell` 与 `stdio` / `HTTP` MCP 连接器统一到同一工具定义、授权与执行契约，修改 `config.json` 自动热加载）。
+- `Sources/EjaClient/` + `Sources/EjaApp/`：纯薄 macOS 原生交互壳（对话、关切与唤醒查看、LLM 与 MCP 设置、菜单栏常驻），零核心业务逻辑。
 
 ## 构建与运行
 
@@ -32,3 +30,4 @@ cargo build --release -p eja-host
 - `subject.db`：`eja-core` 永久主体日志
 - `config.json`：LLM 与 MCP 连接器配置
 - `wakes.json`：EJA 自设的定时唤醒
+- `window.json`：当前上下文窗口起点 `anchor`

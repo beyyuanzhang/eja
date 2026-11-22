@@ -40,16 +40,6 @@ public struct ModelRefDTO: Codable, Equatable, Sendable {
     }
 }
 
-public struct AssignmentsDTO: Codable, Equatable, Sendable {
-    public var judge: ModelRefDTO
-    public var consolidate: ModelRefDTO?
-
-    public init(judge: ModelRefDTO = ModelRefDTO(), consolidate: ModelRefDTO? = nil) {
-        self.judge = judge
-        self.consolidate = consolidate
-    }
-}
-
 public struct ConnectorTransportDTO: Codable, Equatable, Sendable {
     public var type: String // "stdio" | "http"
     public var command: String?
@@ -83,12 +73,12 @@ public struct ConnectorConfigDTO: Codable, Equatable, Identifiable, Sendable {
 
 public struct HostConfigDTO: Codable, Equatable, Sendable {
     public var providers: [ProviderConfigDTO]
-    public var assignments: AssignmentsDTO
+    public var judge: ModelRefDTO
     public var connectors: [ConnectorConfigDTO]
 
-    public init(providers: [ProviderConfigDTO] = [], assignments: AssignmentsDTO = AssignmentsDTO(), connectors: [ConnectorConfigDTO] = []) {
+    public init(providers: [ProviderConfigDTO] = [], judge: ModelRefDTO = ModelRefDTO(), connectors: [ConnectorConfigDTO] = []) {
         self.providers = providers
-        self.assignments = assignments
+        self.judge = judge
         self.connectors = connectors
     }
 }
@@ -144,20 +134,17 @@ private struct StateEventDTO: Decodable {
     let status: String
     let statusDetail: String
     let dataDir: String
-    let hasEncoder: Bool
     let configured: Bool
     let config: HostConfigDTO
     let connectorStatuses: [ConnectorStatusDTO]
     let stream: [StreamItemDTO]
     let concerns: [ConcernDTO]
-    let consolidated: String?
     let wakes: [WakeAlarmDTO]
 
     enum CodingKeys: String, CodingKey {
-        case status, config, stream, concerns, consolidated, wakes, configured
+        case status, config, stream, concerns, wakes, configured
         case statusDetail = "status_detail"
         case dataDir = "data_dir"
-        case hasEncoder = "has_encoder"
         case connectorStatuses = "connector_statuses"
     }
 }
@@ -168,13 +155,11 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var status: String = "idle"
     @Published public private(set) var statusDetail: String = "启动中…"
     @Published public private(set) var dataDir: String = ""
-    @Published public private(set) var hasEncoder: Bool = false
     @Published public private(set) var isConfigured: Bool = false
     @Published public private(set) var config: HostConfigDTO = HostConfigDTO()
     @Published public private(set) var connectorStatuses: [ConnectorStatusDTO] = []
     @Published public private(set) var stream: [StreamItemDTO] = []
     @Published public private(set) var concerns: [ConcernDTO] = []
-    @Published public private(set) var consolidated: String?
     @Published public private(set) var wakes: [WakeAlarmDTO] = []
     @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
@@ -229,11 +214,6 @@ public final class HostClient: ObservableObject {
     public func reloadConnectors() {
         errorBanner = nil
         sendCommand(["cmd": "reload_connectors"])
-    }
-
-    public func consolidateNow() {
-        errorBanner = nil
-        sendCommand(["cmd": "consolidate"])
     }
 
     private func startHost(executableURL: URL?, dataDir: URL?) {
@@ -297,13 +277,11 @@ public final class HostClient: ObservableObject {
                 status = state.status
                 statusDetail = state.statusDetail
                 dataDir = state.dataDir
-                hasEncoder = state.hasEncoder
                 isConfigured = state.configured
                 config = state.config
                 connectorStatuses = state.connectorStatuses
                 stream = state.stream
                 concerns = state.concerns
-                consolidated = state.consolidated
                 wakes = state.wakes
             }
         case "error":

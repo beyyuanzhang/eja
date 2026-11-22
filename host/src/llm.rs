@@ -1,30 +1,53 @@
 use crate::config::{ProviderConfig, ProviderKind};
-use crate::mcp::{truncate_utf8, McpTool};
-use eja_core::{Act, Consolidation, Fact, Keep, Source, Step, View};
+use crate::hands::ToolSpec;
+use crate::mcp::truncate_utf8;
+use eja_core::{Act, Concern, Eja, Entry, Fact, Id, Keep, Step, View};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+pub const WINDOW_MAX_BYTES: usize = 64 * 1024;
+
+pub struct TurnContext<'a> {
+    pub provider: &'a ProviderConfig,
+    pub model: &'a str,
+    pub tools: &'a [ToolSpec],
+    pub data_dir: &'a str,
+    pub local_tz: &'a str,
+    pub window: &'a [String],
+    pub triggered_by_person: bool,
+}
+
+pub struct StepFeedback<'a> {
+    pub entries: &'a [Entry],
+    pub actions: &'a [Id],
+}
+
+#[derive(Default)]
+pub struct TurnSession {
+    messages: Vec<Value>,
+    pending: Vec<(String, PendingCall)>,
+    said: bool,
+}
+
+enum PendingCall {
+    Keep,
+    Release,
+    Read,
+    Search,
+    Action,
+    Invalid,
+}
+
 pub trait Brain: Send + Sync {
-    #[allow(clippy::too_many_arguments)]
     fn judge(
         &self,
-        provider: &ProviderConfig,
-        model: &str,
+        ctx: &TurnContext<'_>,
         view: &View,
-        mcp_tools: &[McpTool],
-        has_encoder: bool,
-        local_time: &str,
-        data_dir: &str,
+        turn: &mut TurnSession,
+        feedback: StepFeedback<'_>,
     ) -> Result<Step, String>;
-
-    fn distill(
-        &self,
-        provider: &ProviderConfig,
-        model: &str,
-        window: &Consolidation,
-    ) -> Result<String, String>;
 
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String>;
 }
@@ -34,142 +57,132 @@ pub struct HttpBrain;
 impl Brain for HttpBrain {
     fn judge(
         &self,
-        provider: &ProviderConfig,
-        model: &str,
+        ctx: &TurnContext<'_>,
         view: &View,
-        mcp_tools: &[McpTool],
-        has_encoder: bool,
-        local_time: &str,
-        data_dir: &str,
+        turn: &mut TurnSession,
+        feedback: StepFeedback<'_>,
     ) -> Result<Step, String> {
-        let (defs, alias_to_cap) = build_tool_specs(mcp_tools, has_encoder);
-        let earliest_recent = view.recent.iter().map(|entry| entry.id).min();
-        let has_earlier = earliest_recent.is_some_and(|id| id > 1);
-        let search_note = if has_encoder {
-            "支持 `search(cue)` 语义检索全部历史。"
-        } else {
-            "当前未挂载语义编码器，请勿调用 `search`；需要翻看更早日志时用 `read(fact)`。"
-        };
+        let defs = build_tool_defs(ctx.tools);
+        let tool_map: HashMap<&str, &str> = ctx
+            .tools
+            .iter()
+            .map(|spec| (spec.name.as_str(), spec.capability.as_str()))
+            .collect();
         let system = format!(
             "你是 EJA，一个持续存在的自我同一性主体。\n\
-            本机当前时间：{local_time}\n\
-            数据目录：{data_dir}（配置文件：{data_dir}/config.json）\n\n\
-            记忆规则：\n\
-            - `view.recent` 只展示最近最多 8 条日志，不代表之前的历史不存在；若 `has_earlier_history` 为 true，说明存在更早日志（ID 1..{}），可用 `read(fact)` 回查，绝不要编造“没有更早记录”。\n\
-            - {search_note}\n\
-            - 用 `keep` / `release` 维护跨回合挂念。\n\n\
-            行动规则：\n\
-            - 回复人请调用 `say(text)`（支持 Markdown）；主动定时提醒请调用 `wake(delay_seconds, reason)`。\n\
-            - `shell(command)` 可在本机执行命令、读写文件；若需要新能力，可编写标准 stdio MCP Server 并写入 `{data_dir}/config.json` 的 `connectors` 中，保存后会自动热加载。\n\
-            - 所有已连接的 MCP 工具均以 `mcp.*` 形式直接可用。完成后不调工具即可自然结束回合。",
-            earliest_recent.unwrap_or(1).saturating_sub(1)
+            数据目录：{}（配置文件：{}/config.json）\n\
+            本地时区：{}\n\n\
+            开头的消息序列是你的只追加主体日志（每条消息对应一条 JSON 记录，按时间正序；若首条带 `anchor`，表示该版本起的新窗口及其当时的开放挂念）。\n\
+            日志末尾的新 `noticed` 记录是刚刚发生的输入或唤醒；本回合的工具结果会按顺序追加在对话后面。\n\n\
+            - 用 `keep(text, concern?)` / `release(concern)` 维护跨窗口持续挂念（修订或放下时传原挂念 ID）。\n\
+            - 想找当前窗口之外的旧事实时用 `search(cue)` 定位（可传空格分隔的短关键词）；知道事实 ID 时可用 `read(fact)` 回查原文。\n\
+            - 回复人请调用 `say(text)`，预约未来主动唤醒请调用 `wake(delay_seconds, reason)`。\n\
+            - `shell(command)` 可在本机执行命令、读写文件；若需要新能力，可编写标准 stdio MCP Server 并写入 `{}/config.json` 的 `connectors` 中，保存后会自动热加载。\n\
+            - 完成后不调工具即可自然结束回合。",
+            ctx.data_dir, ctx.data_dir, ctx.local_tz, ctx.data_dir
         );
 
-        let user_payload = json!({
-            "local_time": local_time,
-            "has_earlier_history": has_earlier,
-            "earliest_recent_id": earliest_recent,
-            "view": view
-        });
-        let user_text = serde_json::to_string(&user_payload).map_err(|err| err.to_string())?;
-        let (text, calls) = match provider.kind {
-            ProviderKind::OpenAi => call_openai(provider, model, &system, &user_text, Some(&defs))?,
-            ProviderKind::Anthropic => {
-                call_anthropic(provider, model, &system, &user_text, Some(&defs))?
+        if turn.messages.is_empty() {
+            for record in ctx.window {
+                turn.messages.push(user_message(record.as_str()));
             }
-        };
+        } else {
+            turn.append_feedback(&ctx.provider.kind, view, feedback);
+        }
+
+        let completion = complete(
+            ctx.provider,
+            ctx.model,
+            &system,
+            &turn.messages,
+            Some(&defs),
+        )?;
 
         let mut step = Step::default();
-        for (name, args) in calls {
-            match name.as_str() {
+        for ToolInvocation { id, name, args } in completion.calls {
+            let kind = match name.as_str() {
                 "keep" => {
                     let text = args
                         .get("text")
-                        .and_then(|v| v.as_str())
+                        .and_then(Value::as_str)
                         .unwrap_or("")
                         .trim();
                     if !text.is_empty() {
                         step.keep.push(Keep {
-                            concern: args.get("concern").and_then(|v| v.as_i64()),
+                            concern: args.get("concern").and_then(Value::as_i64),
                             text: text.to_string(),
                         });
+                        PendingCall::Keep
+                    } else {
+                        PendingCall::Invalid
                     }
                 }
-                "release" => {
-                    if let Some(id) = args.get("concern").and_then(|v| v.as_i64()) {
+                "release" => match args.get("concern").and_then(Value::as_i64) {
+                    Some(id) => {
                         step.release.push(id);
+                        PendingCall::Release
                     }
-                }
-                "read" => {
-                    if let Some(id) = args.get("fact").and_then(|v| v.as_i64()) {
+                    None => PendingCall::Invalid,
+                },
+                "read" => match args.get("fact").and_then(Value::as_i64) {
+                    Some(id) => {
                         step.read.push(id);
+                        PendingCall::Read
                     }
-                }
-                "search" if has_encoder => {
-                    let cue = args
-                        .get("cue")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim();
+                    None => PendingCall::Invalid,
+                },
+                "search" => {
+                    let cue = args.get("cue").and_then(Value::as_str).unwrap_or("").trim();
                     if !cue.is_empty() {
                         step.search.push(cue.to_string());
+                        PendingCall::Search
+                    } else {
+                        PendingCall::Invalid
                     }
-                }
-                "say" | "wake" | "shell" => {
-                    step.act.push(Act {
-                        capability: name,
-                        input: args,
-                    });
                 }
                 other => {
-                    if let Some(cap) = alias_to_cap.get(other) {
+                    if let Some(&capability) = tool_map.get(other) {
+                        if capability == "say" {
+                            turn.said = true;
+                        }
                         step.act.push(Act {
-                            capability: cap.clone(),
+                            capability: capability.to_string(),
                             input: args,
                         });
+                        PendingCall::Action
+                    } else {
+                        PendingCall::Invalid
                     }
                 }
-            }
+            };
+            turn.pending.push((id, kind));
         }
 
-        if !step.has_mutations() && !step.needs_followup() {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() && latest_notice_needs_reply(view) {
+        if !step.has_mutations() && !step.needs_followup() && ctx.triggered_by_person && !turn.said
+        {
+            let trimmed = completion.text.trim();
+            let has_say = ctx.tools.iter().any(|spec| spec.capability == "say");
+            if !trimmed.is_empty() && has_say {
+                turn.said = true;
                 step.act.push(Act {
                     capability: "say".into(),
                     input: json!({ "text": trimmed }),
                 });
             }
         }
+        turn.messages.push(completion.message);
         Ok(step)
     }
 
-    fn distill(
-        &self,
-        provider: &ProviderConfig,
-        model: &str,
-        window: &Consolidation,
-    ) -> Result<String, String> {
-        let system = "你是 EJA 的长期记忆整理器。把之前的长期记忆 `previous` 与本批日志 `entries` 融合为一份精炼、准确的纯文本长期记忆，保留用户身份、偏好、约定、长期事实与重要决定，去掉寒暄和过程噪音。直接输出记忆正文，不要 Markdown 外壳。";
-        let user_text = serde_json::to_string(window).map_err(|err| err.to_string())?;
-        let (text, _) = match provider.kind {
-            ProviderKind::OpenAi => call_openai(provider, model, system, &user_text, None)?,
-            ProviderKind::Anthropic => call_anthropic(provider, model, system, &user_text, None)?,
-        };
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Err("记忆整理返回为空".into());
-        }
-        Ok(truncate_utf8(trimmed, 7000))
-    }
-
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String> {
-        let (text, _) = match provider.kind {
-            ProviderKind::OpenAi => call_openai(provider, model, "Reply with OK.", "ping", None)?,
-            ProviderKind::Anthropic => {
-                call_anthropic(provider, model, "Reply with OK.", "ping", None)?
-            }
-        };
+        let text = complete(
+            provider,
+            model,
+            "Reply with OK.",
+            &[user_message("ping")],
+            None,
+        )?
+        .text;
         Ok(format!(
             "连接成功 ({model}): {}",
             truncate_utf8(text.trim(), 60)
@@ -177,20 +190,213 @@ impl Brain for HttpBrain {
     }
 }
 
-struct ToolSpec {
+impl TurnSession {
+    fn append_feedback(
+        &mut self,
+        provider: &ProviderKind,
+        view: &View,
+        feedback: StepFeedback<'_>,
+    ) {
+        let mut kept = feedback
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.fact, Fact::Kept { .. }));
+        let mut released = feedback
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.fact, Fact::Released { .. }));
+        let mut reads = view.reads.iter();
+        let mut searches = view.searches.iter();
+        let mut actions = feedback.actions.iter().copied();
+        let receipts: HashMap<_, _> = feedback
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if let Fact::Returned { action, outcome } = &entry.fact {
+                    Some((*action, (entry.id, outcome)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut sent: HashSet<_> = feedback.actions.iter().copied().collect();
+        let mut blocks = Vec::new();
+
+        for (id, kind) in self.pending.drain(..) {
+            let data = match kind {
+                PendingCall::Keep | PendingCall::Release => {
+                    let entry = match kind {
+                        PendingCall::Keep => kept.next(),
+                        _ => released.next(),
+                    };
+                    entry.map(|entry| {
+                        sent.insert(entry.id);
+                        match entry.fact {
+                            Fact::Kept { concern, .. } | Fact::Released { concern } => {
+                                json!({ "id": entry.id, "concern": concern })
+                            }
+                            _ => unreachable!(),
+                        }
+                    })
+                }
+                PendingCall::Read => reads.next().map(|evidence| json!(evidence)),
+                PendingCall::Search => searches.next().map(|hits| json!(hits)),
+                PendingCall::Action => actions.next().and_then(|action| {
+                    receipts.get(&action).map(|(id, outcome)| {
+                        sent.insert(*id);
+                        json!({ "id": id, "action": action, "outcome": outcome })
+                    })
+                }),
+                PendingCall::Invalid => Some(json!({ "error": "无效工具调用" })),
+            }
+            .unwrap_or_else(|| json!({ "error": "工具结果缺失" }))
+            .to_string();
+            match provider {
+                ProviderKind::OpenAi => self.messages.push(json!({
+                    "role": "tool", "tool_call_id": id, "content": data
+                })),
+                ProviderKind::Anthropic => blocks.push(json!({
+                    "type": "tool_result", "tool_use_id": id, "content": data
+                })),
+            }
+        }
+
+        let extra_lines: Vec<String> = feedback
+            .entries
+            .iter()
+            .filter(|entry| !sent.contains(&entry.id))
+            .filter_map(|entry| serde_json::to_string(entry).ok())
+            .collect();
+        if !extra_lines.is_empty() {
+            let extra = format!("{}\n", extra_lines.join("\n"));
+            match provider {
+                ProviderKind::OpenAi => self.messages.push(user_message(extra)),
+                ProviderKind::Anthropic => {
+                    blocks.push(json!({ "type": "text", "text": extra }));
+                }
+            }
+        }
+        if !blocks.is_empty() {
+            self.messages
+                .push(json!({ "role": "user", "content": blocks }));
+        }
+    }
+}
+
+/// Project the immutable Core journal from `anchor` through `head` into a strictly append-only
+/// sequence of immutable JSON record messages.
+/// Advances `anchor` only when the projected window exceeds `max_bytes`.
+pub fn project_window(
+    eja: &Eja,
+    anchor: &mut Id,
+    max_bytes: usize,
+) -> eja_core::Result<Vec<String>> {
+    let head = eja.view()?.revision;
+    if head == 0 {
+        *anchor = 0;
+        return Ok(Vec::new());
+    }
+    if *anchor > head {
+        *anchor = 0;
+    }
+    let rendered = render_window(eja, *anchor, head)?;
+    if window_bytes(&rendered) <= max_bytes {
+        return Ok(rendered);
+    }
+    let entries = entries_since(eja, *anchor, head)?;
+    let target_bytes = max_bytes / 2;
+    let mut kept_bytes = 0usize;
+    let mut keep_from = entries.len().saturating_sub(1);
+    for idx in (0..entries.len()).rev() {
+        let line_len = serde_json::to_string(&entries[idx])?.len() + 1;
+        if idx < entries.len() - 1 && kept_bytes + line_len > target_bytes {
+            break;
+        }
+        kept_bytes += line_len;
+        keep_from = idx;
+    }
+    let new_anchor = if keep_from > 0 {
+        entries[keep_from - 1].id
+    } else {
+        *anchor
+    };
+    if new_anchor > *anchor {
+        *anchor = new_anchor;
+        render_window(eja, *anchor, head)
+    } else {
+        Ok(rendered)
+    }
+}
+
+pub fn window_bytes(records: &[String]) -> usize {
+    records.iter().map(|record| record.len() + 1).sum()
+}
+
+pub fn render_window(eja: &Eja, anchor: Id, head: Id) -> eja_core::Result<Vec<String>> {
+    let mut out = Vec::new();
+    if anchor > 0 {
+        let concerns = concerns_at(eja, anchor)?;
+        out.push(serde_json::to_string(&json!({
+            "anchor": anchor,
+            "concerns": concerns
+        }))?);
+    }
+    for entry in entries_since(eja, anchor, head)? {
+        out.push(serde_json::to_string(&entry)?);
+    }
+    Ok(out)
+}
+
+pub fn entries_since(eja: &Eja, after: Id, mut through: Id) -> eja_core::Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    while through > after {
+        let page = eja.history(through)?;
+        let Some(last_id) = page.last().map(|entry| entry.id) else {
+            break;
+        };
+        let reached = last_id <= after;
+        entries.extend(page.into_iter().take_while(|entry| entry.id > after));
+        if reached || last_id <= 1 {
+            break;
+        }
+        through = last_id - 1;
+    }
+    entries.reverse();
+    Ok(entries)
+}
+
+fn concerns_at(eja: &Eja, revision: Id) -> eja_core::Result<Vec<Concern>> {
+    if revision == 0 {
+        return Ok(Vec::new());
+    }
+    let mut all = Vec::new();
+    let mut cursor = revision;
+    loop {
+        let page = eja.concerns(revision, cursor)?;
+        let count = page.len();
+        let Some(last_latest) = page.last().map(|item| item.latest) else {
+            break;
+        };
+        all.extend(page);
+        if count < eja_core::PAGE || last_latest <= 1 {
+            break;
+        }
+        cursor = last_latest - 1;
+    }
+    Ok(all)
+}
+
+struct WireToolDef {
     name: String,
     description: String,
     schema: Value,
 }
 
-fn build_tool_specs(
-    mcp_tools: &[McpTool],
-    has_encoder: bool,
-) -> (Vec<ToolSpec>, HashMap<String, String>) {
-    let mut specs = vec![
-        ToolSpec {
+fn build_tool_defs(hands_tools: &[ToolSpec]) -> Vec<WireToolDef> {
+    let mut defs = vec![
+        WireToolDef {
             name: "keep".into(),
-            description: "新建或更新一条跨回合挂念。".into(),
+            description: "新建或更新一条跨窗口挂念。".into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -200,7 +406,7 @@ fn build_tool_specs(
                 "required": ["text"]
             }),
         },
-        ToolSpec {
+        WireToolDef {
             name: "release".into(),
             description: "结束并放下不再需要的挂念。".into(),
             schema: json!({
@@ -209,7 +415,7 @@ fn build_tool_specs(
                 "required": ["concern"]
             }),
         },
-        ToolSpec {
+        WireToolDef {
             name: "read".into(),
             description: "按 ID 回读任意历史日志条目的完整内容。".into(),
             schema: json!({
@@ -218,92 +424,73 @@ fn build_tool_specs(
                 "required": ["fact"]
             }),
         },
-    ];
-    if has_encoder {
-        specs.push(ToolSpec {
+        WireToolDef {
             name: "search".into(),
-            description: "按语义检索全历史日志。".into(),
+            description: "用简短线索查找历史事实。可用空格分隔多个关键词。".into(),
             schema: json!({
                 "type": "object",
                 "properties": { "cue": { "type": "string" } },
                 "required": ["cue"]
             }),
+        },
+    ];
+    for spec in hands_tools {
+        defs.push(WireToolDef {
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+            schema: spec.schema.clone(),
         });
     }
-    specs.extend([
-        ToolSpec {
-            name: "say".into(),
-            description: "对人说一句话（支持 Markdown）。".into(),
-            schema: json!({
-                "type": "object",
-                "properties": { "text": { "type": "string" } },
-                "required": ["text"]
-            }),
-        },
-        ToolSpec {
-            name: "wake".into(),
-            description: "预约未来某个时刻主动唤醒自己。".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "delay_seconds": { "type": "integer", "minimum": 5 },
-                    "reason": { "type": "string" }
-                },
-                "required": ["delay_seconds", "reason"]
-            }),
-        },
-        ToolSpec {
-            name: "shell".into(),
-            description: "在本地 macOS 上执行 shell 命令（可用于读写文件、编写 MCP Server 等）。"
-                .into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "cwd": { "type": "string" }
-                },
-                "required": ["command"]
-            }),
-        },
-    ]);
+    defs
+}
 
-    let mut used: HashSet<String> = specs.iter().map(|s| s.name.clone()).collect();
-    let mut alias_to_cap = HashMap::new();
-    for tool in mcp_tools {
-        let alias = safe_tool_name(&tool.capability, &mut used);
-        alias_to_cap.insert(alias.clone(), tool.capability.clone());
-        specs.push(ToolSpec {
-            name: alias,
-            description: if tool.description.is_empty() {
-                format!("MCP 工具 {}", tool.capability)
-            } else {
-                tool.description.clone()
-            },
-            schema: tool.input_schema.clone(),
-        });
+struct ToolInvocation {
+    id: String,
+    name: String,
+    args: Value,
+}
+
+struct Completion {
+    message: Value,
+    text: String,
+    calls: Vec<ToolInvocation>,
+}
+
+fn user_message(content: impl Into<String>) -> Value {
+    json!({ "role": "user", "content": content.into() })
+}
+
+fn complete(
+    provider: &ProviderConfig,
+    model: &str,
+    system: &str,
+    messages: &[Value],
+    tools: Option<&[WireToolDef]>,
+) -> Result<Completion, String> {
+    match provider.kind {
+        ProviderKind::OpenAi => call_openai(provider, model, system, messages, tools),
+        ProviderKind::Anthropic => call_anthropic(provider, model, system, messages, tools),
     }
-    (specs, alias_to_cap)
 }
 
 fn call_openai(
     provider: &ProviderConfig,
     model: &str,
     system: &str,
-    user: &str,
-    tools: Option<&[ToolSpec]>,
-) -> Result<(String, Vec<(String, Value)>), String> {
+    messages: &[Value],
+    tools: Option<&[WireToolDef]>,
+) -> Result<Completion, String> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/chat/completions") {
         base.to_string()
     } else {
         format!("{base}/chat/completions")
     };
+    let system_message = json!({ "role": "system", "content": system });
+    let messages: Vec<_> = std::iter::once(&system_message).chain(messages).collect();
     let mut body = json!({
         "model": model,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user }
-        ]
+        "messages": messages
     });
     if let Some(list) = tools {
         let mapped: Vec<Value> = list
@@ -340,33 +527,60 @@ fn call_openai(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let mut message = json!({ "role": "assistant", "content": msg["content"] });
+    if let Some(reasoning) = msg
+        .get("reasoning_content")
+        .filter(|value| value.is_string())
+    {
+        message["reasoning_content"] = reasoning.clone();
+    }
     let mut calls = Vec::new();
-    if let Some(arr) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-        for item in arr {
-            let Some(name) = item.pointer("/function/name").and_then(|v| v.as_str()) else {
+    if let Some(arr) = msg.get("tool_calls").and_then(Value::as_array) {
+        let mut wire_calls = Vec::new();
+        for (index, item) in arr.iter().enumerate() {
+            let Some(name) = item.pointer("/function/name").and_then(Value::as_str) else {
                 continue;
             };
-            let raw_args = item.pointer("/function/arguments");
-            let args = match raw_args {
-                Some(Value::String(s)) => {
-                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
-                }
-                Some(v) if v.is_object() => v.clone(),
-                _ => json!({}),
+            let id = item["id"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("call_{}_{index}", messages.len()));
+            let (args, arguments) = match item.pointer("/function/arguments") {
+                Some(Value::String(s)) => (
+                    serde_json::from_str(s).unwrap_or_else(|_| json!({})),
+                    s.clone(),
+                ),
+                Some(v) if v.is_object() => (v.clone(), v.to_string()),
+                _ => (json!({}), "{}".into()),
             };
-            calls.push((name.to_string(), args));
+            wire_calls.push(json!({
+                "id": id, "type": "function",
+                "function": { "name": name, "arguments": arguments }
+            }));
+            calls.push(ToolInvocation {
+                id,
+                name: name.into(),
+                args,
+            });
+        }
+        if !wire_calls.is_empty() {
+            message["tool_calls"] = json!(wire_calls);
         }
     }
-    Ok((text, calls))
+    Ok(Completion {
+        message,
+        text,
+        calls,
+    })
 }
 
 fn call_anthropic(
     provider: &ProviderConfig,
     model: &str,
     system: &str,
-    user: &str,
-    tools: Option<&[ToolSpec]>,
-) -> Result<(String, Vec<(String, Value)>), String> {
+    messages: &[Value],
+    tools: Option<&[WireToolDef]>,
+) -> Result<Completion, String> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/messages") {
         base.to_string()
@@ -379,7 +593,7 @@ fn call_anthropic(
         "model": model,
         "max_tokens": 4096,
         "system": system,
-        "messages": [{ "role": "user", "content": user }]
+        "messages": messages
     });
     if let Some(list) = tools {
         let mapped: Vec<Value> = list
@@ -419,15 +633,22 @@ fn call_anthropic(
                 }
             }
             Some("tool_use") => {
-                if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
-                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                    calls.push((name.to_string(), input));
+                if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
+                    calls.push(ToolInvocation {
+                        id: id.into(),
+                        name: name.into(),
+                        args: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                    });
                 }
             }
             _ => {}
         }
     }
-    Ok((texts.join("\n"), calls))
+    Ok(Completion {
+        message: json!({ "role": "assistant", "content": blocks }),
+        text: texts.join("\n"),
+        calls,
+    })
 }
 
 fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Value, String> {
@@ -482,36 +703,108 @@ fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Va
     Ok(parsed)
 }
 
-fn latest_notice_needs_reply(view: &View) -> bool {
-    matches!(
-        view.recent.first().map(|entry| &entry.fact),
-        Some(Fact::Noticed {
-            source: Source::Person | Source::Clock,
-            ..
-        })
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eja_core::{Outcome, Source};
 
-fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
-    let mut base: String = capability
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(56)
-        .collect();
-    if base.is_empty() {
-        base = "mcp_tool".to_string();
+    #[test]
+    fn deterministic_window_projection_is_strictly_append_only_until_reset() -> eja_core::Result<()>
+    {
+        let eja = Eja::open(":memory:")?;
+        let mut anchor = 0;
+        let first = eja.notice(Source::Person, "first notice")?;
+        let w1 = project_window(&eja, &mut anchor, 4096)?;
+        assert_eq!(anchor, 0);
+
+        eja.commit(
+            first,
+            &Step {
+                keep: vec![Keep {
+                    concern: None,
+                    text: "track workshop labels".into(),
+                }],
+                ..Step::default()
+            },
+            &[],
+        )?;
+        eja.notice(Source::Person, "second notice")?;
+        let w2 = project_window(&eja, &mut anchor, 4096)?;
+        assert_eq!(anchor, 0);
+        assert!(w2.starts_with(&w1));
+
+        let w3 = project_window(&eja, &mut anchor, 220)?;
+        assert!(anchor > 0);
+        let header: Value = serde_json::from_str(&w3[0]).unwrap();
+        assert_eq!(header["anchor"], anchor);
+        assert_eq!(header["concerns"][0]["text"], "track workshop labels");
+        Ok(())
     }
-    let mut candidate = base.clone();
-    let mut idx = 2usize;
-    while !used.insert(candidate.clone()) {
-        candidate = format!("{base}_{idx}");
-        idx += 1;
+
+    #[test]
+    fn batched_tool_results_follow_call_ids_in_both_protocols() -> eja_core::Result<()> {
+        let eja = Eja::open(":memory:")?;
+        let input = eja.notice(Source::Person, "check")?;
+        let calls = eja.commit(
+            input,
+            &Step {
+                keep: vec![Keep {
+                    concern: None,
+                    text: "follow up".into(),
+                }],
+                act: vec![Act {
+                    capability: "check".into(),
+                    input: Value::Null,
+                }],
+                ..Step::default()
+            },
+            &["check"],
+        )?;
+        let action = calls[0].id;
+        let receipt = eja.finish(action, Outcome::Failed("unavailable".into()))?;
+        let mut view = eja.view()?;
+        view.reads.push(eja.evidence(input, view.revision)?);
+        let entries: Vec<_> = (input + 1..=receipt)
+            .map(|id| eja.read(id))
+            .collect::<eja_core::Result<_>>()?;
+
+        for provider in [ProviderKind::OpenAi, ProviderKind::Anthropic] {
+            let mut turn = TurnSession {
+                messages: vec![user_message("start")],
+                pending: vec![
+                    ("action".into(), PendingCall::Action),
+                    ("read".into(), PendingCall::Read),
+                    ("keep".into(), PendingCall::Keep),
+                ],
+                said: false,
+            };
+            turn.append_feedback(
+                &provider,
+                &view,
+                StepFeedback {
+                    entries: &entries,
+                    actions: &[action],
+                },
+            );
+            let (results, id_key) = match provider {
+                ProviderKind::OpenAi => (&turn.messages[1..], "tool_call_id"),
+                ProviderKind::Anthropic => (
+                    turn.messages[1]["content"].as_array().unwrap().as_slice(),
+                    "tool_use_id",
+                ),
+            };
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[0][id_key], "action");
+            assert_eq!(results[1][id_key], "read");
+            assert_eq!(results[2][id_key], "keep");
+            let result = |index: usize| {
+                serde_json::from_str::<Value>(results[index]["content"].as_str().unwrap()).unwrap()
+            };
+            assert_eq!(result(0)["id"], receipt);
+            assert_eq!(result(0)["outcome"]["status"], "failed");
+            assert_eq!(result(1)["id"], input);
+            assert_eq!(result(2)["concern"], input + 1);
+        }
+        Ok(())
     }
-    candidate
 }

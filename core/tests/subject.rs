@@ -1,6 +1,5 @@
 use eja_core::{
     Act, Eja, Error, Fact, Keep, Outcome, Source, Step, Stop, Timestamp, FACT_BYTES, PAGE,
-    REPLAY_PAGE,
 };
 use serde_json::json;
 use std::sync::{
@@ -485,7 +484,6 @@ fn commit_records_revisions_and_releases_explicitly() -> Result<()> {
     let eja = Eja::open(":memory:")?;
     let basis = eja.notice(Source::Person, "remember aurora and refine if needed")?;
     assert!(!eja.has_encoder());
-    assert!(matches!(eja.search("aurora"), Err(Error::Invalid(_))));
     eja.commit(basis, &step_keep(vec![keep(None, "aurora")]), &[])?;
     let concern = eja.view()?.concerns[0].id;
     eja.commit(
@@ -552,144 +550,5 @@ fn physical_time_is_rfc3339_monotonic_and_visible_across_reopen() -> Result<()> 
     assert_eq!(view.now, t2);
     assert_eq!(view.concerns[0].at, t1);
     assert_eq!(reopened.read(first)?.at, t0);
-    Ok(())
-}
-
-#[test]
-fn slow_consolidation_replays_chronologically_and_enforces_monotonic_watermark() -> Result<()> {
-    let t0 = Timestamp::parse_rfc3339("2026-11-01T08:00:00Z")?.as_unix();
-    let clock = Arc::new(AtomicI64::new(t0));
-    let shared = Arc::clone(&clock);
-    let eja = Eja::open(":memory:")?
-        .with_clock(move || Timestamp::from_unix(shared.load(Ordering::SeqCst)));
-
-    let total = REPLAY_PAGE + 5;
-    for idx in 1..=total {
-        clock.store(t0 + (idx as i64) * 3_600, Ordering::SeqCst);
-        eja.notice(Source::World, format!("episode {idx}"))?;
-    }
-    let rev = eja.view()?.revision;
-    assert_eq!(rev as usize, total);
-    assert!(eja.view()?.consolidated.is_none());
-
-    // Reject invalid consolidation bounds, empty text, and stale CAS revisions.
-    assert!(matches!(
-        eja.commit_consolidation(None, rev + 1, "future"),
-        Err(Error::Invalid(_))
-    ));
-    assert!(matches!(
-        eja.commit_consolidation(Some(999), rev, "stale"),
-        Err(Error::Conflict)
-    ));
-    assert!(matches!(
-        eja.commit_consolidation(None, rev, "   "),
-        Err(Error::Invalid(_))
-    ));
-    assert_eq!(eja.view()?.revision, rev);
-
-    // Run the slow consolidation loop across two bounded chronological replay windows.
-    let mut windows = 0;
-    let latest = eja.consolidate(5, |window| {
-        windows += 1;
-        match windows {
-            1 => {
-                assert!(window.previous.is_none());
-                assert_eq!(window.entries.len(), REPLAY_PAGE);
-                assert_eq!(window.entries.first().unwrap().id, 1);
-                assert_eq!(window.through as usize, REPLAY_PAGE);
-                Ok("distilled window 1".into())
-            }
-            2 => {
-                assert!(matches!(
-                    &window.previous.as_ref().unwrap().fact,
-                    Fact::Consolidated { through, text }
-                        if *through as usize == REPLAY_PAGE && text == "distilled window 1"
-                ));
-                // Window 2 excludes the consolidation fact itself and ends cleanly at `rev`.
-                assert_eq!(window.entries.len(), 5);
-                assert_eq!(window.entries.first().unwrap().id as usize, REPLAY_PAGE + 1);
-                assert_eq!(window.through, rev);
-                Ok("distilled window 1 + 2".into())
-            }
-            _ => panic!("expected loop to terminate once caught up"),
-        }
-    })?;
-    assert_eq!(windows, 2);
-
-    let view = eja.view()?;
-    let second_id = view.consolidated.as_ref().unwrap().id;
-    assert_eq!(latest, Some(second_id));
-    let first_id = second_id - 1;
-    assert!(matches!(
-        &view.consolidated.as_ref().unwrap().fact,
-        Fact::Consolidated { through, text }
-            if *through == rev && text == "distilled window 1 + 2"
-    ));
-
-    // Evidence on an older consolidation carries `latest` pointing to the newest consolidation.
-    let evidence = eja.evidence(first_id, view.revision)?;
-    assert_eq!(evidence.latest.as_ref().unwrap().id, second_id);
-
-    // Once caught up, `consolidate` performs zero work and returns `None`.
-    assert!(eja.unconsolidated()?.is_none());
-    assert_eq!(eja.consolidate(3, |_| panic!("already caught up"))?, None);
-
-    // Cannot re-consolidate backwards or consolidate only consolidation entries with no new facts.
-    assert!(matches!(
-        eja.commit_consolidation(Some(second_id), rev, "duplicate"),
-        Err(Error::Invalid(_))
-    ));
-    assert!(matches!(
-        eja.commit_consolidation(Some(second_id), view.revision, "only consolidations"),
-        Err(Error::Invalid(_))
-    ));
-    Ok(())
-}
-
-#[test]
-fn consolidation_tolerates_concurrent_notices_and_blocks_competing_consolidators() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("subject.db");
-    let writer = Eja::open(&path)?;
-    let first = writer.notice(Source::World, "event 1")?;
-    let second = writer.notice(Source::World, "event 2")?;
-
-    // A new notice arriving while distillation is in flight must not starve consolidation.
-    let consolidator = Eja::open(&path)?;
-    let window = consolidator.unconsolidated()?.unwrap();
-    assert_eq!(window.through, second);
-    assert!(window.previous.is_none());
-    let arrived_during_sleep = writer.notice(Source::Person, "event 3 arrived mid-sleep")?;
-    let c1 = consolidator.commit_consolidation(None, window.through, "distilled 1..=2")?;
-    assert!(c1 > arrived_during_sleep);
-
-    // The newly arrived notice is picked up cleanly by the next window.
-    let next_window = consolidator.unconsolidated()?.unwrap();
-    assert_eq!(next_window.previous.as_ref().unwrap().id, c1);
-    assert_eq!(next_window.entries.len(), 1);
-    assert_eq!(next_window.entries[0].id, arrived_during_sleep);
-    assert_eq!(next_window.through, arrived_during_sleep);
-    drop((writer, consolidator));
-
-    // Two competing consolidators racing on the same `previous` yield exactly one winner.
-    let left = Eja::open(&path)?;
-    let right = Eja::open(&path)?;
-    let barrier = std::sync::Barrier::new(2);
-    std::thread::scope(|scope| {
-        let race = |eja: Eja, label: &str| {
-            barrier.wait();
-            match eja.commit_consolidation(Some(c1), arrived_during_sleep, label) {
-                Ok(_) => true,
-                Err(Error::Conflict) => false,
-                other => panic!("unexpected result: {other:?}"),
-            }
-        };
-        let a = scope.spawn(move || race(left, "winner A"));
-        let b = scope.spawn(move || race(right, "winner B"));
-        assert_ne!(a.join().unwrap(), b.join().unwrap());
-    });
-    let check = Eja::open(&path)?;
-    assert!(check.unconsolidated()?.is_none());
-    assert!(check.read(first).is_ok());
     Ok(())
 }

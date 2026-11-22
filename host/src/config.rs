@@ -53,14 +53,6 @@ impl ModelRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Assignments {
-    #[serde(default)]
-    pub judge: ModelRef,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consolidate: Option<ModelRef>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConnectorTransport {
@@ -96,7 +88,7 @@ pub struct HostConfig {
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
-    pub assignments: Assignments,
+    pub judge: ModelRef,
     #[serde(default)]
     pub connectors: Vec<ConnectorConfig>,
 }
@@ -112,12 +104,9 @@ impl Default for HostConfig {
                 api_key: String::new(),
                 models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
             }],
-            assignments: Assignments {
-                judge: ModelRef {
-                    provider_id: "openai".into(),
-                    model: "gpt-4o".into(),
-                },
-                consolidate: None,
+            judge: ModelRef {
+                provider_id: "openai".into(),
+                model: "gpt-4o".into(),
             },
             connectors: Vec::new(),
         }
@@ -148,19 +137,7 @@ impl HostConfig {
     }
 
     pub fn resolve_judge(&self) -> Option<(&ProviderConfig, &str)> {
-        self.resolve_ref(&self.assignments.judge)
-    }
-
-    pub fn resolve_consolidate(&self) -> Option<(&ProviderConfig, &str)> {
-        if let Some(target) = &self.assignments.consolidate {
-            if let Some(resolved) = self.resolve_ref(target) {
-                return Some(resolved);
-            }
-        }
-        self.resolve_judge()
-    }
-
-    fn resolve_ref<'a>(&'a self, target: &'a ModelRef) -> Option<(&'a ProviderConfig, &'a str)> {
+        let target = &self.judge;
         if !target.is_set() {
             return None;
         }

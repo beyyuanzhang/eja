@@ -1,4 +1,5 @@
 mod config;
+mod hands;
 mod llm;
 mod mcp;
 mod runtime;
@@ -29,7 +30,6 @@ enum Command {
         model: String,
     },
     ReloadConnectors,
-    Consolidate,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -112,9 +112,6 @@ fn main() {
             }
             Command::ReloadConnectors => {
                 thread::spawn(move || rt.reload_connectors());
-            }
-            Command::Consolidate => {
-                thread::spawn(move || rt.consolidate_now(true));
             }
         }
     }

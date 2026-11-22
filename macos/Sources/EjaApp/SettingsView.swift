@@ -7,9 +7,6 @@ final class SettingsDraft: ObservableObject {
     @Published var providers: [ProviderConfigDTO] = []
     @Published var judgeProviderId: String = ""
     @Published var judgeModel: String = ""
-    @Published var useSameConsolidate: Bool = true
-    @Published var consolidateProviderId: String = ""
-    @Published var consolidateModel: String = ""
     @Published var selectedProviderId: String?
 
     @Published var connectors: [ConnectorConfigDTO] = []
@@ -18,17 +15,8 @@ final class SettingsDraft: ObservableObject {
 
     func load(from config: HostConfigDTO) {
         providers = config.providers
-        judgeProviderId = config.assignments.judge.providerId
-        judgeModel = config.assignments.judge.model
-        if let cons = config.assignments.consolidate, !cons.model.isEmpty {
-            useSameConsolidate = false
-            consolidateProviderId = cons.providerId
-            consolidateModel = cons.model
-        } else {
-            useSameConsolidate = true
-            consolidateProviderId = judgeProviderId
-            consolidateModel = ""
-        }
+        judgeProviderId = config.judge.providerId
+        judgeModel = config.judge.model
         selectedProviderId = providers.first?.id
         connectors = config.connectors
         selectedConnectorId = connectors.first?.id
@@ -36,13 +24,9 @@ final class SettingsDraft: ObservableObject {
 
     func buildConfig() -> HostConfigDTO {
         let judge = ModelRefDTO(providerId: judgeProviderId, model: judgeModel.trimmingCharacters(in: .whitespacesAndNewlines))
-        let consolidate: ModelRefDTO? = useSameConsolidate ? nil : ModelRefDTO(
-            providerId: consolidateProviderId,
-            model: consolidateModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
         return HostConfigDTO(
             providers: providers,
-            assignments: AssignmentsDTO(judge: judge, consolidate: consolidate),
+            judge: judge,
             connectors: connectors
         )
     }
@@ -123,35 +107,15 @@ struct SettingsView: View {
 
     private var llmTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            GroupBox("模型分配") {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("主思考模型").frame(width: 90, alignment: .leading)
-                        Picker("", selection: $draft.judgeProviderId) {
-                            ForEach(draft.providers) { Text($0.name).tag($0.id) }
-                        }
-                        .labelsHidden()
-                        .frame(width: 150)
-                        TextField("模型名，如 gpt-4o / deepseek-chat", text: $draft.judgeModel)
-                            .textFieldStyle(.roundedBorder)
+            GroupBox("主模型") {
+                HStack {
+                    Picker("", selection: $draft.judgeProviderId) {
+                        ForEach(draft.providers) { Text($0.name).tag($0.id) }
                     }
-                    HStack {
-                        Toggle("记忆整理复用主模型", isOn: $draft.useSameConsolidate)
-                            .font(.callout)
-                        Spacer()
-                    }
-                    if !draft.useSameConsolidate {
-                        HStack {
-                            Text("记忆整理").frame(width: 90, alignment: .leading)
-                            Picker("", selection: $draft.consolidateProviderId) {
-                                ForEach(draft.providers) { Text($0.name).tag($0.id) }
-                            }
-                            .labelsHidden()
-                            .frame(width: 150)
-                            TextField("便宜/快速的模型名", text: $draft.consolidateModel)
-                                .textFieldStyle(.roundedBorder)
-                        }
-                    }
+                    .labelsHidden()
+                    .frame(width: 150)
+                    TextField("模型名，如 gpt-4o / deepseek-chat", text: $draft.judgeModel)
+                        .textFieldStyle(.roundedBorder)
                 }
                 .padding(6)
             }

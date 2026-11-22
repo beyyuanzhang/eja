@@ -2,9 +2,11 @@
 
 EJA 是一个连续的、有自我同一性的主体。仓库采用极简三层结构：
 
-- `core/`（`eja-core`）：主体内核，负责 SQLite 主体日志、状态机、关切、快回路 `turn`、慢回路 `consolidate` 以及可选语义召回（`onnx` + `sqlite-vec`）。详见 `core/README.md`。
-- `host/`（`eja-host`）：Rust 运行时与能力层，直接驱动 `eja-core`，提供多 LLM Provider 管理（OpenAI 兼容 / Anthropic）、统一标准 MCP 连接器（`stdio` + `HTTP` 热加载）以及 `say` / `wake` / `shell` 最小内置原语。
-- `macos/`（`EjaClient` + `EjaApp`）：纯薄 macOS 原生 SwiftUI 交互壳（对话、记忆查看、LLM 与 MCP 设置、菜单栏常驻）。详见 `macos/README.md`。
+- `core/`（`eja-core`）：主体内核，负责 SQLite 主体日志、状态机、关切、回合 `turn` 以及可选语义召回（`onnx` + `sqlite-vec`）。详见 `core/README.md`。
+- `host/`（`eja-host`）：Rust 驱动循环与统一能力层，由三块组成：`llm.rs` 基于 `anchor` 将只追加主体日志确定性投影到模型上下文（超限时推进 `anchor` 重置窗口，单回合内临时附着工具结果），`hands.rs` 与 `mcp.rs` 将 `say` / `wake` / `shell` 和热加载 MCP 连接器统一到同一工具注册与执行接口，`runtime.rs` 负责事件桥接与配置同步。
+- `macos/`（`EjaClient` + `EjaApp`）：纯薄 macOS 原生 SwiftUI 交互壳（对话、关切与唤醒查看、LLM 与 MCP 设置、菜单栏常驻）。详见 `macos/README.md`。
+
+默认支持本地关键词查找旧事实，可选语义编码器。
 
 ## 构建与验证
 
@@ -33,3 +35,4 @@ cargo build -p eja-host
 - `subject.db`：`eja-core` 永久主体日志
 - `config.json`：LLM 与 MCP 连接器配置
 - `wakes.json`：定时唤醒记录
+- `window.json`：当前上下文窗口起点 `anchor`

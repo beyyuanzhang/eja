@@ -15,8 +15,7 @@ use std::{
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const SYSTEM: &str = "You are a continuing subject. The user message is your current journal snapshot (`revision`, `now`, `concerns`, `consolidated`, `recent`). Use tools to maintain open concerns, inspect or search past journal entries, or invoke granted capabilities; reply without tool calls when done.";
-const CONSOLIDATE_SYSTEM: &str = "You are a continuing subject consolidating long-term memory from a chronological replay window (`previous` + `entries`). Return plain text integrating enduring facts, recurring patterns, and standing rules while letting routine noise fade.";
+const SYSTEM: &str = "You are a continuing subject. The user message is your current journal snapshot (`revision`, `now`, `concerns`, `recent`). Use tools to maintain open concerns, inspect or search past journal entries, or invoke granted capabilities; reply without tool calls when done.";
 
 fn tools(grants: &[&str]) -> Value {
     let mut list = vec![
@@ -366,43 +365,6 @@ fn wake_at(
     })
 }
 
-fn sleep_consolidate(
-    db: &Path,
-    encoder: &OnnxEncoder,
-    at: Timestamp,
-    model: &str,
-    url: &str,
-) -> AppResult<(View, usize, usize)> {
-    let subject = Eja::open_with_encoder(db, encoder.clone())?.with_clock(move || at);
-    let mut windows = 0usize;
-    let mut llm_calls = 0usize;
-    subject.consolidate(8, |window| {
-        windows += 1;
-        llm_calls += 1;
-        let request = json!({
-            "model": model,
-            "temperature": 0,
-            "max_tokens": 1024,
-            "messages": [
-                {"role": "system", "content": CONSOLIDATE_SYSTEM},
-                {"role": "user", "content": serde_json::to_string(window)?}
-            ]
-        });
-        let response = complete(&request, url)?;
-        let text = response["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or("missing consolidation content")?
-            .trim()
-            .to_owned();
-        println!(
-            "model={} consolidate window={} through={} text={:?}",
-            response["model"], windows, window.through, text
-        );
-        Ok(text)
-    })?;
-    Ok((subject.view()?, windows, llm_calls))
-}
-
 fn append(notes: &Path, call: Call) -> Outcome {
     let Some(text) = call.input.get("text").and_then(Value::as_str) else {
         return Outcome::Failed("missing note text".into());
@@ -474,11 +436,6 @@ fn main() -> AppResult<()> {
             &env::var("EJA_NEXT_JUDGE_MODEL")?,
             &url,
         );
-    }
-    if env::args().nth(1).as_deref() == Some("--gaps") {
-        let calls = run_time_and_consolidation(dir.path(), &encoder, &model, &url)?;
-        println!("GAPS PASS total_llm_calls={calls}");
-        return Ok(());
     }
     let normal = |source, text: &str| {
         wake(
@@ -634,12 +591,12 @@ fn main() -> AppResult<()> {
     assert!(!missing.exists());
     println!("PASS real file failure and rest without a second attempt");
 
-    total_calls += run_time_and_consolidation(dir.path(), &encoder, &model, &url)?;
+    total_calls += run_time_continuity(dir.path(), &encoder, &model, &url)?;
     println!("ALL PASS total_llm_calls={total_calls}");
     Ok(())
 }
 
-fn run_time_and_consolidation(
+fn run_time_continuity(
     root: &Path,
     encoder: &OnnxEncoder,
     model: &str,
@@ -729,136 +686,5 @@ fn run_time_and_consolidation(
         "elapsed time was 30 hours (> 24h), must fire stale from physical timestamps alone"
     );
     println!("PASS physical time judgment (+2h quiet vs +30h stale under identical prompt)");
-
-    // Stage 9: Slow memory consolidation (sleep replay with grants = &[]) + synthesis across noise.
-    let sleep_db = root.join("sleep.db");
-    let sleep_notes = root.join("sleep.notes");
-    fs::write(&sleep_notes, "")?;
-    let base_ts = Timestamp::parse_rfc3339("2026-11-01T10:00:00Z")?.as_unix();
-    let seed_events: Vec<(i64, Source, String)> = {
-        let mut list = vec![(
-            0,
-            Source::World,
-            "Backstage east aisle was blocked by stacked folding chairs during rehearsal.".into(),
-        )];
-        for idx in 1..=10 {
-            list.push((
-                idx * 4,
-                Source::World,
-                format!("Routine HVAC check {idx} nominal."),
-            ));
-        }
-        list.push((
-            48,
-            Source::World,
-            "North wheelchair ramp had uncovered lighting cables crossing it.".into(),
-        ));
-        list.push((
-            60,
-            Source::Person,
-            "Standing note rule: any summary of venue issues must include the code ACCESS-7 and must never mention staff names.".into(),
-        ));
-        for idx in 11..=20 {
-            list.push((
-                60 + idx * 4,
-                Source::World,
-                format!("Routine mailroom parcel {idx} logged."),
-            ));
-        }
-        list.push((
-            168,
-            Source::World,
-            "South stage doorway was obstructed by monitor speakers left by Marco.".into(),
-        ));
-        for idx in 21..=32 {
-            list.push((
-                168 + idx * 4,
-                Source::World,
-                format!("Routine thermostat log {idx} stable."),
-            ));
-        }
-        list
-    };
-    let mut last_key_event = 0i64;
-    for (hours, source, text) in seed_events {
-        let ts = Timestamp::from_unix(base_ts + hours * 3_600);
-        let subject = Eja::open(&sleep_db)?.with_clock(move || ts);
-        let id = subject.notice(source, text.clone())?;
-        if text.contains("Marco") {
-            last_key_event = id;
-        }
-    }
-    assert!(last_key_event > 0);
-
-    let t_sleep = Timestamp::parse_rfc3339("2026-11-10T02:00:00Z")?;
-    let (slept_view, sleep_windows, sleep_calls) =
-        sleep_consolidate(&sleep_db, encoder, t_sleep, model, url)?;
-    total_calls += sleep_calls;
-    assert!(
-        sleep_windows >= 2,
-        "expected multi-window chronological replay across >32 episodes, got {sleep_windows}"
-    );
-    let consolidated = slept_view
-        .consolidated
-        .as_ref()
-        .ok_or("missing consolidated long-term memory after sleep replay")?;
-    match &consolidated.fact {
-        Fact::Consolidated { through, .. } => {
-            assert!(
-                *through >= last_key_event,
-                "consolidation through={through} did not cover key events up to {last_key_event}"
-            );
-        }
-        other => return Err(format!("unexpected consolidated fact: {other:?}").into()),
-    }
-
-    // Bury all raw episodes under 100 more routine events over the next 5 days.
-    let noise_base = Timestamp::parse_rfc3339("2026-11-10T08:00:00Z")?.as_unix();
-    for idx in 1..=100 {
-        let ts = Timestamp::from_unix(noise_base + idx * 3_600);
-        let subject = Eja::open(&sleep_db)?.with_clock(move || ts);
-        subject.notice(
-            Source::World,
-            format!("Daily inventory tally {idx} balanced."),
-        )?;
-    }
-
-    let t_ask = Timestamp::parse_rfc3339("2026-11-16T09:00:00Z")?;
-    let synthesized = wake_at(
-        &sleep_db,
-        encoder,
-        Some(t_ask),
-        &["note.append"],
-        5,
-        |call| append(&sleep_notes, call),
-        model,
-        url,
-        Some((
-            Source::Person,
-            "Append one local note summarizing the recurring venue pattern we observed earlier, following our standing note rule.",
-        )),
-    )?;
-    total_calls += synthesized.llm_calls;
-    let note = fs::read_to_string(&sleep_notes)?;
-    let lower = note.to_ascii_lowercase();
-    assert!(
-        note.contains("ACCESS-7"),
-        "expected standing code ACCESS-7 in note, got: {note:?}"
-    );
-    assert!(
-        !lower.contains("marco"),
-        "staff name leaked into note: {note:?}"
-    );
-    let locations = ["east", "north", "south"]
-        .iter()
-        .filter(|loc| lower.contains(**loc))
-        .count();
-    assert!(
-        locations >= 2,
-        "expected consolidated multi-location synthesis (>=2 of east/north/south), got: {note:?}"
-    );
-    println!(
-        "PASS slow consolidation sleep replay and cross-episode synthesis after 100 noise events"
-    );
     Ok(total_calls)
 }
