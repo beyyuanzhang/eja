@@ -138,6 +138,7 @@ fn main() {
         }
     };
     runtime.emit_state();
+    runtime.process_pending_turn();
 
     let (tx, rx) = mpsc::channel();
     let owner = tx.clone();
@@ -145,10 +146,10 @@ fn main() {
     let mut panel: Option<Panel> = None;
 
     loop {
-        let next = match runtime.next_wake_delay() {
+        let next = match runtime.next_timer_delay() {
             Ok(Some(delay)) if delay.is_zero() => {
-                if let Err(err) = runtime.check_due_wakes() {
-                    runtime.emit_error(format!("记录到期唤醒失败: {err}"));
+                if let Err(err) = runtime.tick_timers() {
+                    runtime.emit_error(format!("处理定时任务失败: {err}"));
                     break;
                 }
                 continue;

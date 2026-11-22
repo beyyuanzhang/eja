@@ -13,7 +13,8 @@ eja-host --data-dir "<data_dir>"
 ## 数据目录边界
 
 - 内核与用户数据使用同级目录。数据目录名为 `Eja` 时，内核目录为 `ai.eja.kernel`，其他目录名追加 `.kernel`。
-- 内核目录由 macOS Seatbelt 保护，沙箱内 `shell` 与本地 stdio MCP 进程无权读写。它包含 `subject.db`（主体日志和唤醒计划）、`config.json`、`window.json`、`kernel_version` 与单实例锁 `host.lock`。升级时，宿主持有原实例锁并把旧 `core/` 整体移到新位置。
+- 内核目录由 macOS Seatbelt 保护，沙箱内 `shell` 与本地 stdio MCP 进程无权读写。它包含 `subject.db`（主体日志和唤醒计划）、`config.json`、`window.json`（上下文窗口起点 `anchor` 与已判结触发水位线 `settled_through`）、`kernel_version` 与单实例锁 `host.lock`。升级时，宿主持有原实例锁并把旧 `core/` 整体移到新位置。
+- 能力授权采用“OS 沙箱边界 + 宿主暴露即授权”契约：宿主暴露给模型的工具列表（`wake`、`shell` 与已启用的 MCP 连接器）即为当次行动授权集合；宿主在用户数据目录内读写 `connectors.json` 与 `outputs/` 时不跟随符号链接，防止沙箱内进程借助宿主权限越界写入内核目录或应用包。
 - `connectors.json` 保存 MCP 连接器数组，文件变更在运行期自动热加载。
 - `ui/` 保存用户空间前端。运行 `ui/apply.sh` 发布 `ui/Eja.app` 后，宿主在与 Shell 相同的 macOS 沙箱中启动 `Contents/MacOS/EjaApp`，并通过其标准输入输出连接同一个主体。前端读入状态和事件，向标准输出写指令，环境变量 `EJA_ATTACHED_UI=1` 表示已有宿主。自定义前端可以发消息与重载用户连接器，编辑或测试模型配置由官方设置窗口处理。启动官方 App 时按住 `Option` 键进入默认界面。
 

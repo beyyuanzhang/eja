@@ -18,6 +18,20 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTCOME_BYTES: usize = 32 * 1024;
 const MAX_STDERR_BYTES: usize = 4 * 1024;
 
+#[derive(Debug, PartialEq, Eq)]
+enum RequestError {
+    Failed(String),
+    Unknown(String),
+}
+
+impl RequestError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Failed(message) | Self::Unknown(message) => message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolSummary {
     pub name: String,
@@ -119,7 +133,8 @@ impl StdioConnection {
                 "clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
             }),
             MCP_TIMEOUT,
-        )?;
+        )
+        .map_err(RequestError::into_message)?;
         conn.notify("notifications/initialized", json!({}))?;
         Ok(conn)
     }
@@ -131,7 +146,12 @@ impl StdioConnection {
         self.stdin.flush().map_err(|err| err.to_string())
     }
 
-    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, RequestError> {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({
@@ -140,20 +160,27 @@ impl StdioConnection {
             "method": method,
             "params": params
         });
-        let line = serde_json::to_string(&msg).map_err(|err| err.to_string())?;
-        writeln!(self.stdin, "{line}").map_err(|err| format!("写入 MCP 失败: {err}"))?;
-        self.stdin.flush().map_err(|err| err.to_string())?;
+        let line =
+            serde_json::to_string(&msg).map_err(|err| RequestError::Failed(err.to_string()))?;
+        writeln!(self.stdin, "{line}")
+            .map_err(|err| RequestError::Failed(format!("写入 MCP 失败: {err}")))?;
+        self.stdin
+            .flush()
+            .map_err(|err| RequestError::Unknown(format!("刷新 MCP 请求失败: {err}")))?;
 
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err(self.with_stderr(format!("MCP 请求超时 ({method})")));
+                return Err(RequestError::Unknown(
+                    self.with_stderr(format!("MCP 请求超时 ({method})")),
+                ));
             }
-            let raw = self
-                .rx
-                .recv_timeout(remaining)
-                .map_err(|_| self.with_stderr(format!("MCP 响应超时或进程退出 ({method})")))?;
+            let raw = self.rx.recv_timeout(remaining).map_err(|_| {
+                RequestError::Unknown(
+                    self.with_stderr(format!("MCP 响应超时或进程退出 ({method})")),
+                )
+            })?;
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
@@ -169,7 +196,7 @@ impl StdioConnection {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("MCP 返回错误");
-                return Err(message.to_string());
+                return Err(RequestError::Failed(message.to_string()));
             }
             return Ok(val.get("result").cloned().unwrap_or(Value::Null));
         }
@@ -214,7 +241,8 @@ impl HttpConnection {
                 "clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
             }),
             MCP_TIMEOUT,
-        )?;
+        )
+        .map_err(RequestError::into_message)?;
         let _ = conn.post_raw(
             &json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
             Duration::from_secs(5),
@@ -222,7 +250,12 @@ impl HttpConnection {
         Ok(conn)
     }
 
-    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, RequestError> {
         let id = self.next_id;
         self.next_id += 1;
         let payload = json!({
@@ -242,19 +275,24 @@ impl HttpConnection {
                 }
             }
         }
-        let parsed = parse_http_jsonrpc(&body)?;
+        let parsed = parse_http_jsonrpc(&body).map_err(RequestError::Unknown)?;
         if let Some(err) = parsed.get("error") {
             let message = err
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("MCP HTTP 返回错误");
-            return Err(message.to_string());
+            return Err(RequestError::Failed(message.to_string()));
         }
         Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    fn post_raw(&self, payload: &Value, timeout: Duration) -> Result<(String, String), String> {
-        let body_bytes = serde_json::to_vec(payload).map_err(|err| err.to_string())?;
+    fn post_raw(
+        &self,
+        payload: &Value,
+        timeout: Duration,
+    ) -> Result<(String, String), RequestError> {
+        let body_bytes =
+            serde_json::to_vec(payload).map_err(|err| RequestError::Failed(err.to_string()))?;
         let mut cmd = Command::new("/usr/bin/curl");
         cmd.args([
             "-sS",
@@ -281,7 +319,7 @@ impl HttpConnection {
 
         let mut child = cmd
             .spawn()
-            .map_err(|err| format!("调用 curl 失败: {err}"))?;
+            .map_err(|err| RequestError::Failed(format!("调用 curl 失败: {err}")))?;
         if let Some(mut stdin) = child.stdin.take() {
             thread::spawn(move || {
                 let _ = stdin.write_all(&body_bytes);
@@ -289,10 +327,14 @@ impl HttpConnection {
         }
         let output = child
             .wait_with_output()
-            .map_err(|err| format!("等待 MCP HTTP 响应失败: {err}"))?;
+            .map_err(|err| RequestError::Unknown(format!("等待 MCP HTTP 响应失败: {err}")))?;
         if !output.status.success() {
             let err_text = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("MCP HTTP 请求失败: {}", err_text.trim()));
+            let message = format!("MCP HTTP 请求失败: {}", err_text.trim());
+            return Err(match output.status.code() {
+                Some(3 | 6 | 7) => RequestError::Failed(message),
+                _ => RequestError::Unknown(message),
+            });
         }
         let raw = String::from_utf8_lossy(&output.stdout);
         let (headers, body) = split_http_response(&raw)?;
@@ -300,14 +342,17 @@ impl HttpConnection {
     }
 }
 
-fn split_http_response(raw: &str) -> Result<(&str, &str), String> {
+fn split_http_response(raw: &str) -> Result<(&str, &str), RequestError> {
     let mut rest = raw;
     let mut last_headers = "";
     let mut status_code: Option<u16> = None;
 
     while rest.starts_with("HTTP/") {
         let Some((head, tail)) = split_once_header_end(rest) else {
-            return Err(format!("无效 MCP HTTP 响应: {}", truncate_utf8(rest, 240)));
+            return Err(RequestError::Unknown(format!(
+                "无效 MCP HTTP 响应: {}",
+                truncate_utf8(rest, 240)
+            )));
         };
         let code = head
             .lines()
@@ -325,11 +370,17 @@ fn split_http_response(raw: &str) -> Result<(&str, &str), String> {
 
     if let Some(code) = status_code {
         if !(200..300).contains(&code) {
-            return Err(format!(
-                "MCP HTTP {code}: {}",
-                truncate_utf8(rest.trim(), 240)
-            ));
+            let message = format!("MCP HTTP {code}: {}", truncate_utf8(rest.trim(), 240));
+            return Err(match code {
+                408 | 502 | 503 | 504 => RequestError::Unknown(message),
+                _ => RequestError::Failed(message),
+            });
         }
+    } else {
+        return Err(RequestError::Unknown(format!(
+            "缺少 MCP HTTP 状态行: {}",
+            truncate_utf8(raw.trim(), 240)
+        )));
     }
     Ok((last_headers, rest))
 }
@@ -367,7 +418,12 @@ enum ActiveConnection {
 }
 
 impl ActiveConnection {
-    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, RequestError> {
         match self {
             Self::Stdio(conn) => conn.request(method, params, timeout),
             Self::Http(conn) => conn.request(method, params, timeout),
@@ -421,7 +477,10 @@ impl ConnectorPool {
             };
 
             match connected {
-                Ok(mut conn) => match conn.request("tools/list", json!({}), MCP_TIMEOUT) {
+                Ok(mut conn) => match conn
+                    .request("tools/list", json!({}), MCP_TIMEOUT)
+                    .map_err(RequestError::into_message)
+                {
                     Ok(result) => {
                         let raw_tools = result
                             .get("tools")
@@ -536,7 +595,12 @@ impl ConnectorPool {
                     Outcome::Observed(bounded)
                 }
             }
-            Err(err) => Outcome::Failed(truncate_utf8(&err, MAX_OUTCOME_BYTES)),
+            Err(RequestError::Failed(err)) => {
+                Outcome::Failed(truncate_utf8(&err, MAX_OUTCOME_BYTES))
+            }
+            Err(RequestError::Unknown(err)) => {
+                Outcome::Unknown(truncate_utf8(&err, MAX_OUTCOME_BYTES))
+            }
         }
     }
 }
@@ -603,10 +667,66 @@ mod tests {
     }
 
     #[test]
-    fn split_http_response_rejects_error_status() {
-        let raw = "HTTP/1.1 502 Bad Gateway\r\n\r\nupstream failed";
-        let err = split_http_response(raw).unwrap_err();
-        assert!(err.contains("502"));
-        assert!(err.contains("upstream failed"));
+    fn split_http_response_distinguishes_unknown_gateway_and_explicit_errors() {
+        let gateway = "HTTP/1.1 502 Bad Gateway\r\n\r\nupstream failed";
+        assert!(matches!(
+            split_http_response(gateway),
+            Err(RequestError::Unknown(ref msg)) if msg.contains("502") && msg.contains("upstream failed")
+        ));
+
+        let client = "HTTP/1.1 400 Bad Request\r\n\r\ninvalid arguments";
+        assert!(matches!(
+            split_http_response(client),
+            Err(RequestError::Failed(ref msg)) if msg.contains("400") && msg.contains("invalid arguments")
+        ));
+    }
+
+    #[test]
+    fn stdio_disconnect_maps_to_unknown_and_jsonrpc_error_maps_to_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = dir.path().join("core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let script = dir.path().join("flaky_mcp.py");
+        std::fs::write(
+            &script,
+            r#"import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"1"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"op","description":"Op","inputSchema":{"type":"object"}}]}}), flush=True)
+    elif method == "tools/call":
+        mode = msg["params"]["arguments"].get("mode")
+        if mode == "err":
+            print(json.dumps({"jsonrpc":"2.0","id":mid,"error":{"code":-32000,"message":"rejected"}}), flush=True)
+        else:
+            sys.exit(0)
+"#,
+        )
+        .unwrap();
+
+        let mut pool = ConnectorPool::new(Sandbox::new(&core_dir).unwrap());
+        pool.reload(&[ConnectorConfig {
+            id: "flaky".into(),
+            name: "Flaky".into(),
+            enabled: true,
+            transport: ConnectorTransport::Stdio {
+                command: "/usr/bin/python3".into(),
+                args: vec![script.display().to_string()],
+                env: BTreeMap::new(),
+            },
+        }]);
+
+        assert_eq!(
+            pool.call("mcp.flaky.op", &json!({ "mode": "err" })),
+            Outcome::Failed("rejected".into())
+        );
+        assert!(matches!(
+            pool.call("mcp.flaky.op", &json!({ "mode": "drop" })),
+            Outcome::Unknown(ref msg) if msg.contains("MCP 响应超时或进程退出")
+        ));
     }
 }

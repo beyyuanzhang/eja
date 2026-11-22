@@ -12,11 +12,12 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub type EventSink = Box<dyn FnMut(Value)>;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_RETRY_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamItem {
@@ -55,6 +56,8 @@ pub struct HostState {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct WindowState {
     anchor: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_through: Option<Id>,
 }
 
 pub struct HostRuntime {
@@ -68,6 +71,9 @@ pub struct HostRuntime {
     hands: Hands,
     sandbox: Sandbox,
     anchor: Id,
+    settled_through: Id,
+    retry_at: Option<Instant>,
+    retry_attempts: u8,
     local_tz: String,
     status: (String, String),
     brain: Arc<dyn Brain>,
@@ -115,7 +121,8 @@ impl HostRuntime {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.to_string()),
         }
-        for action in eja.unfinished_actions().map_err(|err| err.to_string())? {
+        let unfinished = eja.unfinished_actions().map_err(|err| err.to_string())?;
+        for &action in &unfinished {
             eja.finish(
                 action,
                 Outcome::Unknown("上次执行因宿主中断而未完成".into()),
@@ -129,7 +136,17 @@ impl HostRuntime {
         config.connectors =
             HostConfig::parse_connectors(connectors_bytes.as_deref()).unwrap_or_default();
         let hands = Hands::open(data_dir.clone(), sandbox.clone(), &config.connectors);
-        let anchor = load_anchor(&core_dir);
+        let window = load_window_state(&core_dir);
+        let anchor = window.anchor;
+        let head = eja.revision().map_err(|err| err.to_string())?;
+        let settled_through = match window.settled_through {
+            Some(id) if id <= head => id,
+            _ => {
+                let initial = initial_settled_through(&eja, unfinished.first().copied(), head);
+                save_window_state(&core_dir, anchor, initial);
+                initial
+            }
+        };
         Ok(Self {
             data_dir,
             core_dir,
@@ -141,6 +158,9 @@ impl HostRuntime {
             hands,
             sandbox,
             anchor,
+            settled_through,
+            retry_at: None,
+            retry_attempts: 0,
             local_tz: detect_local_tz(),
             status: ("idle".into(), "在线".into()),
             brain,
@@ -158,11 +178,90 @@ impl HostRuntime {
         command
     }
 
-    pub fn next_wake_delay(&self) -> Result<Option<Duration>, String> {
+    fn next_wake_delay(&self) -> Result<Option<Duration>, String> {
         self.eja
             .next_wake_at()
             .map(|at| at.map(|at| Duration::from_secs(at.saturating_sub(unix_now()).max(0) as u64)))
             .map_err(|err| err.to_string())
+    }
+
+    pub fn next_timer_delay(&self) -> Result<Option<Duration>, String> {
+        let wake = self.next_wake_delay()?;
+        let retry = self
+            .retry_at
+            .map(|at| at.saturating_duration_since(Instant::now()));
+        Ok(match (wake, retry) {
+            (Some(wake_delay), Some(retry_delay)) => Some(wake_delay.min(retry_delay)),
+            (wake_delay, retry_delay) => wake_delay.or(retry_delay),
+        })
+    }
+
+    fn clear_retry(&mut self) {
+        self.retry_at = None;
+        self.retry_attempts = 0;
+    }
+
+    pub fn has_pending_trigger(&self) -> bool {
+        matches!(self.pending_trigger(), Ok(Some(_)))
+    }
+
+    pub fn process_pending_turn(&mut self) {
+        match self.pending_trigger() {
+            Ok(Some(proactive)) => self.run_turn(proactive),
+            Ok(None) => {}
+            Err(err) => self.emit_error(format!("检查待处理触发失败: {err}")),
+        }
+    }
+
+    fn pending_trigger(&self) -> Result<Option<bool>, String> {
+        let head = self.eja.revision().map_err(|err| err.to_string())?;
+        if head <= self.settled_through {
+            return Ok(None);
+        }
+        let entries = self
+            .eja
+            .entries_after(self.settled_through, head)
+            .map_err(|err| err.to_string())?;
+        let mut last_trigger: Option<(Id, bool)> = None;
+        let mut has_person = false;
+        let mut said_after_trigger = false;
+        for entry in entries {
+            match entry.fact {
+                Fact::Noticed {
+                    source: Source::Person,
+                    ..
+                } => {
+                    has_person = true;
+                    last_trigger = Some((entry.id, false));
+                    said_after_trigger = false;
+                }
+                Fact::Noticed {
+                    source: Source::Clock,
+                    ..
+                } => {
+                    last_trigger = Some((entry.id, !has_person));
+                    said_after_trigger = false;
+                }
+                Fact::Said { .. } if last_trigger.is_some() => {
+                    said_after_trigger = true;
+                }
+                _ => {}
+            }
+        }
+        if last_trigger.is_none() || said_after_trigger {
+            return Ok(None);
+        }
+        Ok(last_trigger.map(|(_, proactive)| proactive))
+    }
+
+    fn mark_settled(&mut self) {
+        self.clear_retry();
+        if let Ok(head) = self.eja.revision() {
+            if head > self.settled_through {
+                self.settled_through = head;
+                save_window_state(&self.core_dir, self.anchor, self.settled_through);
+            }
+        }
     }
 
     pub fn snapshot(&self) -> HostState {
@@ -224,11 +323,19 @@ impl HostRuntime {
         if connectors != self.config.connectors {
             let path = HostConfig::connectors_path(&self.data_dir);
             match write_json_atomic(&path, &connectors) {
-                Ok(()) => return self.reload_connectors(),
-                Err(err) => self.emit_error(format!("保存连接器失败: {err}")),
+                Ok(()) => self.reload_connectors(),
+                Err(err) => {
+                    self.emit_error(format!("保存连接器失败: {err}"));
+                    self.emit_state();
+                }
             }
+        } else {
+            self.emit_state();
         }
-        self.emit_state();
+        if self.config.is_configured() && self.has_pending_trigger() {
+            self.clear_retry();
+            self.process_pending_turn();
+        }
     }
 
     pub fn reload_connectors(&mut self) {
@@ -268,16 +375,23 @@ impl HostRuntime {
             self.emit_error(format!("写入消息失败: {err}"));
             return;
         }
+        self.clear_retry();
         self.run_turn(false);
     }
 
-    pub fn check_due_wakes(&mut self) -> Result<(), String> {
+    pub fn tick_timers(&mut self) -> Result<(), String> {
         if self
             .eja
             .record_due_wakes(unix_now())
             .map_err(|err| err.to_string())?
         {
-            self.run_turn(true);
+            self.clear_retry();
+            self.process_pending_turn();
+            return Ok(());
+        }
+        if self.retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.retry_at = None;
+            self.process_pending_turn();
         }
         Ok(())
     }
@@ -305,6 +419,7 @@ impl HostRuntime {
         self.set_status("thinking", "思考中…");
         self.refresh_connectors(false);
         let Some((provider, model)) = self.config.resolve_judge() else {
+            self.clear_retry();
             self.emit_error("请先在设置中配置可用的 LLM Provider 与主模型");
             self.set_status("idle", "在线");
             return;
@@ -338,11 +453,12 @@ impl HostRuntime {
             }
         };
         if self.anchor != initial_anchor {
-            save_anchor(&self.core_dir, self.anchor);
+            save_window_state(&self.core_dir, self.anchor, self.settled_through);
         }
 
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
+        let mut recoverable = false;
 
         for _ in 0..max_steps {
             self.set_status("thinking", "思考中…");
@@ -353,6 +469,7 @@ impl HostRuntime {
             {
                 Ok(r) => r,
                 Err(err) => {
+                    recoverable = is_recoverable_llm_error(&err);
                     fatal_error = Some(err);
                     break;
                 }
@@ -398,9 +515,19 @@ impl HostRuntime {
             append_tool_results(&provider.kind, &mut messages, results);
         }
 
-        if let Some(err) = fatal_error {
+        if completed {
+            self.mark_settled();
+        } else if let Some(err) = fatal_error {
+            if recoverable && self.retry_attempts < MAX_RETRY_ATTEMPTS {
+                let delay_secs = 5u64 * 3u64.pow(u32::from(self.retry_attempts));
+                self.retry_attempts += 1;
+                self.retry_at = Some(Instant::now() + Duration::from_secs(delay_secs));
+            } else {
+                self.clear_retry();
+            }
             self.emit_error(format!("执行回合失败: {err}"));
-        } else if !completed {
+        } else {
+            self.clear_retry();
             self.emit_error(format!("达到单回合最大步数上限 ({max_steps})，回合已暂停"));
         }
         self.set_status("idle", "在线");
@@ -611,19 +738,58 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
     items
 }
 
-fn load_anchor(core_dir: &Path) -> Id {
+fn load_window_state(core_dir: &Path) -> WindowState {
     fs::read(core_dir.join("window.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<WindowState>(&bytes).ok())
-        .map(|state| state.anchor.max(0))
-        .unwrap_or(0)
+        .map(|state| WindowState {
+            anchor: state.anchor.max(0),
+            settled_through: state.settled_through.map(|id| id.max(0)),
+        })
+        .unwrap_or_default()
 }
 
-fn save_anchor(core_dir: &Path, anchor: Id) {
-    let state = WindowState { anchor };
-    if let Ok(bytes) = serde_json::to_vec(&state) {
-        let _ = fs::write(core_dir.join("window.json"), bytes);
+fn save_window_state(core_dir: &Path, anchor: Id, settled_through: Id) {
+    let state = WindowState {
+        anchor,
+        settled_through: Some(settled_through),
+    };
+    let _ = write_json_atomic(&core_dir.join("window.json"), &state);
+}
+
+fn initial_settled_through(eja: &Eja, first_unfinished: Option<Id>, head: Id) -> Id {
+    let Some(first_action) = first_unfinished else {
+        return head;
+    };
+    let Ok(prior) = eja.entries_after(0, first_action) else {
+        return head;
+    };
+    prior
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                entry.fact,
+                Fact::Noticed {
+                    source: Source::Person | Source::Clock,
+                    ..
+                }
+            )
+        })
+        .map(|entry| entry.id.saturating_sub(1))
+        .unwrap_or(head)
+}
+
+fn is_recoverable_llm_error(err: &str) -> bool {
+    if let Some(rest) = err.strip_prefix("HTTP ") {
+        let code = rest
+            .split(|ch: char| !ch.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u16>().ok())
+            .unwrap_or(0);
+        return matches!(code, 408 | 429 | 500..=599);
     }
+    err.starts_with("网络请求失败") || err.starts_with("等待 LLM 响应失败")
 }
 
 fn detect_local_tz() -> String {
@@ -655,7 +821,10 @@ enum LockError {
 fn lock_core_dir(data_dir: &Path, core_dir: &Path) -> Result<fs::File, LockError> {
     let old_dir = data_dir.join("core");
     let io_error = |err| LockError::Io(format!("准备内核目录失败: {err}"));
-    if !core_dir.try_exists().map_err(io_error)? && old_dir.try_exists().map_err(io_error)? {
+    let old_is_real_dir = fs::symlink_metadata(&old_dir)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false);
+    if !core_dir.try_exists().map_err(io_error)? && old_is_real_dir {
         // Carry the existing instance lock along with the journal and SQLite sidecars.
         let lock = acquire_instance_lock(&old_dir)?;
         fs::rename(old_dir, core_dir).map_err(io_error)?;
@@ -1219,5 +1388,146 @@ for line in sys.stdin:
         let reopened =
             HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
         assert_eq!(reopened.eja.revision().unwrap(), rev_after_first);
+    }
+
+    struct ScriptedBrain {
+        replies: Mutex<Vec<Result<ModelReply, String>>>,
+        seen_windows: Mutex<Vec<Vec<Value>>>,
+    }
+
+    impl Brain for ScriptedBrain {
+        fn complete(
+            &self,
+            _provider: &ProviderConfig,
+            _model: &str,
+            _system: &str,
+            messages: &[Value],
+            _tools: &[ToolSpec],
+        ) -> Result<ModelReply, String> {
+            self.seen_windows.lock().unwrap().push(messages.to_vec());
+            self.replies.lock().unwrap().remove(0)
+        }
+
+        fn test_connection(
+            &self,
+            _provider: &ProviderConfig,
+            model: &str,
+        ) -> Result<String, String> {
+            Ok(format!("ok:{model}"))
+        }
+    }
+
+    #[test]
+    fn due_wake_persists_pending_across_unconfigured_restart_and_resumes_on_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        rt.save_config(HostConfig {
+            providers: Vec::new(),
+            judge: ModelRef::default(),
+            connectors: Vec::new(),
+            window_max_bytes: None,
+            max_steps: None,
+        });
+        rt.eja
+            .schedule_wakes(&[WakeAlarm {
+                id: "w-1".into(),
+                fire_at_unix: 1,
+                fire_at_display: "00:00:01".into(),
+                reason: "喝水提醒".into(),
+            }])
+            .unwrap();
+        rt.tick_timers().unwrap();
+        assert!(rt.has_pending_trigger());
+        assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 0);
+        drop(rt);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let mut restarted = HostRuntime::open_with_brain(
+            dir.path().join("Eja"),
+            brain.clone(),
+            Box::new(move |event| sink.lock().unwrap().push(event)),
+        )
+        .unwrap();
+        assert!(restarted.has_pending_trigger());
+        restarted.save_config(configured(vec![]));
+        assert!(!restarted.has_pending_trigger());
+        assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 1);
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "notify" && event["body"] == "你好，我在。"));
+        drop(restarted);
+
+        let mut settled =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        assert!(!settled.has_pending_trigger());
+        settled.process_pending_turn();
+        assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn intentional_silence_settles_and_recoverable_failure_retries_without_replaying_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(ScriptedBrain {
+            replies: Mutex::new(vec![
+                Ok(text_reply("   ")),
+                Err("HTTP 503: temporary".into()),
+                Err("HTTP 503: still down".into()),
+                Ok(text_reply("恢复完成")),
+            ]),
+            seen_windows: Mutex::new(Vec::new()),
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        rt.save_config(configured(vec![]));
+        rt.handle_user_message("保持沉默测试");
+        assert!(!rt.has_pending_trigger());
+        assert!(rt.retry_at.is_none());
+
+        rt.handle_user_message("故障恢复测试");
+        assert!(rt.has_pending_trigger());
+        assert!(rt.retry_at.is_some());
+        assert!(rt.next_timer_delay().unwrap().is_some());
+        rt.retry_at = Some(Instant::now());
+        rt.tick_timers().unwrap();
+        assert!(rt.has_pending_trigger());
+        assert_eq!(rt.retry_attempts, 2);
+
+        let rev = rt.eja.revision().unwrap();
+        let acted = rt
+            .eja
+            .act(rev, "shell", json!({ "command": "echo once" }), &["shell"])
+            .unwrap();
+        drop(rt);
+
+        let mut restarted =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        assert!(restarted.has_pending_trigger());
+        restarted.process_pending_turn();
+        assert!(!restarted.has_pending_trigger());
+
+        let windows = brain.seen_windows.lock().unwrap();
+        let resumed_window = windows.last().unwrap();
+        assert!(resumed_window.iter().any(|msg| {
+            msg["content"].as_str().is_some_and(|text| {
+                text.contains(&format!("\"action\":{}", acted.id)) && text.contains("unknown")
+            })
+        }));
+        let snap = restarted.snapshot();
+        assert!(snap
+            .stream
+            .iter()
+            .any(|item| item.kind == "eja" && item.text == "恢复完成"));
     }
 }

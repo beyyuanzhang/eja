@@ -1,3 +1,4 @@
+use crate::sandbox::{read_file_nofollow, write_file_atomic_in_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -132,7 +133,7 @@ impl HostConfig {
     }
 
     pub fn read_connectors(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
-        match fs::read(Self::connectors_path(data_dir)) {
+        match read_file_nofollow(data_dir, "connectors.json") {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(format!("读取连接器配置失败: {err}")),
@@ -209,8 +210,11 @@ impl HostConfig {
 }
 
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let tmp = path.with_extension("json.tmp");
+    let parent = path.parent().ok_or("无效配置路径")?;
+    let name = path
+        .file_name()
+        .and_then(|segment| segment.to_str())
+        .ok_or("无效配置路径")?;
     let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
-    fs::write(&tmp, bytes).map_err(|err| err.to_string())?;
-    fs::rename(&tmp, path).map_err(|err| err.to_string())
+    write_file_atomic_in_dir(parent, name, &bytes).map_err(|err| err.to_string())
 }

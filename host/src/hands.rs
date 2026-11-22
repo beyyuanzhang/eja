@@ -1,10 +1,9 @@
 use crate::config::ConnectorConfig;
 use crate::mcp::{truncate_utf8, ConnectorPool, ConnectorStatus};
-use crate::sandbox::{kill_process_tree, Sandbox};
+use crate::sandbox::{kill_process_tree, write_new_file_in_subdir, Sandbox};
 use eja_core::{Call, Eja, Outcome, WakeAlarm};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -219,9 +218,10 @@ fn run_shell(
     };
     let bounded = if combined.len() > MAX_SHELL_BYTES {
         let preview = truncate_utf8(&combined, MAX_SHELL_BYTES);
-        let outputs_dir = data_dir.join("outputs");
-        let spill_path = outputs_dir.join(format!("shell-{call_id}.log"));
-        if fs::create_dir_all(&outputs_dir).is_ok() && fs::write(&spill_path, &combined).is_ok() {
+        let file_name = format!("shell-{call_id}.log");
+        if let Ok(spill_path) =
+            write_new_file_in_subdir(data_dir, "outputs", &file_name, combined.as_bytes())
+        {
             format!(
                 "{preview}\n[output truncated at {} bytes; full {} bytes saved to {}]",
                 MAX_SHELL_BYTES,
@@ -237,7 +237,7 @@ fn run_shell(
     match status {
         Some(st) if st.success() => Outcome::Observed(bounded),
         Some(st) => Outcome::Failed(format!("exit {}: {bounded}", st.code().unwrap_or(-1))),
-        None => Outcome::Failed(format!("命令超时 ({}s): {bounded}", timeout.as_secs())),
+        None => Outcome::Unknown(format!("命令超时 ({}s): {bounded}", timeout.as_secs())),
     }
 }
 
@@ -285,6 +285,7 @@ fn format_local_unix(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn shell_closes_stdin_and_reaps_pipeline_grandchildren_on_timeout() {
@@ -317,7 +318,7 @@ mod tests {
             2,
         );
         assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(matches!(outcome, Outcome::Failed(ref msg) if msg.contains("命令超时")));
+        assert!(matches!(outcome, Outcome::Unknown(ref msg) if msg.contains("命令超时")));
 
         let started = Instant::now();
         let outcome = run_shell(
@@ -329,7 +330,7 @@ mod tests {
             3,
         );
         assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(matches!(outcome, Outcome::Failed(ref msg) if msg.contains("命令超时")));
+        assert!(matches!(outcome, Outcome::Unknown(ref msg) if msg.contains("命令超时")));
 
         if let Ok(pid_text) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = pid_text.trim().parse::<i32>() {
@@ -342,5 +343,30 @@ mod tests {
                 assert!(!alive, "grandchild process {pid} should be terminated");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_spill_refuses_symlinked_outputs_dir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("Eja");
+        let core_dir = dir.path().join("ai.eja.kernel");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&core_dir).unwrap();
+        let sandbox = Sandbox::new(&core_dir).unwrap();
+        symlink(&core_dir, data_dir.join("outputs")).unwrap();
+
+        let outcome = run_shell(
+            &sandbox,
+            "python3 -c 'print(\"x\" * 40000)'",
+            &data_dir,
+            Duration::from_secs(5),
+            &data_dir,
+            7,
+        );
+        assert!(matches!(outcome, Outcome::Observed(ref text) if !text.contains("saved to")));
+        assert!(!core_dir.join("shell-7.log").exists());
     }
 }
