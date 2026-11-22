@@ -179,10 +179,12 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var wakes: [WakeAlarmDTO] = []
     @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
+    public private(set) var hostExecutableURL: URL?
 
     private var process: Process?
     private var stdinHandle: FileHandle?
     private let decoder = JSONDecoder()
+    private let configuredDataDir: URL?
 
     public var connectedToolCount: Int {
         connectorStatuses.filter(\.connected).reduce(0) { $0 + $1.tools.count }
@@ -192,7 +194,12 @@ public final class HostClient: ObservableObject {
         if Bundle.main.bundleURL.pathExtension == "app" {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
-        startHost(executableURL: hostExecutableURL ?? Self.resolveHostExecutable(), dataDir: dataDir)
+        let resolvedHost = hostExecutableURL ?? Self.resolveHostExecutable()
+        let resolvedDataDir = dataDir ?? ProcessInfo.processInfo.environment["EJA_DATA_DIR"]
+            .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+        self.hostExecutableURL = resolvedHost
+        self.configuredDataDir = resolvedDataDir
+        startHost(executableURL: resolvedHost, dataDir: resolvedDataDir)
     }
 
     deinit {
@@ -202,8 +209,16 @@ public final class HostClient: ObservableObject {
     public func shutdown() {
         try? stdinHandle?.close()
         stdinHandle = nil
-        process?.terminate()
+        if let proc = process {
+            proc.terminate()
+            proc.waitUntilExit()
+        }
         process = nil
+    }
+
+    public func restart() {
+        shutdown()
+        startHost(executableURL: hostExecutableURL, dataDir: configuredDataDir)
     }
 
     public func sendMessage(_ text: String) {

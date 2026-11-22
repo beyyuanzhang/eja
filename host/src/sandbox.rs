@@ -156,8 +156,10 @@ mod tests {
         fs::create_dir_all(&core_dir).unwrap();
         let db = core_dir.join("subject.db");
         fs::write(&db, "secret-journal").unwrap();
-        let config = data_dir.join("config.json");
-        fs::write(&config, "{}").unwrap();
+        let core_config = core_dir.join("config.json");
+        fs::write(&core_config, "{\"api_key\":\"secret-key\"}").unwrap();
+        let connectors = data_dir.join("connectors.json");
+        fs::write(&connectors, "[]").unwrap();
         let fake_exe = data_dir.join("eja-host");
         fs::write(&fake_exe, "host-binary").unwrap();
 
@@ -174,27 +176,27 @@ mod tests {
         );
         assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "ok");
 
-        let edit_cfg = sandbox
+        let edit_connectors = sandbox
             .command(
                 "/bin/sh",
                 [
                     "-c",
                     &format!(
-                        "printf '{{\"ok\":true}}' > '{0}.tmp' && mv '{0}.tmp' '{0}' && cat '{0}'",
-                        config.display()
+                        "printf '[{{\"id\":\"demo\"}}]' > '{0}.tmp' && mv '{0}.tmp' '{0}' && cat '{0}'",
+                        connectors.display()
                     ),
                 ],
             )
             .output()
             .unwrap();
         assert!(
-            edit_cfg.status.success(),
-            "editing config.json should succeed: {}",
-            String::from_utf8_lossy(&edit_cfg.stderr)
+            edit_connectors.status.success(),
+            "editing connectors.json should succeed: {}",
+            String::from_utf8_lossy(&edit_connectors.stderr)
         );
         assert_eq!(
-            String::from_utf8_lossy(&edit_cfg.stdout).trim(),
-            "{\"ok\":true}"
+            String::from_utf8_lossy(&edit_connectors.stdout).trim(),
+            "[{\"id\":\"demo\"}]"
         );
 
         let read_db = sandbox
@@ -204,6 +206,18 @@ mod tests {
         assert!(
             !read_db.status.success(),
             "reading core/subject.db must fail"
+        );
+
+        let read_core_cfg = sandbox
+            .command(
+                "/bin/sh",
+                ["-c", &format!("cat '{}'", core_config.display())],
+            )
+            .output()
+            .unwrap();
+        assert!(
+            !read_core_cfg.status.success(),
+            "reading core/config.json must fail"
         );
 
         let write_db = sandbox

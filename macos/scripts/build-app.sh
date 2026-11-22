@@ -17,9 +17,12 @@ HOST_BIN="${REPO_DIR}/target/release/eja-host"
 
 echo "[3/3] Assembling ${APP_DIR}..."
 rm -rf "${APP_DIR}"
-mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources/ui-template"
 cp "${APP_BIN}" "${APP_DIR}/Contents/MacOS/EjaApp"
 cp "${HOST_BIN}" "${APP_DIR}/Contents/MacOS/eja-host"
+cp "${MACOS_DIR}/Package.swift" "${APP_DIR}/Contents/Resources/ui-template/Package.swift"
+cp -R "${MACOS_DIR}/Sources" "${APP_DIR}/Contents/Resources/ui-template/Sources"
+cp -R "${MACOS_DIR}/Tests" "${APP_DIR}/Contents/Resources/ui-template/Tests"
 
 cat > "${APP_DIR}/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

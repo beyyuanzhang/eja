@@ -54,7 +54,7 @@ pub struct HostRuntime {
     core_dir: PathBuf,
     eja: Mutex<Eja>,
     config: Mutex<HostConfig>,
-    config_bytes: Mutex<Option<Vec<u8>>>,
+    connectors_bytes: Mutex<Option<Vec<u8>>>,
     hands: Mutex<Hands>,
     anchor: Mutex<Id>,
     local_tz: String,
@@ -78,8 +78,8 @@ impl HostRuntime {
         fs::create_dir_all(&core_dir).map_err(|err| err.to_string())?;
         let sandbox = Sandbox::new(&core_dir)?;
         let eja = open_subject(&core_dir.join("subject.db"))?;
-        let config = HostConfig::load(&data_dir);
-        let config_bytes = read_config_bytes(&data_dir);
+        let config = HostConfig::load(&core_dir, &data_dir);
+        let connectors_bytes = read_connectors_bytes(&data_dir);
         let hands = Hands::open(
             data_dir.clone(),
             core_dir.clone(),
@@ -92,7 +92,7 @@ impl HostRuntime {
             core_dir,
             eja: Mutex::new(eja),
             config: Mutex::new(config),
-            config_bytes: Mutex::new(config_bytes),
+            connectors_bytes: Mutex::new(connectors_bytes),
             hands: Mutex::new(hands),
             anchor: Mutex::new(anchor),
             local_tz: detect_local_tz(),
@@ -150,7 +150,7 @@ impl HostRuntime {
     }
 
     pub fn save_config(&self, updated: HostConfig) {
-        if let Err(err) = updated.save(&self.data_dir) {
+        if let Err(err) = updated.save(&self.core_dir, &self.data_dir) {
             self.emit_error(format!("保存配置失败: {err}"));
             return;
         }
@@ -160,7 +160,7 @@ impl HostRuntime {
             *guard = updated.clone();
             changed
         };
-        *self.config_bytes.lock().unwrap() = read_config_bytes(&self.data_dir);
+        *self.connectors_bytes.lock().unwrap() = read_connectors_bytes(&self.data_dir);
         if connectors_changed {
             self.hands.lock().unwrap().reload(&updated.connectors);
         }
@@ -168,11 +168,11 @@ impl HostRuntime {
     }
 
     pub fn reload_connectors(&self) {
-        match HostConfig::try_load(&self.data_dir) {
-            Ok(config) => {
-                *self.config.lock().unwrap() = config.clone();
-                *self.config_bytes.lock().unwrap() = read_config_bytes(&self.data_dir);
-                self.hands.lock().unwrap().reload(&config.connectors);
+        match HostConfig::load_connectors(&self.data_dir) {
+            Ok(connectors) => {
+                self.config.lock().unwrap().connectors = connectors.clone();
+                *self.connectors_bytes.lock().unwrap() = read_connectors_bytes(&self.data_dir);
+                self.hands.lock().unwrap().reload(&connectors);
                 self.emit_state();
             }
             Err(err) => self.emit_error(err),
@@ -225,10 +225,10 @@ impl HostRuntime {
         self.run_turn_locked(true);
     }
 
-    fn sync_config_if_changed(&self) {
-        let latest_bytes = read_config_bytes(&self.data_dir);
+    fn sync_connectors_if_changed(&self) {
+        let latest_bytes = read_connectors_bytes(&self.data_dir);
         let changed = {
-            let mut guard = self.config_bytes.lock().unwrap();
+            let mut guard = self.connectors_bytes.lock().unwrap();
             if *guard != latest_bytes {
                 *guard = latest_bytes;
                 true
@@ -237,16 +237,16 @@ impl HostRuntime {
             }
         };
         if changed {
-            match HostConfig::try_load(&self.data_dir) {
-                Ok(loaded) => {
+            match HostConfig::load_connectors(&self.data_dir) {
+                Ok(connectors) => {
                     let connectors_changed = {
                         let mut cfg = self.config.lock().unwrap();
-                        let diff = cfg.connectors != loaded.connectors;
-                        *cfg = loaded.clone();
+                        let diff = cfg.connectors != connectors;
+                        cfg.connectors = connectors.clone();
                         diff
                     };
                     if connectors_changed {
-                        self.hands.lock().unwrap().reload(&loaded.connectors);
+                        self.hands.lock().unwrap().reload(&connectors);
                     }
                 }
                 Err(err) => self.emit_error(err),
@@ -255,7 +255,7 @@ impl HostRuntime {
     }
 
     fn run_turn_locked(&self, proactive: bool) {
-        self.sync_config_if_changed();
+        self.sync_connectors_if_changed();
         let config = self.config.lock().unwrap().clone();
         let Some((provider, model)) = config.resolve_judge() else {
             self.emit_error("请先在设置中配置可用的 LLM Provider 与主模型");
@@ -271,10 +271,11 @@ impl HostRuntime {
         let system = format!(
             "你是 EJA，一个持续存在的自我同一性主体。\n\
             数据目录：{}\n\
-            配置文件：{}/config.json（`connectors` 变更会自动热加载）\n\
+            连接器配置：{}/connectors.json（变更会自动热加载）\n\
+            界面源码：{}/ui/（修改 SwiftUI 后运行 {}/ui/apply.sh 编译并热重启前端）\n\
             本地时区：{}\n\n\
             前置消息是你按时间正序排列的不可变主体日志；末尾新增的 `noticed` 记录是本次触发。不调工具时的文本回复会发送给人，留空则保持沉默。",
-            data_dir_str, data_dir_str, self.local_tz
+            data_dir_str, data_dir_str, data_dir_str, data_dir_str, self.local_tz
         );
         let mut messages = {
             let eja = self.eja.lock().unwrap();
@@ -301,7 +302,7 @@ impl HostRuntime {
 
         for step_index in 0..max_steps {
             if step_index > 0 {
-                self.sync_config_if_changed();
+                self.sync_connectors_if_changed();
             }
             let tools = self.hands.lock().unwrap().tools();
             let reply = match self
@@ -352,7 +353,7 @@ impl HostRuntime {
         } else if !completed {
             self.emit_error(format!("达到单回合最大步数上限 ({max_steps})，回合已暂停"));
         }
-        self.sync_config_if_changed();
+        self.sync_connectors_if_changed();
         self.set_status("idle", "在线");
     }
 
@@ -548,8 +549,8 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
     items
 }
 
-fn read_config_bytes(data_dir: &Path) -> Option<Vec<u8>> {
-    fs::read(HostConfig::path(data_dir)).ok()
+fn read_connectors_bytes(data_dir: &Path) -> Option<Vec<u8>> {
+    fs::read(HostConfig::connectors_path(data_dir)).ok()
 }
 
 fn load_anchor(core_dir: &Path) -> Id {
@@ -896,7 +897,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn invalid_config_json_keeps_existing_runtime_config() {
+    fn split_config_and_connectors_and_preserve_state_on_invalid_connectors_json() {
         let dir = tempfile::tempdir().unwrap();
         let brain = Arc::new(MockBrain {
             judge_calls: AtomicUsize::new(0),
@@ -907,7 +908,16 @@ for line in sys.stdin:
                 .unwrap();
         rt.save_config(configured(vec![]));
 
-        fs::write(HostConfig::path(dir.path()), "{ broken json").unwrap();
+        let core_config = HostConfig::config_path(&dir.path().join("core"));
+        let connectors_path = HostConfig::connectors_path(dir.path());
+        assert!(core_config.exists());
+        assert!(connectors_path.exists());
+        assert!(!dir.path().join("config.json").exists());
+        assert!(!fs::read_to_string(&core_config)
+            .unwrap()
+            .contains("connectors"));
+
+        fs::write(&connectors_path, "{ broken json").unwrap();
         rt.handle_user_message("依然可用");
 
         let snap = rt.snapshot();

@@ -205,7 +205,7 @@ struct SettingsView: View {
     private var connectorsTab: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("统一 MCP 连接器（外部 MCP 与 EJA 自建 MCP 共用此列表与 config.json）")
+                Text("统一 MCP 连接器（外部 MCP 与 EJA 自建 MCP 共用此列表与 connectors.json）")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -231,7 +231,7 @@ struct SettingsView: View {
                 if let idx = draft.connectors.firstIndex(where: { $0.id == draft.selectedConnectorId }) {
                     connectorEditor(index: idx)
                 } else {
-                    Text("点击右上角“+ 添加 MCP”接入外部 MCP，或让 EJA 写好 MCP 后自动写入 config.json。")
+                    Text("点击右上角“+ 添加 MCP”接入外部 MCP，或让 EJA 写好 MCP 后自动写入 connectors.json。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)

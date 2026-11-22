@@ -113,31 +113,41 @@ impl Default for HostConfig {
 }
 
 impl HostConfig {
-    pub fn path(data_dir: &Path) -> PathBuf {
-        data_dir.join("config.json")
+    pub fn config_path(core_dir: &Path) -> PathBuf {
+        core_dir.join("config.json")
     }
 
-    pub fn load(data_dir: &Path) -> Self {
-        Self::try_load(data_dir).unwrap_or_default()
+    pub fn connectors_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("connectors.json")
     }
 
-    pub fn try_load(data_dir: &Path) -> Result<Self, String> {
-        let cfg_path = Self::path(data_dir);
-        let bytes = match fs::read(&cfg_path) {
+    pub fn load(core_dir: &Path, data_dir: &Path) -> Self {
+        let mut config = fs::read(Self::config_path(core_dir))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .unwrap_or_default();
+        config.connectors = Self::load_connectors(data_dir).unwrap_or_default();
+        config
+    }
+
+    pub fn load_connectors(data_dir: &Path) -> Result<Vec<ConnectorConfig>, String> {
+        let path = Self::connectors_path(data_dir);
+        let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(err) => return Err(format!("读取配置失败: {err}")),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(format!("读取连接器配置失败: {err}")),
         };
-        serde_json::from_slice::<Self>(&bytes)
-            .map_err(|err| format!("解析 config.json 失败: {err}"))
+        serde_json::from_slice::<Vec<ConnectorConfig>>(&bytes)
+            .map_err(|err| format!("解析 connectors.json 失败: {err}"))
     }
 
-    pub fn save(&self, data_dir: &Path) -> Result<(), String> {
-        let path = Self::path(data_dir);
-        let tmp = data_dir.join("config.json.tmp");
-        let bytes = serde_json::to_vec_pretty(self).map_err(|err| err.to_string())?;
-        fs::write(&tmp, bytes).map_err(|err| err.to_string())?;
-        fs::rename(&tmp, &path).map_err(|err| err.to_string())
+    pub fn save(&self, core_dir: &Path, data_dir: &Path) -> Result<(), String> {
+        let mut core_value = serde_json::to_value(self).map_err(|err| err.to_string())?;
+        if let Some(map) = core_value.as_object_mut() {
+            map.remove("connectors");
+        }
+        write_json_atomic(&Self::config_path(core_dir), &core_value)?;
+        write_json_atomic(&Self::connectors_path(data_dir), &self.connectors)
     }
 
     pub fn resolve_judge(&self) -> Option<(&ProviderConfig, &str)> {
@@ -168,4 +178,11 @@ impl HostConfig {
     pub fn max_steps(&self) -> usize {
         self.max_steps.filter(|&steps| steps > 0).unwrap_or(40)
     }
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
+    fs::write(&tmp, bytes).map_err(|err| err.to_string())?;
+    fs::rename(&tmp, path).map_err(|err| err.to_string())
 }

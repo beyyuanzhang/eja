@@ -33,6 +33,8 @@ cargo build -p eja-host
 
 默认数据目录为 `~/Library/Application Support/Eja/`：
 - `core/subject.db`：`eja-core` 永久主体日志
+- `core/config.json`：LLM Provider、密钥与宿主参数
 - `core/wakes.json`：定时唤醒记录
 - `core/window.json`：当前上下文窗口起点 `anchor`
-- `config.json`：LLM 与 MCP 连接器配置
+- `connectors.json`：MCP 连接器列表（变更自动热加载）
+- `ui/`：可由 EJA 直接修改的原生 SwiftUI 前端源码（运行 `ui/apply.sh` 编译并热重启前端）
