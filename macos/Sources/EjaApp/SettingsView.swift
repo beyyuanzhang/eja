@@ -171,7 +171,10 @@ struct SettingsView: View {
                 Text("Anthropic").tag("anthropic")
             }
             TextField("Base URL", text: $draft.providers[index].baseUrl)
-            SecureField("API Key", text: $draft.providers[index].apiKey)
+            SecureField(
+                draft.providers[index].hasApiKey ? "已保存密钥（留空继续沿用）" : "API Key",
+                text: $draft.providers[index].apiKey
+            )
             TextField("常用模型（逗号分隔）", text: modelsBinding)
             HStack {
                 Button("测试连接") {

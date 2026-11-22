@@ -5,6 +5,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+const SCHEMA_VERSION: i32 = 1;
+
 fn head_on(conn: &Connection) -> Result<Id> {
     Ok(
         conn.query_row("SELECT coalesce(max(id), 0) FROM facts", [], |row| {
@@ -102,19 +104,9 @@ impl Eja {
         db.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
-             PRAGMA busy_timeout = 5000;
-             CREATE TABLE IF NOT EXISTS facts (
-                 id INTEGER PRIMARY KEY,
-                 at INTEGER NOT NULL,
-                 body TEXT NOT NULL,
-                 concern INTEGER,
-                 live INTEGER
-             );
-             CREATE INDEX IF NOT EXISTS keep_events ON facts(id) WHERE live=1;
-             CREATE INDEX IF NOT EXISTS concern_edits ON facts(concern, id DESC);
-             CREATE INDEX IF NOT EXISTS action_receipts ON facts(json_extract(body,'$.action'), id)
-                 WHERE json_extract(body,'$.kind')='returned';",
+             PRAGMA busy_timeout = 5000;",
         )?;
+        migrate_schema(&db)?;
         Ok(Self {
             db,
             memory: None,
@@ -380,4 +372,30 @@ impl Eja {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+}
+
+fn migrate_schema(db: &Connection) -> Result<()> {
+    let version: i32 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(Error::Storage(format!(
+            "subject.db schema version {version} is newer than supported version {SCHEMA_VERSION}"
+        )));
+    }
+    if version < 1 {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS facts (
+                 id INTEGER PRIMARY KEY,
+                 at INTEGER NOT NULL,
+                 body TEXT NOT NULL,
+                 concern INTEGER,
+                 live INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS keep_events ON facts(id) WHERE live=1;
+             CREATE INDEX IF NOT EXISTS concern_edits ON facts(concern, id DESC);
+             CREATE INDEX IF NOT EXISTS action_receipts ON facts(json_extract(body,'$.action'), id)
+                 WHERE json_extract(body,'$.kind')='returned';
+             PRAGMA user_version = 1;",
+        )?;
+    }
+    Ok(())
 }

@@ -7,21 +7,43 @@ public struct ProviderConfigDTO: Codable, Equatable, Identifiable, Sendable {
     public var kind: String // "openai" | "anthropic"
     public var baseUrl: String
     public var apiKey: String
+    public var hasApiKey: Bool
     public var models: [String]
 
     enum CodingKeys: String, CodingKey {
         case id, name, kind, models
         case baseUrl = "base_url"
         case apiKey = "api_key"
+        case hasApiKey = "has_api_key"
     }
 
-    public init(id: String, name: String, kind: String = "openai", baseUrl: String, apiKey: String = "", models: [String] = []) {
+    public init(
+        id: String,
+        name: String,
+        kind: String = "openai",
+        baseUrl: String,
+        apiKey: String = "",
+        hasApiKey: Bool = false,
+        models: [String] = []
+    ) {
         self.id = id
         self.name = name
         self.kind = kind
         self.baseUrl = baseUrl
         self.apiKey = apiKey
+        self.hasApiKey = hasApiKey
         self.models = models
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "openai"
+        baseUrl = try c.decode(String.self, forKey: .baseUrl)
+        apiKey = try c.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
+        hasApiKey = try c.decodeIfPresent(Bool.self, forKey: .hasApiKey) ?? !apiKey.isEmpty
+        models = try c.decodeIfPresent([String].self, forKey: .models) ?? []
     }
 }
 
@@ -147,6 +169,9 @@ public struct ProviderTestResult: Equatable, Sendable {
 }
 
 private struct StateEventDTO: Decodable {
+    let protocolVersion: Int?
+    let kernelVersion: String?
+    let resourcesDir: String?
     let status: String
     let statusDetail: String
     let dataDir: String
@@ -159,6 +184,9 @@ private struct StateEventDTO: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case status, config, stream, concerns, wakes, configured
+        case protocolVersion = "protocol_version"
+        case kernelVersion = "kernel_version"
+        case resourcesDir = "resources_dir"
         case statusDetail = "status_detail"
         case dataDir = "data_dir"
         case connectorStatuses = "connector_statuses"
@@ -168,6 +196,9 @@ private struct StateEventDTO: Decodable {
 @MainActor
 public final class HostClient: ObservableObject {
     @Published public private(set) var isReady: Bool = false
+    @Published public private(set) var protocolVersion: Int = 1
+    @Published public private(set) var kernelVersion: String = ""
+    @Published public private(set) var resourcesDir: String?
     @Published public private(set) var status: String = "idle"
     @Published public private(set) var statusDetail: String = "启动中…"
     @Published public private(set) var dataDir: String = ""
@@ -305,6 +336,9 @@ public final class HostClient: ObservableObject {
         case "state":
             if let state = try? decoder.decode(StateEventDTO.self, from: data) {
                 isReady = true
+                protocolVersion = state.protocolVersion ?? 1
+                kernelVersion = state.kernelVersion ?? ""
+                resourcesDir = state.resourcesDir
                 status = state.status
                 statusDetail = state.statusDetail
                 dataDir = state.dataDir

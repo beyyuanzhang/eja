@@ -35,8 +35,14 @@ impl Sandbox {
             fs::canonicalize(protected_dir).map_err(|err| format!("规范化核心目录失败: {err}"))?;
         let host_exe =
             fs::canonicalize(host_exe).map_err(|err| format!("定位宿主程序失败: {err}"))?;
-        let ancestors = collect_ancestors(&[protected.as_path(), host_exe.as_path()]);
-        let (profile, params) = build_seatbelt_policy(&protected, &host_exe, &ancestors);
+        let app_bundle = app_bundle_root(&host_exe);
+        let mut roots = vec![protected.as_path(), host_exe.as_path()];
+        if let Some(bundle) = app_bundle.as_deref() {
+            roots.push(bundle);
+        }
+        let ancestors = collect_ancestors(&roots);
+        let (profile, params) =
+            build_seatbelt_policy(&protected, &host_exe, app_bundle.as_deref(), &ancestors);
         Ok(Self { profile, params })
     }
 
@@ -68,6 +74,23 @@ impl Sandbox {
 }
 
 #[cfg(target_os = "macos")]
+fn app_bundle_root(host_exe: &Path) -> Option<PathBuf> {
+    let macos_dir = host_exe.parent()?;
+    if macos_dir.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents_dir = macos_dir.parent()?;
+    if contents_dir.file_name()? != "Contents" {
+        return None;
+    }
+    let bundle = contents_dir.parent()?;
+    if bundle.extension()? != "app" {
+        return None;
+    }
+    Some(bundle.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
 fn collect_ancestors(roots: &[&Path]) -> BTreeSet<PathBuf> {
     let mut unique = BTreeSet::new();
     for root in roots {
@@ -82,6 +105,7 @@ fn collect_ancestors(roots: &[&Path]) -> BTreeSet<PathBuf> {
 fn build_seatbelt_policy(
     protected_dir: &Path,
     host_exe: &Path,
+    app_bundle: Option<&Path>,
     ancestors: &BTreeSet<PathBuf>,
 ) -> (String, Vec<OsString>) {
     let mut profile = String::from(
@@ -98,6 +122,10 @@ fn build_seatbelt_policy(
         define_param("PROTECTED_DIR", protected_dir),
         define_param("HOST_EXE", host_exe),
     ];
+    if let Some(bundle) = app_bundle {
+        profile.push_str("(deny file-write* (subpath (param \"APP_BUNDLE\")))\n");
+        params.push(define_param("APP_BUNDLE", bundle));
+    }
     for (index, ancestor) in ancestors.iter().enumerate() {
         let key = format!("ANCESTOR_{index}");
         profile.push_str(&format!(
@@ -344,6 +372,61 @@ mod tests {
             signal_own_child.status.success(),
             "signaling process inside same sandbox should succeed: {}",
             String::from_utf8_lossy(&signal_own_child.stderr)
+        );
+    }
+
+    #[test]
+    fn seatbelt_protects_entire_app_bundle_for_writes_while_allowing_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = dir.path().join("core");
+        let bundle = dir.path().join("Eja.app");
+        let macos_dir = bundle.join("Contents/MacOS");
+        let resources_dir = bundle.join("Contents/Resources");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::create_dir_all(&macos_dir).unwrap();
+        fs::create_dir_all(&resources_dir).unwrap();
+
+        let host_exe = macos_dir.join("eja-host");
+        let app_exe = macos_dir.join("EjaApp");
+        let protocol_doc = resources_dir.join("PROTOCOL.md");
+        fs::write(&host_exe, "host").unwrap();
+        fs::write(&app_exe, "app").unwrap();
+        fs::write(&protocol_doc, "# Protocol v1\n").unwrap();
+
+        let sandbox = Sandbox::with_host_exe(&core_dir, &host_exe).unwrap();
+
+        let read_doc = sandbox
+            .command(
+                "/bin/sh",
+                ["-c", &format!("cat '{}'", protocol_doc.display())],
+            )
+            .output()
+            .unwrap();
+        assert!(read_doc.status.success());
+        assert!(String::from_utf8_lossy(&read_doc.stdout).contains("Protocol v1"));
+
+        let write_app = sandbox
+            .command(
+                "/bin/sh",
+                ["-c", &format!("echo evil > '{}'", app_exe.display())],
+            )
+            .output()
+            .unwrap();
+        assert!(
+            !write_app.status.success(),
+            "writing Eja.app binary must fail"
+        );
+
+        let write_doc = sandbox
+            .command(
+                "/bin/sh",
+                ["-c", &format!("echo evil > '{}'", protocol_doc.display())],
+            )
+            .output()
+            .unwrap();
+        assert!(
+            !write_doc.status.success(),
+            "writing Eja.app Resources must fail"
         );
     }
 }

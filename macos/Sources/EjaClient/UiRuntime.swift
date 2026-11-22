@@ -91,11 +91,17 @@ public enum UiRuntime {
         return fallback
     }
 
-    public static func launch(executable: URL, dataDir: URL, hostExecutableURL: URL?) throws {
+    public static func launch(
+        executable: URL,
+        dataDir: URL,
+        hostExecutableURL: URL?,
+        verifySeconds: TimeInterval = 1.5
+    ) throws {
         let proc = Process()
         proc.executableURL = executable
         var env = ProcessInfo.processInfo.environment
         env["EJA_DATA_DIR"] = dataDir.path
+        env.removeValue(forKey: "EJA_SAFE_MODE")
         if let host = hostExecutableURL { env["EJA_HOST_BIN"] = host.path }
         if let tpl = resolveTemplateDir() { env["EJA_UI_TEMPLATE_DIR"] = tpl.path }
         if (env["EJA_FALLBACK_APP_BIN"] ?? "").isEmpty, let cur = currentExecutable() {
@@ -103,6 +109,17 @@ public enum UiRuntime {
         }
         proc.environment = env
         try proc.run()
+        let deadline = Date().addingTimeInterval(verifySeconds)
+        while Date() < deadline {
+            if !proc.isRunning {
+                throw NSError(
+                    domain: "UiRuntime",
+                    code: Int(proc.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: "进程启动后立即退出（退出码 \(proc.terminationStatus)）"]
+                )
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
     }
 
     private static func copyTemplate(from source: URL, to target: URL) throws {

@@ -85,9 +85,15 @@ for line in sys.stdin:
         )
         client.saveConfig(cfg)
 
+        var expectedRedacted = cfg
+        for idx in expectedRedacted.providers.indices {
+            expectedRedacted.providers[idx].hasApiKey = !expectedRedacted.providers[idx].apiKey.isEmpty
+            expectedRedacted.providers[idx].apiKey = ""
+        }
+
         #expect(await waitUntil {
             client.isConfigured
-                && client.config == cfg
+                && client.config == expectedRedacted
                 && client.connectorStatuses.first?.connected == true
                 && client.connectorStatuses.first?.tools.first?.capability == "mcp.echo.echo"
         })
@@ -99,7 +105,7 @@ for line in sys.stdin:
 
         #expect(await waitUntil {
             restarted.isReady
-                && restarted.config == cfg
+                && restarted.config == expectedRedacted
                 && restarted.connectorStatuses.first?.connected == true
         })
     }

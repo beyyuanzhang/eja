@@ -116,7 +116,7 @@ impl StdioConnection {
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": { "name": "eja", "version": "0.1.0" }
+                "clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
             }),
             MCP_TIMEOUT,
         )?;
@@ -212,7 +212,7 @@ impl HttpConnection {
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": { "name": "eja", "version": "0.1.0" }
+                "clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
             }),
             MCP_TIMEOUT,
         )?;

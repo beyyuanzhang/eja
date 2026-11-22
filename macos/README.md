@@ -27,9 +27,10 @@ cargo build --release -p eja-host
 ```
 
 数据默认保存在 `~/Library/Application Support/Eja/`：
-- `core/subject.db`：`eja-core` 永久主体日志
-- `core/config.json`：LLM Provider、密钥与宿主参数
+- `core/subject.db`：`eja-core` 永久主体日志（`PRAGMA user_version` 版本迁移）
+- `core/config.json`：LLM Provider、密钥与宿主参数（Seatbelt 保护，前端仅见脱敏状态）
+- `core/kernel_version`：内核版本记录（升级 `Eja.app` 后自动感知版本变更）
 - `core/wakes.json`：EJA 自设的定时唤醒
 - `core/window.json`：当前上下文窗口起点 `anchor`
 - `connectors.json`：MCP 连接器列表（变更自动热加载）
-- `ui/`：可由 EJA 直接修改的原生 SwiftUI 前端源码（运行 `ui/apply.sh` 编译并热重启前端）
+- `ui/`：可由 EJA 直接修改的前端目录（默认原生 SwiftUI 源码，运行 `ui/apply.sh` 编译为 `ui/EjaApp` 并热切；启动 `Eja.app` 时按住 `Option` 可进入官方默认安全模式）

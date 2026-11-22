@@ -254,3 +254,21 @@ fn physical_time_is_rfc3339_monotonic_and_visible_across_reopen() -> Result<()> 
     assert_eq!(reopened.read(first)?.at, t0);
     Ok(())
 }
+
+#[test]
+fn subject_db_sets_schema_version_and_rejects_future_versions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("subject.db");
+    let eja = Eja::open(&path)?;
+    drop(eja);
+
+    let conn = rusqlite::Connection::open(&path)?;
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    assert_eq!(version, 1);
+
+    conn.execute_batch("PRAGMA user_version = 99;")?;
+    drop(conn);
+
+    assert!(Eja::open(&path).is_err());
+    Ok(())
+}

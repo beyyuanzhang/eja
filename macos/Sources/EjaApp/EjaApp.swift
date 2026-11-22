@@ -6,9 +6,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var onTerminate: (() -> Void)?
     var runningStamp: BinaryStamp?
     var uiReady = false
+    var isRelaunching = false
+    var safeMode = ProcessInfo.processInfo.environment["EJA_SAFE_MODE"] == "1"
+        || NSEvent.modifierFlags.contains(.option)
     private var reloadTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if NSEvent.modifierFlags.contains(.option) {
+            safeMode = true
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -66,7 +72,7 @@ struct EjaApp: App {
         }
 
         MenuBarExtra {
-            Text("EJA · \(client.statusDetail)")
+            Text(client.kernelVersion.isEmpty ? "EJA · \(client.statusDetail)" : "EJA \(client.kernelVersion) · \(client.statusDetail)")
             if let nextWake = client.wakes.first {
                 Text("下次唤醒：\(nextWake.fireAtDisplay)")
             }
@@ -97,13 +103,18 @@ struct EjaApp: App {
         appDelegate.uiReady = true
         let dataDir = URL(fileURLWithPath: dataDirPath, isDirectory: true)
         UiRuntime.bootstrapIfNeeded(dataDir: dataDir)
-        appDelegate.runningStamp = UiRuntime.runningStamp(in: dataDir)
-        checkHotReload()
+        if appDelegate.safeMode {
+            appDelegate.runningStamp = UiRuntime.binaryStamp(at: UiRuntime.evolvedExecutable(in: dataDir))
+            client.errorBanner = "已进入安全模式（官方默认界面），可修改内核设置或重置界面"
+        } else {
+            appDelegate.runningStamp = UiRuntime.runningStamp(in: dataDir)
+            checkHotReload()
+        }
     }
 
     @MainActor
     private func checkHotReload() {
-        guard appDelegate.uiReady, client.status == "idle", !client.dataDir.isEmpty else { return }
+        guard appDelegate.uiReady, !appDelegate.isRelaunching, client.status == "idle", !client.dataDir.isEmpty else { return }
         let dataDir = URL(fileURLWithPath: client.dataDir, isDirectory: true)
         guard let target = UiRuntime.updatedExecutable(in: dataDir, runningStamp: appDelegate.runningStamp) else { return }
         relaunch(to: target, dataDir: dataDir)
@@ -124,15 +135,27 @@ struct EjaApp: App {
 
     @MainActor
     private func relaunch(to executable: URL, dataDir: URL) {
+        guard !appDelegate.isRelaunching else { return }
+        appDelegate.isRelaunching = true
         let hostBin = client.hostExecutableURL
         client.shutdown()
-        do {
-            try UiRuntime.launch(executable: executable, dataDir: dataDir, hostExecutableURL: hostBin)
-            NSApp.terminate(nil)
-        } catch {
-            appDelegate.runningStamp = UiRuntime.binaryStamp(at: executable)
-            client.restart()
-            client.errorBanner = "热重启前端失败：\(error.localizedDescription)"
+        Task.detached {
+            do {
+                try UiRuntime.launch(executable: executable, dataDir: dataDir, hostExecutableURL: hostBin)
+                await MainActor.run {
+                    NSApp.terminate(nil)
+                }
+            } catch {
+                let message = error.localizedDescription
+                await MainActor.run {
+                    if executable.resolvingSymlinksInPath().path == UiRuntime.evolvedExecutable(in: dataDir).resolvingSymlinksInPath().path {
+                        appDelegate.runningStamp = UiRuntime.binaryStamp(at: executable)
+                    }
+                    appDelegate.isRelaunching = false
+                    client.restart()
+                    client.errorBanner = "热重启前端失败，已保留当前界面：\(message)"
+                }
+            }
         }
     }
 }

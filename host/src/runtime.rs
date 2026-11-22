@@ -13,6 +13,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamItem {
@@ -33,6 +35,10 @@ pub struct ConcernDto {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HostState {
+    pub protocol_version: u32,
+    pub kernel_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources_dir: Option<String>,
     pub status: String,
     pub status_detail: String,
     pub data_dir: String,
@@ -52,6 +58,7 @@ struct WindowState {
 pub struct HostRuntime {
     data_dir: PathBuf,
     core_dir: PathBuf,
+    resources_dir: Option<PathBuf>,
     eja: Mutex<Eja>,
     config: Mutex<HostConfig>,
     connectors_bytes: Mutex<Option<Vec<u8>>>,
@@ -78,6 +85,8 @@ impl HostRuntime {
         fs::create_dir_all(&core_dir).map_err(|err| err.to_string())?;
         let sandbox = Sandbox::new(&core_dir)?;
         let eja = open_subject(&core_dir.join("subject.db"))?;
+        let resources_dir = resolve_resources_dir();
+        sync_kernel_version(&core_dir, &eja, resources_dir.as_deref());
         let config = HostConfig::load(&core_dir, &data_dir);
         let connectors_bytes = read_connectors_bytes(&data_dir);
         let hands = Hands::open(
@@ -90,6 +99,7 @@ impl HostRuntime {
         Ok(Self {
             data_dir,
             core_dir,
+            resources_dir,
             eja: Mutex::new(eja),
             config: Mutex::new(config),
             connectors_bytes: Mutex::new(connectors_bytes),
@@ -126,11 +136,17 @@ impl HostRuntime {
             })
             .unwrap_or_default();
         HostState {
+            protocol_version: PROTOCOL_VERSION,
+            kernel_version: KERNEL_VERSION.to_string(),
+            resources_dir: self
+                .resources_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string()),
             status,
             status_detail,
             data_dir: self.data_dir.display().to_string(),
             configured: config.is_configured(),
-            config,
+            config: config.redacted_for_ui(),
             connector_statuses,
             stream: build_stream(&entries),
             concerns,
@@ -149,7 +165,11 @@ impl HostRuntime {
         (self.emit)(json!({ "event": "error", "message": message.into() }));
     }
 
-    pub fn save_config(&self, updated: HostConfig) {
+    pub fn save_config(&self, mut updated: HostConfig) {
+        {
+            let current = self.config.lock().unwrap();
+            updated.merge_preserved(&current);
+        }
         if let Err(err) = updated.save(&self.core_dir, &self.data_dir) {
             self.emit_error(format!("保存配置失败: {err}"));
             return;
@@ -179,7 +199,19 @@ impl HostRuntime {
         }
     }
 
-    pub fn test_provider(&self, id: String, provider: ProviderConfig, model: String) {
+    pub fn test_provider(&self, id: String, mut provider: ProviderConfig, model: String) {
+        if provider.api_key.is_empty() {
+            if let Some(existing) = self
+                .config
+                .lock()
+                .unwrap()
+                .providers
+                .iter()
+                .find(|p| p.id == provider.id)
+            {
+                provider.api_key = existing.api_key.clone();
+            }
+        }
         let result = self.brain.test_connection(&provider, &model);
         match result {
             Ok(message) => (self.emit)(json!({
@@ -268,8 +300,13 @@ impl HostRuntime {
 
         self.set_status("thinking", "思考中…");
         let data_dir_str = self.data_dir.display().to_string();
+        let resources_line = match &self.resources_dir {
+            Some(dir) => format!("\n只读协议与模板参考：{}", dir.display()),
+            None => String::new(),
+        };
         let system = format!(
             "你是 EJA，一个持续存在的自我同一性主体。\n\
+            内核版本：{KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）{resources_line}\n\
             数据目录：{}\n\
             连接器配置：{}/connectors.json（变更会自动热加载）\n\
             界面源码：{}/ui/（修改 SwiftUI 后运行 {}/ui/apply.sh 编译并热重启前端）\n\
@@ -579,6 +616,49 @@ fn detect_local_tz() -> String {
         .unwrap_or_else(|| "UTC (+0000)".into())
 }
 
+fn resolve_resources_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("EJA_RESOURCES_DIR") {
+        let dir = PathBuf::from(path);
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let macos_dir = exe.parent()?;
+    if macos_dir.file_name()? != "MacOS" {
+        return None;
+    }
+    let resources = macos_dir.parent()?.join("Resources");
+    resources.is_dir().then_some(resources)
+}
+
+fn sync_kernel_version(core_dir: &Path, eja: &Eja, resources_dir: Option<&Path>) {
+    let version_path = core_dir.join("kernel_version");
+    let prev = fs::read_to_string(&version_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(old) = prev.as_deref() {
+        if old == KERNEL_VERSION {
+            return;
+        }
+        let notice = match resources_dir {
+            Some(dir) => format!(
+                "内核已从 {old} 升级到 {KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）。协议文档与默认界面参考位于 {}，可按需对照调整本地前端或连接器。",
+                dir.display()
+            ),
+            None => format!("内核已从 {old} 升级到 {KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）。"),
+        };
+        if eja.notice(Source::World, notice).is_err() {
+            return;
+        }
+    }
+    let tmp = core_dir.join("kernel_version.tmp");
+    if fs::write(&tmp, format!("{KERNEL_VERSION}\n")).is_ok() {
+        let _ = fs::rename(&tmp, &version_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +746,7 @@ mod tests {
                 kind: ProviderKind::OpenAi,
                 base_url: "http://127.0.0.1:9999/v1".into(),
                 api_key: String::new(),
+                has_api_key: false,
                 models: vec!["demo".into()],
             }],
             judge: ModelRef {
@@ -927,5 +1008,64 @@ for line in sys.stdin:
             .stream
             .iter()
             .any(|item| item.kind == "eja" && item.text == "你好，我在。"));
+    }
+
+    #[test]
+    fn redacts_api_key_in_state_and_preserves_it_on_empty_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let rt = HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Arc::new(|_| {}))
+            .unwrap();
+        let mut cfg = configured(vec![]);
+        cfg.providers[0].api_key = "sk-top-secret".into();
+        rt.save_config(cfg);
+
+        let snap = rt.snapshot();
+        assert_eq!(snap.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(snap.kernel_version, KERNEL_VERSION);
+        assert_eq!(snap.config.providers[0].api_key, "");
+        assert!(snap.config.providers[0].has_api_key);
+
+        // Saving redacted config back from UI must preserve stored api_key on disk.
+        rt.save_config(snap.config);
+        let disk = fs::read_to_string(HostConfig::config_path(&dir.path().join("core"))).unwrap();
+        assert!(disk.contains("sk-top-secret"));
+        assert!(!disk.contains("has_api_key"));
+    }
+
+    #[test]
+    fn detects_kernel_upgrade_and_emits_world_notice_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
+        assert!(rt.snapshot().stream.is_empty());
+        let version_file = dir.path().join("core/kernel_version");
+        assert_eq!(
+            fs::read_to_string(&version_file).unwrap().trim(),
+            KERNEL_VERSION
+        );
+        drop(rt);
+
+        fs::write(&version_file, "0.9.0\n").unwrap();
+        let upgraded =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Arc::new(|_| {}))
+                .unwrap();
+        assert_eq!(
+            fs::read_to_string(&version_file).unwrap().trim(),
+            KERNEL_VERSION
+        );
+        assert!(upgraded
+            .snapshot()
+            .stream
+            .iter()
+            .any(|item| item.text.contains("0.9.0") && item.text.contains(KERNEL_VERSION)));
     }
 }

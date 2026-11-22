@@ -22,6 +22,8 @@ pub struct ProviderConfig {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_api_key: bool,
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -99,6 +101,7 @@ impl Default for HostConfig {
                 kind: ProviderKind::OpenAi,
                 base_url: "https://api.openai.com/v1".into(),
                 api_key: String::new(),
+                has_api_key: false,
                 models: vec!["gpt-4o".into(), "gpt-4o-mini".into()],
             }],
             judge: ModelRef {
@@ -177,6 +180,32 @@ impl HostConfig {
 
     pub fn max_steps(&self) -> usize {
         self.max_steps.filter(|&steps| steps > 0).unwrap_or(40)
+    }
+
+    pub fn redacted_for_ui(&self) -> Self {
+        let mut copy = self.clone();
+        for provider in &mut copy.providers {
+            provider.has_api_key = !provider.api_key.is_empty();
+            provider.api_key.clear();
+        }
+        copy
+    }
+
+    pub fn merge_preserved(&mut self, current: &Self) {
+        for provider in &mut self.providers {
+            provider.has_api_key = false;
+            if provider.api_key.is_empty() {
+                if let Some(existing) = current.providers.iter().find(|p| p.id == provider.id) {
+                    provider.api_key = existing.api_key.clone();
+                }
+            }
+        }
+        if self.window_max_bytes.is_none() {
+            self.window_max_bytes = current.window_max_bytes;
+        }
+        if self.max_steps.is_none() {
+            self.max_steps = current.max_steps;
+        }
     }
 }
 
