@@ -70,6 +70,7 @@ struct EjaApp: App {
                 }
         }
         .defaultSize(width: 780, height: 600)
+        .windowStyle(.hiddenTitleBar)
 
         Settings {
             SettingsView(client: client)
@@ -79,6 +80,13 @@ struct EjaApp: App {
             Text(client.kernelVersion.isEmpty ? "EJA · \(client.statusDetail)" : "EJA \(client.kernelVersion) · \(client.statusDetail)")
             if let nextWake = client.wakes.first {
                 Text("下次唤醒：\(nextWake.fireAtDisplay)")
+            }
+            if !client.concerns.isEmpty {
+                Divider()
+                Text("挂念 (\(client.concerns.count))")
+                ForEach(client.concerns) { concern in
+                    Text("• \(concern.text)")
+                }
             }
             Divider()
             Button("打开 EJA") {

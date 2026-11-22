@@ -5,15 +5,11 @@ import SwiftUI
 final class ContentUIState: ObservableObject {
     @Published var draftText: String = ""
     @Published var showSettingsSheet: Bool = false
-    @Published var showSubjectState: Bool = false
-    @Published var expandedEvents: Set<Int64> = []
+    @Published var baselineId: Int64 = -1
 
-    func toggleEvent(_ id: Int64) {
-        if expandedEvents.contains(id) {
-            expandedEvents.remove(id)
-        } else {
-            expandedEvents.insert(id)
-        }
+    func captureBaselineIfNeeded(isReady: Bool, from stream: [StreamItemDTO]) {
+        guard isReady, baselineId < 0 else { return }
+        baselineId = stream.last?.id ?? 0
     }
 }
 
@@ -51,45 +47,48 @@ struct ContentView: View {
                 .background(.red.opacity(0.08))
             }
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    if client.stream.isEmpty {
-                        VStack(spacing: 8) {
-                            Text("EJA").font(.system(size: 26, weight: .semibold, design: .rounded))
-                            Text("连续记忆 · 标准 MCP 连接器 · 可自进化原点")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 120)
-                    } else {
+            ZStack(alignment: .top) {
+                ScrollViewReader { proxy in
+                    ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
-                            ForEach(client.stream) { item in
+                            ForEach(visibleItems) { item in
                                 streamRow(item).id(item.id)
                             }
                             if client.status != "idle" {
-                                HStack(spacing: 8) {
-                                    ProgressView().controlSize(.small)
-                                    Text(client.statusDetail).font(.caption).foregroundStyle(.secondary)
-                                }
-                                .padding(.horizontal, 10)
-                                .id("eja-busy")
+                                BusyDots()
+                                    .padding(.horizontal, 14)
+                                    .id("eja-busy")
                             }
                         }
                         .padding(.horizontal, 20)
                         .padding(.vertical, 16)
                     }
-                }
-                .onChange(of: client.stream.last?.id) { _, lastId in
-                    if let lastId {
-                        withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(lastId, anchor: .bottom) }
+                    .contentMargins(.top, 34, for: .scrollContent)
+                    .scrollIndicators(.never)
+                    .mask(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.0),
+                                .init(color: .black, location: 0.10),
+                                .init(color: .black, location: 1.0),
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .onChange(of: visibleItems.last?.id) { _, lastId in
+                        if let lastId {
+                            withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(lastId, anchor: .bottom) }
+                        }
+                    }
+                    .onChange(of: client.status) { _, newStatus in
+                        if newStatus != "idle" {
+                            withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("eja-busy", anchor: .bottom) }
+                        }
                     }
                 }
-                .onChange(of: client.status) { _, newStatus in
-                    if newStatus != "idle" {
-                        withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("eja-busy", anchor: .bottom) }
-                    }
-                }
+
+                topFade
             }
 
             Divider()
@@ -118,27 +117,7 @@ struct ContentView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(client.status == "thinking" ? .blue : (client.isConfigured ? .green : .secondary))
-                        .frame(width: 8, height: 8)
-                    Text(client.statusDetail).font(.subheadline).foregroundStyle(.secondary)
-                }
-            }
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { ui.showSubjectState.toggle() } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "brain")
-                        let count = client.concerns.count + client.wakes.count
-                        if count > 0 { Text("\(count)").font(.caption2.monospacedDigit()) }
-                    }
-                }
-                .help("挂念与定时唤醒")
-                .popover(isPresented: $ui.showSubjectState, arrowEdge: .bottom) {
-                    SubjectStatePopoverView(client: client)
-                }
-
                 Button { ui.showSettingsSheet = true } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "slider.horizontal.3")
@@ -153,7 +132,36 @@ struct ContentView: View {
         .sheet(isPresented: $ui.showSettingsSheet) {
             SettingsView(client: client)
         }
-        .onAppear { composerFocused = true }
+        .onAppear {
+            composerFocused = true
+            ui.captureBaselineIfNeeded(isReady: client.isReady, from: client.stream)
+        }
+        .onChange(of: client.isReady) { _, ready in
+            ui.captureBaselineIfNeeded(isReady: ready, from: client.stream)
+        }
+    }
+
+    private var topFade: some View {
+        LinearGradient(
+            stops: [
+                .init(color: Color(nsColor: .windowBackgroundColor), location: 0.0),
+                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.92), location: 0.45),
+                .init(color: Color(nsColor: .windowBackgroundColor).opacity(0.0), location: 1.0),
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        .frame(height: 52)
+        .frame(maxWidth: .infinity, alignment: .top)
+        .ignoresSafeArea(edges: .top)
+        .allowsHitTesting(false)
+    }
+
+    private var visibleItems: [StreamItemDTO] {
+        guard ui.baselineId >= 0 else { return [] }
+        return client.stream.filter { item in
+            item.id > ui.baselineId && (item.kind == "person" || item.kind == "eja")
+        }
     }
 
     private var canSend: Bool {
@@ -180,7 +188,7 @@ struct ContentView: View {
                     .background(Color.accentColor.opacity(0.14))
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
-        case "eja":
+        default:
             HStack {
                 VStack(alignment: .leading, spacing: 6) {
                     if item.proactive == true {
@@ -198,38 +206,6 @@ struct ContentView: View {
                 .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.06), lineWidth: 1))
                 Spacer(minLength: 48)
             }
-        default:
-            let expanded = ui.expandedEvents.contains(item.id)
-            let hasDetail = !(item.detail?.isEmpty ?? true)
-            VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    if hasDetail { ui.toggleEvent(item.id) }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "terminal").font(.caption2).foregroundStyle(.secondary)
-                        Text(item.text).font(.caption).foregroundStyle(.secondary)
-                        if hasDetail {
-                            Image(systemName: expanded ? "chevron.up" : "chevron.down").font(.caption2).foregroundStyle(.tertiary)
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.primary.opacity(0.04))
-                    .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-
-                if expanded, let detail = item.detail {
-                    Text(detail)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(nsColor: .textBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-            }
         }
     }
 
@@ -244,38 +220,39 @@ struct ContentView: View {
     }
 }
 
-private struct SubjectStatePopoverView: View {
-    @ObservedObject var client: HostClient
+/// 等待指示：约一秒后仍未完成才浮现，三个点缓慢明灭。
+@MainActor
+private final class BusyDotsModel: ObservableObject {
+    @Published var visible = false
+    @Published var lit = false
+
+    init() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            self.visible = true
+            self.lit = true
+        }
+    }
+}
+
+private struct BusyDots: View {
+    @StateObject private var model = BusyDotsModel()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("主体状态").font(.headline)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    GroupBox("挂念 (\(client.concerns.count))") {
-                        if client.concerns.isEmpty {
-                            Text("暂无").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-                        } else {
-                            VStack(alignment: .leading, spacing: 4) {
-                                ForEach(client.concerns) { Text("• \($0.text)").font(.callout).textSelection(.enabled) }
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    GroupBox("定时唤醒 (\(client.wakes.count))") {
-                        if client.wakes.isEmpty {
-                            Text("暂无").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
-                        } else {
-                            VStack(alignment: .leading, spacing: 4) {
-                                ForEach(client.wakes) { Text("\($0.fireAtDisplay) · \($0.reason)").font(.callout) }
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                }
+        HStack(spacing: 5) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(Color.secondary)
+                    .frame(width: 4, height: 4)
+                    .opacity(model.visible ? (model.lit ? 0.7 : 0.2) : 0)
+                    .animation(
+                        .easeInOut(duration: 0.6)
+                        .repeatForever(autoreverses: true)
+                        .delay(Double(i) * 0.14),
+                        value: model.lit
+                    )
             }
         }
-        .padding(14)
-        .frame(width: 320, height: 340)
+        .frame(height: 16)
     }
 }
