@@ -617,12 +617,6 @@ fn detect_local_tz() -> String {
 }
 
 fn resolve_resources_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("EJA_RESOURCES_DIR") {
-        let dir = PathBuf::from(path);
-        if dir.is_dir() {
-            return Some(dir);
-        }
-    }
     let exe = std::env::current_exe().ok()?;
     let macos_dir = exe.parent()?;
     if macos_dir.file_name()? != "MacOS" {

@@ -127,6 +127,10 @@ struct EjaApp: App {
         do {
             if let fallback = try UiRuntime.resetToDefault(dataDir: dataDir) {
                 relaunch(to: fallback, dataDir: dataDir)
+            } else {
+                appDelegate.runningStamp = nil
+                appDelegate.safeMode = false
+                client.errorBanner = nil
             }
         } catch {
             client.errorBanner = "重置默认界面失败：\(error.localizedDescription)"

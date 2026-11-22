@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MACOS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="$(cd "${MACOS_DIR}/.." && pwd)"
 APP_DIR="${MACOS_DIR}/build/Eja.app"
+VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${REPO_DIR}/Cargo.toml" | head -n 1)"
+: "${VERSION:?Failed to read version from Cargo.toml}"
 
 echo "[1/3] Building eja-host (Rust release)..."
 (cd "${REPO_DIR}" && MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release -p eja-host)
@@ -25,7 +27,7 @@ cp "${MACOS_DIR}/Package.swift" "${APP_DIR}/Contents/Resources/ui-template/Packa
 cp -R "${MACOS_DIR}/Sources" "${APP_DIR}/Contents/Resources/ui-template/Sources"
 cp -R "${MACOS_DIR}/Tests" "${APP_DIR}/Contents/Resources/ui-template/Tests"
 
-cat > "${APP_DIR}/Contents/Info.plist" <<'EOF'
+cat > "${APP_DIR}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -43,7 +45,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>${VERSION}</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>

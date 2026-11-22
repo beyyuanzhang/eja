@@ -36,11 +36,7 @@ impl Sandbox {
         let host_exe =
             fs::canonicalize(host_exe).map_err(|err| format!("定位宿主程序失败: {err}"))?;
         let app_bundle = app_bundle_root(&host_exe);
-        let mut roots = vec![protected.as_path(), host_exe.as_path()];
-        if let Some(bundle) = app_bundle.as_deref() {
-            roots.push(bundle);
-        }
-        let ancestors = collect_ancestors(&roots);
+        let ancestors = collect_ancestors(&[protected.as_path(), host_exe.as_path()]);
         let (profile, params) =
             build_seatbelt_policy(&protected, &host_exe, app_bundle.as_deref(), &ancestors);
         Ok(Self { profile, params })
@@ -115,16 +111,15 @@ fn build_seatbelt_policy(
          (allow signal (target same-sandbox))\n\
          (deny process-info-pidinfo)\n\
          (allow process-info-pidinfo (target same-sandbox))\n\
-         (deny file-read* file-write* (subpath (param \"PROTECTED_DIR\")))\n\
-         (deny file-write* (literal (param \"HOST_EXE\")))\n",
+         (deny file-read* file-write* (subpath (param \"PROTECTED_DIR\")))\n",
     );
-    let mut params = vec![
-        define_param("PROTECTED_DIR", protected_dir),
-        define_param("HOST_EXE", host_exe),
-    ];
+    let mut params = vec![define_param("PROTECTED_DIR", protected_dir)];
     if let Some(bundle) = app_bundle {
         profile.push_str("(deny file-write* (subpath (param \"APP_BUNDLE\")))\n");
         params.push(define_param("APP_BUNDLE", bundle));
+    } else {
+        profile.push_str("(deny file-write* (literal (param \"HOST_EXE\")))\n");
+        params.push(define_param("HOST_EXE", host_exe));
     }
     for (index, ancestor) in ancestors.iter().enumerate() {
         let key = format!("ANCESTOR_{index}");
