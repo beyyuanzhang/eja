@@ -23,9 +23,6 @@ mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources/ui-template"
 cp "${APP_BIN}" "${APP_DIR}/Contents/MacOS/EjaApp"
 cp "${HOST_BIN}" "${APP_DIR}/Contents/MacOS/eja-host"
 cp "${REPO_DIR}/PROTOCOL.md" "${APP_DIR}/Contents/Resources/PROTOCOL.md"
-cp "${MACOS_DIR}/Package.swift" "${APP_DIR}/Contents/Resources/ui-template/Package.swift"
-cp -R "${MACOS_DIR}/Sources" "${APP_DIR}/Contents/Resources/ui-template/Sources"
-cp -R "${MACOS_DIR}/Tests" "${APP_DIR}/Contents/Resources/ui-template/Tests"
 
 cat > "${APP_DIR}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -55,6 +52,10 @@ cat > "${APP_DIR}/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+cp "${APP_DIR}/Contents/Info.plist" "${APP_DIR}/Contents/Resources/ui-template/Info.plist"
+cp "${MACOS_DIR}/Package.swift" "${APP_DIR}/Contents/Resources/ui-template/Package.swift"
+cp -R "${MACOS_DIR}/Sources" "${APP_DIR}/Contents/Resources/ui-template/Sources"
+cp -R "${MACOS_DIR}/Tests" "${APP_DIR}/Contents/Resources/ui-template/Tests"
 
 echo "Done: ${APP_DIR}"
 echo "Run with: open \"${APP_DIR}\""

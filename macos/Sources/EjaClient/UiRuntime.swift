@@ -12,12 +12,37 @@ public enum UiRuntime {
     UI_DIR="$(cd "$(dirname "$0")" && pwd)"
     swift build --package-path "$UI_DIR" --product EjaApp --disable-sandbox
     BIN="$(swift build --package-path "$UI_DIR" --product EjaApp --disable-sandbox --show-bin-path)/EjaApp"
-    cp "$BIN" "$UI_DIR/EjaApp.tmp"
-    mv "$UI_DIR/EjaApp.tmp" "$UI_DIR/EjaApp"
+    STAGE="$UI_DIR/Eja.app.tmp"
+    TARGET="$UI_DIR/Eja.app"
+    rm -rf "$STAGE"
+    mkdir -p "$STAGE/Contents/MacOS"
+    cp "$BIN" "$STAGE/Contents/MacOS/EjaApp"
+    if [ -f "$UI_DIR/Info.plist" ]; then
+        cp "$UI_DIR/Info.plist" "$STAGE/Contents/Info.plist"
+    else
+        cat > "$STAGE/Contents/Info.plist" <<'EOF'
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+        <key>CFBundleExecutable</key><string>EjaApp</string>
+        <key>CFBundleIdentifier</key><string>ai.eja.origin</string>
+        <key>CFBundleName</key><string>EJA</string>
+        <key>CFBundlePackageType</key><string>APPL</string>
+        <key>NSHighResolutionCapable</key><true/>
+    </dict></plist>
+    EOF
+    fi
+    codesign --force --sign - "$STAGE" >/dev/null 2>&1 || true
+    rm -rf "$TARGET"
+    mv "$STAGE" "$TARGET"
     """
 
+    public static func evolvedAppBundle(in dataDir: URL) -> URL {
+        dataDir.appendingPathComponent("ui/Eja.app", isDirectory: true)
+    }
+
     public static func evolvedExecutable(in dataDir: URL) -> URL {
-        dataDir.appendingPathComponent("ui/EjaApp")
+        evolvedAppBundle(in: dataDir).appendingPathComponent("Contents/MacOS/EjaApp")
     }
 
     public static func resolveTemplateDir() -> URL? {
@@ -79,7 +104,7 @@ public enum UiRuntime {
         }
         try copyTemplate(from: source, to: uiDir)
         writeApplyScript(in: uiDir, overwrite: true)
-        try? FileManager.default.removeItem(at: evolvedExecutable(in: dataDir))
+        try? FileManager.default.removeItem(at: evolvedAppBundle(in: dataDir))
         guard let path = ProcessInfo.processInfo.environment["EJA_FALLBACK_APP_BIN"], !path.isEmpty else {
             return nil
         }
@@ -125,7 +150,7 @@ public enum UiRuntime {
     private static func copyTemplate(from source: URL, to target: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: target, withIntermediateDirectories: true)
-        for item in ["Package.swift", "Sources", "Tests"] {
+        for item in ["Package.swift", "Sources", "Tests", "Info.plist"] {
             let src = source.appendingPathComponent(item)
             guard fm.fileExists(atPath: src.path) else { continue }
             let dst = target.appendingPathComponent(item)

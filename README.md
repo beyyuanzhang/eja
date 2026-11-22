@@ -39,6 +39,6 @@ cargo build -p eja-host
 - `core/wakes.json`：定时唤醒记录
 - `core/window.json`：当前上下文窗口起点 `anchor`
 - `connectors.json`：MCP 连接器列表（变更自动热加载）
-- `ui/`：可由 EJA 直接修改的前端目录（默认原生 SwiftUI 源码，运行 `ui/apply.sh` 编译为 `ui/EjaApp` 并热切；按住 `Option` 启动 `Eja.app` 可进入默认安全模式）
+- `ui/`：可由 EJA 直接修改的前端目录（默认原生 SwiftUI 源码，运行 `ui/apply.sh` 编译并封装为完整 `ui/Eja.app` 后热切；按住 `Option` 启动 `Eja.app` 可进入默认安全模式）
 
 前端与宿主协议见 `PROTOCOL.md`（同时随 `Eja.app/Contents/Resources/PROTOCOL.md` 只读分发）。
