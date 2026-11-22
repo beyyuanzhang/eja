@@ -101,7 +101,7 @@ struct ContentView: View {
                             Text("尚未配置模型")
                                 .font(.system(size: 12))
                                 .foregroundStyle(EjaTheme.inkSecondary)
-                            Button("前往设置") { ui.showSettingsSheet = true }
+                            Button("前往设置", action: showSettings)
                                 .buttonStyle(.plain)
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(EjaTheme.ink)
@@ -119,7 +119,7 @@ struct ContentView: View {
                 .animation(.easeOut(duration: 0.16), value: client.errorBanner != nil)
             }
 
-            Button { ui.showSettingsSheet = true } label: {
+            Button(action: showSettings) {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 13, weight: .regular))
             }
@@ -139,6 +139,14 @@ struct ContentView: View {
         }
         .onChange(of: client.isReady) { _, ready in
             ui.captureBaselineIfNeeded(isReady: ready, from: client.stream)
+        }
+    }
+
+    private func showSettings() {
+        if client.isAttachedUI {
+            client.requestOwnerSettings()
+        } else {
+            ui.showSettingsSheet = true
         }
     }
 

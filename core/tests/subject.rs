@@ -1,4 +1,4 @@
-use eja_core::{Eja, Error, Fact, Outcome, Source, Timestamp, FACT_BYTES};
+use eja_core::{Eja, Error, Fact, Outcome, Source, Timestamp, WakeAlarm, FACT_BYTES};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
@@ -6,6 +6,43 @@ use std::sync::{
 };
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[test]
+fn wake_notice_and_removal_roll_back_together() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("subject.db");
+    let eja = Eja::open(&path)?;
+    let alarms = [WakeAlarm {
+        id: "wake-1".into(),
+        fire_at_unix: 10,
+        fire_at_display: "00:00:10".into(),
+        reason: "检查事务".into(),
+    }];
+    eja.schedule_wakes(&alarms)?;
+    let db = rusqlite::Connection::open(&path)?;
+    db.execute_batch(
+        "CREATE TRIGGER fail_delete BEFORE DELETE ON wakes
+         BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;",
+    )?;
+    assert!(eja.record_due_wakes(10).is_err());
+    drop(eja);
+
+    let reopened = Eja::open(&path)?;
+    assert_eq!(reopened.revision()?, 0);
+    assert_eq!(reopened.pending_wakes()?.len(), 1);
+    db.execute_batch("DROP TRIGGER fail_delete")?;
+    assert!(reopened.record_due_wakes(10)?);
+    assert!(reopened.pending_wakes()?.is_empty());
+    assert!(!reopened.record_due_wakes(10)?);
+    assert!(matches!(
+        reopened.read(1)?.fact,
+        Fact::Noticed {
+            source: Source::Clock,
+            ..
+        }
+    ));
+    Ok(())
+}
 
 #[test]
 fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
@@ -264,7 +301,7 @@ fn subject_db_sets_schema_version_and_rejects_future_versions() -> Result<()> {
 
     let conn = rusqlite::Connection::open(&path)?;
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     conn.execute_batch("PRAGMA user_version = 99;")?;
     drop(conn);

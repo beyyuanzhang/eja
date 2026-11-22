@@ -1,11 +1,27 @@
 use crate::{
-    Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Timestamp, FACT_BYTES,
+    Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Source, Timestamp,
+    FACT_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct WakeAlarm {
+    pub id: String,
+    pub fire_at_unix: i64,
+    pub fire_at_display: String,
+    pub reason: String,
+}
+
+fn wake_notice(reason: &str) -> Fact {
+    Fact::Noticed {
+        source: Source::Clock,
+        text: format!("定时唤醒：{reason}"),
+    }
+}
 
 fn head_on(conn: &Connection) -> Result<Id> {
     Ok(
@@ -335,6 +351,67 @@ impl Eja {
         decode_entries(rows)
     }
 
+    pub fn schedule_wakes(&self, alarms: &[WakeAlarm]) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        for alarm in alarms {
+            if serde_json::to_vec(&wake_notice(&alarm.reason))?.len() > FACT_BYTES {
+                return Err(Error::invalid("wake notice exceeds the byte budget"));
+            }
+            tx.execute(
+                "INSERT INTO wakes(id, fire_at, display, reason) VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    alarm.id,
+                    alarm.fire_at_unix,
+                    alarm.fire_at_display,
+                    alarm.reason
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_wakes(&self) -> Result<Vec<WakeAlarm>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT id, fire_at, display, reason FROM wakes ORDER BY fire_at, id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WakeAlarm {
+                id: row.get(0)?,
+                fire_at_unix: row.get(1)?,
+                fire_at_display: row.get(2)?,
+                reason: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn next_wake_at(&self) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .query_row("SELECT min(fire_at) FROM wakes", [], |row| row.get(0))?)
+    }
+
+    pub fn record_due_wakes(&self, now: i64) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let mut stmt =
+            tx.prepare("SELECT reason FROM wakes WHERE fire_at <= ?1 ORDER BY fire_at, id")?;
+        let reasons = stmt
+            .query_map([now], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if !reasons.is_empty() {
+            let at = self.now_at(&tx)?;
+            for reason in &reasons {
+                insert_fact(&tx, at, &wake_notice(reason), None)?;
+            }
+            tx.execute("DELETE FROM wakes WHERE fire_at <= ?1", [now])?;
+        }
+        tx.commit()?;
+        Ok(!reasons.is_empty())
+    }
+
     /// Actions without a receipt, in journal order.
     pub fn unfinished_actions(&self) -> Result<Vec<Id>> {
         let mut stmt = self.db.prepare(
@@ -411,6 +488,19 @@ fn migrate_schema(db: &Connection) -> Result<()> {
              CREATE INDEX IF NOT EXISTS action_receipts ON facts(json_extract(body,'$.action'), id)
                  WHERE json_extract(body,'$.kind')='returned';
              PRAGMA user_version = 1;",
+        )?;
+    }
+    if version < 2 {
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS wakes (
+                 id TEXT PRIMARY KEY,
+                 fire_at INTEGER NOT NULL,
+                 display TEXT NOT NULL,
+                 reason TEXT NOT NULL
+             );
+             PRAGMA user_version = 2;
+             COMMIT;",
         )?;
     }
     Ok(())

@@ -1,8 +1,7 @@
-use crate::config::{write_json_atomic, ConnectorConfig};
+use crate::config::ConnectorConfig;
 use crate::mcp::{truncate_utf8, ConnectorPool, ConnectorStatus};
 use crate::sandbox::{kill_process_tree, Sandbox};
-use eja_core::{Call, Outcome};
-use serde::{Deserialize, Serialize};
+use eja_core::{Call, Eja, Outcome, WakeAlarm};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs;
@@ -24,38 +23,18 @@ pub struct ToolSpec {
     pub schema: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WakeAlarm {
-    pub id: String,
-    pub fire_at_unix: i64,
-    pub fire_at_display: String,
-    pub reason: String,
-}
-
 pub struct Hands {
     data_dir: PathBuf,
-    core_dir: PathBuf,
-    sandbox: Sandbox,
     connectors: ConnectorPool,
-    wakes: Vec<WakeAlarm>,
 }
 
 impl Hands {
-    pub fn open(
-        data_dir: PathBuf,
-        core_dir: PathBuf,
-        sandbox: Sandbox,
-        connectors: &[ConnectorConfig],
-    ) -> Self {
-        let mut pool = ConnectorPool::new(sandbox.clone());
+    pub fn open(data_dir: PathBuf, sandbox: Sandbox, connectors: &[ConnectorConfig]) -> Self {
+        let mut pool = ConnectorPool::new(sandbox);
         pool.reload(connectors);
-        let wakes = load_wakes(&core_dir);
         Self {
             data_dir,
-            core_dir,
-            sandbox,
             connectors: pool,
-            wakes,
         }
     }
 
@@ -65,37 +44,6 @@ impl Hands {
 
     pub fn connector_statuses(&self) -> Vec<ConnectorStatus> {
         self.connectors.statuses()
-    }
-
-    pub fn wakes(&self) -> Vec<WakeAlarm> {
-        self.wakes.clone()
-    }
-
-    pub fn next_wake_delay(&self) -> Option<Duration> {
-        let next_unix = self.wakes.iter().map(|w| w.fire_at_unix).min()?;
-        let now = unix_now();
-        if next_unix <= now {
-            Some(Duration::ZERO)
-        } else {
-            Some(Duration::from_secs((next_unix - now) as u64) + Duration::from_millis(50))
-        }
-    }
-
-    pub fn drain_due_wakes(&mut self) -> Vec<WakeAlarm> {
-        let now = unix_now();
-        let mut fired = Vec::new();
-        self.wakes.retain(|alarm| {
-            if alarm.fire_at_unix <= now {
-                fired.push(alarm.clone());
-                false
-            } else {
-                true
-            }
-        });
-        if !fired.is_empty() {
-            let _ = write_json_atomic(&self.core_dir.join("wakes.json"), &self.wakes);
-        }
-        fired
     }
 
     pub fn tools(&self) -> Vec<ToolSpec> {
@@ -152,49 +100,16 @@ impl Hands {
         specs
     }
 
-    pub fn execute(&mut self, call: &Call) -> Outcome {
+    pub fn execute(&mut self, call: &Call, eja: &Eja, sandbox: &Sandbox) -> Outcome {
         match call.capability.as_str() {
-            "wake" => self.execute_wake(call.id, &call.input),
-            "shell" => self.execute_shell(call.id, &call.input),
+            "wake" => execute_wake(eja, call.id, &call.input),
+            "shell" => self.execute_shell(sandbox, call.id, &call.input),
             other if other.starts_with("mcp.") => self.connectors.call(other, &call.input),
             other => Outcome::Failed(format!("未知能力: {other}")),
         }
     }
 
-    fn execute_wake(&mut self, call_id: eja_core::Id, input: &Value) -> Outcome {
-        let delay = input
-            .get("delay_seconds")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let reason = input
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if delay < 1 || reason.is_empty() {
-            return Outcome::Failed("wake 需要 delay_seconds >= 1 且非空 reason".into());
-        }
-        let Some(fire_at) = unix_now().checked_add(delay) else {
-            return Outcome::Failed("唤醒时间超出范围".into());
-        };
-        let display = format_local_unix(fire_at);
-        let alarm = WakeAlarm {
-            id: format!("w-{fire_at}-{call_id}"),
-            fire_at_unix: fire_at,
-            fire_at_display: display.clone(),
-            reason: reason.to_string(),
-        };
-        let mut wakes = self.wakes.clone();
-        wakes.push(alarm);
-        wakes.sort_by_key(|a| a.fire_at_unix);
-        if let Err(err) = write_json_atomic(&self.core_dir.join("wakes.json"), &wakes) {
-            return Outcome::Failed(format!("保存唤醒失败: {err}"));
-        }
-        self.wakes = wakes;
-        Outcome::Observed(format!("scheduled at {display} ({reason})"))
-    }
-
-    fn execute_shell(&self, call_id: eja_core::Id, input: &Value) -> Outcome {
+    fn execute_shell(&self, sandbox: &Sandbox, call_id: eja_core::Id, input: &Value) -> Outcome {
         let command = input
             .get("command")
             .and_then(Value::as_str)
@@ -215,14 +130,36 @@ impl Hands {
             .filter(|&secs| secs >= 1)
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_SHELL_TIMEOUT);
-        run_shell(
-            &self.sandbox,
-            command,
-            &cwd,
-            timeout,
-            &self.data_dir,
-            call_id,
-        )
+        run_shell(sandbox, command, &cwd, timeout, &self.data_dir, call_id)
+    }
+}
+
+fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
+    let delay = input
+        .get("delay_seconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let reason = input
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if delay < 1 || reason.is_empty() {
+        return Outcome::Failed("wake 需要 delay_seconds >= 1 且非空 reason".into());
+    }
+    let Some(fire_at) = unix_now().checked_add(delay) else {
+        return Outcome::Failed("唤醒时间超出范围".into());
+    };
+    let display = format_local_unix(fire_at);
+    let alarm = WakeAlarm {
+        id: format!("w-{fire_at}-{call_id}"),
+        fire_at_unix: fire_at,
+        fire_at_display: display.clone(),
+        reason: reason.to_string(),
+    };
+    match eja.schedule_wakes(&[alarm]) {
+        Ok(()) => Outcome::Observed(format!("scheduled at {display} ({reason})")),
+        Err(err) => Outcome::Failed(format!("保存唤醒失败: {err}")),
     }
 }
 
@@ -328,14 +265,7 @@ fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
     candidate
 }
 
-fn load_wakes(core_dir: &Path) -> Vec<WakeAlarm> {
-    fs::read(core_dir.join("wakes.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

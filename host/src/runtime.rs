@@ -1,9 +1,9 @@
 use crate::config::{write_json_atomic, HostConfig, ProviderConfig};
-use crate::hands::{Hands, ToolSpec, WakeAlarm};
+use crate::hands::{unix_now, Hands, ToolSpec};
 use crate::llm::{append_tool_results, project_window, Brain, HttpBrain, ToolCall};
 use crate::mcp::{truncate_utf8, ConnectorStatus};
 use crate::sandbox::Sandbox;
-use eja_core::{Eja, Entry, Fact, Id, Outcome, Source};
+use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, WakeAlarm};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -66,6 +66,7 @@ pub struct HostRuntime {
     config: HostConfig,
     connectors_bytes: Option<Vec<u8>>,
     hands: Hands,
+    sandbox: Sandbox,
     anchor: Id,
     local_tz: String,
     status: (String, String),
@@ -103,6 +104,17 @@ impl HostRuntime {
         };
         let sandbox = Sandbox::new(&core_dir)?;
         let eja = open_subject(&core_dir.join("subject.db"))?;
+        let legacy_wakes = core_dir.join("wakes.json");
+        match fs::read(&legacy_wakes) {
+            Ok(bytes) => {
+                let alarms: Vec<WakeAlarm> =
+                    serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+                eja.schedule_wakes(&alarms).map_err(|err| err.to_string())?;
+                fs::remove_file(legacy_wakes).map_err(|err| err.to_string())?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.to_string()),
+        }
         for action in eja.unfinished_actions().map_err(|err| err.to_string())? {
             eja.finish(
                 action,
@@ -116,12 +128,7 @@ impl HostRuntime {
         let connectors_bytes = HostConfig::read_connectors(&data_dir).ok().flatten();
         config.connectors =
             HostConfig::parse_connectors(connectors_bytes.as_deref()).unwrap_or_default();
-        let hands = Hands::open(
-            data_dir.clone(),
-            core_dir.clone(),
-            sandbox,
-            &config.connectors,
-        );
+        let hands = Hands::open(data_dir.clone(), sandbox.clone(), &config.connectors);
         let anchor = load_anchor(&core_dir);
         Ok(Self {
             data_dir,
@@ -132,6 +139,7 @@ impl HostRuntime {
             config,
             connectors_bytes,
             hands,
+            sandbox,
             anchor,
             local_tz: detect_local_tz(),
             status: ("idle".into(), "在线".into()),
@@ -140,8 +148,21 @@ impl HostRuntime {
         })
     }
 
-    pub fn next_wake_delay(&self) -> Option<Duration> {
-        self.hands.next_wake_delay()
+    pub fn panel_command(&self) -> Command {
+        let executable = self.data_dir.join("ui/Eja.app/Contents/MacOS/EjaApp");
+        let mut command = self.sandbox.command(executable, std::iter::empty::<&str>());
+        command
+            .current_dir(&self.data_dir)
+            .env("EJA_ATTACHED_UI", "1")
+            .env_remove("EJA_HOST_BIN");
+        command
+    }
+
+    pub fn next_wake_delay(&self) -> Result<Option<Duration>, String> {
+        self.eja
+            .next_wake_at()
+            .map(|at| at.map(|at| Duration::from_secs(at.saturating_sub(unix_now()).max(0) as u64)))
+            .map_err(|err| err.to_string())
     }
 
     pub fn snapshot(&self) -> HostState {
@@ -175,7 +196,7 @@ impl HostRuntime {
             connector_statuses: self.hands.connector_statuses(),
             stream: build_stream(&entries),
             concerns,
-            wakes: self.hands.wakes(),
+            wakes: self.eja.pending_wakes().unwrap_or_default(),
         }
     }
 
@@ -250,16 +271,15 @@ impl HostRuntime {
         self.run_turn(false);
     }
 
-    pub fn check_due_wakes(&mut self) {
-        let due = self.hands.drain_due_wakes();
-        if due.is_empty() {
-            return;
+    pub fn check_due_wakes(&mut self) -> Result<(), String> {
+        if self
+            .eja
+            .record_due_wakes(unix_now())
+            .map_err(|err| err.to_string())?
+        {
+            self.run_turn(true);
         }
-        for alarm in due {
-            let notice = format!("定时唤醒：{}", alarm.reason);
-            let _ = self.eja.notice(Source::Clock, notice);
-        }
-        self.run_turn(true);
+        Ok(())
     }
 
     fn refresh_connectors(&mut self, force: bool) {
@@ -452,7 +472,7 @@ impl HostRuntime {
                     Err(eja_core::Error::Invalid(msg)) => return Ok(json!({ "error": msg })),
                     Err(err) => return Err(err.to_string()),
                 };
-                let outcome = self.hands.execute(&acted);
+                let outcome = self.hands.execute(&acted, &self.eja, &self.sandbox);
                 let receipt = self
                     .eja
                     .finish(acted.id, outcome)

@@ -51,10 +51,6 @@ public enum UiRuntime {
 
     public static func resolveTemplateDir() -> URL? {
         let fm = FileManager.default
-        if let env = ProcessInfo.processInfo.environment["EJA_UI_TEMPLATE_DIR"], !env.isEmpty {
-            let url = URL(fileURLWithPath: env, isDirectory: true)
-            if isTemplateDir(url, fm: fm) { return url }
-        }
         if let res = Bundle.main.resourceURL?.appendingPathComponent("ui-template", isDirectory: true),
            isTemplateDir(res, fm: fm) {
             return res
@@ -80,53 +76,6 @@ public enum UiRuntime {
         }
         writeApplyScript(in: uiDir)
         return true
-    }
-
-    public static func runningStamp(in dataDir: URL) -> BinaryStamp? {
-        let evolved = evolvedExecutable(in: dataDir)
-        guard let current = currentExecutable(),
-              current.resolvingSymlinksInPath().path == evolved.resolvingSymlinksInPath().path else {
-            return nil
-        }
-        return binaryStamp(at: evolved)
-    }
-
-    public static func updatedExecutable(in dataDir: URL, runningStamp: BinaryStamp?) -> URL? {
-        let evolved = evolvedExecutable(in: dataDir)
-        guard FileManager.default.isExecutableFile(atPath: evolved.path),
-              let latest = binaryStamp(at: evolved),
-              latest != runningStamp else {
-            return nil
-        }
-        return evolved
-    }
-
-    public static func launch(
-        executable: URL,
-        dataDir: URL,
-        hostExecutableURL: URL?,
-        verifySeconds: TimeInterval = 1.5
-    ) throws {
-        let proc = Process()
-        proc.executableURL = executable
-        var env = ProcessInfo.processInfo.environment
-        env["EJA_DATA_DIR"] = dataDir.path
-        env.removeValue(forKey: "EJA_SAFE_MODE")
-        if let host = hostExecutableURL { env["EJA_HOST_BIN"] = host.path }
-        if let tpl = resolveTemplateDir() { env["EJA_UI_TEMPLATE_DIR"] = tpl.path }
-        proc.environment = env
-        try proc.run()
-        let deadline = Date().addingTimeInterval(verifySeconds)
-        while Date() < deadline {
-            if !proc.isRunning {
-                throw NSError(
-                    domain: "UiRuntime",
-                    code: Int(proc.terminationStatus),
-                    userInfo: [NSLocalizedDescriptionKey: "进程启动后立即退出（退出码 \(proc.terminationStatus)）"]
-                )
-            }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
     }
 
     private static func copyTemplate(from source: URL, to target: URL) throws {
@@ -161,7 +110,4 @@ public enum UiRuntime {
         return BinaryStamp(inode: inode, mtime: mtime)
     }
 
-    private static func currentExecutable() -> URL? {
-        Bundle.main.executableURL ?? CommandLine.arguments.first.map { URL(fileURLWithPath: $0) }
-    }
 }

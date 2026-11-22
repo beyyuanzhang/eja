@@ -7,12 +7,16 @@ mod sandbox;
 
 use config::{HostConfig, ProviderConfig};
 use runtime::{EventSink, HostRuntime};
+use sandbox::kill_process_tree;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::process::{Child, Stdio};
+use std::rc::Rc;
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread;
 
 #[derive(Deserialize)]
@@ -30,6 +34,61 @@ enum Command {
         model: String,
     },
     ReloadConnectors,
+    LaunchUi,
+    UiReady,
+    OpenSettings,
+}
+
+enum Input {
+    Line(Option<u32>, String),
+    Closed(Option<u32>),
+}
+
+struct Panel(Child);
+
+impl Drop for Panel {
+    fn drop(&mut self) {
+        kill_process_tree(&mut self.0);
+    }
+}
+
+fn read_commands(reader: impl BufRead, sender: Sender<Input>, panel: Option<u32>) {
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if !line.trim().is_empty() && sender.send(Input::Line(panel, line)).is_err() {
+            return;
+        }
+    }
+    let _ = sender.send(Input::Closed(panel));
+}
+
+fn attach_panel(
+    runtime: &HostRuntime,
+    sender: &Sender<Input>,
+) -> Result<(Panel, SyncSender<String>), String> {
+    let mut panel = Panel(
+        runtime
+            .panel_command()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| err.to_string())?,
+    );
+    let id = panel.0.id();
+    let stdout = panel.0.stdout.take().unwrap();
+    let mut stdin = panel.0.stdin.take().unwrap();
+    let sender = sender.clone();
+    thread::spawn(move || read_commands(BufReader::new(stdout), sender, Some(id)));
+    let (output, lines) = mpsc::sync_channel::<String>(16);
+    thread::spawn(move || {
+        for line in lines {
+            if writeln!(stdin, "{line}").is_err() {
+                break;
+            }
+        }
+    });
+    Ok((panel, output))
 }
 
 fn default_data_dir() -> PathBuf {
@@ -52,74 +111,102 @@ fn parse_data_dir() -> PathBuf {
     default_data_dir()
 }
 
+fn send_owner(value: &Value) {
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{value}");
+    let _ = out.flush();
+}
+
 fn main() {
-    let data_dir = parse_data_dir();
-    let emit: EventSink = Box::new(|val: Value| {
-        if let Ok(line) = serde_json::to_string(&val) {
-            let mut out = io::stdout().lock();
-            let _ = writeln!(out, "{line}");
-            let _ = out.flush();
+    let panel_output = Rc::new(RefCell::new(None::<SyncSender<String>>));
+    let output = Rc::clone(&panel_output);
+    let emit: EventSink = Box::new(move |value| {
+        send_owner(&value);
+        let mut output = output.borrow_mut();
+        if let Some(panel) = output.as_ref() {
+            if panel.try_send(value.to_string()).is_err() {
+                output.take();
+            }
         }
     });
 
-    let mut runtime = match HostRuntime::open(data_dir, emit) {
+    let mut runtime = match HostRuntime::open(parse_data_dir(), emit) {
         Ok(rt) => rt,
         Err(err) => {
-            let payload =
-                serde_json::json!({ "event": "error", "message": format!("初始化失败: {err}") });
-            if let Ok(line) = serde_json::to_string(&payload) {
-                println!("{line}");
-            }
+            send_owner(&json!({ "event": "error", "message": format!("初始化失败: {err}") }));
             std::process::exit(1);
         }
     };
     runtime.emit_state();
 
-    let (tx, rx) = mpsc::channel::<Result<Command, String>>();
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(raw) = line else { break };
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let parsed =
-                serde_json::from_str::<Command>(trimmed).map_err(|err| format!("无效指令: {err}"));
-            if tx.send(parsed).is_err() {
-                break;
-            }
-        }
-    });
+    let (tx, rx) = mpsc::channel();
+    let owner = tx.clone();
+    thread::spawn(move || read_commands(io::stdin().lock(), owner, None));
+    let mut panel: Option<Panel> = None;
 
     loop {
         let next = match runtime.next_wake_delay() {
-            Some(delay) => match rx.recv_timeout(delay) {
-                Ok(msg) => msg,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    runtime.check_due_wakes();
-                    continue;
+            Ok(Some(delay)) if delay.is_zero() => {
+                if let Err(err) = runtime.check_due_wakes() {
+                    runtime.emit_error(format!("记录到期唤醒失败: {err}"));
+                    break;
                 }
+                continue;
+            }
+            Ok(Some(delay)) => match rx.recv_timeout(delay) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
-            None => match rx.recv() {
+            Ok(None) => match rx.recv() {
                 Ok(msg) => msg,
                 Err(_) => break,
             },
+            Err(err) => {
+                runtime.emit_error(format!("读取唤醒计划失败: {err}"));
+                break;
+            }
         };
-        match next {
+        let panel_id = panel.as_ref().map(|p| p.0.id());
+        let (source, line) = match next {
+            Input::Closed(None) => break,
+            Input::Closed(Some(id)) if Some(id) == panel_id => {
+                panel_output.borrow_mut().take();
+                panel.take();
+                send_owner(&json!({ "event": "ui_closed" }));
+                continue;
+            }
+            Input::Line(id, line) if id.is_none() || id == panel_id => (id, line),
+            _ => continue,
+        };
+        match serde_json::from_str::<Command>(&line) {
             Ok(Command::Send { text }) => runtime.handle_user_message(&text),
-            Ok(Command::SaveConfig { config }) => runtime.save_config(config),
+            Ok(Command::SaveConfig { config }) if source.is_none() => runtime.save_config(config),
             Ok(Command::TestProvider {
                 id,
                 provider,
                 model,
-            }) => {
-                runtime.test_provider(id, provider, model);
-            }
+            }) if source.is_none() => runtime.test_provider(id, provider, model),
             Ok(Command::ReloadConnectors) => runtime.reload_connectors(),
-            Err(err) => runtime.emit_error(err),
+            Ok(Command::LaunchUi) if source.is_none() => match attach_panel(&runtime, &tx) {
+                Ok((child, output)) => {
+                    panel = Some(child);
+                    *panel_output.borrow_mut() = Some(output);
+                    runtime.emit_state();
+                }
+                Err(err) => runtime.emit_error(format!("启动自定义界面失败: {err}")),
+            },
+            Ok(Command::UiReady) if source.is_some() => {
+                send_owner(&json!({ "event": "ui_ready", "pid": source }));
+            }
+            Ok(Command::OpenSettings) if source.is_some() => {
+                send_owner(&json!({ "event": "open_settings" }));
+            }
+            Ok(Command::SaveConfig { .. } | Command::TestProvider { .. }) => {
+                runtime.emit_error("请在官方设置窗口编辑或测试模型配置");
+            }
+            Ok(Command::LaunchUi | Command::UiReady | Command::OpenSettings) => {}
+            Err(err) => runtime.emit_error(format!("无效指令: {err}")),
         }
-        runtime.check_due_wakes();
     }
 }

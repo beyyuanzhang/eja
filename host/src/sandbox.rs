@@ -49,7 +49,7 @@ impl Sandbox {
         Ok(Self {})
     }
 
-    pub fn command<I, S>(&self, program: &str, args: I) -> Command
+    pub fn command<I, S>(&self, program: impl AsRef<OsStr>, args: I) -> Command
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,

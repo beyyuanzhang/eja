@@ -7,6 +7,7 @@ mod memory;
 #[cfg(feature = "onnx")]
 mod onnx;
 mod time;
+pub use journal::WakeAlarm;
 pub use memory::Match;
 #[cfg(feature = "onnx")]
 pub use onnx::OnnxEncoder;

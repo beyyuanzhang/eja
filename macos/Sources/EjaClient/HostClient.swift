@@ -212,47 +212,45 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var wakes: [WakeAlarmDTO] = []
     @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
-    public private(set) var hostExecutableURL: URL?
+    @Published public private(set) var panelPid: Int32?
+    @Published public private(set) var settingsRequests = 0
+    public let isAttachedUI = ProcessInfo.processInfo.environment["EJA_ATTACHED_UI"] == "1"
 
     private var process: Process?
     private var stdinHandle: FileHandle?
     private let decoder = JSONDecoder()
-    private let configuredDataDir: URL?
 
     public var connectedToolCount: Int {
         connectorStatuses.filter(\.connected).reduce(0) { $0 + $1.tools.count }
     }
 
     public init(hostExecutableURL: URL? = nil, dataDir: URL? = nil) {
-        if Bundle.main.bundleURL.pathExtension == "app" {
+        if !isAttachedUI && Bundle.main.bundleURL.pathExtension == "app" {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+        if isAttachedUI {
+            stdinHandle = .standardOutput
+            readEvents(from: .standardInput, process: nil)
+            return
         }
         let resolvedHost = hostExecutableURL ?? Self.resolveHostExecutable()
         let resolvedDataDir = dataDir ?? ProcessInfo.processInfo.environment["EJA_DATA_DIR"]
             .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
-        self.hostExecutableURL = resolvedHost
-        self.configuredDataDir = resolvedDataDir
         startHost(executableURL: resolvedHost, dataDir: resolvedDataDir)
     }
 
-    deinit {
-        process?.terminate()
-    }
-
-    public func shutdown() {
-        let proc = process
-        process = nil
+    public func shutdown(wait: Bool = true) {
         try? stdinHandle?.close()
         stdinHandle = nil
-        if let proc {
-            proc.terminate()
-            proc.waitUntilExit()
-        }
+        if wait { process?.waitUntilExit() }
     }
 
-    public func restart() {
-        shutdown()
-        startHost(executableURL: hostExecutableURL, dataDir: configuredDataDir)
+    public func requestOwnerSettings() {
+        sendCommand(["cmd": "open_settings"])
+    }
+
+    public func launchUserInterface() {
+        sendCommand(["cmd": "launch_ui"])
     }
 
     public func sendMessage(_ text: String) {
@@ -305,7 +303,10 @@ public final class HostClient: ObservableObject {
         process = proc
         stdinHandle = inPipe.fileHandleForWriting
 
-        let reader = outPipe.fileHandleForReading
+        readEvents(from: outPipe.fileHandleForReading, process: proc)
+    }
+
+    private func readEvents(from reader: FileHandle, process: Process?) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var buffer = Data()
             while true {
@@ -321,15 +322,15 @@ public final class HostClient: ObservableObject {
                     }
                 }
             }
-            proc.waitUntilExit()
-            let exitCode = proc.terminationStatus
+            process?.waitUntilExit()
+            let exitCode = process?.terminationStatus ?? 0
             Task { @MainActor [weak self] in
-                self?.handleHostExited(proc, status: exitCode)
+                self?.handleHostExited(process, status: exitCode)
             }
         }
     }
 
-    private func handleHostExited(_ exited: Process, status exitCode: Int32) {
+    private func handleHostExited(_ exited: Process?, status exitCode: Int32) {
         guard process === exited else { return }
         process = nil
         stdinHandle = nil
@@ -355,6 +356,9 @@ public final class HostClient: ObservableObject {
         switch event {
         case "state":
             if let state = try? decoder.decode(StateEventDTO.self, from: data) {
+                if !isReady && isAttachedUI {
+                    sendCommand(["cmd": "ui_ready"])
+                }
                 isReady = true
                 protocolVersion = state.protocolVersion ?? 1
                 kernelVersion = state.kernelVersion ?? ""
@@ -373,6 +377,12 @@ public final class HostClient: ObservableObject {
             if let detail = json["status_detail"] as? String {
                 statusDetail = detail
             }
+        case "ui_ready":
+            panelPid = (json["pid"] as? NSNumber)?.int32Value
+        case "ui_closed":
+            panelPid = nil
+        case "open_settings":
+            settingsRequests &+= 1
         case "already_running":
             alreadyRunning = true
             alreadyRunningPid = (json["ui_pid"] as? Int).map { Int32($0) }
@@ -387,7 +397,7 @@ public final class HostClient: ObservableObject {
                 providerTestResults[id] = ProviderTestResult(ok: ok, message: msg)
             }
         case "notify":
-            if Bundle.main.bundleURL.pathExtension == "app",
+            if !isAttachedUI, Bundle.main.bundleURL.pathExtension == "app",
                let title = json["title"] as? String,
                let body = json["body"] as? String {
                 let content = UNMutableNotificationContent()

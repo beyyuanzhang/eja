@@ -5,11 +5,9 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var onTerminate: (() -> Void)?
     var runningStamp: BinaryStamp?
-    var uiReady = false
-    var isRelaunching = false
     var safeMode = ProcessInfo.processInfo.environment["EJA_SAFE_MODE"] == "1"
         || NSEvent.modifierFlags.contains(.option)
-    private var reloadTimer: Timer?
+    private var uiWatch: DispatchSourceFileSystemObject?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if NSEvent.modifierFlags.contains(.option) {
@@ -19,22 +17,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func startReloadPolling(_ tick: @escaping @MainActor () -> Void) {
-        guard reloadTimer == nil else { return }
-        reloadTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
-            Task { @MainActor in
-                tick()
-            }
+    func watchUI(at directory: URL, onChange: @escaping @MainActor () -> Void) {
+        guard uiWatch == nil else { return }
+        let fd = open(directory.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let watch = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: .write, queue: .main
+        )
+        watch.setEventHandler {
+            Task { @MainActor in onChange() }
         }
+        watch.setCancelHandler { close(fd) }
+        uiWatch = watch
+        watch.resume()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        false
+        ProcessInfo.processInfo.environment["EJA_ATTACHED_UI"] == "1"
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        reloadTimer?.invalidate()
-        reloadTimer = nil
+        uiWatch?.cancel()
         onTerminate?()
     }
 }
@@ -44,6 +47,7 @@ struct EjaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var client = HostClient()
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some Scene {
         Window("EJA", id: "main") {
@@ -53,17 +57,31 @@ struct EjaApp: App {
                     let hostClient = client
                     appDelegate.onTerminate = { [weak hostClient] in
                         Task { @MainActor in
-                            hostClient?.shutdown()
+                            hostClient?.shutdown(wait: false)
                         }
                     }
                     bootstrapUI(dataDirPath: client.dataDir)
                     handleAlreadyRunning()
-                    appDelegate.startReloadPolling {
-                        checkHotReload()
-                    }
                 }
                 .onChange(of: client.dataDir) { _, newDir in
                     bootstrapUI(dataDirPath: newDir)
+                }
+                .onChange(of: client.panelPid) { old, pid in
+                    if pid != nil {
+                        NSApp.hide(nil)
+                    } else if old != nil {
+                        NSApp.unhide(nil)
+                        NSApp.activate(ignoringOtherApps: true)
+                    }
+                }
+                .onChange(of: client.isReady) { wasReady, ready in
+                    if client.isAttachedUI && wasReady && !ready {
+                        NSApp.terminate(nil)
+                    }
+                }
+                .onChange(of: client.settingsRequests) { _, _ in
+                    NSApp.activate(ignoringOtherApps: true)
+                    openSettings()
                 }
                 .onChange(of: client.alreadyRunning) { _, _ in
                     handleAlreadyRunning()
@@ -76,7 +94,7 @@ struct EjaApp: App {
             SettingsView(client: client)
         }
 
-        MenuBarExtra {
+        MenuBarExtra(isInserted: .constant(!client.isAttachedUI)) {
             Text(client.kernelVersion.isEmpty ? "EJA · \(client.statusDetail)" : "EJA \(client.kernelVersion) · \(client.statusDetail)")
             if let nextWake = client.wakes.first {
                 Text("下次唤醒：\(nextWake.fireAtDisplay)")
@@ -90,13 +108,18 @@ struct EjaApp: App {
             }
             Divider()
             Button("打开 EJA") {
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "main")
+                if let pid = client.panelPid,
+                   let panel = NSRunningApplication(processIdentifier: pid) {
+                    panel.activate()
+                } else {
+                    NSApp.activate(ignoringOtherApps: true)
+                    openWindow(id: "main")
+                }
             }
             .keyboardShortcut("o")
             Divider()
             Button("退出 EJA") {
-                client.shutdown()
+                client.shutdown(wait: false)
                 NSApp.terminate(nil)
             }
             .keyboardShortcut("q")
@@ -113,56 +136,28 @@ struct EjaApp: App {
            let running = NSRunningApplication(processIdentifier: pid) {
             running.activate()
         }
-        client.shutdown()
+        client.shutdown(wait: false)
         NSApp.terminate(nil)
     }
 
     @MainActor
     private func bootstrapUI(dataDirPath: String) {
-        guard !appDelegate.uiReady, !dataDirPath.isEmpty else { return }
-        appDelegate.uiReady = true
+        guard !client.isAttachedUI, !dataDirPath.isEmpty, !appDelegate.safeMode else { return }
         let dataDir = URL(fileURLWithPath: dataDirPath, isDirectory: true)
-        UiRuntime.bootstrapIfNeeded(dataDir: dataDir)
-        if appDelegate.safeMode {
-            appDelegate.runningStamp = UiRuntime.binaryStamp(at: UiRuntime.evolvedExecutable(in: dataDir))
-            client.errorBanner = "已进入安全模式（官方默认界面）"
-        } else {
-            appDelegate.runningStamp = UiRuntime.runningStamp(in: dataDir)
-            checkHotReload()
+        guard UiRuntime.bootstrapIfNeeded(dataDir: dataDir) else { return }
+        appDelegate.watchUI(at: dataDir.appendingPathComponent("ui")) {
+            checkHotReload(in: dataDir)
         }
+        checkHotReload(in: dataDir)
     }
 
     @MainActor
-    private func checkHotReload() {
-        guard appDelegate.uiReady, !appDelegate.isRelaunching, client.status == "idle", !client.dataDir.isEmpty else { return }
-        let dataDir = URL(fileURLWithPath: client.dataDir, isDirectory: true)
-        guard let target = UiRuntime.updatedExecutable(in: dataDir, runningStamp: appDelegate.runningStamp) else { return }
-        relaunch(to: target, dataDir: dataDir)
-    }
-
-    @MainActor
-    private func relaunch(to executable: URL, dataDir: URL) {
-        guard !appDelegate.isRelaunching else { return }
-        appDelegate.isRelaunching = true
-        let hostBin = client.hostExecutableURL
-        client.shutdown()
-        Task.detached {
-            do {
-                try UiRuntime.launch(executable: executable, dataDir: dataDir, hostExecutableURL: hostBin)
-                await MainActor.run {
-                    NSApp.terminate(nil)
-                }
-            } catch {
-                let message = error.localizedDescription
-                await MainActor.run {
-                    if executable.resolvingSymlinksInPath().path == UiRuntime.evolvedExecutable(in: dataDir).resolvingSymlinksInPath().path {
-                        appDelegate.runningStamp = UiRuntime.binaryStamp(at: executable)
-                    }
-                    appDelegate.isRelaunching = false
-                    client.restart()
-                    client.errorBanner = "热重启前端失败，已保留当前界面：\(message)"
-                }
-            }
-        }
+    private func checkHotReload(in dataDir: URL) {
+        let target = UiRuntime.evolvedExecutable(in: dataDir)
+        guard FileManager.default.isExecutableFile(atPath: target.path),
+              let stamp = UiRuntime.binaryStamp(at: target),
+              stamp != appDelegate.runningStamp else { return }
+        appDelegate.runningStamp = stamp
+        client.launchUserInterface()
     }
 }
