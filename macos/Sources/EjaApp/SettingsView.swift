@@ -13,6 +13,10 @@ final class SettingsDraft: ObservableObject {
     @Published var selectedConnectorId: String?
     @Published var activeTab: Int = 0
 
+    private var originalProviders: [ProviderConfigDTO] = []
+    private var originalJudge = ModelRefDTO()
+    private var originalConnectors: [ConnectorConfigDTO] = []
+
     func load(from config: HostConfigDTO) {
         providers = config.providers
         judgeProviderId = config.judge.providerId
@@ -20,15 +24,35 @@ final class SettingsDraft: ObservableObject {
         selectedProviderId = providers.first?.id
         connectors = config.connectors
         selectedConnectorId = connectors.first?.id
+        originalProviders = config.providers
+        originalJudge = config.judge
+        originalConnectors = config.connectors
     }
 
-    func buildConfig() -> HostConfigDTO {
-        let judge = ModelRefDTO(providerId: judgeProviderId, model: judgeModel.trimmingCharacters(in: .whitespacesAndNewlines))
-        return HostConfigDTO(
-            providers: providers,
-            judge: judge,
-            connectors: connectors
+    func syncExternalConnectors(_ latest: [ConnectorConfigDTO]) {
+        guard !connectorsDirty else { return }
+        connectors = latest
+        originalConnectors = latest
+        if let selected = selectedConnectorId, !latest.contains(where: { $0.id == selected }) {
+            selectedConnectorId = latest.first?.id
+        } else if selectedConnectorId == nil {
+            selectedConnectorId = latest.first?.id
+        }
+    }
+
+    func buildJudge() -> ModelRefDTO {
+        ModelRefDTO(
+            providerId: judgeProviderId,
+            model: judgeModel.trimmingCharacters(in: .whitespacesAndNewlines)
         )
+    }
+
+    var modelsDirty: Bool {
+        providers != originalProviders || buildJudge() != originalJudge
+    }
+
+    var connectorsDirty: Bool {
+        connectors != originalConnectors
     }
 
     func addPreset(id: String, name: String, kind: String, baseUrl: String, models: [String]) {
@@ -92,6 +116,9 @@ struct SettingsView: View {
         .tint(EjaTheme.ink)
         .frame(width: 620, height: 480)
         .onAppear { draft.load(from: client.config) }
+        .onChange(of: client.config.connectors) { _, latest in
+            draft.syncExternalConnectors(latest)
+        }
     }
 
     private var headerBar: some View {
@@ -152,7 +179,11 @@ struct SettingsView: View {
                 .buttonStyle(EjaSecondaryButtonStyle())
                 .keyboardShortcut(.cancelAction)
             Button("保存") {
-                client.saveConfig(draft.buildConfig())
+                client.saveConfigPatch(
+                    providers: draft.modelsDirty ? draft.providers : nil,
+                    judge: draft.modelsDirty ? draft.buildJudge() : nil,
+                    connectors: draft.connectorsDirty ? draft.connectors : nil
+                )
                 dismiss()
             }
             .buttonStyle(EjaPrimaryButtonStyle())

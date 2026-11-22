@@ -7,6 +7,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const SCHEMA_VERSION: i32 = 2;
+const UNFINISHED_ACTIONS_SQL: &str = "SELECT action.id FROM facts AS action
+    WHERE json_extract(action.body, '$.kind') = 'acted'
+      AND NOT EXISTS (
+          SELECT 1 FROM facts AS receipt
+          WHERE json_extract(receipt.body, '$.kind') = 'returned'
+            AND json_extract(receipt.body, '$.action') = +action.id
+      )
+    ORDER BY action.id";
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct WakeAlarm {
@@ -414,16 +422,7 @@ impl Eja {
 
     /// Actions without a receipt, in journal order.
     pub fn unfinished_actions(&self) -> Result<Vec<Id>> {
-        let mut stmt = self.db.prepare(
-            "SELECT action.id FROM facts AS action
-             WHERE json_extract(action.body, '$.kind') = 'acted'
-               AND NOT EXISTS (
-                   SELECT 1 FROM facts AS receipt
-                   WHERE json_extract(receipt.body, '$.kind') = 'returned'
-                     AND json_extract(receipt.body, '$.action') = action.id
-               )
-             ORDER BY action.id",
-        )?;
+        let mut stmt = self.db.prepare(UNFINISHED_ACTIONS_SQL)?;
         let ids = stmt.query_map([], |row| row.get(0))?;
         Ok(ids.collect::<rusqlite::Result<_>>()?)
     }
@@ -504,4 +503,26 @@ fn migrate_schema(db: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_actions_query_searches_action_receipts_index() -> Result<()> {
+        let eja = Eja::open(":memory:")?;
+        let mut stmt = eja
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {UNFINISHED_ACTIONS_SQL}"))?;
+        let plan: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH receipt USING INDEX action_receipts")),
+            "unexpected query plan: {plan:?}"
+        );
+        Ok(())
+    }
 }

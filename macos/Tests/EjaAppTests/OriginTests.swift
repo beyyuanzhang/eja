@@ -108,5 +108,15 @@ for line in sys.stdin:
                 && restarted.config == expectedRedacted
                 && restarted.connectorStatuses.first?.connected == true
         })
+
+        var renamedProviders = restarted.config.providers
+        renamedProviders[0].name = "DeepSeek Updated"
+        restarted.saveConfigPatch(providers: renamedProviders, judge: restarted.config.judge)
+
+        #expect(await waitUntil {
+            restarted.config.providers.first?.name == "DeepSeek Updated"
+                && restarted.config.connectors == expectedRedacted.connectors
+                && restarted.connectorStatuses.first?.connected == true
+        })
     }
 }

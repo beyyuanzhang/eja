@@ -121,8 +121,9 @@ pub fn project_window(
         .iter()
         .map(render_entry)
         .collect::<eja_core::Result<_>>()?;
+    let header_budget = max_bytes / 2;
     let header = if *anchor > 0 {
-        Some(render_anchor_header(eja, *anchor)?)
+        Some(render_anchor_header(eja, *anchor, header_budget)?)
     } else {
         None
     };
@@ -150,30 +151,155 @@ pub fn project_window(
     }
     if keep_from > 0 {
         *anchor = entries[keep_from - 1].id;
+        let new_header = render_anchor_header(eja, *anchor, header_budget)?;
+        let remaining_budget = max_bytes.saturating_sub(msg_bytes(&new_header));
         let mut out = Vec::with_capacity(1 + entry_msgs.len() - keep_from);
-        out.push(render_anchor_header(eja, *anchor)?);
-        out.extend(entry_msgs.into_iter().skip(keep_from));
+        out.push(new_header);
+        if keep_from + 1 == entries.len() && kept_bytes > remaining_budget {
+            out.push(bound_entry_message(
+                &entries[keep_from],
+                entry_msgs.into_iter().nth(keep_from).unwrap(),
+                remaining_budget,
+            ));
+        } else {
+            out.extend(entry_msgs.into_iter().skip(keep_from));
+        }
         Ok(out)
     } else {
+        let header_bytes = header.as_ref().map_or(0, msg_bytes);
+        let remaining_budget = max_bytes.saturating_sub(header_bytes);
         let mut out = Vec::with_capacity(usize::from(header.is_some()) + entry_msgs.len());
         if let Some(h) = header {
             out.push(h);
         }
-        out.extend(entry_msgs);
+        if entries.len() == 1 && kept_bytes > remaining_budget {
+            out.push(bound_entry_message(
+                &entries[0],
+                entry_msgs.into_iter().next().unwrap(),
+                remaining_budget,
+            ));
+        } else {
+            out.extend(entry_msgs);
+        }
         Ok(out)
     }
 }
 
-fn msg_bytes(msg: &Value) -> usize {
-    msg["content"].as_str().map_or(0, str::len) + 1
+pub fn messages_bytes(messages: &[Value]) -> usize {
+    messages.iter().map(msg_bytes).sum()
 }
 
-fn render_anchor_header(eja: &Eja, anchor: Id) -> eja_core::Result<Value> {
+pub fn cap_tool_result(value: Value, max_bytes: usize) -> Value {
+    let serialized = value.to_string();
+    if serialized.len() <= max_bytes {
+        return value;
+    }
+    let wrapper_overhead = 72;
+    let preview_budget = max_bytes.saturating_sub(wrapper_overhead);
+    json!({
+        "truncated": true,
+        "total_bytes": serialized.len(),
+        "preview": truncate_utf8(&serialized, preview_budget)
+    })
+}
+
+fn msg_bytes(msg: &Value) -> usize {
+    if msg.get("tool_calls").is_some() {
+        return msg.to_string().len() + 1;
+    }
+    msg["content"]
+        .as_str()
+        .map(|text| text.len() + 1)
+        .unwrap_or_else(|| msg.to_string().len() + 1)
+}
+
+fn bound_entry_message(entry: &Entry, message: Value, budget: usize) -> Value {
+    if msg_bytes(&message) <= budget {
+        return message;
+    }
+    let content_budget = budget.saturating_sub(1);
+    let role = message["role"].as_str().unwrap_or("user");
+    let raw = message["content"].as_str().unwrap_or("");
+    let suffix = format!(" [truncated; read fact {}]", entry.id);
+    let bounded = if content_budget <= suffix.len() {
+        truncate_utf8(&suffix, content_budget)
+    } else {
+        format!(
+            "{}{suffix}",
+            truncate_utf8(raw, content_budget - suffix.len())
+        )
+    };
+    json!({ "role": role, "content": bounded })
+}
+
+fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Result<Value> {
     let concerns = eja.concerns(anchor)?;
-    Ok(user_message(serde_json::to_string(&json!({
+    let full = serde_json::to_string(&json!({
         "anchor": anchor,
         "concerns": concerns
-    }))?))
+    }))?;
+    let content_budget = budget.saturating_sub(1);
+    if full.len() <= content_budget {
+        return Ok(user_message(full));
+    }
+    let total_concerns = concerns.len();
+    let max_text_each = (content_budget / total_concerns.max(1)).clamp(48, 2048);
+    let mut packed = Vec::new();
+    for (index, concern) in concerns.iter().enumerate() {
+        let remaining_after = total_concerns - index - 1;
+        let mut text_limit = max_text_each.min(concern.text.len());
+        let mut fitted = false;
+        loop {
+            let item = if text_limit < concern.text.len() {
+                json!({
+                    "id": concern.id,
+                    "latest": concern.latest,
+                    "at": concern.at,
+                    "text": truncate_utf8(&concern.text, text_limit),
+                    "truncated": true
+                })
+            } else {
+                json!(concern)
+            };
+            packed.push(item);
+            let candidate = serialize_anchor_header(anchor, &packed, remaining_after)?;
+            if candidate.len() <= content_budget {
+                fitted = true;
+                break;
+            }
+            packed.pop();
+            if text_limit == 0 {
+                break;
+            }
+            text_limit = if text_limit <= 32 { 0 } else { text_limit / 2 };
+        }
+        if !fitted {
+            break;
+        }
+    }
+    let omitted = total_concerns - packed.len();
+    Ok(user_message(serialize_anchor_header(
+        anchor, &packed, omitted,
+    )?))
+}
+
+fn serialize_anchor_header(
+    anchor: Id,
+    concerns: &[Value],
+    omitted: usize,
+) -> eja_core::Result<String> {
+    if omitted > 0 {
+        Ok(serde_json::to_string(&json!({
+            "anchor": anchor,
+            "concerns": concerns,
+            "omitted_concerns": omitted
+        }))?)
+    } else {
+        Ok(serde_json::to_string(&json!({
+            "anchor": anchor,
+            "concerns": concerns
+        }))?)
+    }
 }
 
 fn render_entry(entry: &Entry) -> eja_core::Result<Value> {
@@ -560,5 +686,34 @@ mod tests {
             assert_eq!(result(2)["fact_id"], 2);
             assert_eq!(result(2)["concern"], 2);
         }
+    }
+
+    #[test]
+    fn project_window_enforces_budget_even_with_large_open_concerns() -> eja_core::Result<()> {
+        let eja = Eja::open(":memory:")?;
+        let payload = "a".repeat(60_000);
+        for index in 0..5 {
+            eja.keep(None, format!("concern-{index}-{payload}"))?;
+        }
+        for index in 0..3 {
+            eja.notice(Source::World, format!("log-{index}-{payload}"))?;
+        }
+        eja.notice(Source::Person, "trigger after large concerns")?;
+
+        let mut anchor = 0;
+        let window = project_window(&eja, &mut anchor, WINDOW_MAX_BYTES)?;
+        assert!(anchor >= 5);
+        assert!(
+            messages_bytes(&window) <= WINDOW_MAX_BYTES,
+            "projected window exceeded budget: {}",
+            messages_bytes(&window)
+        );
+        let header: Value = serde_json::from_str(window[0]["content"].as_str().unwrap()).unwrap();
+        let concerns = header["concerns"].as_array().unwrap();
+        assert_eq!(concerns.len(), 5);
+        assert!(concerns.iter().all(|item| {
+            item["latest"].as_i64().is_some() && item["truncated"].as_bool() == Some(true)
+        }));
+        Ok(())
     }
 }

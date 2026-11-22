@@ -267,6 +267,33 @@ public final class HostClient: ObservableObject {
         sendCommand(["cmd": "save_config", "config": obj])
     }
 
+    public func saveConfigPatch(
+        providers: [ProviderConfigDTO]? = nil,
+        judge: ModelRefDTO? = nil,
+        connectors: [ConnectorConfigDTO]? = nil
+    ) {
+        var patch: [String: Any] = [:]
+        let encoder = JSONEncoder()
+        if let providers,
+           let data = try? encoder.encode(providers),
+           let obj = try? JSONSerialization.jsonObject(with: data) {
+            patch["providers"] = obj
+        }
+        if let judge,
+           let data = try? encoder.encode(judge),
+           let obj = try? JSONSerialization.jsonObject(with: data) {
+            patch["judge"] = obj
+        }
+        if let connectors,
+           let data = try? encoder.encode(connectors),
+           let obj = try? JSONSerialization.jsonObject(with: data) {
+            patch["connectors"] = obj
+        }
+        guard !patch.isEmpty else { return }
+        errorBanner = nil
+        sendCommand(["cmd": "save_config", "config": patch])
+    }
+
     public func testProvider(_ provider: ProviderConfigDTO, model: String) {
         providerTestResults[provider.id] = ProviderTestResult(ok: true, message: "测试中…")
         guard let data = try? JSONEncoder().encode(provider),

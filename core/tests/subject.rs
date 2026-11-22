@@ -309,3 +309,18 @@ fn subject_db_sets_schema_version_and_rejects_future_versions() -> Result<()> {
     assert!(Eja::open(&path).is_err());
     Ok(())
 }
+
+#[test]
+fn unfinished_actions_finds_only_unsettled_actions_on_long_journal() -> Result<()> {
+    let eja = Eja::open(":memory:")?;
+    for index in 0..300 {
+        let rev = eja.revision()?;
+        let call = eja.act(rev, "shell", json!({ "n": index }), &["shell"])?;
+        eja.finish(call.id, Outcome::Observed("ok".into()))?;
+    }
+    let rev = eja.revision()?;
+    let pending = eja.act(rev, "shell", json!({ "n": 300 }), &["shell"])?;
+
+    assert_eq!(eja.unfinished_actions()?, vec![pending.id]);
+    Ok(())
+}

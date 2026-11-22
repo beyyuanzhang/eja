@@ -25,7 +25,7 @@ eja-host --data-dir "<data_dir>"
 ## 输入指令（Frontend -> Host，每行一条 JSON）
 
 - 发送消息 `{"cmd":"send","text":"你好"}`
-- 保存配置 `{"cmd":"save_config","config":{...}}`（Provider 的 `api_key` 为空字符串时自动保留 内核目录中已有密钥）
+- 保存配置 `{"cmd":"save_config","config":{...}}`（支持按域部分更新：省略 `connectors` 不改动 `connectors.json`，省略 `providers`/`judge` 不改动模型配置；Provider 的 `api_key` 为空字符串时自动保留内核目录中已有密钥）
 - 测试 Provider `{"cmd":"test_provider","id":"openai","provider":{...},"model":"gpt-4o"}`（`api_key` 为空时自动复用已保存密钥）
 - 立即重载连接器 `{"cmd":"reload_connectors"}`
 - 官方界面请求接入自定义前端 `{"cmd":"launch_ui"}`。自定义前端读到首个状态快照后发送 `{"cmd":"ui_ready"}`，宿主向官方界面发送 `ui_ready`（含 `pid`）或在断开时发送 `ui_closed`。自定义前端可发送 `{"cmd":"open_settings"}` 请求官方设置窗口。

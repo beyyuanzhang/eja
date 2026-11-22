@@ -1,6 +1,9 @@
-use crate::config::{write_json_atomic, HostConfig, ProviderConfig};
+use crate::config::{write_json_atomic, ConfigPatch, HostConfig, ProviderConfig};
 use crate::hands::{unix_now, Hands, ToolSpec};
-use crate::llm::{append_tool_results, project_window, Brain, HttpBrain, ToolCall};
+use crate::llm::{
+    append_tool_results, cap_tool_result, messages_bytes, project_window, Brain, HttpBrain,
+    ToolCall,
+};
 use crate::mcp::{truncate_utf8, ConnectorStatus};
 use crate::sandbox::Sandbox;
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, WakeAlarm};
@@ -311,25 +314,49 @@ impl HostRuntime {
         (self.emit)(json!({ "event": "error", "message": message.into() }));
     }
 
-    pub fn save_config(&mut self, mut updated: HostConfig) {
-        updated.merge_preserved(&self.config);
-        let connectors = std::mem::replace(&mut updated.connectors, self.config.connectors.clone());
-        if updated != self.config {
-            match updated.save_models(&self.core_dir) {
-                Ok(()) => self.config = updated,
-                Err(err) => self.emit_error(format!("保存模型配置失败: {err}")),
+    pub fn save_config(&mut self, patch: impl Into<ConfigPatch>) {
+        let patch = patch.into();
+        let has_model_update = patch.providers.is_some()
+            || patch.judge.is_some()
+            || patch.window_max_bytes.is_some()
+            || patch.max_steps.is_some();
+        if has_model_update {
+            let mut updated = self.config.clone();
+            if let Some(providers) = patch.providers {
+                updated.providers = providers;
             }
-        }
-        if connectors != self.config.connectors {
-            let path = HostConfig::connectors_path(&self.data_dir);
-            match write_json_atomic(&path, &connectors) {
-                Ok(()) => self.reload_connectors(),
-                Err(err) => {
-                    self.emit_error(format!("保存连接器失败: {err}"));
-                    self.emit_state();
+            if let Some(judge) = patch.judge {
+                updated.judge = judge;
+            }
+            if patch.window_max_bytes.is_some() {
+                updated.window_max_bytes = patch.window_max_bytes;
+            }
+            if patch.max_steps.is_some() {
+                updated.max_steps = patch.max_steps;
+            }
+            updated.merge_preserved(&self.config);
+            if updated != self.config {
+                match updated.save_models(&self.core_dir) {
+                    Ok(()) => self.config = updated,
+                    Err(err) => self.emit_error(format!("保存模型配置失败: {err}")),
                 }
             }
+        }
+        if let Some(connectors) = patch.connectors {
+            if connectors != self.config.connectors {
+                let path = HostConfig::connectors_path(&self.data_dir);
+                match write_json_atomic(&path, &connectors) {
+                    Ok(()) => self.reload_connectors(),
+                    Err(err) => {
+                        self.emit_error(format!("保存连接器失败: {err}"));
+                        self.emit_state();
+                    }
+                }
+            } else {
+                self.emit_state();
+            }
         } else {
+            self.refresh_connectors(false);
             self.emit_state();
         }
         if self.config.is_configured() && self.has_pending_trigger() {
@@ -490,6 +517,9 @@ impl HostRuntime {
                 break;
             }
 
+            let step_start = messages.len();
+            let per_result_budget =
+                (window_max_bytes / 2 / reply.calls.len().max(1)).min(32 * 1024);
             messages.push(reply.message);
             let mut results = Vec::with_capacity(reply.calls.len());
             for call in reply.calls {
@@ -502,7 +532,7 @@ impl HostRuntime {
                 };
                 self.set_status("thinking", detail);
                 match self.execute_tool_call(&call, &tools) {
-                    Ok(val) => results.push((call.id, val)),
+                    Ok(val) => results.push((call.id, cap_tool_result(val, per_result_budget))),
                     Err(err) => {
                         fatal_error = Some(err);
                         break;
@@ -513,6 +543,25 @@ impl HostRuntime {
                 break;
             }
             append_tool_results(&provider.kind, &mut messages, results);
+            if messages_bytes(&messages) > window_max_bytes {
+                let step_tail = messages.split_off(step_start);
+                let tail_bytes = messages_bytes(&step_tail);
+                let prefix_budget = window_max_bytes.saturating_sub(tail_bytes);
+                let prev_anchor = self.anchor;
+                match project_window(&self.eja, &mut self.anchor, prefix_budget) {
+                    Ok(mut prefix) => {
+                        if self.anchor != prev_anchor {
+                            save_window_state(&self.core_dir, self.anchor, self.settled_through);
+                        }
+                        prefix.extend(step_tail);
+                        messages = prefix;
+                    }
+                    Err(err) => {
+                        fatal_error = Some(format!("重投影日志窗口失败: {err}"));
+                        break;
+                    }
+                }
+            }
         }
 
         if completed {
@@ -1529,5 +1578,116 @@ for line in sys.stdin:
             .stream
             .iter()
             .any(|item| item.kind == "eja" && item.text == "恢复完成"));
+    }
+
+    #[test]
+    fn partial_save_config_preserves_other_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
+        let mut cfg = configured(vec![]);
+        cfg.providers[0].api_key = "sk-keep-me".into();
+        rt.save_config(cfg);
+
+        let external_connectors = vec![ConnectorConfig {
+            id: "ext".into(),
+            name: "External".into(),
+            enabled: false,
+            transport: ConnectorTransport::Http {
+                url: "http://127.0.0.1:8080/mcp".into(),
+                headers: BTreeMap::new(),
+            },
+        }];
+        write_json_atomic(
+            &HostConfig::connectors_path(&dir.path().join("Eja")),
+            &external_connectors,
+        )
+        .unwrap();
+        rt.reload_connectors();
+
+        let mut renamed = rt.snapshot().config.providers;
+        renamed[0].name = "Renamed Local".into();
+        rt.save_config(ConfigPatch {
+            providers: Some(renamed),
+            judge: Some(rt.snapshot().config.judge),
+            ..ConfigPatch::default()
+        });
+
+        assert_eq!(rt.snapshot().config.connectors, external_connectors);
+        assert_eq!(rt.snapshot().config.providers[0].name, "Renamed Local");
+        let disk_connectors: Vec<ConnectorConfig> = serde_json::from_slice(
+            &fs::read(HostConfig::connectors_path(&dir.path().join("Eja"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(disk_connectors, external_connectors);
+
+        rt.save_config(ConfigPatch {
+            connectors: Some(Vec::new()),
+            ..ConfigPatch::default()
+        });
+        assert!(rt.snapshot().config.connectors.is_empty());
+        assert!(rt.snapshot().config.providers[0].has_api_key);
+    }
+
+    struct MultiSearchBrain {
+        max_seen_bytes: Mutex<usize>,
+        step: AtomicUsize,
+    }
+
+    impl Brain for MultiSearchBrain {
+        fn complete(
+            &self,
+            _provider: &ProviderConfig,
+            _model: &str,
+            _system: &str,
+            messages: &[Value],
+            _tools: &[ToolSpec],
+        ) -> Result<ModelReply, String> {
+            let bytes = messages_bytes(messages);
+            let mut guard = self.max_seen_bytes.lock().unwrap();
+            *guard = (*guard).max(bytes);
+            if self.step.fetch_add(1, Ordering::SeqCst) < 3 {
+                return Ok(tool_reply(
+                    &format!("s{}", self.step.load(Ordering::SeqCst)),
+                    "search",
+                    json!({ "cue": "alpha" }),
+                ));
+            }
+            Ok(text_reply("done"))
+        }
+
+        fn test_connection(
+            &self,
+            _provider: &ProviderConfig,
+            model: &str,
+        ) -> Result<String, String> {
+            Ok(format!("ok:{model}"))
+        }
+    }
+
+    #[test]
+    fn in_turn_tool_results_stay_within_window_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(MultiSearchBrain {
+            max_seen_bytes: Mutex::new(0),
+            step: AtomicUsize::new(0),
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        let mut cfg = configured(vec![]);
+        cfg.window_max_bytes = Some(4096);
+        rt.save_config(cfg);
+        let blob = "alpha ".repeat(1200);
+        for _ in 0..4 {
+            rt.eja.notice(Source::World, &blob).unwrap();
+        }
+
+        rt.handle_user_message("检索 alpha");
+        assert!(*brain.max_seen_bytes.lock().unwrap() <= 4096);
     }
 }

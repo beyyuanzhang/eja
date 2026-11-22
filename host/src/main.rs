@@ -5,7 +5,7 @@ mod mcp;
 mod runtime;
 mod sandbox;
 
-use config::{HostConfig, ProviderConfig};
+use config::{ConfigPatch, ProviderConfig};
 use runtime::{EventSink, HostRuntime};
 use sandbox::kill_process_tree;
 use serde::Deserialize;
@@ -26,7 +26,7 @@ enum Command {
         text: String,
     },
     SaveConfig {
-        config: HostConfig,
+        config: ConfigPatch,
     },
     TestProvider {
         id: String,

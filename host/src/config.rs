@@ -93,6 +93,32 @@ pub struct HostConfig {
     pub max_steps: Option<usize>,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct ConfigPatch {
+    #[serde(default)]
+    pub providers: Option<Vec<ProviderConfig>>,
+    #[serde(default)]
+    pub judge: Option<ModelRef>,
+    #[serde(default)]
+    pub connectors: Option<Vec<ConnectorConfig>>,
+    #[serde(default)]
+    pub window_max_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_steps: Option<usize>,
+}
+
+impl From<HostConfig> for ConfigPatch {
+    fn from(config: HostConfig) -> Self {
+        Self {
+            providers: Some(config.providers),
+            judge: Some(config.judge),
+            connectors: Some(config.connectors),
+            window_max_bytes: config.window_max_bytes,
+            max_steps: config.max_steps,
+        }
+    }
+}
+
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
