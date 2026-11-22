@@ -12,7 +12,8 @@ eja-host --data-dir "<data_dir>"
 
 ## 数据目录边界
 
-- `core/` 由 macOS Seatbelt 保护，沙箱内 `shell` 与 MCP 进程无权读写，包含 `subject.db`、`config.json`、`wakes.json`、`window.json`、`kernel_version` 与单实例文件锁 `host.lock`。
+- 内核与用户数据使用同级目录。数据目录名为 `Eja` 时，内核目录为 `ai.eja.kernel`，其他目录名追加 `.kernel`。
+- 内核目录由 macOS Seatbelt 保护，沙箱内 `shell` 与本地 stdio MCP 进程无权读写。它包含 `subject.db`、`config.json`、`wakes.json`、`window.json`、`kernel_version` 与单实例锁 `host.lock`。升级时，宿主持有原实例锁并把旧 `core/` 整体移到新位置。
 - `connectors.json` 保存 MCP 连接器数组，文件变更在运行期自动热加载。
 - `ui/` 保存用户空间前端。官方启动器按统一约定执行 `ui/Eja.app/Contents/MacOS/EjaApp`（默认由 `ui/apply.sh` 编译原生 SwiftUI 并封装为完整 `ui/Eja.app` 应用包，也可替换为任意符合该入口路径的可执行程序或脚本），并传入 `EJA_DATA_DIR`、`EJA_HOST_BIN` 与 `EJA_UI_TEMPLATE_DIR`。启动 `Eja.app` 时按住 `Option` 键可直接进入官方默认界面。
 
@@ -23,7 +24,7 @@ eja-host --data-dir "<data_dir>"
 ## 输入指令（Frontend -> Host，每行一条 JSON）
 
 - 发送消息 `{"cmd":"send","text":"你好"}`
-- 保存配置 `{"cmd":"save_config","config":{...}}`（Provider 的 `api_key` 为空字符串时自动保留 `core/config.json` 中已有密钥）
+- 保存配置 `{"cmd":"save_config","config":{...}}`（Provider 的 `api_key` 为空字符串时自动保留 内核目录中已有密钥）
 - 测试 Provider `{"cmd":"test_provider","id":"openai","provider":{...},"model":"gpt-4o"}`（`api_key` 为空时自动复用已保存密钥）
 - 立即重载连接器 `{"cmd":"reload_connectors"}`
 

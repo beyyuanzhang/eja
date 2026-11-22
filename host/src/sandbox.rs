@@ -196,8 +196,9 @@ mod tests {
     #[test]
     fn seatbelt_blocks_core_access_rename_and_parent_signal_while_allowing_data_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path();
-        let core_dir = data_dir.join("core");
+        let data_dir = dir.path().join("Eja");
+        let core_dir = dir.path().join("ai.eja.kernel");
+        fs::create_dir(&data_dir).unwrap();
         fs::create_dir_all(&core_dir).unwrap();
         let db = core_dir.join("subject.db");
         fs::write(&db, "secret-journal").unwrap();
@@ -205,7 +206,7 @@ mod tests {
         fs::write(&core_config, "{\"api_key\":\"secret-key\"}").unwrap();
         let connectors = data_dir.join("connectors.json");
         fs::write(&connectors, "[]").unwrap();
-        let fake_exe = data_dir.join("eja-host");
+        let fake_exe = dir.path().join("eja-host");
         fs::write(&fake_exe, "host-binary").unwrap();
 
         let sandbox = Sandbox::with_host_exe(&core_dir, &fake_exe).unwrap();
@@ -293,16 +294,13 @@ mod tests {
         let rename_parent = sandbox
             .command(
                 "/bin/sh",
-                [
-                    "-c",
-                    &format!("mv '{}' '{}.moved'", data_dir.display(), data_dir.display()),
-                ],
+                ["-c", &format!("mv '{0}' '{0}.moved'", dir.path().display())],
             )
             .output()
             .unwrap();
         assert!(
             !rename_parent.status.success(),
-            "renaming ancestor data_dir must fail"
+            "renaming the protected directory's ancestor must fail"
         );
 
         let symlink_read = sandbox

@@ -34,8 +34,7 @@ struct ContentView: View {
                                         .transition(.opacity.combined(with: .offset(y: 4)))
                                 }
                                 if client.status != "idle" {
-                                    BusyDots()
-                                        .padding(.leading, 2)
+                                    ActivityPill(detail: client.statusDetail)
                                         .id("eja-busy")
                                 }
                             }
@@ -278,39 +277,22 @@ private struct SendScaleButtonStyle: ButtonStyle {
     }
 }
 
-/// 等待指示：约一秒后仍未完成才浮现，三个点缓慢明灭。
-@MainActor
-private final class BusyDotsModel: ObservableObject {
-    @Published var visible = false
-    @Published var lit = false
-
-    init() {
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 900_000_000)
-            self.visible = true
-            self.lit = true
-        }
-    }
-}
-
-private struct BusyDots: View {
-    @StateObject private var model = BusyDotsModel()
+private struct ActivityPill: View {
+    let detail: String
 
     var body: some View {
-        HStack(spacing: 5) {
-            ForEach(0..<3, id: \.self) { i in
-                Circle()
-                    .fill(EjaTheme.inkMuted)
-                    .frame(width: 4, height: 4)
-                    .opacity(model.visible ? (model.lit ? 0.7 : 0.2) : 0)
-                    .animation(
-                        .easeInOut(duration: 0.6)
-                        .repeatForever(autoreverses: true)
-                        .delay(Double(i) * 0.14),
-                        value: model.lit
-                    )
-            }
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.mini)
+                .accessibilityHidden(true)
+            Text(detail)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(EjaTheme.inkSecondary)
+                .lineLimit(1)
         }
-        .frame(height: 16)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(EjaTheme.surface, in: Capsule())
+        .overlay(Capsule().strokeBorder(EjaTheme.hairline, lineWidth: 1))
     }
 }

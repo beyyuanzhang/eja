@@ -31,13 +31,17 @@ cargo build -p eja-host
 (cd macos && swift run EjaApp)
 ```
 
-默认数据目录为 `~/Library/Application Support/Eja/`：
-- `core/subject.db`：`eja-core` 永久主体日志（`PRAGMA user_version` 版本迁移）
-- `core/config.json`：LLM Provider、密钥与宿主参数（Seatbelt 保护，前端仅见脱敏状态）
-- `core/kernel_version`：内核版本记录（升级 `Eja.app` 后自动触发版本感知）
-- `core/host.lock`：单实例操作系统文件锁（确保同一数据目录仅运行一个主体实例）
-- `core/wakes.json`：定时唤醒记录
-- `core/window.json`：当前上下文窗口起点 `anchor`
+内核目录默认为 `~/Library/Application Support/ai.eja.kernel/`。
+
+- `subject.db`：`eja-core` 永久主体日志（`PRAGMA user_version` 版本迁移）
+- `config.json`：LLM Provider、密钥与宿主参数（Seatbelt 保护，前端仅见脱敏状态）
+- `kernel_version`：内核版本记录（升级 `Eja.app` 后自动触发版本感知）
+- `host.lock`：单实例操作系统文件锁（确保同一数据目录仅运行一个主体实例）
+- `wakes.json`：定时唤醒记录
+- `window.json`：当前上下文窗口起点 `anchor`
+
+用户数据目录默认为 `~/Library/Application Support/Eja/`。
+
 - `connectors.json`：MCP 连接器列表（变更自动热加载）
 - `ui/`：可由 EJA 直接修改的前端目录（默认原生 SwiftUI 源码，运行 `ui/apply.sh` 编译并封装为完整 `ui/Eja.app` 后热切；按住 `Option` 启动 `Eja.app` 可进入默认安全模式）
 

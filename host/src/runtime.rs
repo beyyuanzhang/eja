@@ -83,9 +83,17 @@ impl HostRuntime {
         brain: Arc<dyn Brain>,
         mut emit: EventSink,
     ) -> Result<Self, String> {
-        let core_dir = data_dir.join("core");
-        fs::create_dir_all(&core_dir).map_err(|err| err.to_string())?;
-        let instance_lock = match acquire_instance_lock(&core_dir) {
+        fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
+        let data_dir = fs::canonicalize(data_dir).map_err(|err| err.to_string())?;
+        let name = data_dir.file_name().ok_or("数据目录不能是文件系统根目录")?;
+        let mut core_name = name.to_os_string();
+        if name == "Eja" {
+            core_name = "ai.eja.kernel".into();
+        } else {
+            core_name.push(".kernel");
+        }
+        let core_dir = data_dir.with_file_name(core_name);
+        let instance_lock = match lock_core_dir(&data_dir, &core_dir) {
             Ok(lock) => lock,
             Err(LockError::AlreadyRunning(ui_pid)) => {
                 (emit)(json!({ "event": "already_running", "ui_pid": ui_pid }));
@@ -311,6 +319,7 @@ impl HostRuntime {
         let mut fatal_error: Option<String> = None;
 
         for _ in 0..max_steps {
+            self.set_status("thinking", "思考中…");
             let tools = self.hands.tools();
             let reply = match self
                 .brain
@@ -341,6 +350,14 @@ impl HostRuntime {
             messages.push(reply.message);
             let mut results = Vec::with_capacity(reply.calls.len());
             for call in reply.calls {
+                let detail = match call.name.as_str() {
+                    "shell" => "执行 Shell",
+                    "search" | "read" => "查阅记忆",
+                    "keep" | "release" => "更新挂念",
+                    "wake" => "预约唤醒",
+                    name => name,
+                };
+                self.set_status("thinking", detail);
                 match self.execute_tool_call(&call, &tools) {
                     Ok(val) => results.push((call.id, val)),
                     Err(err) => {
@@ -446,8 +463,10 @@ impl HostRuntime {
     }
 
     fn set_status(&mut self, status: &str, detail: &str) {
-        self.status = (status.to_string(), detail.to_string());
-        self.emit_state();
+        if self.status.0 != status || self.status.1 != detail {
+            self.status = (status.to_string(), detail.to_string());
+            self.emit_state();
+        }
     }
 }
 
@@ -635,6 +654,19 @@ enum LockError {
     Io(String),
 }
 
+fn lock_core_dir(data_dir: &Path, core_dir: &Path) -> Result<fs::File, LockError> {
+    let old_dir = data_dir.join("core");
+    let io_error = |err| LockError::Io(format!("准备内核目录失败: {err}"));
+    if !core_dir.try_exists().map_err(io_error)? && old_dir.try_exists().map_err(io_error)? {
+        // Carry the existing instance lock along with the journal and SQLite sidecars.
+        let lock = acquire_instance_lock(&old_dir)?;
+        fs::rename(old_dir, core_dir).map_err(io_error)?;
+        return Ok(lock);
+    }
+    fs::create_dir_all(core_dir).map_err(io_error)?;
+    acquire_instance_lock(core_dir)
+}
+
 fn acquire_instance_lock(core_dir: &Path) -> Result<fs::File, LockError> {
     let lock_path = core_dir.join("host.lock");
     let mut file = fs::OpenOptions::new()
@@ -802,7 +834,7 @@ mod tests {
             mode: "chat",
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
         rt.handle_user_message("你好");
@@ -850,9 +882,14 @@ for line in sys.stdin:
             judge_calls: AtomicUsize::new(0),
             mode: "mcp",
         });
-        let mut rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
-                .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let mut rt = HostRuntime::open_with_brain(
+            dir.path().join("Eja"),
+            brain,
+            Box::new(move |event| sink.lock().unwrap().push(event)),
+        )
+        .unwrap();
         rt.save_config(configured(vec![ConnectorConfig {
             id: "demo".into(),
             name: "Demo MCP".into(),
@@ -883,6 +920,12 @@ for line in sys.stdin:
             .stream
             .iter()
             .any(|item| item.kind == "eja" && item.text == "mcp ok"));
+        let events = events.lock().unwrap();
+        let activity: Vec<_> = events
+            .iter()
+            .filter_map(|e| e["status_detail"].as_str())
+            .collect();
+        assert!(activity.ends_with(&["思考中…", "mcp_demo_echo", "思考中…", "在线"]));
     }
 
     struct WindowRecordingBrain {
@@ -926,7 +969,7 @@ for line in sys.stdin:
             windows: Mutex::new(Vec::new()),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         let mut cfg = configured(vec![]);
         cfg.window_max_bytes = Some(900);
@@ -948,7 +991,7 @@ for line in sys.stdin:
 
         // Reopen runtime and verify persisted anchor starts cleanly with the open concern snapshot.
         let mut restarted =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         restarted.handle_user_message("重启后第一轮");
 
@@ -999,7 +1042,7 @@ for line in sys.stdin:
             seen_error: Mutex::new(None),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
 
@@ -1020,15 +1063,15 @@ for line in sys.stdin:
             mode: "chat",
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
 
-        let core_config = HostConfig::config_path(&dir.path().join("core"));
-        let connectors_path = HostConfig::connectors_path(dir.path());
+        let core_config = HostConfig::config_path(&dir.path().join("ai.eja.kernel"));
+        let connectors_path = HostConfig::connectors_path(&dir.path().join("Eja"));
         assert!(core_config.exists());
         assert!(connectors_path.exists());
-        assert!(!dir.path().join("config.json").exists());
+        assert!(!dir.path().join("Eja/core").exists());
         assert!(!fs::read_to_string(&core_config)
             .unwrap()
             .contains("connectors"));
@@ -1053,8 +1096,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Box::new(|_| {}))
-                .unwrap();
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
         let mut cfg = configured(vec![]);
         cfg.providers[0].api_key = "sk-top-secret".into();
         rt.save_config(cfg);
@@ -1067,7 +1109,8 @@ for line in sys.stdin:
 
         // Saving redacted config back from UI must preserve stored api_key on disk.
         rt.save_config(snap.config);
-        let disk = fs::read_to_string(HostConfig::config_path(&dir.path().join("core"))).unwrap();
+        let disk =
+            fs::read_to_string(HostConfig::config_path(&dir.path().join("ai.eja.kernel"))).unwrap();
         assert!(disk.contains("sk-top-secret"));
         assert!(!disk.contains("has_api_key"));
     }
@@ -1080,10 +1123,10 @@ for line in sys.stdin:
             mode: "chat",
         });
         let rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         assert!(rt.snapshot().stream.is_empty());
-        let version_file = dir.path().join("core/kernel_version");
+        let version_file = dir.path().join("ai.eja.kernel/kernel_version");
         assert_eq!(
             fs::read_to_string(&version_file).unwrap().trim(),
             KERNEL_VERSION
@@ -1092,8 +1135,7 @@ for line in sys.stdin:
 
         fs::write(&version_file, "0.9.0\n").unwrap();
         let upgraded =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Box::new(|_| {}))
-                .unwrap();
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
         assert_eq!(
             fs::read_to_string(&version_file).unwrap().trim(),
             KERNEL_VERSION
@@ -1113,13 +1155,13 @@ for line in sys.stdin:
             mode: "chat",
         });
         let rt1 =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
 
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink_events = Arc::clone(&events);
         let second = HostRuntime::open_with_brain(
-            dir.path().to_path_buf(),
+            dir.path().join("Eja"),
             brain.clone(),
             Box::new(move |val| sink_events.lock().unwrap().push(val)),
         );
@@ -1132,17 +1174,16 @@ for line in sys.stdin:
 
         drop(rt1);
         assert!(
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Box::new(|_| {}),)
-                .is_ok()
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {}),).is_ok()
         );
     }
 
     #[test]
-    fn reconciles_unfinished_acted_entries_on_open() {
+    fn moves_legacy_core_and_reconciles_unfinished_actions() {
         let dir = tempfile::tempdir().unwrap();
-        let core_dir = dir.path().join("core");
-        fs::create_dir_all(&core_dir).unwrap();
-        let eja = Eja::open(core_dir.join("subject.db")).unwrap();
+        let old_dir = dir.path().join("Eja/core");
+        fs::create_dir_all(&old_dir).unwrap();
+        let eja = Eja::open(old_dir.join("subject.db")).unwrap();
         let rev = eja.revision().unwrap();
         let dangling = eja
             .act(rev, "shell", json!({ "command": "sleep 999" }), &["shell"])
@@ -1153,8 +1194,16 @@ for line in sys.stdin:
             judge_calls: AtomicUsize::new(0),
             mode: "chat",
         });
+        let legacy_lock = acquire_instance_lock(&old_dir).ok().unwrap();
+        assert!(matches!(
+            lock_core_dir(&dir.path().join("Eja"), &dir.path().join("ai.eja.kernel")),
+            Err(LockError::AlreadyRunning(_))
+        ));
+        assert!(old_dir.exists());
+        legacy_lock.unlock().unwrap();
+
         let rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         let snap = rt.snapshot();
         assert!(snap.stream.iter().any(|item| {
@@ -1164,12 +1213,13 @@ for line in sys.stdin:
                     .as_deref()
                     .is_some_and(|d| d.contains("未知:") && d.contains("中断"))
         }));
+        assert!(!old_dir.exists());
+        assert!(dir.path().join("ai.eja.kernel/subject.db").is_file());
         let rev_after_first = rt.eja.revision().unwrap();
         drop(rt);
 
         let reopened =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Box::new(|_| {}))
-                .unwrap();
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
         assert_eq!(reopened.eja.revision().unwrap(), rev_after_first);
     }
 }
