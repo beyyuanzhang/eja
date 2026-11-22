@@ -1,5 +1,6 @@
 use crate::config::ConnectorConfig;
 use crate::mcp::{truncate_utf8, ConnectorPool, ConnectorStatus};
+use crate::sandbox::Sandbox;
 use eja_core::{Call, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -33,17 +34,26 @@ pub struct WakeAlarm {
 
 pub struct Hands {
     data_dir: PathBuf,
+    core_dir: PathBuf,
+    sandbox: Sandbox,
     connectors: ConnectorPool,
     wakes: Vec<WakeAlarm>,
 }
 
 impl Hands {
-    pub fn open(data_dir: PathBuf, connectors: &[ConnectorConfig]) -> Self {
-        let mut pool = ConnectorPool::default();
+    pub fn open(
+        data_dir: PathBuf,
+        core_dir: PathBuf,
+        sandbox: Sandbox,
+        connectors: &[ConnectorConfig],
+    ) -> Self {
+        let mut pool = ConnectorPool::new(sandbox.clone());
         pool.reload(connectors);
-        let wakes = load_wakes(&data_dir);
+        let wakes = load_wakes(&core_dir);
         Self {
             data_dir,
+            core_dir,
+            sandbox,
             connectors: pool,
             wakes,
         }
@@ -73,7 +83,7 @@ impl Hands {
             }
         });
         if !fired.is_empty() {
-            save_wakes(&self.data_dir, &self.wakes);
+            save_wakes(&self.core_dir, &self.wakes);
         }
         fired
     }
@@ -164,7 +174,7 @@ impl Hands {
         };
         self.wakes.push(alarm);
         self.wakes.sort_by_key(|a| a.fire_at_unix);
-        save_wakes(&self.data_dir, &self.wakes);
+        save_wakes(&self.core_dir, &self.wakes);
         Outcome::Observed(format!("scheduled at {display} ({reason})"))
     }
 
@@ -189,19 +199,27 @@ impl Hands {
             .filter(|&secs| secs >= 1)
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_SHELL_TIMEOUT);
-        run_shell(command, &cwd, timeout, &self.data_dir, call_id)
+        run_shell(
+            &self.sandbox,
+            command,
+            &cwd,
+            timeout,
+            &self.data_dir,
+            call_id,
+        )
     }
 }
 
 fn run_shell(
+    sandbox: &Sandbox,
     command: &str,
     cwd: &Path,
     timeout: Duration,
     data_dir: &Path,
     call_id: eja_core::Id,
 ) -> Outcome {
-    let mut child = match Command::new("/bin/sh")
-        .args(["-c", command])
+    let mut child = match sandbox
+        .command("/bin/sh", ["-c", command])
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -296,16 +314,16 @@ fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
     candidate
 }
 
-fn load_wakes(data_dir: &Path) -> Vec<WakeAlarm> {
-    fs::read(data_dir.join("wakes.json"))
+fn load_wakes(core_dir: &Path) -> Vec<WakeAlarm> {
+    fs::read(core_dir.join("wakes.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-fn save_wakes(data_dir: &Path, wakes: &[WakeAlarm]) {
+fn save_wakes(core_dir: &Path, wakes: &[WakeAlarm]) {
     if let Ok(bytes) = serde_json::to_vec_pretty(wakes) {
-        let _ = fs::write(data_dir.join("wakes.json"), bytes);
+        let _ = fs::write(core_dir.join("wakes.json"), bytes);
     }
 }
 

@@ -3,6 +3,7 @@ mod hands;
 mod llm;
 mod mcp;
 mod runtime;
+mod sandbox;
 
 use config::{HostConfig, ProviderConfig};
 use runtime::HostRuntime;

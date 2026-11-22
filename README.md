@@ -32,7 +32,7 @@ cargo build -p eja-host
 ```
 
 默认数据目录为 `~/Library/Application Support/Eja/`：
-- `subject.db`：`eja-core` 永久主体日志
+- `core/subject.db`：`eja-core` 永久主体日志
+- `core/wakes.json`：定时唤醒记录
+- `core/window.json`：当前上下文窗口起点 `anchor`
 - `config.json`：LLM 与 MCP 连接器配置
-- `wakes.json`：定时唤醒记录
-- `window.json`：当前上下文窗口起点 `anchor`

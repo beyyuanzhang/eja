@@ -27,7 +27,7 @@ cargo build --release -p eja-host
 ```
 
 数据默认保存在 `~/Library/Application Support/Eja/`：
-- `subject.db`：`eja-core` 永久主体日志
+- `core/subject.db`：`eja-core` 永久主体日志
+- `core/wakes.json`：EJA 自设的定时唤醒
+- `core/window.json`：当前上下文窗口起点 `anchor`
 - `config.json`：LLM 与 MCP 连接器配置
-- `wakes.json`：EJA 自设的定时唤醒
-- `window.json`：当前上下文窗口起点 `anchor`

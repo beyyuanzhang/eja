@@ -2,6 +2,7 @@ use crate::config::{HostConfig, ProviderConfig};
 use crate::hands::{Hands, ToolSpec, WakeAlarm};
 use crate::llm::{append_tool_results, project_window, Brain, HttpBrain, ToolCall};
 use crate::mcp::{truncate_utf8, ConnectorStatus};
+use crate::sandbox::Sandbox;
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -50,6 +51,7 @@ struct WindowState {
 
 pub struct HostRuntime {
     data_dir: PathBuf,
+    core_dir: PathBuf,
     eja: Mutex<Eja>,
     config: Mutex<HostConfig>,
     config_bytes: Mutex<Option<Vec<u8>>>,
@@ -72,14 +74,22 @@ impl HostRuntime {
         brain: Arc<dyn Brain>,
         emit: EventSink,
     ) -> Result<Self, String> {
-        fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
-        let eja = open_subject(&data_dir.join("subject.db"))?;
+        let core_dir = data_dir.join("core");
+        fs::create_dir_all(&core_dir).map_err(|err| err.to_string())?;
+        let sandbox = Sandbox::new(&core_dir)?;
+        let eja = open_subject(&core_dir.join("subject.db"))?;
         let config = HostConfig::load(&data_dir);
         let config_bytes = read_config_bytes(&data_dir);
-        let hands = Hands::open(data_dir.clone(), &config.connectors);
-        let anchor = load_anchor(&data_dir);
+        let hands = Hands::open(
+            data_dir.clone(),
+            core_dir.clone(),
+            sandbox,
+            &config.connectors,
+        );
+        let anchor = load_anchor(&core_dir);
         Ok(Self {
             data_dir,
+            core_dir,
             eja: Mutex::new(eja),
             config: Mutex::new(config),
             config_bytes: Mutex::new(config_bytes),
@@ -281,7 +291,7 @@ impl HostRuntime {
                 }
             };
             if *anchor != initial_anchor {
-                save_anchor(&self.data_dir, *anchor);
+                save_anchor(&self.core_dir, *anchor);
             }
             projected
         };
@@ -542,18 +552,18 @@ fn read_config_bytes(data_dir: &Path) -> Option<Vec<u8>> {
     fs::read(HostConfig::path(data_dir)).ok()
 }
 
-fn load_anchor(data_dir: &Path) -> Id {
-    fs::read(data_dir.join("window.json"))
+fn load_anchor(core_dir: &Path) -> Id {
+    fs::read(core_dir.join("window.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<WindowState>(&bytes).ok())
         .map(|state| state.anchor.max(0))
         .unwrap_or(0)
 }
 
-fn save_anchor(data_dir: &Path, anchor: Id) {
+fn save_anchor(core_dir: &Path, anchor: Id) {
     let state = WindowState { anchor };
     if let Ok(bytes) = serde_json::to_vec(&state) {
-        let _ = fs::write(data_dir.join("window.json"), bytes);
+        let _ = fs::write(core_dir.join("window.json"), bytes);
     }
 }
 

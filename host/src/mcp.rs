@@ -1,4 +1,5 @@
 use crate::config::{ConnectorConfig, ConnectorTransport};
+use crate::sandbox::Sandbox;
 use eja_core::Outcome;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -54,13 +55,13 @@ struct StdioConnection {
 
 impl StdioConnection {
     fn connect(
+        sandbox: &Sandbox,
         command: &str,
         args: &[String],
         env: &BTreeMap<String, String>,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(command);
-        cmd.args(args)
-            .envs(env)
+        let mut cmd = sandbox.command(command, args);
+        cmd.envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -375,14 +376,23 @@ impl ActiveConnection {
     }
 }
 
-#[derive(Default)]
 pub struct ConnectorPool {
+    sandbox: Sandbox,
     connections: HashMap<String, ActiveConnection>,
     statuses: Vec<ConnectorStatus>,
     tools: Vec<McpTool>,
 }
 
 impl ConnectorPool {
+    pub fn new(sandbox: Sandbox) -> Self {
+        Self {
+            sandbox,
+            connections: HashMap::new(),
+            statuses: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+
     pub fn reload(&mut self, configs: &[ConnectorConfig]) {
         self.connections.clear();
         self.statuses.clear();
@@ -403,7 +413,8 @@ impl ConnectorPool {
 
             let connected = match &cfg.transport {
                 ConnectorTransport::Stdio { command, args, env } => {
-                    StdioConnection::connect(command, args, env).map(ActiveConnection::Stdio)
+                    StdioConnection::connect(&self.sandbox, command, args, env)
+                        .map(ActiveConnection::Stdio)
                 }
                 ConnectorTransport::Http { url, headers } => {
                     HttpConnection::connect(url, headers).map(ActiveConnection::Http)
