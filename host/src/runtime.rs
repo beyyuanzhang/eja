@@ -1,4 +1,4 @@
-use crate::config::{HostConfig, ProviderConfig};
+use crate::config::{write_json_atomic, HostConfig, ProviderConfig};
 use crate::hands::{Hands, ToolSpec, WakeAlarm};
 use crate::llm::{append_tool_results, project_window, Brain, HttpBrain, ToolCall};
 use crate::mcp::{truncate_utf8, ConnectorStatus};
@@ -6,7 +6,7 @@ use crate::sandbox::Sandbox;
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -103,11 +103,19 @@ impl HostRuntime {
         };
         let sandbox = Sandbox::new(&core_dir)?;
         let eja = open_subject(&core_dir.join("subject.db"))?;
-        reconcile_unfinished_actions(&eja);
+        for action in eja.unfinished_actions().map_err(|err| err.to_string())? {
+            eja.finish(
+                action,
+                Outcome::Unknown("上次执行因宿主中断而未完成".into()),
+            )
+            .map_err(|err| err.to_string())?;
+        }
         let resources_dir = resolve_resources_dir();
         sync_kernel_version(&core_dir, &eja, resources_dir.as_deref());
-        let config = HostConfig::load(&core_dir, &data_dir);
-        let connectors_bytes = read_connectors_bytes(&data_dir);
+        let mut config = HostConfig::load(&core_dir);
+        let connectors_bytes = HostConfig::read_connectors(&data_dir).ok().flatten();
+        config.connectors =
+            HostConfig::parse_connectors(connectors_bytes.as_deref()).unwrap_or_default();
         let hands = Hands::open(
             data_dir.clone(),
             core_dir.clone(),
@@ -185,29 +193,26 @@ impl HostRuntime {
 
     pub fn save_config(&mut self, mut updated: HostConfig) {
         updated.merge_preserved(&self.config);
-        if let Err(err) = updated.save(&self.core_dir, &self.data_dir) {
-            self.emit_error(format!("保存配置失败: {err}"));
-            return;
+        let connectors = std::mem::replace(&mut updated.connectors, self.config.connectors.clone());
+        if updated != self.config {
+            match updated.save_models(&self.core_dir) {
+                Ok(()) => self.config = updated,
+                Err(err) => self.emit_error(format!("保存模型配置失败: {err}")),
+            }
         }
-        let connectors_changed = self.config.connectors != updated.connectors;
-        self.config = updated;
-        self.connectors_bytes = read_connectors_bytes(&self.data_dir);
-        if connectors_changed {
-            self.hands.reload(&self.config.connectors);
+        if connectors != self.config.connectors {
+            let path = HostConfig::connectors_path(&self.data_dir);
+            match write_json_atomic(&path, &connectors) {
+                Ok(()) => return self.reload_connectors(),
+                Err(err) => self.emit_error(format!("保存连接器失败: {err}")),
+            }
         }
         self.emit_state();
     }
 
     pub fn reload_connectors(&mut self) {
-        match HostConfig::load_connectors(&self.data_dir) {
-            Ok(connectors) => {
-                self.config.connectors = connectors;
-                self.connectors_bytes = read_connectors_bytes(&self.data_dir);
-                self.hands.reload(&self.config.connectors);
-                self.emit_state();
-            }
-            Err(err) => self.emit_error(err),
-        }
+        self.refresh_connectors(true);
+        self.emit_state();
     }
 
     pub fn test_provider(&mut self, id: String, mut provider: ProviderConfig, model: String) {
@@ -242,7 +247,6 @@ impl HostRuntime {
             self.emit_error(format!("写入消息失败: {err}"));
             return;
         }
-        self.emit_state();
         self.run_turn(false);
     }
 
@@ -255,30 +259,34 @@ impl HostRuntime {
             let notice = format!("定时唤醒：{}", alarm.reason);
             let _ = self.eja.notice(Source::Clock, notice);
         }
-        self.emit_state();
         self.run_turn(true);
     }
 
-    fn sync_connectors_if_changed(&mut self) {
-        let latest_bytes = read_connectors_bytes(&self.data_dir);
-        if self.connectors_bytes != latest_bytes {
-            self.connectors_bytes = latest_bytes;
-            match HostConfig::load_connectors(&self.data_dir) {
-                Ok(connectors) => {
-                    if self.config.connectors != connectors {
-                        self.config.connectors = connectors;
-                        self.hands.reload(&self.config.connectors);
-                    }
-                }
-                Err(err) => self.emit_error(err),
+    fn refresh_connectors(&mut self, force: bool) {
+        let bytes = match HostConfig::read_connectors(&self.data_dir) {
+            Ok(bytes) => bytes,
+            Err(err) => return self.emit_error(err),
+        };
+        if !force && self.connectors_bytes == bytes {
+            return;
+        }
+        self.connectors_bytes = bytes;
+        match HostConfig::parse_connectors(self.connectors_bytes.as_deref()) {
+            Ok(connectors) if force || self.config.connectors != connectors => {
+                self.hands.reload(&connectors);
+                self.config.connectors = connectors;
             }
+            Ok(_) => {}
+            Err(err) => self.emit_error(err),
         }
     }
 
     fn run_turn(&mut self, proactive: bool) {
-        self.sync_connectors_if_changed();
+        self.set_status("thinking", "思考中…");
+        self.refresh_connectors(false);
         let Some((provider, model)) = self.config.resolve_judge() else {
             self.emit_error("请先在设置中配置可用的 LLM Provider 与主模型");
+            self.set_status("idle", "在线");
             return;
         };
         let provider = provider.clone();
@@ -286,7 +294,6 @@ impl HostRuntime {
         let window_max_bytes = self.config.window_max_bytes();
         let max_steps = self.config.max_steps();
 
-        self.set_status("thinking", "思考中…");
         let data_dir_str = self.data_dir.display().to_string();
         let resources_line = match &self.resources_dir {
             Some(dir) => format!("\n只读协议与模板参考：{}", dir.display()),
@@ -297,10 +304,9 @@ impl HostRuntime {
             内核版本：{KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）{resources_line}\n\
             数据目录：{}\n\
             连接器配置：{}/connectors.json（变更会自动热加载）\n\
-            界面源码：{}/ui/（修改 SwiftUI 后运行 {}/ui/apply.sh 编译并热重启前端）\n\
             本地时区：{}\n\n\
             前置消息是你按时间正序排列的不可变主体日志；末尾新增的 `noticed` 记录是本次触发。不调工具时的文本回复会发送给人，留空则保持沉默。",
-            data_dir_str, data_dir_str, data_dir_str, data_dir_str, self.local_tz
+            data_dir_str, data_dir_str, self.local_tz
         );
         let initial_anchor = self.anchor;
         let mut messages = match project_window(&self.eja, &mut self.anchor, window_max_bytes) {
@@ -452,7 +458,7 @@ impl HostRuntime {
                     .finish(acted.id, outcome)
                     .map_err(|err| err.to_string())?;
                 if spec.capability == "shell" {
-                    self.sync_connectors_if_changed();
+                    self.refresh_connectors(false);
                 }
                 let Fact::Returned { outcome, .. } = receipt.fact else {
                     unreachable!()
@@ -464,8 +470,13 @@ impl HostRuntime {
 
     fn set_status(&mut self, status: &str, detail: &str) {
         if self.status.0 != status || self.status.1 != detail {
+            let phase_changed = self.status.0 != status;
             self.status = (status.to_string(), detail.to_string());
-            self.emit_state();
+            if phase_changed {
+                self.emit_state();
+            } else {
+                (self.emit)(json!({ "event": "activity", "status_detail": detail }));
+            }
         }
     }
 }
@@ -473,35 +484,6 @@ impl HostRuntime {
 impl Drop for HostRuntime {
     fn drop(&mut self) {
         let _ = self._instance_lock.unlock();
-    }
-}
-
-fn reconcile_unfinished_actions(eja: &Eja) {
-    let Ok(rev) = eja.revision() else { return };
-    if rev == 0 {
-        return;
-    }
-    let Ok(entries) = eja.entries_after(0, rev) else {
-        return;
-    };
-    let mut returned: HashSet<Id> = HashSet::new();
-    let mut acted: Vec<Id> = Vec::new();
-    for entry in &entries {
-        match &entry.fact {
-            Fact::Acted { .. } => acted.push(entry.id),
-            Fact::Returned { action, .. } => {
-                returned.insert(*action);
-            }
-            _ => {}
-        }
-    }
-    for action_id in acted {
-        if !returned.contains(&action_id) {
-            let _ = eja.finish(
-                action_id,
-                Outcome::Unknown("上次执行因宿主中断而未完成".into()),
-            );
-        }
     }
 }
 
@@ -607,10 +589,6 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
         }
     }
     items
-}
-
-fn read_connectors_bytes(data_dir: &Path) -> Option<Vec<u8>> {
-    fs::read(HostConfig::connectors_path(data_dir)).ok()
 }
 
 fn load_anchor(core_dir: &Path) -> Id {
@@ -1070,7 +1048,7 @@ for line in sys.stdin:
         let core_config = HostConfig::config_path(&dir.path().join("ai.eja.kernel"));
         let connectors_path = HostConfig::connectors_path(&dir.path().join("Eja"));
         assert!(core_config.exists());
-        assert!(connectors_path.exists());
+        assert!(!connectors_path.exists());
         assert!(!dir.path().join("Eja/core").exists());
         assert!(!fs::read_to_string(&core_config)
             .unwrap()

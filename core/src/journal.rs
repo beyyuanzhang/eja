@@ -335,6 +335,22 @@ impl Eja {
         decode_entries(rows)
     }
 
+    /// Actions without a receipt, in journal order.
+    pub fn unfinished_actions(&self) -> Result<Vec<Id>> {
+        let mut stmt = self.db.prepare(
+            "SELECT action.id FROM facts AS action
+             WHERE json_extract(action.body, '$.kind') = 'acted'
+               AND NOT EXISTS (
+                   SELECT 1 FROM facts AS receipt
+                   WHERE json_extract(receipt.body, '$.kind') = 'returned'
+                     AND json_extract(receipt.body, '$.action') = action.id
+               )
+             ORDER BY action.id",
+        )?;
+        let ids = stmt.query_map([], |row| row.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Up to `limit` most recent entries in chronological order.
     pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
         if limit == 0 {

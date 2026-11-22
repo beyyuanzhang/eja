@@ -95,7 +95,7 @@ fn main() {
     loop {
         let next = match runtime.next_wake_delay() {
             Some(delay) => match rx.recv_timeout(delay) {
-                Ok(msg) => Some(msg),
+                Ok(msg) => msg,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     runtime.check_due_wakes();
                     continue;
@@ -103,23 +103,22 @@ fn main() {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
             None => match rx.recv() {
-                Ok(msg) => Some(msg),
+                Ok(msg) => msg,
                 Err(_) => break,
             },
         };
         match next {
-            Some(Ok(Command::Send { text })) => runtime.handle_user_message(&text),
-            Some(Ok(Command::SaveConfig { config })) => runtime.save_config(config),
-            Some(Ok(Command::TestProvider {
+            Ok(Command::Send { text }) => runtime.handle_user_message(&text),
+            Ok(Command::SaveConfig { config }) => runtime.save_config(config),
+            Ok(Command::TestProvider {
                 id,
                 provider,
                 model,
-            })) => {
+            }) => {
                 runtime.test_provider(id, provider, model);
             }
-            Some(Ok(Command::ReloadConnectors)) => runtime.reload_connectors(),
-            Some(Err(err)) => runtime.emit_error(err),
-            None => break,
+            Ok(Command::ReloadConnectors) => runtime.reload_connectors(),
+            Err(err) => runtime.emit_error(err),
         }
         runtime.check_due_wakes();
     }

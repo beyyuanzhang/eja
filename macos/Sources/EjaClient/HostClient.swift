@@ -369,6 +369,10 @@ public final class HostClient: ObservableObject {
                 concerns = state.concerns
                 wakes = state.wakes
             }
+        case "activity":
+            if let detail = json["status_detail"] as? String {
+                statusDetail = detail
+            }
         case "already_running":
             alreadyRunning = true
             alreadyRunningPid = (json["ui_pid"] as? Int).map { Int32($0) }

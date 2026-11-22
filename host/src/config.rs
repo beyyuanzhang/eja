@@ -124,33 +124,32 @@ impl HostConfig {
         data_dir.join("connectors.json")
     }
 
-    pub fn load(core_dir: &Path, data_dir: &Path) -> Self {
-        let mut config = fs::read(Self::config_path(core_dir))
+    pub fn load(core_dir: &Path) -> Self {
+        fs::read(Self::config_path(core_dir))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
-            .unwrap_or_default();
-        config.connectors = Self::load_connectors(data_dir).unwrap_or_default();
-        config
+            .unwrap_or_default()
     }
 
-    pub fn load_connectors(data_dir: &Path) -> Result<Vec<ConnectorConfig>, String> {
-        let path = Self::connectors_path(data_dir);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(format!("读取连接器配置失败: {err}")),
-        };
-        serde_json::from_slice::<Vec<ConnectorConfig>>(&bytes)
+    pub fn read_connectors(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
+        match fs::read(Self::connectors_path(data_dir)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("读取连接器配置失败: {err}")),
+        }
+    }
+
+    pub fn parse_connectors(bytes: Option<&[u8]>) -> Result<Vec<ConnectorConfig>, String> {
+        serde_json::from_slice(bytes.unwrap_or(b"[]"))
             .map_err(|err| format!("解析 connectors.json 失败: {err}"))
     }
 
-    pub fn save(&self, core_dir: &Path, data_dir: &Path) -> Result<(), String> {
+    pub fn save_models(&self, core_dir: &Path) -> Result<(), String> {
         let mut core_value = serde_json::to_value(self).map_err(|err| err.to_string())?;
         if let Some(map) = core_value.as_object_mut() {
             map.remove("connectors");
         }
-        write_json_atomic(&Self::config_path(core_dir), &core_value)?;
-        write_json_atomic(&Self::connectors_path(data_dir), &self.connectors)
+        write_json_atomic(&Self::config_path(core_dir), &core_value)
     }
 
     pub fn resolve_judge(&self) -> Option<(&ProviderConfig, &str)> {
@@ -209,7 +208,7 @@ impl HostConfig {
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
     fs::write(&tmp, bytes).map_err(|err| err.to_string())?;

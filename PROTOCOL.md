@@ -32,6 +32,7 @@ eja-host --data-dir "<data_dir>"
 
 - 状态快照 `{"event":"state","protocol_version":1,"kernel_version":"1.0.0","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"connector_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
   其中 `config.providers[].api_key` 始终返回空字符串，通过 `has_api_key` 布尔字段表示是否已保存密钥。
+- 回合内活动 `{"event":"activity","status_detail":"执行 Shell"}`。回合开始和结束仍发送状态快照。
 - 单实例冲突 `{"event":"already_running","ui_pid":12345}`（同一数据目录已有运行中的 `eja-host` 时立即发出并退出，前端可激活已有实例后退出自身）
 - Provider 测试结果 `{"event":"provider_test","id":"openai","ok":true,"message":"..."}`
 - 系统通知 `{"event":"notify","title":"EJA","body":"..."}`

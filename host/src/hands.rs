@@ -1,4 +1,4 @@
-use crate::config::ConnectorConfig;
+use crate::config::{write_json_atomic, ConnectorConfig};
 use crate::mcp::{truncate_utf8, ConnectorPool, ConnectorStatus};
 use crate::sandbox::{kill_process_tree, Sandbox};
 use eja_core::{Call, Outcome};
@@ -93,7 +93,7 @@ impl Hands {
             }
         });
         if !fired.is_empty() {
-            save_wakes(&self.core_dir, &self.wakes);
+            let _ = write_json_atomic(&self.core_dir.join("wakes.json"), &self.wakes);
         }
         fired
     }
@@ -174,7 +174,9 @@ impl Hands {
         if delay < 1 || reason.is_empty() {
             return Outcome::Failed("wake 需要 delay_seconds >= 1 且非空 reason".into());
         }
-        let fire_at = unix_now() + delay;
+        let Some(fire_at) = unix_now().checked_add(delay) else {
+            return Outcome::Failed("唤醒时间超出范围".into());
+        };
         let display = format_local_unix(fire_at);
         let alarm = WakeAlarm {
             id: format!("w-{fire_at}-{call_id}"),
@@ -182,9 +184,13 @@ impl Hands {
             fire_at_display: display.clone(),
             reason: reason.to_string(),
         };
-        self.wakes.push(alarm);
-        self.wakes.sort_by_key(|a| a.fire_at_unix);
-        save_wakes(&self.core_dir, &self.wakes);
+        let mut wakes = self.wakes.clone();
+        wakes.push(alarm);
+        wakes.sort_by_key(|a| a.fire_at_unix);
+        if let Err(err) = write_json_atomic(&self.core_dir.join("wakes.json"), &wakes) {
+            return Outcome::Failed(format!("保存唤醒失败: {err}"));
+        }
+        self.wakes = wakes;
         Outcome::Observed(format!("scheduled at {display} ({reason})"))
     }
 
@@ -255,16 +261,12 @@ fn run_shell(
         String::from_utf8_lossy(&buf).to_string()
     });
 
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
     let status = loop {
         match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) if Instant::now() >= deadline => {
-                kill_process_tree(&mut child);
-                break None;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(_) => {
+            Ok(Some(st)) if out_handle.is_finished() && err_handle.is_finished() => break Some(st),
+            Ok(_) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(25)),
+            _ => {
                 kill_process_tree(&mut child);
                 break None;
             }
@@ -333,12 +335,6 @@ fn load_wakes(core_dir: &Path) -> Vec<WakeAlarm> {
         .unwrap_or_default()
 }
 
-fn save_wakes(core_dir: &Path, wakes: &[WakeAlarm]) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(wakes) {
-        let _ = fs::write(core_dir.join("wakes.json"), bytes);
-    }
-}
-
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -389,6 +385,18 @@ mod tests {
             Duration::from_secs(1),
             dir.path(),
             2,
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(matches!(outcome, Outcome::Failed(ref msg) if msg.contains("命令超时")));
+
+        let started = Instant::now();
+        let outcome = run_shell(
+            &sandbox,
+            "sleep 5 & printf ready",
+            dir.path(),
+            Duration::from_secs(1),
+            dir.path(),
+            3,
         );
         assert!(started.elapsed() < Duration::from_secs(4));
         assert!(matches!(outcome, Outcome::Failed(ref msg) if msg.contains("命令超时")));
