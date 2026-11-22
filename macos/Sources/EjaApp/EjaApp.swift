@@ -94,9 +94,6 @@ struct EjaApp: App {
                 openWindow(id: "main")
             }
             .keyboardShortcut("o")
-            Button("重置默认界面") {
-                resetUI()
-            }
             Divider()
             Button("退出 EJA") {
                 client.shutdown()
@@ -128,7 +125,7 @@ struct EjaApp: App {
         UiRuntime.bootstrapIfNeeded(dataDir: dataDir)
         if appDelegate.safeMode {
             appDelegate.runningStamp = UiRuntime.binaryStamp(at: UiRuntime.evolvedExecutable(in: dataDir))
-            client.errorBanner = "已进入安全模式（官方默认界面），可修改内核设置或重置界面"
+            client.errorBanner = "已进入安全模式（官方默认界面）"
         } else {
             appDelegate.runningStamp = UiRuntime.runningStamp(in: dataDir)
             checkHotReload()
@@ -141,23 +138,6 @@ struct EjaApp: App {
         let dataDir = URL(fileURLWithPath: client.dataDir, isDirectory: true)
         guard let target = UiRuntime.updatedExecutable(in: dataDir, runningStamp: appDelegate.runningStamp) else { return }
         relaunch(to: target, dataDir: dataDir)
-    }
-
-    @MainActor
-    private func resetUI() {
-        guard !client.dataDir.isEmpty else { return }
-        let dataDir = URL(fileURLWithPath: client.dataDir, isDirectory: true)
-        do {
-            if let fallback = try UiRuntime.resetToDefault(dataDir: dataDir) {
-                relaunch(to: fallback, dataDir: dataDir)
-            } else {
-                appDelegate.runningStamp = nil
-                appDelegate.safeMode = false
-                client.errorBanner = nil
-            }
-        } catch {
-            client.errorBanner = "重置默认界面失败：\(error.localizedDescription)"
-        }
     }
 
     @MainActor

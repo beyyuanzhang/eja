@@ -17,6 +17,12 @@
 open macos/build/Eja.app
 ```
 
+生成拖拽安装的 `.dmg` 安装包：
+
+```sh
+./macos/scripts/build-dmg.sh
+```
+
 或直接用 SwiftPM 开发运行与测试：
 
 ```sh

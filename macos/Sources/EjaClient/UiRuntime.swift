@@ -15,8 +15,11 @@ public enum UiRuntime {
     STAGE="$UI_DIR/Eja.app.tmp"
     TARGET="$UI_DIR/Eja.app"
     rm -rf "$STAGE"
-    mkdir -p "$STAGE/Contents/MacOS"
+    mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
     cp "$BIN" "$STAGE/Contents/MacOS/EjaApp"
+    if [ -f "$UI_DIR/AppIcon.icns" ]; then
+        cp "$UI_DIR/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
+    fi
     if [ -f "$UI_DIR/Info.plist" ]; then
         cp "$UI_DIR/Info.plist" "$STAGE/Contents/Info.plist"
     else
@@ -25,6 +28,7 @@ public enum UiRuntime {
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
     <plist version="1.0"><dict>
         <key>CFBundleExecutable</key><string>EjaApp</string>
+        <key>CFBundleIconFile</key><string>AppIcon</string>
         <key>CFBundleIdentifier</key><string>ai.eja.origin</string>
         <key>CFBundleName</key><string>EJA</string>
         <key>CFBundlePackageType</key><string>APPL</string>
@@ -97,25 +101,6 @@ public enum UiRuntime {
         return evolved
     }
 
-    public static func resetToDefault(dataDir: URL, templateDir: URL? = nil) throws -> URL? {
-        let uiDir = dataDir.appendingPathComponent("ui", isDirectory: true)
-        guard let source = templateDir ?? resolveTemplateDir() else {
-            throw NSError(domain: "UiRuntime", code: 1, userInfo: [NSLocalizedDescriptionKey: "找不到默认界面模板目录"])
-        }
-        try copyTemplate(from: source, to: uiDir)
-        writeApplyScript(in: uiDir, overwrite: true)
-        try? FileManager.default.removeItem(at: evolvedAppBundle(in: dataDir))
-        guard let path = ProcessInfo.processInfo.environment["EJA_FALLBACK_APP_BIN"], !path.isEmpty else {
-            return nil
-        }
-        let fallback = URL(fileURLWithPath: path)
-        guard FileManager.default.isExecutableFile(atPath: fallback.path),
-              fallback.resolvingSymlinksInPath().path != currentExecutable()?.resolvingSymlinksInPath().path else {
-            return nil
-        }
-        return fallback
-    }
-
     public static func launch(
         executable: URL,
         dataDir: URL,
@@ -129,9 +114,6 @@ public enum UiRuntime {
         env.removeValue(forKey: "EJA_SAFE_MODE")
         if let host = hostExecutableURL { env["EJA_HOST_BIN"] = host.path }
         if let tpl = resolveTemplateDir() { env["EJA_UI_TEMPLATE_DIR"] = tpl.path }
-        if (env["EJA_FALLBACK_APP_BIN"] ?? "").isEmpty, let cur = currentExecutable() {
-            env["EJA_FALLBACK_APP_BIN"] = cur.path
-        }
         proc.environment = env
         try proc.run()
         let deadline = Date().addingTimeInterval(verifySeconds)
@@ -150,7 +132,7 @@ public enum UiRuntime {
     private static func copyTemplate(from source: URL, to target: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: target, withIntermediateDirectories: true)
-        for item in ["Package.swift", "Sources", "Tests", "Info.plist"] {
+        for item in ["Package.swift", "Sources", "Tests", "Info.plist", "AppIcon.icns"] {
             let src = source.appendingPathComponent(item)
             guard fm.fileExists(atPath: src.path) else { continue }
             let dst = target.appendingPathComponent(item)
@@ -159,9 +141,9 @@ public enum UiRuntime {
         }
     }
 
-    private static func writeApplyScript(in uiDir: URL, overwrite: Bool = false) {
+    private static func writeApplyScript(in uiDir: URL) {
         let script = uiDir.appendingPathComponent("apply.sh")
-        if overwrite || !FileManager.default.fileExists(atPath: script.path) {
+        if !FileManager.default.fileExists(atPath: script.path) {
             try? applyScript.write(to: script, atomically: true, encoding: .utf8)
         }
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)

@@ -14,7 +14,7 @@ eja-host --data-dir "<data_dir>"
 
 - `core/` 由 macOS Seatbelt 保护，沙箱内 `shell` 与 MCP 进程无权读写，包含 `subject.db`、`config.json`、`wakes.json`、`window.json`、`kernel_version` 与单实例文件锁 `host.lock`。
 - `connectors.json` 保存 MCP 连接器数组，文件变更在运行期自动热加载。
-- `ui/` 保存用户空间前端。官方启动器按统一约定执行 `ui/Eja.app/Contents/MacOS/EjaApp`（默认由 `ui/apply.sh` 编译原生 SwiftUI 并封装为完整 `ui/Eja.app` 应用包，也可替换为任意符合该入口路径的可执行程序或脚本），并传入 `EJA_DATA_DIR`、`EJA_HOST_BIN`、`EJA_UI_TEMPLATE_DIR` 与 `EJA_FALLBACK_APP_BIN`。启动 `Eja.app` 时按住 `Option` 键可直接进入官方默认界面。
+- `ui/` 保存用户空间前端。官方启动器按统一约定执行 `ui/Eja.app/Contents/MacOS/EjaApp`（默认由 `ui/apply.sh` 编译原生 SwiftUI 并封装为完整 `ui/Eja.app` 应用包，也可替换为任意符合该入口路径的可执行程序或脚本），并传入 `EJA_DATA_DIR`、`EJA_HOST_BIN` 与 `EJA_UI_TEMPLATE_DIR`。启动 `Eja.app` 时按住 `Option` 键可直接进入官方默认界面。
 
 ## 兼容性约定
 
