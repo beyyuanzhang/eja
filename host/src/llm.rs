@@ -3,8 +3,12 @@ use crate::hands::ToolSpec;
 use crate::mcp::truncate_utf8;
 use eja_core::{Eja, Entry, Fact, Id};
 use serde_json::{json, Value};
+use std::ffi::OsString;
+use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
 
@@ -435,8 +439,52 @@ fn call_anthropic(
     })
 }
 
+pub(crate) struct TempPayload(PathBuf);
+
+impl TempPayload {
+    pub(crate) fn write(bytes: &[u8]) -> Result<Self, String> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir();
+        for _ in 0..16 {
+            let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("eja-req-{pid}-{seq}.json"));
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
+                Ok(mut file) => {
+                    file.write_all(bytes)
+                        .map_err(|err| format!("写入请求体失败: {err}"))?;
+                    return Ok(Self(path));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(format!("创建临时请求文件失败: {err}")),
+            }
+        }
+        Err("创建临时请求文件失败: 文件名冲突".into())
+    }
+
+    pub(crate) fn curl_arg(&self) -> OsString {
+        let mut arg = OsString::from("@");
+        arg.push(self.0.as_os_str());
+        arg
+    }
+}
+
+impl Drop for TempPayload {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
+    let payload = TempPayload::write(&bytes)?;
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
         "-sS",
@@ -450,20 +498,14 @@ fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Va
     for (k, v) in headers {
         cmd.arg("-H").arg(format!("{k}: {v}"));
     }
-    cmd.args(["--data-binary", "@-", url])
-        .stdin(Stdio::piped())
+    cmd.arg("--data-binary")
+        .arg(payload.curl_arg())
+        .arg(url)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("启动 curl 失败: {err}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&bytes)
-            .map_err(|err| format!("写入请求体失败: {err}"))?;
-    }
-    let output = child
-        .wait_with_output()
+    let output = cmd
+        .output()
         .map_err(|err| format!("等待 LLM 响应失败: {err}"))?;
     if !output.status.success() {
         return Err(format!(

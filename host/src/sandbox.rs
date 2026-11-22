@@ -1,6 +1,8 @@
 use std::ffi::OsStr;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 #[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
@@ -53,20 +55,50 @@ impl Sandbox {
         S: AsRef<OsStr>,
     {
         #[cfg(target_os = "macos")]
-        {
+        let mut cmd = {
             let mut cmd = Command::new(SANDBOX_EXEC);
             cmd.arg("-p").arg(&self.profile);
             cmd.args(&self.params);
             cmd.arg("--").arg(program).args(args);
             cmd
-        }
+        };
         #[cfg(not(target_os = "macos"))]
-        {
+        let mut cmd = {
             let mut cmd = Command::new(program);
             cmd.args(args);
             cmd
+        };
+        cmd.stdin(Stdio::null());
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+pub fn kill_process_group(pgid: u32) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(pgid) {
+        if pid > 0 {
+            const SIGKILL: i32 = 9;
+            // Negative PID targets the entire process group created via process_group(0).
+            unsafe {
+                let _ = kill(-pid, SIGKILL);
+            }
         }
     }
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
+pub fn kill_process_tree(child: &mut Child) {
+    kill_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(target_os = "macos")]

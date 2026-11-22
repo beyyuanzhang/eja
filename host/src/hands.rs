@@ -1,6 +1,6 @@
 use crate::config::ConnectorConfig;
 use crate::mcp::{truncate_utf8, ConnectorPool, ConnectorStatus};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{kill_process_group, kill_process_tree, Sandbox};
 use eja_core::{Call, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -9,6 +9,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,6 +70,16 @@ impl Hands {
 
     pub fn wakes(&self) -> Vec<WakeAlarm> {
         self.wakes.clone()
+    }
+
+    pub fn next_wake_delay(&self) -> Option<Duration> {
+        let next_unix = self.wakes.iter().map(|w| w.fire_at_unix).min()?;
+        let now = unix_now();
+        if next_unix <= now {
+            Some(Duration::ZERO)
+        } else {
+            Some(Duration::from_secs((next_unix - now) as u64) + Duration::from_millis(50))
+        }
     }
 
     pub fn drain_due_wakes(&mut self) -> Vec<WakeAlarm> {
@@ -228,21 +239,24 @@ fn run_shell(
         Ok(c) => c,
         Err(err) => return Outcome::Failed(format!("启动 shell 失败: {err}")),
     };
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out_handle = thread::spawn(move || {
+    let pgid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(ref mut r) = stdout {
+        if let Some(mut r) = stdout {
             let _ = r.read_to_end(&mut buf);
         }
-        String::from_utf8_lossy(&buf).to_string()
+        let _ = out_tx.send(String::from_utf8_lossy(&buf).to_string());
     });
-    let err_handle = thread::spawn(move || {
+    thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(ref mut r) = stderr {
+        if let Some(mut r) = stderr {
             let _ = r.read_to_end(&mut buf);
         }
-        String::from_utf8_lossy(&buf).to_string()
+        let _ = err_tx.send(String::from_utf8_lossy(&buf).to_string());
     });
 
     let deadline = Instant::now() + timeout;
@@ -250,16 +264,28 @@ fn run_shell(
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_process_tree(&mut child);
                 break None;
             }
             Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(_) => break None,
+            Err(_) => {
+                kill_process_tree(&mut child);
+                break None;
+            }
         }
     };
-    let out = out_handle.join().unwrap_or_default();
-    let err = err_handle.join().unwrap_or_default();
+    let collect = |rx: mpsc::Receiver<String>| -> String {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(text) => text,
+            Err(_) => {
+                kill_process_group(pgid);
+                rx.recv_timeout(Duration::from_millis(500))
+                    .unwrap_or_default()
+            }
+        }
+    };
+    let out = collect(out_rx);
+    let err = collect(err_rx);
     let combined = match (out.trim(), err.trim()) {
         ("", "") => "(no output)".to_string(),
         (o, "") => o.to_string(),
@@ -342,4 +368,55 @@ fn format_local_unix(secs: i64) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| secs.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_closes_stdin_and_reaps_pipeline_grandchildren_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        let sandbox = Sandbox::new(&core_dir).unwrap();
+
+        // stdin is /dev/null so a stdin reader exits immediately instead of hanging.
+        let stdin_check = run_shell(
+            &sandbox,
+            "cat",
+            dir.path(),
+            Duration::from_secs(2),
+            dir.path(),
+            1,
+        );
+        assert_eq!(stdin_check, Outcome::Observed("(no output)".into()));
+
+        // Pipeline grandchildren holding stdout open must be killed on timeout without hanging join.
+        let pid_file = dir.path().join("grandchild.pid");
+        let cmd = format!("(sleep 30 & echo $! > {}; wait) | cat", pid_file.display());
+        let started = Instant::now();
+        let outcome = run_shell(
+            &sandbox,
+            &cmd,
+            dir.path(),
+            Duration::from_secs(1),
+            dir.path(),
+            2,
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(matches!(outcome, Outcome::Failed(ref msg) if msg.contains("命令超时")));
+
+        if let Ok(pid_text) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid_text.trim().parse::<i32>() {
+                let alive = Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(!alive, "grandchild process {pid} should be terminated");
+            }
+        }
+    }
 }

@@ -6,15 +6,14 @@ mod runtime;
 mod sandbox;
 
 use config::{HostConfig, ProviderConfig};
-use runtime::HostRuntime;
+use runtime::{EventSink, HostRuntime};
 use serde::Deserialize;
 use serde_json::Value;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -55,65 +54,73 @@ fn parse_data_dir() -> PathBuf {
 
 fn main() {
     let data_dir = parse_data_dir();
-    let stdout = Arc::new(Mutex::new(io::stdout()));
-    let emit = {
-        let out = Arc::clone(&stdout);
-        Arc::new(move |val: Value| {
-            if let Ok(line) = serde_json::to_string(&val) {
-                let mut guard = out.lock().unwrap();
-                let _ = writeln!(guard, "{line}");
-                let _ = guard.flush();
-            }
-        })
-    };
+    let emit: EventSink = Box::new(|val: Value| {
+        if let Ok(line) = serde_json::to_string(&val) {
+            let mut out = io::stdout().lock();
+            let _ = writeln!(out, "{line}");
+            let _ = out.flush();
+        }
+    });
 
-    let runtime = match HostRuntime::open(data_dir, emit.clone()) {
-        Ok(rt) => Arc::new(rt),
+    let mut runtime = match HostRuntime::open(data_dir, emit) {
+        Ok(rt) => rt,
         Err(err) => {
-            emit(serde_json::json!({ "event": "error", "message": format!("初始化失败: {err}") }));
+            let payload =
+                serde_json::json!({ "event": "error", "message": format!("初始化失败: {err}") });
+            if let Ok(line) = serde_json::to_string(&payload) {
+                println!("{line}");
+            }
             std::process::exit(1);
         }
     };
     runtime.emit_state();
 
-    let wake_rt = Arc::clone(&runtime);
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(2));
-        wake_rt.check_due_wakes();
-    });
-
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(raw) = line else { break };
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let parsed = match serde_json::from_str::<Command>(trimmed) {
-            Ok(cmd) => cmd,
-            Err(err) => {
-                runtime.emit_error(format!("无效指令: {err}"));
+    let (tx, rx) = mpsc::channel::<Result<Command, String>>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(raw) = line else { break };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
                 continue;
             }
+            let parsed =
+                serde_json::from_str::<Command>(trimmed).map_err(|err| format!("无效指令: {err}"));
+            if tx.send(parsed).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        let next = match runtime.next_wake_delay() {
+            Some(delay) => match rx.recv_timeout(delay) {
+                Ok(msg) => Some(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    runtime.check_due_wakes();
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(msg) => Some(msg),
+                Err(_) => break,
+            },
         };
-        let rt = Arc::clone(&runtime);
-        match parsed {
-            Command::Send { text } => {
-                thread::spawn(move || rt.handle_user_message(&text));
-            }
-            Command::SaveConfig { config } => {
-                thread::spawn(move || rt.save_config(config));
-            }
-            Command::TestProvider {
+        match next {
+            Some(Ok(Command::Send { text })) => runtime.handle_user_message(&text),
+            Some(Ok(Command::SaveConfig { config })) => runtime.save_config(config),
+            Some(Ok(Command::TestProvider {
                 id,
                 provider,
                 model,
-            } => {
-                thread::spawn(move || rt.test_provider(id, provider, model));
+            })) => {
+                runtime.test_provider(id, provider, model);
             }
-            Command::ReloadConnectors => {
-                thread::spawn(move || rt.reload_connectors());
-            }
+            Some(Ok(Command::ReloadConnectors)) => runtime.reload_connectors(),
+            Some(Err(err)) => runtime.emit_error(err),
+            None => break,
         }
+        runtime.check_due_wakes();
     }
 }

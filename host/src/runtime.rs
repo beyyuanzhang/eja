@@ -6,14 +6,15 @@ use crate::sandbox::Sandbox;
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
-pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
+pub type EventSink = Box<dyn FnMut(Value)>;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -61,14 +62,13 @@ pub struct HostRuntime {
     core_dir: PathBuf,
     resources_dir: Option<PathBuf>,
     _instance_lock: fs::File,
-    eja: Mutex<Eja>,
-    config: Mutex<HostConfig>,
-    connectors_bytes: Mutex<Option<Vec<u8>>>,
-    hands: Mutex<Hands>,
-    anchor: Mutex<Id>,
+    eja: Eja,
+    config: HostConfig,
+    connectors_bytes: Option<Vec<u8>>,
+    hands: Hands,
+    anchor: Id,
     local_tz: String,
-    status: Mutex<(String, String)>,
-    busy: Mutex<()>,
+    status: (String, String),
     brain: Arc<dyn Brain>,
     emit: EventSink,
 }
@@ -81,7 +81,7 @@ impl HostRuntime {
     pub fn open_with_brain(
         data_dir: PathBuf,
         brain: Arc<dyn Brain>,
-        emit: EventSink,
+        mut emit: EventSink,
     ) -> Result<Self, String> {
         let core_dir = data_dir.join("core");
         fs::create_dir_all(&core_dir).map_err(|err| err.to_string())?;
@@ -95,6 +95,7 @@ impl HostRuntime {
         };
         let sandbox = Sandbox::new(&core_dir)?;
         let eja = open_subject(&core_dir.join("subject.db"))?;
+        reconcile_unfinished_actions(&eja);
         let resources_dir = resolve_resources_dir();
         sync_kernel_version(&core_dir, &eja, resources_dir.as_deref());
         let config = HostConfig::load(&core_dir, &data_dir);
@@ -111,30 +112,27 @@ impl HostRuntime {
             core_dir,
             resources_dir,
             _instance_lock: instance_lock,
-            eja: Mutex::new(eja),
-            config: Mutex::new(config),
-            connectors_bytes: Mutex::new(connectors_bytes),
-            hands: Mutex::new(hands),
-            anchor: Mutex::new(anchor),
+            eja,
+            config,
+            connectors_bytes,
+            hands,
+            anchor,
             local_tz: detect_local_tz(),
-            status: Mutex::new(("idle".into(), "在线".into())),
-            busy: Mutex::new(()),
+            status: ("idle".into(), "在线".into()),
             brain,
             emit,
         })
     }
 
+    pub fn next_wake_delay(&self) -> Option<Duration> {
+        self.hands.next_wake_delay()
+    }
+
     pub fn snapshot(&self) -> HostState {
-        let config = self.config.lock().unwrap().clone();
-        let (status, status_detail) = self.status.lock().unwrap().clone();
-        let (connector_statuses, wakes) = {
-            let hands = self.hands.lock().unwrap();
-            (hands.connector_statuses(), hands.wakes())
-        };
-        let eja = self.eja.lock().unwrap();
-        let revision = eja.revision().unwrap_or(0);
-        let entries = eja.recent(80).unwrap_or_default();
-        let concerns = eja
+        let revision = self.eja.revision().unwrap_or(0);
+        let entries = self.eja.recent(80).unwrap_or_default();
+        let concerns = self
+            .eja
             .concerns(revision)
             .map(|items| {
                 items
@@ -153,73 +151,60 @@ impl HostRuntime {
                 .resources_dir
                 .as_ref()
                 .map(|dir| dir.display().to_string()),
-            status,
-            status_detail,
+            status: self.status.0.clone(),
+            status_detail: self.status.1.clone(),
             data_dir: self.data_dir.display().to_string(),
-            configured: config.is_configured(),
-            config: config.redacted_for_ui(),
-            connector_statuses,
+            configured: self.config.is_configured(),
+            config: self.config.redacted_for_ui(),
+            connector_statuses: self.hands.connector_statuses(),
             stream: build_stream(&entries),
             concerns,
-            wakes,
+            wakes: self.hands.wakes(),
         }
     }
 
-    pub fn emit_state(&self) {
-        if let Ok(mut payload) = serde_json::to_value(self.snapshot()) {
+    pub fn emit_state(&mut self) {
+        let snap = self.snapshot();
+        if let Ok(mut payload) = serde_json::to_value(snap) {
             payload["event"] = Value::String("state".into());
             (self.emit)(payload);
         }
     }
 
-    pub fn emit_error(&self, message: impl Into<String>) {
+    pub fn emit_error(&mut self, message: impl Into<String>) {
         (self.emit)(json!({ "event": "error", "message": message.into() }));
     }
 
-    pub fn save_config(&self, mut updated: HostConfig) {
-        {
-            let current = self.config.lock().unwrap();
-            updated.merge_preserved(&current);
-        }
+    pub fn save_config(&mut self, mut updated: HostConfig) {
+        updated.merge_preserved(&self.config);
         if let Err(err) = updated.save(&self.core_dir, &self.data_dir) {
             self.emit_error(format!("保存配置失败: {err}"));
             return;
         }
-        let connectors_changed = {
-            let mut guard = self.config.lock().unwrap();
-            let changed = guard.connectors != updated.connectors;
-            *guard = updated.clone();
-            changed
-        };
-        *self.connectors_bytes.lock().unwrap() = read_connectors_bytes(&self.data_dir);
+        let connectors_changed = self.config.connectors != updated.connectors;
+        self.config = updated;
+        self.connectors_bytes = read_connectors_bytes(&self.data_dir);
         if connectors_changed {
-            self.hands.lock().unwrap().reload(&updated.connectors);
+            self.hands.reload(&self.config.connectors);
         }
         self.emit_state();
     }
 
-    pub fn reload_connectors(&self) {
+    pub fn reload_connectors(&mut self) {
         match HostConfig::load_connectors(&self.data_dir) {
             Ok(connectors) => {
-                self.config.lock().unwrap().connectors = connectors.clone();
-                *self.connectors_bytes.lock().unwrap() = read_connectors_bytes(&self.data_dir);
-                self.hands.lock().unwrap().reload(&connectors);
+                self.config.connectors = connectors;
+                self.connectors_bytes = read_connectors_bytes(&self.data_dir);
+                self.hands.reload(&self.config.connectors);
                 self.emit_state();
             }
             Err(err) => self.emit_error(err),
         }
     }
 
-    pub fn test_provider(&self, id: String, mut provider: ProviderConfig, model: String) {
+    pub fn test_provider(&mut self, id: String, mut provider: ProviderConfig, model: String) {
         if provider.api_key.is_empty() {
-            if let Some(existing) = self
-                .config
-                .lock()
-                .unwrap()
-                .providers
-                .iter()
-                .find(|p| p.id == provider.id)
-            {
+            if let Some(existing) = self.config.providers.iter().find(|p| p.id == provider.id) {
                 provider.api_key = existing.api_key.clone();
             }
         }
@@ -240,56 +225,41 @@ impl HostRuntime {
         }
     }
 
-    pub fn handle_user_message(&self, raw: &str) {
+    pub fn handle_user_message(&mut self, raw: &str) {
         let text = raw.trim();
         if text.is_empty() {
             return;
         }
-        let _guard = self.busy.lock().unwrap();
-        if let Err(err) = self.eja.lock().unwrap().notice(Source::Person, text) {
+        if let Err(err) = self.eja.notice(Source::Person, text) {
             self.emit_error(format!("写入消息失败: {err}"));
             return;
         }
         self.emit_state();
-        self.run_turn_locked(false);
+        self.run_turn(false);
     }
 
-    pub fn check_due_wakes(&self) {
-        let due = self.hands.lock().unwrap().drain_due_wakes();
+    pub fn check_due_wakes(&mut self) {
+        let due = self.hands.drain_due_wakes();
         if due.is_empty() {
             return;
         }
-        let _guard = self.busy.lock().unwrap();
         for alarm in due {
             let notice = format!("定时唤醒：{}", alarm.reason);
-            let _ = self.eja.lock().unwrap().notice(Source::Clock, notice);
+            let _ = self.eja.notice(Source::Clock, notice);
         }
         self.emit_state();
-        self.run_turn_locked(true);
+        self.run_turn(true);
     }
 
-    fn sync_connectors_if_changed(&self) {
+    fn sync_connectors_if_changed(&mut self) {
         let latest_bytes = read_connectors_bytes(&self.data_dir);
-        let changed = {
-            let mut guard = self.connectors_bytes.lock().unwrap();
-            if *guard != latest_bytes {
-                *guard = latest_bytes;
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
+        if self.connectors_bytes != latest_bytes {
+            self.connectors_bytes = latest_bytes;
             match HostConfig::load_connectors(&self.data_dir) {
                 Ok(connectors) => {
-                    let connectors_changed = {
-                        let mut cfg = self.config.lock().unwrap();
-                        let diff = cfg.connectors != connectors;
-                        cfg.connectors = connectors.clone();
-                        diff
-                    };
-                    if connectors_changed {
-                        self.hands.lock().unwrap().reload(&connectors);
+                    if self.config.connectors != connectors {
+                        self.config.connectors = connectors;
+                        self.hands.reload(&self.config.connectors);
                     }
                 }
                 Err(err) => self.emit_error(err),
@@ -297,17 +267,16 @@ impl HostRuntime {
         }
     }
 
-    fn run_turn_locked(&self, proactive: bool) {
+    fn run_turn(&mut self, proactive: bool) {
         self.sync_connectors_if_changed();
-        let config = self.config.lock().unwrap().clone();
-        let Some((provider, model)) = config.resolve_judge() else {
+        let Some((provider, model)) = self.config.resolve_judge() else {
             self.emit_error("请先在设置中配置可用的 LLM Provider 与主模型");
             return;
         };
         let provider = provider.clone();
         let model = model.to_string();
-        let window_max_bytes = config.window_max_bytes();
-        let max_steps = config.max_steps();
+        let window_max_bytes = self.config.window_max_bytes();
+        let max_steps = self.config.max_steps();
 
         self.set_status("thinking", "思考中…");
         let data_dir_str = self.data_dir.display().to_string();
@@ -325,34 +294,24 @@ impl HostRuntime {
             前置消息是你按时间正序排列的不可变主体日志；末尾新增的 `noticed` 记录是本次触发。不调工具时的文本回复会发送给人，留空则保持沉默。",
             data_dir_str, data_dir_str, data_dir_str, data_dir_str, self.local_tz
         );
-        let mut messages = {
-            let eja = self.eja.lock().unwrap();
-            let mut anchor = self.anchor.lock().unwrap();
-            let initial_anchor = *anchor;
-            let projected = match project_window(&eja, &mut anchor, window_max_bytes) {
-                Ok(records) => records,
-                Err(err) => {
-                    drop(anchor);
-                    drop(eja);
-                    self.emit_error(format!("构建日志窗口失败: {err}"));
-                    self.set_status("idle", "在线");
-                    return;
-                }
-            };
-            if *anchor != initial_anchor {
-                save_anchor(&self.core_dir, *anchor);
+        let initial_anchor = self.anchor;
+        let mut messages = match project_window(&self.eja, &mut self.anchor, window_max_bytes) {
+            Ok(records) => records,
+            Err(err) => {
+                self.emit_error(format!("构建日志窗口失败: {err}"));
+                self.set_status("idle", "在线");
+                return;
             }
-            projected
         };
+        if self.anchor != initial_anchor {
+            save_anchor(&self.core_dir, self.anchor);
+        }
 
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
 
-        for step_index in 0..max_steps {
-            if step_index > 0 {
-                self.sync_connectors_if_changed();
-            }
-            let tools = self.hands.lock().unwrap().tools();
+        for _ in 0..max_steps {
+            let tools = self.hands.tools();
             let reply = match self
                 .brain
                 .complete(&provider, &model, &system, &messages, &tools)
@@ -367,7 +326,7 @@ impl HostRuntime {
             if reply.calls.is_empty() {
                 let text = reply.text.trim();
                 if !text.is_empty() {
-                    if let Err(err) = self.eja.lock().unwrap().say(text) {
+                    if let Err(err) = self.eja.say(text) {
                         fatal_error = Some(err.to_string());
                         break;
                     }
@@ -401,11 +360,10 @@ impl HostRuntime {
         } else if !completed {
             self.emit_error(format!("达到单回合最大步数上限 ({max_steps})，回合已暂停"));
         }
-        self.sync_connectors_if_changed();
         self.set_status("idle", "在线");
     }
 
-    fn execute_tool_call(&self, call: &ToolCall, tools: &[ToolSpec]) -> Result<Value, String> {
+    fn execute_tool_call(&mut self, call: &ToolCall, tools: &[ToolSpec]) -> Result<Value, String> {
         match call.name.as_str() {
             "keep" => {
                 let text = call
@@ -415,7 +373,7 @@ impl HostRuntime {
                     .unwrap_or("")
                     .trim();
                 let concern = call.args.get("concern").and_then(Value::as_i64);
-                match self.eja.lock().unwrap().keep(concern, text) {
+                match self.eja.keep(concern, text) {
                     Ok(entry) => {
                         let Fact::Kept { concern, .. } = entry.fact else {
                             unreachable!()
@@ -427,7 +385,7 @@ impl HostRuntime {
                 }
             }
             "release" => match call.args.get("concern").and_then(Value::as_i64) {
-                Some(id) => match self.eja.lock().unwrap().release(id) {
+                Some(id) => match self.eja.release(id) {
                     Ok(entry) => {
                         Ok(json!({ "status": "released", "concern": id, "fact_id": entry.id }))
                     }
@@ -437,7 +395,7 @@ impl HostRuntime {
                 None => Ok(json!({ "error": "release 需要整数 concern" })),
             },
             "read" => match call.args.get("fact").and_then(Value::as_i64) {
-                Some(id) => match self.eja.lock().unwrap().evidence(id) {
+                Some(id) => match self.eja.evidence(id) {
                     Ok(ev) => Ok(json!(ev)),
                     Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
                     Err(err) => Err(err.to_string()),
@@ -451,7 +409,7 @@ impl HostRuntime {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim();
-                match self.eja.lock().unwrap().search(cue) {
+                match self.eja.search(cue) {
                     Ok(matches) => Ok(json!({ "cue": cue, "matches": matches })),
                     Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
                     Err(err) => Err(err.to_string()),
@@ -462,23 +420,23 @@ impl HostRuntime {
                     return Ok(json!({ "error": format!("未知工具: {other}") }));
                 };
                 let grants: Vec<&str> = tools.iter().map(|t| t.capability.as_str()).collect();
-                let acted = {
-                    let eja = self.eja.lock().unwrap();
-                    let revision = eja.revision().map_err(|err| err.to_string())?;
-                    eja.act(revision, &spec.capability, call.args.clone(), &grants)
-                };
+                let revision = self.eja.revision().map_err(|err| err.to_string())?;
+                let acted = self
+                    .eja
+                    .act(revision, &spec.capability, call.args.clone(), &grants);
                 let acted = match acted {
                     Ok(c) => c,
                     Err(eja_core::Error::Invalid(msg)) => return Ok(json!({ "error": msg })),
                     Err(err) => return Err(err.to_string()),
                 };
-                let outcome = self.hands.lock().unwrap().execute(&acted);
+                let outcome = self.hands.execute(&acted);
                 let receipt = self
                     .eja
-                    .lock()
-                    .unwrap()
                     .finish(acted.id, outcome)
                     .map_err(|err| err.to_string())?;
+                if spec.capability == "shell" {
+                    self.sync_connectors_if_changed();
+                }
                 let Fact::Returned { outcome, .. } = receipt.fact else {
                     unreachable!()
                 };
@@ -487,9 +445,38 @@ impl HostRuntime {
         }
     }
 
-    fn set_status(&self, status: &str, detail: &str) {
-        *self.status.lock().unwrap() = (status.to_string(), detail.to_string());
+    fn set_status(&mut self, status: &str, detail: &str) {
+        self.status = (status.to_string(), detail.to_string());
         self.emit_state();
+    }
+}
+
+fn reconcile_unfinished_actions(eja: &Eja) {
+    let Ok(rev) = eja.revision() else { return };
+    if rev == 0 {
+        return;
+    }
+    let Ok(entries) = eja.entries_after(0, rev) else {
+        return;
+    };
+    let mut returned: HashSet<Id> = HashSet::new();
+    let mut acted: Vec<Id> = Vec::new();
+    for entry in &entries {
+        match &entry.fact {
+            Fact::Acted { .. } => acted.push(entry.id),
+            Fact::Returned { action, .. } => {
+                returned.insert(*action);
+            }
+            _ => {}
+        }
+    }
+    for action_id in acted {
+        if !returned.contains(&action_id) {
+            let _ = eja.finish(
+                action_id,
+                Outcome::Unknown("上次执行因宿主中断而未完成".into()),
+            );
+        }
     }
 }
 
@@ -707,6 +694,7 @@ mod tests {
     use crate::llm::ModelReply;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     fn text_reply(text: &str) -> ModelReply {
         ModelReply {
@@ -807,8 +795,8 @@ mod tests {
             judge_calls: AtomicUsize::new(0),
             mode: "chat",
         });
-        let rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
         rt.handle_user_message("你好");
@@ -856,8 +844,8 @@ for line in sys.stdin:
             judge_calls: AtomicUsize::new(0),
             mode: "mcp",
         });
-        let rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![ConnectorConfig {
             id: "demo".into(),
@@ -931,8 +919,8 @@ for line in sys.stdin:
         let brain = Arc::new(WindowRecordingBrain {
             windows: Mutex::new(Vec::new()),
         });
-        let rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         let mut cfg = configured(vec![]);
         cfg.window_max_bytes = Some(900);
@@ -953,8 +941,8 @@ for line in sys.stdin:
         drop(rt);
 
         // Reopen runtime and verify persisted anchor starts cleanly with the open concern snapshot.
-        let restarted =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+        let mut restarted =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         restarted.handle_user_message("重启后第一轮");
 
@@ -1004,8 +992,8 @@ for line in sys.stdin:
         let brain = Arc::new(SelfHealingBrain {
             seen_error: Mutex::new(None),
         });
-        let rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
 
@@ -1025,8 +1013,8 @@ for line in sys.stdin:
             judge_calls: AtomicUsize::new(0),
             mode: "chat",
         });
-        let rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
 
@@ -1058,8 +1046,9 @@ for line in sys.stdin:
             judge_calls: AtomicUsize::new(0),
             mode: "chat",
         });
-        let rt = HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Arc::new(|_| {}))
-            .unwrap();
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Box::new(|_| {}))
+                .unwrap();
         let mut cfg = configured(vec![]);
         cfg.providers[0].api_key = "sk-top-secret".into();
         rt.save_config(cfg);
@@ -1085,7 +1074,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let rt =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         assert!(rt.snapshot().stream.is_empty());
         let version_file = dir.path().join("core/kernel_version");
@@ -1097,7 +1086,7 @@ for line in sys.stdin:
 
         fs::write(&version_file, "0.9.0\n").unwrap();
         let upgraded =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Arc::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Box::new(|_| {}))
                 .unwrap();
         assert_eq!(
             fs::read_to_string(&version_file).unwrap().trim(),
@@ -1118,7 +1107,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let rt1 =
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
                 .unwrap();
 
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1126,7 +1115,7 @@ for line in sys.stdin:
         let second = HostRuntime::open_with_brain(
             dir.path().to_path_buf(),
             brain.clone(),
-            Arc::new(move |val| sink_events.lock().unwrap().push(val)),
+            Box::new(move |val| sink_events.lock().unwrap().push(val)),
         );
         assert!(second.is_err());
         assert!(events
@@ -1137,8 +1126,44 @@ for line in sys.stdin:
 
         drop(rt1);
         assert!(
-            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Arc::new(|_| {}),)
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Box::new(|_| {}),)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn reconciles_unfinished_acted_entries_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = dir.path().join("core");
+        fs::create_dir_all(&core_dir).unwrap();
+        let eja = Eja::open(core_dir.join("subject.db")).unwrap();
+        let rev = eja.revision().unwrap();
+        let dangling = eja
+            .act(rev, "shell", json!({ "command": "sleep 999" }), &["shell"])
+            .unwrap();
+        drop(eja);
+
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        let snap = rt.snapshot();
+        assert!(snap.stream.iter().any(|item| {
+            item.id == dangling.id
+                && item
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("未知:") && d.contains("中断"))
+        }));
+        let rev_after_first = rt.eja.revision().unwrap();
+        drop(rt);
+
+        let reopened =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Box::new(|_| {}))
+                .unwrap();
+        assert_eq!(reopened.eja.revision().unwrap(), rev_after_first);
     }
 }

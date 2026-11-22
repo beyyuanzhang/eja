@@ -240,13 +240,14 @@ public final class HostClient: ObservableObject {
     }
 
     public func shutdown() {
+        let proc = process
+        process = nil
         try? stdinHandle?.close()
         stdinHandle = nil
-        if let proc = process {
+        if let proc {
             proc.terminate()
             proc.waitUntilExit()
         }
-        process = nil
     }
 
     public func restart() {
@@ -320,6 +321,23 @@ public final class HostClient: ObservableObject {
                     }
                 }
             }
+            proc.waitUntilExit()
+            let exitCode = proc.terminationStatus
+            Task { @MainActor [weak self] in
+                self?.handleHostExited(proc, status: exitCode)
+            }
+        }
+    }
+
+    private func handleHostExited(_ exited: Process, status exitCode: Int32) {
+        guard process === exited else { return }
+        process = nil
+        stdinHandle = nil
+        isReady = false
+        status = "idle"
+        statusDetail = "已断开"
+        if !alreadyRunning && errorBanner == nil {
+            errorBanner = "eja-host 已退出（退出码 \(exitCode)）"
         }
     }
 
