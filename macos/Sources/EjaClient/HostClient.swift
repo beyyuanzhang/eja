@@ -75,11 +75,27 @@ public struct HostConfigDTO: Codable, Equatable, Sendable {
     public var providers: [ProviderConfigDTO]
     public var judge: ModelRefDTO
     public var connectors: [ConnectorConfigDTO]
+    public var windowMaxBytes: Int?
+    public var maxSteps: Int?
 
-    public init(providers: [ProviderConfigDTO] = [], judge: ModelRefDTO = ModelRefDTO(), connectors: [ConnectorConfigDTO] = []) {
+    enum CodingKeys: String, CodingKey {
+        case providers, judge, connectors
+        case windowMaxBytes = "window_max_bytes"
+        case maxSteps = "max_steps"
+    }
+
+    public init(
+        providers: [ProviderConfigDTO] = [],
+        judge: ModelRefDTO = ModelRefDTO(),
+        connectors: [ConnectorConfigDTO] = [],
+        windowMaxBytes: Int? = nil,
+        maxSteps: Int? = nil
+    ) {
         self.providers = providers
         self.judge = judge
         self.connectors = connectors
+        self.windowMaxBytes = windowMaxBytes
+        self.maxSteps = maxSteps
     }
 }
 

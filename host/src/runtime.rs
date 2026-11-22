@@ -1,11 +1,8 @@
 use crate::config::{HostConfig, ProviderConfig};
-use crate::hands::{Hands, WakeAlarm};
-use crate::llm::{
-    concerns_at, entries_since, project_window, Brain, HttpBrain, StepFeedback, TurnContext,
-    TurnSession,
-};
+use crate::hands::{Hands, ToolSpec, WakeAlarm};
+use crate::llm::{append_tool_results, project_window, Brain, HttpBrain, ToolCall};
 use crate::mcp::{truncate_utf8, ConnectorStatus};
-use eja_core::{Eja, Entry, Fact, Id, Outcome, SearchHits, Source};
+use eja_core::{Eja, Entry, Fact, Id, Outcome, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -105,8 +102,9 @@ impl HostRuntime {
         };
         let eja = self.eja.lock().unwrap();
         let revision = eja.revision().unwrap_or(0);
-        let entries = load_recent_entries(&eja, 80);
-        let concerns = concerns_at(&eja, revision)
+        let entries = eja.recent(80).unwrap_or_default();
+        let concerns = eja
+            .concerns(revision)
             .map(|items| {
                 items
                     .iter()
@@ -160,11 +158,15 @@ impl HostRuntime {
     }
 
     pub fn reload_connectors(&self) {
-        let config = HostConfig::load(&self.data_dir);
-        *self.config.lock().unwrap() = config.clone();
-        *self.config_bytes.lock().unwrap() = read_config_bytes(&self.data_dir);
-        self.hands.lock().unwrap().reload(&config.connectors);
-        self.emit_state();
+        match HostConfig::try_load(&self.data_dir) {
+            Ok(config) => {
+                *self.config.lock().unwrap() = config.clone();
+                *self.config_bytes.lock().unwrap() = read_config_bytes(&self.data_dir);
+                self.hands.lock().unwrap().reload(&config.connectors);
+                self.emit_state();
+            }
+            Err(err) => self.emit_error(err),
+        }
     }
 
     pub fn test_provider(&self, id: String, provider: ProviderConfig, model: String) {
@@ -225,15 +227,19 @@ impl HostRuntime {
             }
         };
         if changed {
-            let loaded = HostConfig::load(&self.data_dir);
-            let connectors_changed = {
-                let mut cfg = self.config.lock().unwrap();
-                let diff = cfg.connectors != loaded.connectors;
-                *cfg = loaded.clone();
-                diff
-            };
-            if connectors_changed {
-                self.hands.lock().unwrap().reload(&loaded.connectors);
+            match HostConfig::try_load(&self.data_dir) {
+                Ok(loaded) => {
+                    let connectors_changed = {
+                        let mut cfg = self.config.lock().unwrap();
+                        let diff = cfg.connectors != loaded.connectors;
+                        *cfg = loaded.clone();
+                        diff
+                    };
+                    if connectors_changed {
+                        self.hands.lock().unwrap().reload(&loaded.connectors);
+                    }
+                }
+                Err(err) => self.emit_error(err),
             }
         }
     }
@@ -252,7 +258,15 @@ impl HostRuntime {
 
         self.set_status("thinking", "思考中…");
         let data_dir_str = self.data_dir.display().to_string();
-        let window = {
+        let system = format!(
+            "你是 EJA，一个持续存在的自我同一性主体。\n\
+            数据目录：{}\n\
+            配置文件：{}/config.json（`connectors` 变更会自动热加载）\n\
+            本地时区：{}\n\n\
+            前置消息是你按时间正序排列的不可变主体日志；末尾新增的 `noticed` 记录是本次触发。不调工具时的文本回复会发送给人，留空则保持沉默。",
+            data_dir_str, data_dir_str, self.local_tz
+        );
+        let mut messages = {
             let eja = self.eja.lock().unwrap();
             let mut anchor = self.anchor.lock().unwrap();
             let initial_anchor = *anchor;
@@ -272,12 +286,6 @@ impl HostRuntime {
             projected
         };
 
-        let mut turn = TurnSession::default();
-        let mut previous_revision: Option<Id> = None;
-        let mut step_actions: Vec<Id> = Vec::new();
-        let mut step_reads: Vec<Result<eja_core::Evidence, String>> = Vec::new();
-        let mut step_searches: Vec<Result<SearchHits, String>> = Vec::new();
-        let mut commit_error: Option<String> = None;
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
 
@@ -286,71 +294,20 @@ impl HostRuntime {
                 self.sync_config_if_changed();
             }
             let tools = self.hands.lock().unwrap().tools();
-            let (revision, entries) = {
-                let eja = self.eja.lock().unwrap();
-                let rev = match eja.revision() {
-                    Ok(r) => r,
-                    Err(err) => {
-                        fatal_error = Some(err.to_string());
-                        break;
-                    }
-                };
-                if rev == 0 {
-                    completed = true;
-                    break;
-                }
-                let delta = match previous_revision.replace(rev) {
-                    Some(previous) => match entries_since(&eja, previous, rev) {
-                        Ok(items) => items,
-                        Err(err) => {
-                            fatal_error = Some(err.to_string());
-                            break;
-                        }
-                    },
-                    None => Vec::new(),
-                };
-                (rev, delta)
-            };
-
-            let ctx = TurnContext {
-                provider: &provider,
-                model: &model,
-                tools: &tools,
-                data_dir: &data_dir_str,
-                local_tz: &self.local_tz,
-                window: &window,
-            };
-            let decision = match self.brain.judge(
-                &ctx,
-                &mut turn,
-                StepFeedback {
-                    entries: &entries,
-                    actions: &step_actions,
-                    reads: &step_reads,
-                    searches: &step_searches,
-                    commit_error: commit_error.as_deref(),
-                },
-            ) {
-                Ok(d) => d,
+            let reply = match self
+                .brain
+                .complete(&provider, &model, &system, &messages, &tools)
+            {
+                Ok(r) => r,
                 Err(err) => {
                     fatal_error = Some(err);
                     break;
                 }
             };
 
-            step_actions.clear();
-            step_reads.clear();
-            step_searches.clear();
-            commit_error = None;
-
-            let step = decision.step;
-            if step.is_empty() && !turn.has_pending() {
-                if let Some(text) = decision
-                    .reply
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
+            if reply.calls.is_empty() {
+                let text = reply.text.trim();
+                if !text.is_empty() {
                     if let Err(err) = self.eja.lock().unwrap().say(text) {
                         fatal_error = Some(err.to_string());
                         break;
@@ -363,67 +320,21 @@ impl HostRuntime {
                 break;
             }
 
-            let grant_refs: Vec<&str> = tools.iter().map(|t| t.capability.as_str()).collect();
-            let calls = if step.has_mutations() {
-                let commit_res = self
-                    .eja
-                    .lock()
-                    .unwrap()
-                    .commit(revision, &step, &grant_refs);
-                match commit_res {
-                    Ok(calls) => calls,
-                    Err(eja_core::Error::Invalid(msg)) => {
-                        commit_error = Some(msg);
-                        Vec::new()
-                    }
+            messages.push(reply.message);
+            let mut results = Vec::with_capacity(reply.calls.len());
+            for call in reply.calls {
+                match self.execute_tool_call(&call, &tools) {
+                    Ok(val) => results.push((call.id, val)),
                     Err(err) => {
-                        fatal_error = Some(err.to_string());
+                        fatal_error = Some(err);
                         break;
                     }
-                }
-            } else {
-                Vec::new()
-            };
-
-            for call in calls {
-                let id = call.id;
-                step_actions.push(id);
-                let outcome = self.hands.lock().unwrap().execute(&call);
-                if let Err(err) = self.eja.lock().unwrap().finish(id, outcome) {
-                    fatal_error = Some(err.to_string());
-                    break;
                 }
             }
             if fatal_error.is_some() {
                 break;
             }
-
-            if !step.read.is_empty() || !step.search.is_empty() {
-                let eja = self.eja.lock().unwrap();
-                let head = match eja.revision() {
-                    Ok(h) => h,
-                    Err(err) => {
-                        fatal_error = Some(err.to_string());
-                        break;
-                    }
-                };
-                for fact_id in step.read {
-                    if fact_id < 1 || fact_id > head {
-                        step_reads.push(Err(format!(
-                            "fact id {fact_id} 超出当前日志范围 (1..={head})"
-                        )));
-                    } else {
-                        step_reads.push(eja.evidence(fact_id, head).map_err(|err| err.to_string()));
-                    }
-                }
-                for cue in step.search {
-                    let res = eja
-                        .search(&cue)
-                        .map(|matches| SearchHits { cue, matches })
-                        .map_err(|err| err.to_string());
-                    step_searches.push(res);
-                }
-            }
+            append_tool_results(&provider.kind, &mut messages, results);
         }
 
         if let Some(err) = fatal_error {
@@ -433,6 +344,88 @@ impl HostRuntime {
         }
         self.sync_config_if_changed();
         self.set_status("idle", "在线");
+    }
+
+    fn execute_tool_call(&self, call: &ToolCall, tools: &[ToolSpec]) -> Result<Value, String> {
+        match call.name.as_str() {
+            "keep" => {
+                let text = call
+                    .args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let concern = call.args.get("concern").and_then(Value::as_i64);
+                match self.eja.lock().unwrap().keep(concern, text) {
+                    Ok(entry) => {
+                        let Fact::Kept { concern, .. } = entry.fact else {
+                            unreachable!()
+                        };
+                        Ok(json!({ "status": "kept", "concern": concern, "fact_id": entry.id }))
+                    }
+                    Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            "release" => match call.args.get("concern").and_then(Value::as_i64) {
+                Some(id) => match self.eja.lock().unwrap().release(id) {
+                    Ok(entry) => {
+                        Ok(json!({ "status": "released", "concern": id, "fact_id": entry.id }))
+                    }
+                    Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
+                    Err(err) => Err(err.to_string()),
+                },
+                None => Ok(json!({ "error": "release 需要整数 concern" })),
+            },
+            "read" => match call.args.get("fact").and_then(Value::as_i64) {
+                Some(id) => match self.eja.lock().unwrap().evidence(id) {
+                    Ok(ev) => Ok(json!(ev)),
+                    Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
+                    Err(err) => Err(err.to_string()),
+                },
+                None => Ok(json!({ "error": "read 需要整数 fact" })),
+            },
+            "search" => {
+                let cue = call
+                    .args
+                    .get("cue")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                match self.eja.lock().unwrap().search(cue) {
+                    Ok(matches) => Ok(json!({ "cue": cue, "matches": matches })),
+                    Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
+                    Err(err) => Err(err.to_string()),
+                }
+            }
+            other => {
+                let Some(spec) = tools.iter().find(|t| t.name == other) else {
+                    return Ok(json!({ "error": format!("未知工具: {other}") }));
+                };
+                let grants: Vec<&str> = tools.iter().map(|t| t.capability.as_str()).collect();
+                let acted = {
+                    let eja = self.eja.lock().unwrap();
+                    let revision = eja.revision().map_err(|err| err.to_string())?;
+                    eja.act(revision, &spec.capability, call.args.clone(), &grants)
+                };
+                let acted = match acted {
+                    Ok(c) => c,
+                    Err(eja_core::Error::Invalid(msg)) => return Ok(json!({ "error": msg })),
+                    Err(err) => return Err(err.to_string()),
+                };
+                let outcome = self.hands.lock().unwrap().execute(&acted);
+                let receipt = self
+                    .eja
+                    .lock()
+                    .unwrap()
+                    .finish(acted.id, outcome)
+                    .map_err(|err| err.to_string())?;
+                let Fact::Returned { outcome, .. } = receipt.fact else {
+                    unreachable!()
+                };
+                Ok(json!({ "id": receipt.id, "action": acted.id, "outcome": outcome }))
+            }
+        }
     }
 
     fn set_status(&self, status: &str, detail: &str) {
@@ -451,31 +444,6 @@ fn open_subject(db_path: &Path) -> Result<Eja, String> {
         }
     }
     Eja::open(db_path).map_err(|err| err.to_string())
-}
-
-fn load_recent_entries(eja: &Eja, limit: usize) -> Vec<Entry> {
-    let Ok(revision) = eja.revision() else {
-        return Vec::new();
-    };
-    if revision == 0 {
-        return Vec::new();
-    }
-    let mut collected = Vec::new();
-    let mut cursor = revision;
-    while collected.len() < limit && cursor > 0 {
-        let Ok(page) = eja.history(cursor) else { break };
-        if page.is_empty() {
-            break;
-        }
-        cursor = page
-            .last()
-            .map(|entry| entry.id.saturating_sub(1))
-            .unwrap_or(0);
-        collected.extend(page);
-    }
-    collected.truncate(limit);
-    collected.reverse();
-    collected
 }
 
 fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
@@ -604,10 +572,37 @@ fn detect_local_tz() -> String {
 mod tests {
     use super::*;
     use crate::config::{ConnectorConfig, ConnectorTransport, ModelRef, ProviderKind};
-    use crate::llm::Decision;
-    use eja_core::{Act, Keep, Step};
+    use crate::llm::ModelReply;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn text_reply(text: &str) -> ModelReply {
+        ModelReply {
+            message: json!({ "role": "assistant", "content": text }),
+            text: text.into(),
+            calls: Vec::new(),
+        }
+    }
+
+    fn tool_reply(id: &str, name: &str, args: Value) -> ModelReply {
+        ModelReply {
+            message: json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args.to_string() }
+                }]
+            }),
+            text: String::new(),
+            calls: vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                args,
+            }],
+        }
+    }
 
     struct MockBrain {
         judge_calls: AtomicUsize,
@@ -615,45 +610,32 @@ mod tests {
     }
 
     impl Brain for MockBrain {
-        fn judge(
+        fn complete(
             &self,
-            ctx: &TurnContext<'_>,
-            _turn: &mut TurnSession,
-            feedback: StepFeedback<'_>,
-        ) -> Result<Decision, String> {
+            _provider: &ProviderConfig,
+            _model: &str,
+            _system: &str,
+            messages: &[Value],
+            tools: &[ToolSpec],
+        ) -> Result<ModelReply, String> {
             self.judge_calls.fetch_add(1, Ordering::SeqCst);
             if self.mode == "mcp" {
-                let already_called = feedback.entries.iter().any(|e| {
-                    matches!(&e.fact, Fact::Returned { outcome: Outcome::Observed(s), .. } if s.contains("pong:hello"))
+                let already_called = messages.iter().any(|m| {
+                    m["role"] == "tool"
+                        && m["content"].as_str().unwrap_or("").contains("pong:hello")
                 });
                 if !already_called {
-                    let cap = ctx
-                        .tools
+                    let name = tools
                         .iter()
                         .find(|t| t.capability.starts_with("mcp."))
                         .unwrap()
-                        .capability
+                        .name
                         .clone();
-                    return Ok(Decision {
-                        step: Step {
-                            act: vec![Act {
-                                capability: cap,
-                                input: json!({ "msg": "hello" }),
-                            }],
-                            ..Step::default()
-                        },
-                        reply: None,
-                    });
+                    return Ok(tool_reply("c1", &name, json!({ "msg": "hello" })));
                 }
-                return Ok(Decision {
-                    step: Step::default(),
-                    reply: Some("mcp ok".into()),
-                });
+                return Ok(text_reply("mcp ok"));
             }
-            Ok(Decision {
-                step: Step::default(),
-                reply: Some("你好，我在。".into()),
-            })
+            Ok(text_reply("你好，我在。"))
         }
 
         fn test_connection(
@@ -781,37 +763,24 @@ for line in sys.stdin:
     }
 
     impl Brain for WindowRecordingBrain {
-        fn judge(
+        fn complete(
             &self,
-            ctx: &TurnContext<'_>,
-            _turn: &mut TurnSession,
-            feedback: StepFeedback<'_>,
-        ) -> Result<Decision, String> {
-            if !feedback.entries.is_empty() {
-                return Ok(Decision {
-                    step: Step::default(),
-                    reply: Some("收到".into()),
-                });
+            _provider: &ProviderConfig,
+            _model: &str,
+            _system: &str,
+            messages: &[Value],
+            _tools: &[ToolSpec],
+        ) -> Result<ModelReply, String> {
+            if messages.last().is_some_and(|m| m["role"] == "tool") {
+                return Ok(text_reply("收到"));
             }
             let mut windows = self.windows.lock().unwrap();
             let first_turn = windows.is_empty();
-            windows.push(ctx.window.to_vec());
+            windows.push(messages.to_vec());
             if first_turn {
-                return Ok(Decision {
-                    step: Step {
-                        keep: vec![Keep {
-                            concern: None,
-                            text: "长期挂念".into(),
-                        }],
-                        ..Step::default()
-                    },
-                    reply: None,
-                });
+                return Ok(tool_reply("k1", "keep", json!({ "text": "长期挂念" })));
             }
-            Ok(Decision {
-                step: Step::default(),
-                reply: Some("收到".into()),
-            })
+            Ok(text_reply("收到"))
         }
 
         fn test_connection(
@@ -868,26 +837,23 @@ for line in sys.stdin:
     }
 
     impl Brain for SelfHealingBrain {
-        fn judge(
+        fn complete(
             &self,
-            _ctx: &TurnContext<'_>,
-            _turn: &mut TurnSession,
-            feedback: StepFeedback<'_>,
-        ) -> Result<Decision, String> {
-            if let Some(err) = feedback.commit_error {
-                *self.seen_error.lock().unwrap() = Some(err.to_string());
-                return Ok(Decision {
-                    step: Step::default(),
-                    reply: Some("已自行纠正".into()),
-                });
+            _provider: &ProviderConfig,
+            _model: &str,
+            _system: &str,
+            messages: &[Value],
+            _tools: &[ToolSpec],
+        ) -> Result<ModelReply, String> {
+            if let Some(tool_msg) = messages.last().filter(|m| m["role"] == "tool") {
+                let parsed: Value =
+                    serde_json::from_str(tool_msg["content"].as_str().unwrap()).unwrap();
+                if let Some(err) = parsed.get("error").and_then(Value::as_str) {
+                    *self.seen_error.lock().unwrap() = Some(err.to_string());
+                    return Ok(text_reply("已自行纠正"));
+                }
             }
-            Ok(Decision {
-                step: Step {
-                    release: vec![99999],
-                    ..Step::default()
-                },
-                reply: None,
-            })
+            Ok(tool_reply("r1", "release", json!({ "concern": 99999 })))
         }
 
         fn test_connection(
@@ -917,5 +883,29 @@ for line in sys.stdin:
             .stream
             .iter()
             .any(|item| item.kind == "eja" && item.text == "已自行纠正"));
+    }
+
+    #[test]
+    fn invalid_config_json_keeps_existing_runtime_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
+        rt.save_config(configured(vec![]));
+
+        fs::write(HostConfig::path(dir.path()), "{ broken json").unwrap();
+        rt.handle_user_message("依然可用");
+
+        let snap = rt.snapshot();
+        assert!(snap.configured);
+        assert_eq!(snap.config.judge.provider_id, "local");
+        assert!(snap
+            .stream
+            .iter()
+            .any(|item| item.kind == "eja" && item.text == "你好，我在。"));
     }
 }

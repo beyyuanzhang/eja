@@ -118,13 +118,18 @@ impl HostConfig {
     }
 
     pub fn load(data_dir: &Path) -> Self {
+        Self::try_load(data_dir).unwrap_or_default()
+    }
+
+    pub fn try_load(data_dir: &Path) -> Result<Self, String> {
         let cfg_path = Self::path(data_dir);
-        if let Ok(bytes) = fs::read(&cfg_path) {
-            if let Ok(cfg) = serde_json::from_slice::<Self>(&bytes) {
-                return cfg;
-            }
-        }
-        Self::default()
+        let bytes = match fs::read(&cfg_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(format!("读取配置失败: {err}")),
+        };
+        serde_json::from_slice::<Self>(&bytes)
+            .map_err(|err| format!("解析 config.json 失败: {err}"))
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<(), String> {

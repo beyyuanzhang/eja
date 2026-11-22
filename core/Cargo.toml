@@ -23,7 +23,3 @@ tempfile = "3"
 [[example]]
 name = "semantic_recall"
 required-features = ["onnx"]
-
-[[example]]
-name = "live_continuity"
-required-features = ["onnx"]

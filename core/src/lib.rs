@@ -19,8 +19,6 @@ use std::{fmt, path::Path};
 
 pub type Id = i64;
 pub type Result<T> = std::result::Result<T, Error>;
-/// Each view contains at most one page of recent entries and one page of open concerns.
-pub const PAGE: usize = 8;
 /// Bound one serialized fact before it enters a model-facing history.
 pub const FACT_BYTES: usize = 64 * 1024;
 
@@ -32,7 +30,7 @@ pub enum Error {
     Invalid(String),
     /// Storage or serialization failure.
     Storage(String),
-    /// Judge callback or encoder failure.
+    /// Encoder failure.
     External(Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -89,51 +87,6 @@ pub enum Outcome {
     Unknown(String),
 }
 
-/// Open a new concern (`concern: None`) or revise an existing open concern (`concern: Some(id)`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Keep {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub concern: Option<Id>,
-    pub text: String,
-}
-
-/// Request one authorized host capability.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Act {
-    pub capability: String,
-    pub input: Value,
-}
-
-/// One step returned by the intelligence.
-/// Any non-empty step commits its changes and feeds receipts/evidence back into the loop;
-/// an empty step closes the turn naturally.
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Step {
-    #[serde(default)]
-    pub keep: Vec<Keep>,
-    #[serde(default)]
-    pub release: Vec<Id>,
-    #[serde(default)]
-    pub read: Vec<Id>,
-    #[serde(default)]
-    pub search: Vec<String>,
-    #[serde(default)]
-    pub act: Vec<Act>,
-}
-
-impl Step {
-    pub fn has_mutations(&self) -> bool {
-        !self.keep.is_empty() || !self.release.is_empty() || !self.act.is_empty()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        !self.has_mutations() && self.read.is_empty() && self.search.is_empty()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fact {
@@ -163,33 +116,11 @@ pub struct Evidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct SearchHits {
-    pub cue: String,
-    pub matches: Vec<Match>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Concern {
     pub id: Id,
     pub latest: Id,
     pub at: Timestamp,
     pub text: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct View {
-    pub revision: Id,
-    pub now: Timestamp,
-    /// Most recently changed open concerns first.
-    pub concerns: Vec<Concern>,
-    /// Newest first. Older entries are readable by id or page.
-    pub recent: Vec<Entry>,
-    /// Evidence returned for `step.read` from the previous step of this turn.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub reads: Vec<Evidence>,
-    /// Results returned for `step.search` from the previous step of this turn.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub searches: Vec<SearchHits>,
 }
 
 /// Delivered once, after the corresponding `Fact::Acted` is durable.
@@ -198,12 +129,6 @@ pub struct Call {
     pub id: Id,
     pub capability: String,
     pub input: Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stop {
-    Done,
-    StepLimit,
 }
 
 pub struct Eja {
@@ -263,75 +188,7 @@ impl Eja {
         self.head()
     }
 
-    /// Pure read-only snapshot of the journal at its current revision.
-    pub fn view(&self) -> Result<View> {
-        let revision = self.head()?;
-        Ok(View {
-            revision,
-            now: self.now_at(&self.db)?,
-            concerns: self.concerns(revision, revision)?,
-            recent: self.history(revision)?,
-            reads: Vec::new(),
-            searches: Vec::new(),
-        })
-    }
-
-    /// Closed-loop turn: commits mutations before external effects, feeds back query results
-    /// and receipts, and terminates naturally when a step requests no new evidence or effects.
-    pub fn turn(
-        &self,
-        grants: &[&str],
-        steps: usize,
-        mut judge: impl FnMut(
-            &View,
-        )
-            -> std::result::Result<Step, Box<dyn std::error::Error + Send + Sync>>,
-        mut perform: impl FnMut(Call) -> Outcome,
-    ) -> Result<Stop> {
-        let mut reads = Vec::new();
-        let mut searches = Vec::new();
-        for _ in 0..steps {
-            let mut view = self.view()?;
-            if view.revision == 0 {
-                return Ok(Stop::Done);
-            }
-            view.reads = std::mem::take(&mut reads);
-            view.searches = std::mem::take(&mut searches);
-            let step = judge(&view).map_err(Error::External)?;
-            if step.is_empty() {
-                return Ok(Stop::Done);
-            }
-            for &fact_id in &step.read {
-                if fact_id < 1 || fact_id > view.revision {
-                    return Err(Error::invalid("read target must reference a recorded fact"));
-                }
-            }
-            for cue in &step.search {
-                memory::validate_cue(cue)?;
-            }
-            let calls = if step.has_mutations() {
-                self.commit(view.revision, &step, grants)?
-            } else {
-                Vec::new()
-            };
-            for call in calls {
-                let id = call.id;
-                self.finish(id, perform(call))?;
-            }
-            let head = self.head()?;
-            for fact_id in step.read {
-                reads.push(self.evidence(fact_id, head)?);
-            }
-            for cue in step.search {
-                let matches = self.search_at(&cue, head, head)?;
-                searches.push(SearchHits { cue, matches });
-            }
-        }
-        Ok(Stop::StepLimit)
-    }
-
-    /// Atomically commit state updates and authorized actions against an exact view revision.
-    pub fn commit(&self, revision: Id, step: &Step, grants: &[&str]) -> Result<Vec<Call>> {
-        self.commit_step(revision, step, grants)
+    pub fn now(&self) -> Result<Timestamp> {
+        self.now_at(&self.db)
     }
 }

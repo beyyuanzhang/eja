@@ -1,8 +1,8 @@
 use crate::{
-    Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Step, Timestamp,
-    FACT_BYTES, PAGE,
+    Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Timestamp, FACT_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 fn head_on(conn: &Connection) -> Result<Id> {
@@ -147,81 +147,80 @@ impl Eja {
         Ok(id)
     }
 
-    /// All invariant checks and writes for one step run inside one IMMEDIATE SQLite transaction.
-    pub(super) fn commit_step(
+    /// Open a new concern (`concern: None`) or revise an existing open concern (`concern: Some(id)`).
+    pub fn keep(&self, concern: Option<Id>, text: impl Into<String>) -> Result<Entry> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(Error::invalid("a concern needs text"));
+        }
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let at = self.now_at(&tx)?;
+        let concern = match concern {
+            Some(id) => {
+                require_open_on(&tx, id)?;
+                id
+            }
+            None => head_on(&tx)?
+                .checked_add(1)
+                .ok_or_else(|| Error::Storage("journal id exhausted".into()))?,
+        };
+        let fact = Fact::Kept { concern, text };
+        let id = insert_fact(&tx, at, &fact, Some((concern, true)))?;
+        tx.commit()?;
+        Ok(Entry { id, at, fact })
+    }
+
+    /// Release an open concern.
+    pub fn release(&self, concern: Id) -> Result<Entry> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        require_open_on(&tx, concern)?;
+        let at = self.now_at(&tx)?;
+        let fact = Fact::Released { concern };
+        let id = insert_fact(&tx, at, &fact, Some((concern, false)))?;
+        tx.commit()?;
+        Ok(Entry { id, at, fact })
+    }
+
+    /// Atomically record one authorized external action against an exact revision.
+    pub fn act(
         &self,
         revision: Id,
-        step: &Step,
+        capability: impl Into<String>,
+        input: Value,
         grants: &[&str],
-    ) -> Result<Vec<Call>> {
+    ) -> Result<Call> {
+        let capability = capability.into();
+        if capability.is_empty() || !grants.contains(&capability.as_str()) {
+            return Err(Error::invalid("capability is not granted"));
+        }
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if head_on(&tx)? != revision {
             return Err(Error::Conflict);
         }
         let at = self.now_at(&tx)?;
-        let mut next = revision;
-        for item in &step.keep {
-            if item.text.trim().is_empty() {
-                return Err(Error::invalid("a concern needs text"));
-            }
-            next = next
-                .checked_add(1)
-                .ok_or_else(|| Error::Storage("journal id exhausted".into()))?;
-            let concern = match item.concern {
-                Some(id) => {
-                    require_open_on(&tx, id)?;
-                    id
-                }
-                None => next,
-            };
-            let id = insert_fact(
-                &tx,
-                at,
-                &Fact::Kept {
-                    concern,
-                    text: item.text.clone(),
-                },
-                Some((concern, true)),
-            )?;
-            debug_assert_eq!(id, next);
-        }
-        for &concern in &step.release {
-            require_open_on(&tx, concern)?;
-            next = next
-                .checked_add(1)
-                .ok_or_else(|| Error::Storage("journal id exhausted".into()))?;
-            let id = insert_fact(&tx, at, &Fact::Released { concern }, Some((concern, false)))?;
-            debug_assert_eq!(id, next);
-        }
-        let mut calls = Vec::with_capacity(step.act.len());
-        for item in &step.act {
-            if item.capability.is_empty() || !grants.contains(&item.capability.as_str()) {
-                return Err(Error::invalid("capability is not granted"));
-            }
-            next = next
-                .checked_add(1)
-                .ok_or_else(|| Error::Storage("journal id exhausted".into()))?;
-            let id = insert_fact(
-                &tx,
-                at,
-                &Fact::Acted {
-                    capability: item.capability.clone(),
-                    input: item.input.clone(),
-                },
-                None,
-            )?;
-            debug_assert_eq!(id, next);
-            calls.push(Call {
-                id,
-                capability: item.capability.clone(),
-                input: item.input.clone(),
-            });
-        }
+        let id = insert_fact(
+            &tx,
+            at,
+            &Fact::Acted {
+                capability: capability.clone(),
+                input: input.clone(),
+            },
+            None,
+        )?;
         tx.commit()?;
-        Ok(calls)
+        Ok(Call {
+            id,
+            capability,
+            input,
+        })
     }
 
-    pub fn evidence(&self, id: Id, revision: Id) -> Result<Evidence> {
+    /// Read one recorded fact paired with its latest superseding receipt or concern update.
+    pub fn evidence(&self, id: Id) -> Result<Evidence> {
+        self.evidence_at(id, self.head()?)
+    }
+
+    pub(super) fn evidence_at(&self, id: Id, revision: Id) -> Result<Evidence> {
         let entry = self.read(id)?;
         let latest = match &entry.fact {
             Fact::Returned { action, .. } => receipt_at_on(&self.db, *action, revision)?,
@@ -246,7 +245,7 @@ impl Eja {
     }
 
     /// An unknown receipt can be settled once. Retrying a recorded receipt returns its ID.
-    pub fn finish(&self, action: Id, outcome: Outcome) -> Result<Id> {
+    pub fn finish(&self, action: Id, outcome: Outcome) -> Result<Entry> {
         let mut fact = Fact::Returned { action, outcome };
         if serde_json::to_vec(&fact)?.len() > FACT_BYTES {
             let full = match &mut fact {
@@ -302,7 +301,7 @@ impl Eja {
             )
             .optional()?;
         if let Some(id) = existing {
-            return Ok(id);
+            return read_on(&tx, id);
         }
         let previous = receipt_at_on(&tx, action, Id::MAX)?;
         if let Some(entry) = &previous {
@@ -325,34 +324,53 @@ impl Eja {
         let at = self.now_at(&tx)?;
         let id = insert_fact(&tx, at, &fact, None)?;
         tx.commit()?;
-        Ok(id)
+        Ok(Entry { id, at, fact })
     }
 
     pub fn read(&self, id: Id) -> Result<Entry> {
         read_on(&self.db, id)
     }
 
-    /// Inclusive cursor. Continue at the last returned id minus one.
-    pub fn history(&self, through: Id) -> Result<Vec<Entry>> {
+    /// Chronological entries strictly after `after` through `through` (inclusive).
+    pub fn entries_after(&self, after: Id, through: Id) -> Result<Vec<Entry>> {
+        if through <= after {
+            return Ok(Vec::new());
+        }
         let mut stmt = self
             .db
-            .prepare("SELECT id, at, body FROM facts WHERE id <= ?1 ORDER BY id DESC LIMIT ?2")?;
-        let rows = stmt.query_map(params![through, PAGE], read_entry_row)?;
+            .prepare("SELECT id, at, body FROM facts WHERE id > ?1 AND id <= ?2 ORDER BY id ASC")?;
+        let rows = stmt.query_map(params![after, through], read_entry_row)?;
         decode_entries(rows)
     }
 
-    /// Concerns as of a fixed view. Page with the last returned latest id minus one.
-    pub fn concerns(&self, revision: Id, through: Id) -> Result<Vec<Concern>> {
+    /// Up to `limit` most recent entries in chronological order.
+    pub fn recent(&self, limit: usize) -> Result<Vec<Entry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .db
+            .prepare("SELECT id, at, body FROM facts ORDER BY id DESC LIMIT ?1")?;
+        let mut entries = decode_entries(stmt.query_map([limit], read_entry_row)?)?;
+        entries.reverse();
+        Ok(entries)
+    }
+
+    /// All open concerns as of `revision`, most recently updated first.
+    pub fn concerns(&self, revision: Id) -> Result<Vec<Concern>> {
+        if revision <= 0 {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.db.prepare(
             "SELECT f.concern, f.id, f.at, json_extract(f.body, '$.text')
-             FROM facts f WHERE f.live = 1 AND f.id <= min(?1, ?2)
+             FROM facts f WHERE f.live = 1 AND f.id <= ?1
                AND NOT EXISTS (
                    SELECT 1 FROM facts later WHERE later.concern = f.concern
                        AND later.id > f.id AND later.id <= ?1
                )
-             ORDER BY f.id DESC LIMIT ?3",
+             ORDER BY f.id DESC",
         )?;
-        let rows = stmt.query_map(params![revision, through, PAGE], |row| {
+        let rows = stmt.query_map([revision], |row| {
             Ok(Concern {
                 id: row.get(0)?,
                 latest: row.get(1)?,

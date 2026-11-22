@@ -294,17 +294,53 @@ impl HttpConnection {
             let err_text = String::from_utf8_lossy(&output.stderr);
             return Err(format!("MCP HTTP 请求失败: {}", err_text.trim()));
         }
-        let raw = String::from_utf8_lossy(&output.stdout).to_string();
-        let split_marker = if raw.contains("\r\n\r\n") {
-            "\r\n\r\n"
-        } else {
-            "\n\n"
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let (headers, body) = split_http_response(&raw)?;
+        Ok((headers.to_string(), body.to_string()))
+    }
+}
+
+fn split_http_response(raw: &str) -> Result<(&str, &str), String> {
+    let mut rest = raw;
+    let mut last_headers = "";
+    let mut status_code: Option<u16> = None;
+
+    while rest.starts_with("HTTP/") {
+        let Some((head, tail)) = split_once_header_end(rest) else {
+            return Err(format!("无效 MCP HTTP 响应: {}", truncate_utf8(rest, 240)));
         };
-        let (headers, body) = raw
-            .rsplit_once(split_marker)
-            .map(|(h, b)| (h.to_string(), b.to_string()))
-            .unwrap_or_else(|| (String::new(), raw));
-        Ok((headers, body))
+        let code = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        last_headers = head;
+        status_code = Some(code);
+        rest = tail;
+        if !(100..200).contains(&code) {
+            break;
+        }
+    }
+
+    if let Some(code) = status_code {
+        if !(200..300).contains(&code) {
+            return Err(format!(
+                "MCP HTTP {code}: {}",
+                truncate_utf8(rest.trim(), 240)
+            ));
+        }
+    }
+    Ok((last_headers, rest))
+}
+
+fn split_once_header_end(input: &str) -> Option<(&str, &str)> {
+    match (input.find("\r\n\r\n"), input.find("\n\n")) {
+        (Some(a), Some(b)) if a <= b => Some((&input[..a], &input[a + 4..])),
+        (Some(_), Some(b)) => Some((&input[..b], &input[b + 2..])),
+        (Some(a), None) => Some((&input[..a], &input[a + 4..])),
+        (None, Some(b)) => Some((&input[..b], &input[b + 2..])),
+        (None, None) => None,
     }
 }
 
@@ -541,4 +577,26 @@ pub fn truncate_utf8(input: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}...", &input[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_http_response_preserves_sse_blank_lines_and_handles_continue() {
+        let raw = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nMcp-Session-Id: s1\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\n\r\n";
+        let (headers, body) = split_http_response(raw).unwrap();
+        assert!(headers.contains("Mcp-Session-Id: s1"));
+        let parsed = parse_http_jsonrpc(body).unwrap();
+        assert_eq!(parsed["result"]["ok"], true);
+    }
+
+    #[test]
+    fn split_http_response_rejects_error_status() {
+        let raw = "HTTP/1.1 502 Bad Gateway\r\n\r\nupstream failed";
+        let err = split_http_response(raw).unwrap_err();
+        assert!(err.contains("502"));
+        assert!(err.contains("upstream failed"));
+    }
 }

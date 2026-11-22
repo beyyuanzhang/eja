@@ -114,12 +114,13 @@ fn main() -> AppResult<()> {
     drop(insert);
     tx.commit()?;
     let start = Instant::now();
-    let view = eja.view()?;
+    let head = eja.revision()?;
+    let concerns = eja.concerns(head)?;
+    let recent = eja.recent(8)?;
     let related = eja.search(PROBES[0].1)?;
     assert!(
-        view.concerns.is_empty()
-            && !view
-                .recent
+        concerns.is_empty()
+            && !recent
                 .iter()
                 .any(|entry| targets.contains(&(entry.id as usize)))
     );

@@ -89,7 +89,7 @@ fn bytes(vector: Vec<f32>, dimensions: usize) -> Result<Vec<u8>> {
     Ok(vector.into_iter().flat_map(f32::to_le_bytes).collect())
 }
 
-pub(super) fn validate_cue(cue: &str) -> Result<()> {
+fn validate_cue(cue: &str) -> Result<()> {
     if cue.trim().is_empty() || cue.len() > crate::FACT_BYTES {
         return Err(Error::invalid("search requires a bounded non-empty cue"));
     }
@@ -101,15 +101,11 @@ impl Eja {
     pub fn search(&self, cue: &str) -> Result<Vec<Match>> {
         validate_cue(cue)?;
         let head = self.head()?;
-        self.search_at(cue, head, head)
-    }
-
-    pub(super) fn search_at(&self, cue: &str, through: Id, revision: Id) -> Result<Vec<Match>> {
-        if through <= 0 {
+        if head <= 0 {
             return Ok(Vec::new());
         }
         if let Some(memory) = &self.memory {
-            return memory.search(self, cue, through, revision);
+            return memory.search(self, cue, head);
         }
 
         let mut words: Vec<String> = cue
@@ -166,13 +162,13 @@ impl Eja {
              ORDER BY hits DESC, id DESC
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![through, words_json, TOP], |row| {
+        let rows = stmt.query_map(params![head, words_json, TOP], |row| {
             Ok((row.get::<_, Id>(0)?, row.get::<_, i64>(1)?))
         })?;
         rows.map(|row| {
             let (id, hits) = row?;
             Ok(Match {
-                evidence: self.evidence(id, revision)?,
+                evidence: self.evidence_at(id, head)?,
                 similarity: (hits as f64) / term_count,
             })
         })
@@ -322,14 +318,8 @@ impl Memory {
         }
     }
 
-    pub(super) fn search(
-        &self,
-        eja: &Eja,
-        cue: &str,
-        through: Id,
-        revision: Id,
-    ) -> Result<Vec<Match>> {
-        self.catch_up(&eja.db, through)?;
+    pub(super) fn search(&self, eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
+        self.catch_up(&eja.db, head)?;
         let chunks = passages(cue);
         let queries = self.encode(InputKind::Query, &chunks)?;
         // One fact fits in at most this many chunks. Collect enough keys for TOP distinct facts.
@@ -344,13 +334,13 @@ impl Memory {
         )?;
         for query in queries {
             let rows = stmt.query_map(
-                params![bytes(query, self.dimensions)?, limit, through],
+                params![bytes(query, self.dimensions)?, limit, head],
                 |row| Ok((row.get::<_, Id>(0)?, row.get::<_, f64>(1)?)),
             )?;
             for row in rows {
                 let (key, distance) = row?;
                 let score = 1.0 - distance;
-                let id: Id = origin.query_row(params![key, through], |row| row.get(0))?;
+                let id: Id = origin.query_row(params![key, head], |row| row.get(0))?;
                 scores
                     .entry(id)
                     .and_modify(|best| *best = best.max(score))
@@ -368,7 +358,7 @@ impl Memory {
             .take(TOP)
             .map(|(id, similarity)| {
                 Ok(Match {
-                    evidence: eja.evidence(id, revision)?,
+                    evidence: eja.evidence_at(id, head)?,
                     similarity,
                 })
             })

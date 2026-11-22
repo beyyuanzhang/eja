@@ -1,66 +1,36 @@
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::hands::ToolSpec;
 use crate::mcp::truncate_utf8;
-use eja_core::{Act, Concern, Eja, Entry, Evidence, Fact, Id, Keep, SearchHits, Step};
+use eja_core::{Eja, Entry, Fact, Id};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
 
-pub struct TurnContext<'a> {
-    pub provider: &'a ProviderConfig,
-    pub model: &'a str,
-    pub tools: &'a [ToolSpec],
-    pub data_dir: &'a str,
-    pub local_tz: &'a str,
-    pub window: &'a [Value],
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub args: Value,
 }
 
-#[derive(Default)]
-pub struct StepFeedback<'a> {
-    pub entries: &'a [Entry],
-    pub actions: &'a [Id],
-    pub reads: &'a [Result<Evidence, String>],
-    pub searches: &'a [Result<SearchHits, String>],
-    pub commit_error: Option<&'a str>,
-}
-
-#[derive(Default)]
-pub struct TurnSession {
-    messages: Vec<Value>,
-    pending: Vec<(String, PendingCall)>,
-}
-
-enum PendingCall {
-    Keep,
-    Release,
-    Read,
-    Search,
-    Action,
-    Invalid(String),
-}
-
-impl TurnSession {
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct Decision {
-    pub step: Step,
-    pub reply: Option<String>,
+#[derive(Debug, Clone)]
+pub struct ModelReply {
+    pub message: Value,
+    pub text: String,
+    pub calls: Vec<ToolCall>,
 }
 
 pub trait Brain: Send + Sync {
-    fn judge(
+    fn complete(
         &self,
-        ctx: &TurnContext<'_>,
-        turn: &mut TurnSession,
-        feedback: StepFeedback<'_>,
-    ) -> Result<Decision, String>;
+        provider: &ProviderConfig,
+        model: &str,
+        system: &str,
+        messages: &[Value],
+        tools: &[ToolSpec],
+    ) -> Result<ModelReply, String>;
 
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String>;
 }
@@ -68,115 +38,20 @@ pub trait Brain: Send + Sync {
 pub struct HttpBrain;
 
 impl Brain for HttpBrain {
-    fn judge(
+    fn complete(
         &self,
-        ctx: &TurnContext<'_>,
-        turn: &mut TurnSession,
-        feedback: StepFeedback<'_>,
-    ) -> Result<Decision, String> {
-        let defs = build_tool_defs(ctx.tools);
-        let tool_map: HashMap<&str, &str> = ctx
-            .tools
-            .iter()
-            .map(|spec| (spec.name.as_str(), spec.capability.as_str()))
-            .collect();
-        let system = format!(
-            "你是 EJA，一个持续存在的自我同一性主体。\n\
-            数据目录：{}\n\
-            配置文件：{}/config.json（`connectors` 变更会自动热加载）\n\
-            本地时区：{}\n\n\
-            前置消息是你按时间正序排列的不可变主体日志；末尾新增的 `noticed` 记录是本次触发。不调工具时的文本回复会发送给人，留空则保持沉默。",
-            ctx.data_dir, ctx.data_dir, ctx.local_tz
-        );
-
-        if turn.messages.is_empty() {
-            turn.messages.extend_from_slice(ctx.window);
-        } else {
-            turn.append_feedback(&ctx.provider.kind, feedback);
-        }
-
-        let completion = complete(
-            ctx.provider,
-            ctx.model,
-            &system,
-            &turn.messages,
-            Some(&defs),
-        )?;
-
-        let mut step = Step::default();
-        for ToolInvocation { id, name, args } in completion.calls {
-            let kind = match name.as_str() {
-                "keep" => {
-                    let text = args
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim();
-                    if !text.is_empty() {
-                        step.keep.push(Keep {
-                            concern: args.get("concern").and_then(Value::as_i64),
-                            text: text.to_string(),
-                        });
-                        PendingCall::Keep
-                    } else {
-                        PendingCall::Invalid("keep 需要非空 text".into())
-                    }
-                }
-                "release" => match args.get("concern").and_then(Value::as_i64) {
-                    Some(id) => {
-                        step.release.push(id);
-                        PendingCall::Release
-                    }
-                    None => PendingCall::Invalid("release 需要整数 concern".into()),
-                },
-                "read" => match args.get("fact").and_then(Value::as_i64) {
-                    Some(id) => {
-                        step.read.push(id);
-                        PendingCall::Read
-                    }
-                    None => PendingCall::Invalid("read 需要整数 fact".into()),
-                },
-                "search" => {
-                    let cue = args.get("cue").and_then(Value::as_str).unwrap_or("").trim();
-                    if !cue.is_empty() {
-                        step.search.push(cue.to_string());
-                        PendingCall::Search
-                    } else {
-                        PendingCall::Invalid("search 需要非空 cue".into())
-                    }
-                }
-                other => {
-                    if let Some(&capability) = tool_map.get(other) {
-                        step.act.push(Act {
-                            capability: capability.to_string(),
-                            input: args,
-                        });
-                        PendingCall::Action
-                    } else {
-                        PendingCall::Invalid(format!("未知工具: {other}"))
-                    }
-                }
-            };
-            turn.pending.push((id, kind));
-        }
-
-        let reply = if turn.pending.is_empty() {
-            let trimmed = completion.text.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        } else {
-            None
-        };
-
-        turn.messages.push(completion.message);
-        Ok(Decision { step, reply })
+        provider: &ProviderConfig,
+        model: &str,
+        system: &str,
+        messages: &[Value],
+        tools: &[ToolSpec],
+    ) -> Result<ModelReply, String> {
+        let defs = build_tool_defs(tools);
+        complete_wire(provider, model, system, messages, Some(&defs))
     }
 
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String> {
-        let text = complete(
+        let text = complete_wire(
             provider,
             model,
             "Reply with OK.",
@@ -191,122 +66,48 @@ impl Brain for HttpBrain {
     }
 }
 
-impl TurnSession {
-    fn append_feedback(&mut self, provider: &ProviderKind, feedback: StepFeedback<'_>) {
-        let mut kept = feedback
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry.fact, Fact::Kept { .. }));
-        let mut released = feedback
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry.fact, Fact::Released { .. }));
-        let mut reads = feedback.reads.iter();
-        let mut searches = feedback.searches.iter();
-        let mut actions = feedback.actions.iter().copied();
-        let receipts: HashMap<_, _> = feedback
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                if let Fact::Returned { action, outcome } = &entry.fact {
-                    Some((*action, (entry.id, outcome)))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut sent: HashSet<_> = feedback.actions.iter().copied().collect();
-        let mut blocks = Vec::new();
-
-        for (id, kind) in self.pending.drain(..) {
-            let data = match kind {
-                PendingCall::Keep | PendingCall::Release => {
-                    if let Some(err) = feedback.commit_error {
-                        Some(json!({ "error": err }))
-                    } else {
-                        let entry = match kind {
-                            PendingCall::Keep => kept.next(),
-                            _ => released.next(),
-                        };
-                        entry.map(|entry| {
-                            sent.insert(entry.id);
-                            match entry.fact {
-                                Fact::Kept { concern, .. } => {
-                                    json!({ "status": "kept", "concern": concern, "fact_id": entry.id })
-                                }
-                                Fact::Released { concern } => {
-                                    json!({ "status": "released", "concern": concern, "fact_id": entry.id })
-                                }
-                                _ => unreachable!(),
-                            }
-                        })
-                    }
-                }
-                PendingCall::Read => reads.next().map(|result| match result {
-                    Ok(evidence) => json!(evidence),
-                    Err(err) => json!({ "error": err }),
-                }),
-                PendingCall::Search => searches.next().map(|result| match result {
-                    Ok(hits) => json!(hits),
-                    Err(err) => json!({ "error": err }),
-                }),
-                PendingCall::Action => {
-                    if let Some(err) = feedback.commit_error {
-                        Some(json!({ "error": err }))
-                    } else {
-                        actions.next().and_then(|action| {
-                            receipts.get(&action).map(|(id, outcome)| {
-                                sent.insert(*id);
-                                json!({ "id": id, "action": action, "outcome": outcome })
-                            })
-                        })
-                    }
-                }
-                PendingCall::Invalid(reason) => Some(json!({ "error": reason })),
-            }
-            .unwrap_or_else(|| json!({ "error": "工具结果缺失" }))
-            .to_string();
-            match provider {
-                ProviderKind::OpenAi => self.messages.push(json!({
-                    "role": "tool", "tool_call_id": id, "content": data
-                })),
-                ProviderKind::Anthropic => blocks.push(json!({
-                    "type": "tool_result", "tool_use_id": id, "content": data
-                })),
+pub fn append_tool_results(
+    provider: &ProviderKind,
+    messages: &mut Vec<Value>,
+    results: Vec<(String, Value)>,
+) {
+    match provider {
+        ProviderKind::OpenAi => {
+            for (id, value) in results {
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": value.to_string(),
+                }));
             }
         }
-
-        let extra_lines: Vec<String> = feedback
-            .entries
-            .iter()
-            .filter(|entry| !sent.contains(&entry.id))
-            .filter_map(|entry| serde_json::to_string(entry).ok())
-            .collect();
-        if !extra_lines.is_empty() {
-            let extra = format!("{}\n", extra_lines.join("\n"));
-            match provider {
-                ProviderKind::OpenAi => self.messages.push(user_message(extra)),
-                ProviderKind::Anthropic => {
-                    blocks.push(json!({ "type": "text", "text": extra }));
-                }
+        ProviderKind::Anthropic => {
+            let blocks: Vec<Value> = results
+                .into_iter()
+                .map(|(id, value)| {
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": id,
+                        "content": value.to_string(),
+                    })
+                })
+                .collect();
+            if !blocks.is_empty() {
+                messages.push(json!({ "role": "user", "content": blocks }));
             }
-        }
-        if !blocks.is_empty() {
-            self.messages
-                .push(json!({ "role": "user", "content": blocks }));
         }
     }
 }
 
 /// Project the immutable Core journal from `anchor` through `head` into a strictly append-only
-/// sequence of immutable JSON record messages.
+/// sequence of immutable messages.
 /// Advances `anchor` only when the projected window exceeds `max_bytes`.
 pub fn project_window(
     eja: &Eja,
     anchor: &mut Id,
     max_bytes: usize,
 ) -> eja_core::Result<Vec<Value>> {
-    let head = eja.view()?.revision;
+    let head = eja.revision()?;
     if head == 0 {
         *anchor = 0;
         return Ok(Vec::new());
@@ -314,97 +115,71 @@ pub fn project_window(
     if *anchor > head {
         *anchor = 0;
     }
-    let rendered = render_window(eja, *anchor, head)?;
-    if window_bytes(&rendered) <= max_bytes {
-        return Ok(rendered);
+    let entries = eja.entries_after(*anchor, head)?;
+    let entry_msgs: Vec<Value> = entries
+        .iter()
+        .map(render_entry)
+        .collect::<eja_core::Result<_>>()?;
+    let header = if *anchor > 0 {
+        Some(render_anchor_header(eja, *anchor)?)
+    } else {
+        None
+    };
+    let total_bytes =
+        header.as_ref().map_or(0, msg_bytes) + entry_msgs.iter().map(msg_bytes).sum::<usize>();
+    if total_bytes <= max_bytes {
+        let mut out = Vec::with_capacity(usize::from(header.is_some()) + entry_msgs.len());
+        if let Some(h) = header {
+            out.push(h);
+        }
+        out.extend(entry_msgs);
+        return Ok(out);
     }
-    let entries = entries_since(eja, *anchor, head)?;
+
     let target_bytes = max_bytes / 2;
     let mut kept_bytes = 0usize;
     let mut keep_from = entries.len().saturating_sub(1);
     for idx in (0..entries.len()).rev() {
-        let line_len = serde_json::to_string(&entries[idx])?.len() + 1;
+        let line_len = msg_bytes(&entry_msgs[idx]);
         if idx < entries.len() - 1 && kept_bytes + line_len > target_bytes {
             break;
         }
         kept_bytes += line_len;
         keep_from = idx;
     }
-    let new_anchor = if keep_from > 0 {
-        entries[keep_from - 1].id
+    if keep_from > 0 {
+        *anchor = entries[keep_from - 1].id;
+        let mut out = Vec::with_capacity(1 + entry_msgs.len() - keep_from);
+        out.push(render_anchor_header(eja, *anchor)?);
+        out.extend(entry_msgs.into_iter().skip(keep_from));
+        Ok(out)
     } else {
-        *anchor
-    };
-    if new_anchor > *anchor {
-        *anchor = new_anchor;
-        render_window(eja, *anchor, head)
-    } else {
-        Ok(rendered)
-    }
-}
-
-pub fn window_bytes(records: &[Value]) -> usize {
-    records
-        .iter()
-        .map(|msg| msg["content"].as_str().map_or(0, str::len) + 1)
-        .sum()
-}
-
-pub fn render_window(eja: &Eja, anchor: Id, head: Id) -> eja_core::Result<Vec<Value>> {
-    let mut out = Vec::new();
-    if anchor > 0 {
-        let concerns = concerns_at(eja, anchor)?;
-        out.push(user_message(serde_json::to_string(&json!({
-            "anchor": anchor,
-            "concerns": concerns
-        }))?));
-    }
-    for entry in entries_since(eja, anchor, head)? {
-        match &entry.fact {
-            Fact::Said { text } => out.push(json!({ "role": "assistant", "content": text })),
-            _ => out.push(user_message(serde_json::to_string(&entry)?)),
+        let mut out = Vec::with_capacity(usize::from(header.is_some()) + entry_msgs.len());
+        if let Some(h) = header {
+            out.push(h);
         }
+        out.extend(entry_msgs);
+        Ok(out)
     }
-    Ok(out)
 }
 
-pub fn entries_since(eja: &Eja, after: Id, mut through: Id) -> eja_core::Result<Vec<Entry>> {
-    let mut entries = Vec::new();
-    while through > after {
-        let page = eja.history(through)?;
-        let Some(last_id) = page.last().map(|entry| entry.id) else {
-            break;
-        };
-        let reached = last_id <= after;
-        entries.extend(page.into_iter().take_while(|entry| entry.id > after));
-        if reached || last_id <= 1 {
-            break;
-        }
-        through = last_id - 1;
-    }
-    entries.reverse();
-    Ok(entries)
+fn msg_bytes(msg: &Value) -> usize {
+    msg["content"].as_str().map_or(0, str::len) + 1
 }
 
-pub fn concerns_at(eja: &Eja, revision: Id) -> eja_core::Result<Vec<Concern>> {
-    if revision == 0 {
-        return Ok(Vec::new());
+fn render_anchor_header(eja: &Eja, anchor: Id) -> eja_core::Result<Value> {
+    let concerns = eja.concerns(anchor)?;
+    Ok(user_message(serde_json::to_string(&json!({
+        "anchor": anchor,
+        "concerns": concerns
+    }))?))
+}
+
+fn render_entry(entry: &Entry) -> eja_core::Result<Value> {
+    match &entry.fact {
+        Fact::Said { text } => Ok(json!({ "role": "assistant", "content": text })),
+        _ => Ok(user_message(serde_json::to_string(entry)?)),
     }
-    let mut all = Vec::new();
-    let mut cursor = revision;
-    loop {
-        let page = eja.concerns(revision, cursor)?;
-        let count = page.len();
-        let Some(last_latest) = page.last().map(|item| item.latest) else {
-            break;
-        };
-        all.extend(page);
-        if count < eja_core::PAGE || last_latest <= 1 {
-            break;
-        }
-        cursor = last_latest - 1;
-    }
-    Ok(all)
 }
 
 struct WireToolDef {
@@ -465,29 +240,17 @@ fn build_tool_defs(hands_tools: &[ToolSpec]) -> Vec<WireToolDef> {
     defs
 }
 
-struct ToolInvocation {
-    id: String,
-    name: String,
-    args: Value,
-}
-
-struct Completion {
-    message: Value,
-    text: String,
-    calls: Vec<ToolInvocation>,
-}
-
 fn user_message(content: impl Into<String>) -> Value {
     json!({ "role": "user", "content": content.into() })
 }
 
-fn complete(
+fn complete_wire(
     provider: &ProviderConfig,
     model: &str,
     system: &str,
     messages: &[Value],
     tools: Option<&[WireToolDef]>,
-) -> Result<Completion, String> {
+) -> Result<ModelReply, String> {
     match provider.kind {
         ProviderKind::OpenAi => call_openai(provider, model, system, messages, tools),
         ProviderKind::Anthropic => call_anthropic(provider, model, system, messages, tools),
@@ -500,7 +263,7 @@ fn call_openai(
     system: &str,
     messages: &[Value],
     tools: Option<&[WireToolDef]>,
-) -> Result<Completion, String> {
+) -> Result<ModelReply, String> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/chat/completions") {
         base.to_string()
@@ -578,7 +341,7 @@ fn call_openai(
                 "id": id, "type": "function",
                 "function": { "name": name, "arguments": arguments }
             }));
-            calls.push(ToolInvocation {
+            calls.push(ToolCall {
                 id,
                 name: name.into(),
                 args,
@@ -588,7 +351,7 @@ fn call_openai(
             message["tool_calls"] = json!(wire_calls);
         }
     }
-    Ok(Completion {
+    Ok(ModelReply {
         message,
         text,
         calls,
@@ -601,7 +364,7 @@ fn call_anthropic(
     system: &str,
     messages: &[Value],
     tools: Option<&[WireToolDef]>,
-) -> Result<Completion, String> {
+) -> Result<ModelReply, String> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/messages") {
         base.to_string()
@@ -655,7 +418,7 @@ fn call_anthropic(
             }
             Some("tool_use") => {
                 if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
-                    calls.push(ToolInvocation {
+                    calls.push(ToolCall {
                         id: id.into(),
                         name: name.into(),
                         args: block.get("input").cloned().unwrap_or_else(|| json!({})),
@@ -665,7 +428,7 @@ fn call_anthropic(
             _ => {}
         }
     }
-    Ok(Completion {
+    Ok(ModelReply {
         message: json!({ "role": "assistant", "content": blocks }),
         text: texts.join("\n"),
         calls,
@@ -727,28 +490,18 @@ fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eja_core::{Outcome, Source};
+    use eja_core::Source;
 
     #[test]
     fn deterministic_window_projection_is_strictly_append_only_until_reset() -> eja_core::Result<()>
     {
         let eja = Eja::open(":memory:")?;
         let mut anchor = 0;
-        let first = eja.notice(Source::Person, "first notice")?;
+        eja.notice(Source::Person, "first notice")?;
         let w1 = project_window(&eja, &mut anchor, 4096)?;
         assert_eq!(anchor, 0);
 
-        eja.commit(
-            first,
-            &Step {
-                keep: vec![Keep {
-                    concern: None,
-                    text: "track workshop labels".into(),
-                }],
-                ..Step::default()
-            },
-            &[],
-        )?;
+        eja.keep(None, "track workshop labels")?;
         eja.say("noted")?;
         eja.notice(Source::Person, "second notice")?;
         let w2 = project_window(&eja, &mut anchor, 4096)?;
@@ -767,55 +520,28 @@ mod tests {
     }
 
     #[test]
-    fn batched_tool_results_follow_call_ids_in_both_protocols() -> eja_core::Result<()> {
-        let eja = Eja::open(":memory:")?;
-        let input = eja.notice(Source::Person, "check")?;
-        let calls = eja.commit(
-            input,
-            &Step {
-                keep: vec![Keep {
-                    concern: None,
-                    text: "follow up".into(),
-                }],
-                act: vec![Act {
-                    capability: "check".into(),
-                    input: Value::Null,
-                }],
-                ..Step::default()
-            },
-            &["check"],
-        )?;
-        let action = calls[0].id;
-        let receipt = eja.finish(action, Outcome::Failed("unavailable".into()))?;
-        let view = eja.view()?;
-        let reads = vec![Ok(eja.evidence(input, view.revision)?)];
-        let entries: Vec<_> = (input + 1..=receipt)
-            .map(|id| eja.read(id))
-            .collect::<eja_core::Result<_>>()?;
-
+    fn append_tool_results_preserves_order_and_ids_in_both_protocols() {
         for provider in [ProviderKind::OpenAi, ProviderKind::Anthropic] {
-            let mut turn = TurnSession {
-                messages: vec![user_message("start")],
-                pending: vec![
-                    ("action".into(), PendingCall::Action),
-                    ("read".into(), PendingCall::Read),
-                    ("keep".into(), PendingCall::Keep),
-                ],
-            };
-            turn.append_feedback(
+            let mut messages = vec![user_message("start")];
+            append_tool_results(
                 &provider,
-                StepFeedback {
-                    entries: &entries,
-                    actions: &[action],
-                    reads: &reads,
-                    searches: &[],
-                    commit_error: None,
-                },
+                &mut messages,
+                vec![
+                    (
+                        "action".into(),
+                        json!({ "id": 4, "outcome": { "status": "failed" } }),
+                    ),
+                    ("read".into(), json!({ "id": 1 })),
+                    (
+                        "keep".into(),
+                        json!({ "status": "kept", "concern": 2, "fact_id": 2 }),
+                    ),
+                ],
             );
             let (results, id_key) = match provider {
-                ProviderKind::OpenAi => (&turn.messages[1..], "tool_call_id"),
+                ProviderKind::OpenAi => (&messages[1..], "tool_call_id"),
                 ProviderKind::Anthropic => (
-                    turn.messages[1]["content"].as_array().unwrap().as_slice(),
+                    messages[1]["content"].as_array().unwrap().as_slice(),
                     "tool_use_id",
                 ),
             };
@@ -826,13 +552,12 @@ mod tests {
             let result = |index: usize| {
                 serde_json::from_str::<Value>(results[index]["content"].as_str().unwrap()).unwrap()
             };
-            assert_eq!(result(0)["id"], receipt);
+            assert_eq!(result(0)["id"], 4);
             assert_eq!(result(0)["outcome"]["status"], "failed");
-            assert_eq!(result(1)["id"], input);
+            assert_eq!(result(1)["id"], 1);
             assert_eq!(result(2)["status"], "kept");
-            assert_eq!(result(2)["fact_id"], input + 1);
-            assert_eq!(result(2)["concern"], input + 1);
+            assert_eq!(result(2)["fact_id"], 2);
+            assert_eq!(result(2)["concern"], 2);
         }
-        Ok(())
     }
 }
