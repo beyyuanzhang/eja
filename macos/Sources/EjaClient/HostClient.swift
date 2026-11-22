@@ -196,6 +196,8 @@ private struct StateEventDTO: Decodable {
 @MainActor
 public final class HostClient: ObservableObject {
     @Published public private(set) var isReady: Bool = false
+    @Published public private(set) var alreadyRunning: Bool = false
+    @Published public private(set) var alreadyRunningPid: Int32?
     @Published public private(set) var protocolVersion: Int = 1
     @Published public private(set) var kernelVersion: String = ""
     @Published public private(set) var resourcesDir: String?
@@ -349,6 +351,9 @@ public final class HostClient: ObservableObject {
                 concerns = state.concerns
                 wakes = state.wakes
             }
+        case "already_running":
+            alreadyRunning = true
+            alreadyRunningPid = (json["ui_pid"] as? Int).map { Int32($0) }
         case "error":
             if let msg = json["message"] as? String {
                 errorBanner = msg

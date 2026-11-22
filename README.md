@@ -35,6 +35,7 @@ cargo build -p eja-host
 - `core/subject.db`：`eja-core` 永久主体日志（`PRAGMA user_version` 版本迁移）
 - `core/config.json`：LLM Provider、密钥与宿主参数（Seatbelt 保护，前端仅见脱敏状态）
 - `core/kernel_version`：内核版本记录（升级 `Eja.app` 后自动触发版本感知）
+- `core/host.lock`：单实例操作系统文件锁（确保同一数据目录仅运行一个主体实例）
 - `core/wakes.json`：定时唤醒记录
 - `core/window.json`：当前上下文窗口起点 `anchor`
 - `connectors.json`：MCP 连接器列表（变更自动热加载）

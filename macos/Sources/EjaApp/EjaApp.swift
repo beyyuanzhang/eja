@@ -57,12 +57,16 @@ struct EjaApp: App {
                         }
                     }
                     bootstrapUI(dataDirPath: client.dataDir)
+                    handleAlreadyRunning()
                     appDelegate.startReloadPolling {
                         checkHotReload()
                     }
                 }
                 .onChange(of: client.dataDir) { _, newDir in
                     bootstrapUI(dataDirPath: newDir)
+                }
+                .onChange(of: client.alreadyRunning) { _, _ in
+                    handleAlreadyRunning()
                 }
         }
         .defaultSize(width: 780, height: 600)
@@ -95,6 +99,17 @@ struct EjaApp: App {
             Image(systemName: client.status == "thinking" ? "sparkles" : "circle.inset.filled")
                 .accessibilityLabel("EJA")
         }
+    }
+
+    @MainActor
+    private func handleAlreadyRunning() {
+        guard client.alreadyRunning else { return }
+        if let pid = client.alreadyRunningPid,
+           let running = NSRunningApplication(processIdentifier: pid) {
+            running.activate()
+        }
+        client.shutdown()
+        NSApp.terminate(nil)
     }
 
     @MainActor

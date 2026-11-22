@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -59,6 +60,7 @@ pub struct HostRuntime {
     data_dir: PathBuf,
     core_dir: PathBuf,
     resources_dir: Option<PathBuf>,
+    _instance_lock: fs::File,
     eja: Mutex<Eja>,
     config: Mutex<HostConfig>,
     connectors_bytes: Mutex<Option<Vec<u8>>>,
@@ -83,6 +85,14 @@ impl HostRuntime {
     ) -> Result<Self, String> {
         let core_dir = data_dir.join("core");
         fs::create_dir_all(&core_dir).map_err(|err| err.to_string())?;
+        let instance_lock = match acquire_instance_lock(&core_dir) {
+            Ok(lock) => lock,
+            Err(LockError::AlreadyRunning(ui_pid)) => {
+                (emit)(json!({ "event": "already_running", "ui_pid": ui_pid }));
+                return Err("EJA 已在运行中".into());
+            }
+            Err(LockError::Io(msg)) => return Err(msg),
+        };
         let sandbox = Sandbox::new(&core_dir)?;
         let eja = open_subject(&core_dir.join("subject.db"))?;
         let resources_dir = resolve_resources_dir();
@@ -100,6 +110,7 @@ impl HostRuntime {
             data_dir,
             core_dir,
             resources_dir,
+            _instance_lock: instance_lock,
             eja: Mutex::new(eja),
             config: Mutex::new(config),
             connectors_bytes: Mutex::new(connectors_bytes),
@@ -626,6 +637,42 @@ fn resolve_resources_dir() -> Option<PathBuf> {
     resources.is_dir().then_some(resources)
 }
 
+enum LockError {
+    AlreadyRunning(Option<u32>),
+    Io(String),
+}
+
+fn acquire_instance_lock(core_dir: &Path) -> Result<fs::File, LockError> {
+    let lock_path = core_dir.join("host.lock");
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| LockError::Io(format!("打开实例锁失败: {err}")))?;
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.set_len(0);
+            let _ = file.seek(SeekFrom::Start(0));
+            #[cfg(unix)]
+            let owner_pid = std::os::unix::process::parent_id();
+            #[cfg(not(unix))]
+            let owner_pid = std::process::id();
+            let _ = writeln!(file, "{owner_pid}");
+            let _ = file.flush();
+            Ok(file)
+        }
+        Err(fs::TryLockError::WouldBlock) => {
+            let ui_pid = fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            Err(LockError::AlreadyRunning(ui_pid))
+        }
+        Err(fs::TryLockError::Error(err)) => Err(LockError::Io(format!("获取实例锁失败: {err}"))),
+    }
+}
+
 fn sync_kernel_version(core_dir: &Path, eja: &Eja, resources_dir: Option<&Path>) {
     let version_path = core_dir.join("kernel_version");
     let prev = fs::read_to_string(&version_path)
@@ -1061,5 +1108,37 @@ for line in sys.stdin:
             .stream
             .iter()
             .any(|item| item.text.contains("0.9.0") && item.text.contains(KERNEL_VERSION)));
+    }
+
+    #[test]
+    fn rejects_second_instance_on_same_data_dir_until_first_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let rt1 =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&events);
+        let second = HostRuntime::open_with_brain(
+            dir.path().to_path_buf(),
+            brain.clone(),
+            Arc::new(move |val| sink_events.lock().unwrap().push(val)),
+        );
+        assert!(second.is_err());
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["event"] == "already_running"));
+
+        drop(rt1);
+        assert!(
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain, Arc::new(|_| {}),)
+                .is_ok()
+        );
     }
 }

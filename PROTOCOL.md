@@ -12,7 +12,7 @@ eja-host --data-dir "<data_dir>"
 
 ## 数据目录边界
 
-- `core/` 由 macOS Seatbelt 保护，沙箱内 `shell` 与 MCP 进程无权读写，包含 `subject.db`、`config.json`、`wakes.json`、`window.json` 与 `kernel_version`。
+- `core/` 由 macOS Seatbelt 保护，沙箱内 `shell` 与 MCP 进程无权读写，包含 `subject.db`、`config.json`、`wakes.json`、`window.json`、`kernel_version` 与单实例文件锁 `host.lock`。
 - `connectors.json` 保存 MCP 连接器数组，文件变更在运行期自动热加载。
 - `ui/` 保存用户空间前端。官方启动器按统一约定执行 `ui/EjaApp`（默认由 `ui/apply.sh` 编译原生 SwiftUI 生成，也可替换为任意可执行程序或脚本），并传入 `EJA_DATA_DIR`、`EJA_HOST_BIN`、`EJA_UI_TEMPLATE_DIR` 与 `EJA_FALLBACK_APP_BIN`。启动 `Eja.app` 时按住 `Option` 键可直接进入官方默认界面。
 
@@ -31,6 +31,7 @@ eja-host --data-dir "<data_dir>"
 
 - 状态快照 `{"event":"state","protocol_version":1,"kernel_version":"1.0.0","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"connector_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
   其中 `config.providers[].api_key` 始终返回空字符串，通过 `has_api_key` 布尔字段表示是否已保存密钥。
+- 单实例冲突 `{"event":"already_running","ui_pid":12345}`（同一数据目录已有运行中的 `eja-host` 时立即发出并退出，前端可激活已有实例后退出自身）
 - Provider 测试结果 `{"event":"provider_test","id":"openai","ok":true,"message":"..."}`
 - 系统通知 `{"event":"notify","title":"EJA","body":"..."}`
 - 错误提示 `{"event":"error","message":"..."}`
