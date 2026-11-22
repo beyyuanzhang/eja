@@ -78,7 +78,10 @@ fn keyword_search_finds_older_evidence_without_writing_to_the_journal() -> Resul
         subject.search("纸质封签 blue-74")?[0].evidence.entry.id,
         notice
     );
-    assert!(subject.search("纸质封签 次日")?.is_empty());
+    let partial = subject.search("纸质封签 次日")?;
+    assert_eq!(partial[0].evidence.entry.id, notice);
+    assert_eq!(partial[0].similarity, 0.5);
+    assert!(subject.search("不存在的关键词")?.is_empty());
     assert!(matches!(subject.search(" "), Err(Error::Invalid(_))));
     let mut first_step = true;
     subject.turn(

@@ -5,13 +5,17 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    mpsc::{self, Receiver},
+    Arc, Mutex,
+};
 use std::thread;
 use std::time::Duration;
 
-const MCP_TIMEOUT: Duration = Duration::from_secs(20);
-const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_OUTCOME_BYTES: usize = 6000;
+const MCP_TIMEOUT: Duration = Duration::from_secs(30);
+const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_OUTCOME_BYTES: usize = 32 * 1024;
+const MAX_STDERR_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolSummary {
@@ -44,6 +48,7 @@ struct StdioConnection {
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<String>,
+    stderr: Arc<Mutex<String>>,
     next_id: u64,
 }
 
@@ -58,12 +63,31 @@ impl StdioConnection {
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
             .map_err(|err| format!("启动 MCP 进程失败 ({command}): {err}"))?;
         let stdin = child.stdin.take().ok_or("无法打开 MCP stdin")?;
         let stdout = child.stdout.take().ok_or("无法打开 MCP stdout")?;
+        let stderr = Arc::new(Mutex::new(String::new()));
+        if let Some(err_pipe) = child.stderr.take() {
+            let buf = Arc::clone(&stderr);
+            thread::spawn(move || {
+                let reader = BufReader::new(err_pipe);
+                for line in reader.lines().map_while(Result::ok) {
+                    let mut guard = buf.lock().unwrap();
+                    if !guard.is_empty() {
+                        guard.push('\n');
+                    }
+                    guard.push_str(&line);
+                    if guard.len() > MAX_STDERR_BYTES {
+                        let drop_to = guard.len() - MAX_STDERR_BYTES;
+                        let start = guard.ceil_char_boundary(drop_to);
+                        guard.drain(..start);
+                    }
+                }
+            });
+        }
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -83,6 +107,7 @@ impl StdioConnection {
             child,
             stdin,
             rx,
+            stderr,
             next_id: 1,
         };
         conn.request(
@@ -122,12 +147,12 @@ impl StdioConnection {
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err(format!("MCP 请求超时 ({method})"));
+                return Err(self.with_stderr(format!("MCP 请求超时 ({method})")));
             }
             let raw = self
                 .rx
                 .recv_timeout(remaining)
-                .map_err(|_| format!("MCP 响应超时或进程退出 ({method})"))?;
+                .map_err(|_| self.with_stderr(format!("MCP 响应超时或进程退出 ({method})")))?;
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 continue;
@@ -146,6 +171,15 @@ impl StdioConnection {
                 return Err(message.to_string());
             }
             return Ok(val.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    fn with_stderr(&self, message: String) -> String {
+        let err = self.stderr.lock().unwrap().trim().to_string();
+        if err.is_empty() {
+            message
+        } else {
+            format!("{message}\n[stderr]\n{err}")
         }
     }
 }

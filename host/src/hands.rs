@@ -8,15 +8,12 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const KERNEL_TOOL_NAMES: &[&str] = &["keep", "release", "read", "search"];
-const SHELL_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_SHELL_BYTES: usize = 6000;
-
-pub type NotifySink = Arc<dyn Fn(&str, &str) + Send + Sync>;
+const DEFAULT_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_SHELL_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
@@ -24,7 +21,6 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub schema: Value,
-    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,11 +35,10 @@ pub struct Hands {
     data_dir: PathBuf,
     connectors: ConnectorPool,
     wakes: Vec<WakeAlarm>,
-    notify: NotifySink,
 }
 
 impl Hands {
-    pub fn open(data_dir: PathBuf, connectors: &[ConnectorConfig], notify: NotifySink) -> Self {
+    pub fn open(data_dir: PathBuf, connectors: &[ConnectorConfig]) -> Self {
         let mut pool = ConnectorPool::default();
         pool.reload(connectors);
         let wakes = load_wakes(&data_dir);
@@ -51,7 +46,6 @@ impl Hands {
             data_dir,
             connectors: pool,
             wakes,
-            notify,
         }
     }
 
@@ -87,44 +81,31 @@ impl Hands {
     pub fn tools(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
             ToolSpec {
-                capability: "say".into(),
-                name: "say".into(),
-                description: "对人说一句话（支持 Markdown）。".into(),
-                schema: json!({
-                    "type": "object",
-                    "properties": { "text": { "type": "string" } },
-                    "required": ["text"]
-                }),
-                terminal: true,
-            },
-            ToolSpec {
                 capability: "wake".into(),
                 name: "wake".into(),
-                description: "预约未来某个时刻主动唤醒自己。".into(),
+                description: "预约未来主动唤醒。".into(),
                 schema: json!({
                     "type": "object",
                     "properties": {
-                        "delay_seconds": { "type": "integer", "minimum": 5 },
+                        "delay_seconds": { "type": "integer", "minimum": 1 },
                         "reason": { "type": "string" }
                     },
                     "required": ["delay_seconds", "reason"]
                 }),
-                terminal: true,
             },
             ToolSpec {
                 capability: "shell".into(),
                 name: "shell".into(),
-                description:
-                    "在本地 macOS 上执行 shell 命令（可用于读写文件、编写 MCP Server 等）。".into(),
+                description: "执行本机 shell 命令。".into(),
                 schema: json!({
                     "type": "object",
                     "properties": {
                         "command": { "type": "string" },
-                        "cwd": { "type": "string" }
+                        "cwd": { "type": "string" },
+                        "timeout_seconds": { "type": "integer", "minimum": 1 }
                     },
                     "required": ["command"]
                 }),
-                terminal: false,
             },
         ];
 
@@ -146,35 +127,18 @@ impl Hands {
                 name,
                 description,
                 schema: tool.input_schema,
-                terminal: false,
             });
         }
         specs
     }
 
-    pub fn execute(&mut self, call: &Call, proactive: bool) -> Outcome {
+    pub fn execute(&mut self, call: &Call) -> Outcome {
         match call.capability.as_str() {
-            "say" => self.execute_say(&call.input, proactive),
             "wake" => self.execute_wake(call.id, &call.input),
-            "shell" => self.execute_shell(&call.input),
+            "shell" => self.execute_shell(call.id, &call.input),
             other if other.starts_with("mcp.") => self.connectors.call(other, &call.input),
             other => Outcome::Failed(format!("未知能力: {other}")),
         }
-    }
-
-    fn execute_say(&self, input: &Value, proactive: bool) -> Outcome {
-        let text = input
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if text.is_empty() {
-            return Outcome::Failed("say 需要非空 text".into());
-        }
-        if proactive {
-            (self.notify)("EJA", text);
-        }
-        Outcome::Observed("delivered".into())
     }
 
     fn execute_wake(&mut self, call_id: eja_core::Id, input: &Value) -> Outcome {
@@ -187,8 +151,8 @@ impl Hands {
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        if delay < 5 || reason.is_empty() {
-            return Outcome::Failed("wake 需要 delay_seconds >= 5 且非空 reason".into());
+        if delay < 1 || reason.is_empty() {
+            return Outcome::Failed("wake 需要 delay_seconds >= 1 且非空 reason".into());
         }
         let fire_at = unix_now() + delay;
         let display = format_local_unix(fire_at);
@@ -204,7 +168,7 @@ impl Hands {
         Outcome::Observed(format!("scheduled at {display} ({reason})"))
     }
 
-    fn execute_shell(&self, input: &Value) -> Outcome {
+    fn execute_shell(&self, call_id: eja_core::Id, input: &Value) -> Outcome {
         let command = input
             .get("command")
             .and_then(Value::as_str)
@@ -219,11 +183,23 @@ impl Hands {
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.data_dir.clone());
-        run_shell(command, &cwd)
+        let timeout = input
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .filter(|&secs| secs >= 1)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_SHELL_TIMEOUT);
+        run_shell(command, &cwd, timeout, &self.data_dir, call_id)
     }
 }
 
-fn run_shell(command: &str, cwd: &Path) -> Outcome {
+fn run_shell(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    data_dir: &Path,
+    call_id: eja_core::Id,
+) -> Outcome {
     let mut child = match Command::new("/bin/sh")
         .args(["-c", command])
         .current_dir(cwd)
@@ -251,7 +227,7 @@ fn run_shell(command: &str, cwd: &Path) -> Outcome {
         String::from_utf8_lossy(&buf).to_string()
     });
 
-    let deadline = Instant::now() + SHELL_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
@@ -272,11 +248,27 @@ fn run_shell(command: &str, cwd: &Path) -> Outcome {
         ("", e) => e.to_string(),
         (o, e) => format!("{o}\n[stderr]\n{e}"),
     };
-    let bounded = truncate_utf8(&combined, MAX_SHELL_BYTES);
+    let bounded = if combined.len() > MAX_SHELL_BYTES {
+        let preview = truncate_utf8(&combined, MAX_SHELL_BYTES);
+        let outputs_dir = data_dir.join("outputs");
+        let spill_path = outputs_dir.join(format!("shell-{call_id}.log"));
+        if fs::create_dir_all(&outputs_dir).is_ok() && fs::write(&spill_path, &combined).is_ok() {
+            format!(
+                "{preview}\n[output truncated at {} bytes; full {} bytes saved to {}]",
+                MAX_SHELL_BYTES,
+                combined.len(),
+                spill_path.display()
+            )
+        } else {
+            preview
+        }
+    } else {
+        combined
+    };
     match status {
         Some(st) if st.success() => Outcome::Observed(bounded),
         Some(st) => Outcome::Failed(format!("exit {}: {bounded}", st.code().unwrap_or(-1))),
-        None => Outcome::Failed(format!("命令超时 (30s): {bounded}")),
+        None => Outcome::Failed(format!("命令超时 ({}s): {bounded}", timeout.as_secs())),
     }
 }
 

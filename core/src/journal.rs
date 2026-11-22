@@ -139,7 +139,7 @@ impl Eja {
         })
     }
 
-    pub(super) fn append_notice(&self, fact: &Fact) -> Result<Id> {
+    pub(super) fn append_fact(&self, fact: &Fact) -> Result<Id> {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let at = self.now_at(&tx)?;
         let id = insert_fact(&tx, at, fact, None)?;
@@ -237,7 +237,7 @@ impl Eja {
                     .optional()?;
                 later.map(|later_id| self.read(later_id)).transpose()?
             }
-            Fact::Noticed { .. } | Fact::Released { .. } => None,
+            Fact::Noticed { .. } | Fact::Said { .. } | Fact::Released { .. } => None,
         };
         Ok(Evidence {
             latest: latest.filter(|later| later.id > id),
@@ -249,21 +249,43 @@ impl Eja {
     pub fn finish(&self, action: Id, outcome: Outcome) -> Result<Id> {
         let mut fact = Fact::Returned { action, outcome };
         if serde_json::to_vec(&fact)?.len() > FACT_BYTES {
-            let Fact::Returned {
-                outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
-                ..
-            } = &mut fact
-            else {
-                unreachable!()
+            let full = match &mut fact {
+                Fact::Returned {
+                    outcome:
+                        Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
+                    ..
+                } => std::mem::take(text),
+                _ => unreachable!(),
             };
             let suffix = format!(
                 "… [truncated; {} bytes; sha256:{:x}]",
-                text.len(),
-                Sha256::digest(text.as_bytes())
+                full.len(),
+                Sha256::digest(full.as_bytes())
             );
-            // A byte can expand to six bytes when escaped in JSON.
-            text.truncate(text.floor_char_boundary((FACT_BYTES - 256) / 6));
-            text.push_str(&suffix);
+            let shell_bytes = serde_json::to_vec(&fact)?.len().saturating_sub(2);
+            let boundaries: Vec<usize> = full
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(full.len()))
+                .collect();
+            let mut lo = 0usize;
+            let mut hi = boundaries.len() - 1;
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                let candidate = format!("{}{suffix}", &full[..boundaries[mid]]);
+                if shell_bytes + serde_json::to_vec(&candidate)?.len() <= FACT_BYTES {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if let Fact::Returned {
+                outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
+                ..
+            } = &mut fact
+            {
+                *text = format!("{}{suffix}", &full[..boundaries[lo]]);
+            }
         }
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if !matches!(read_on(&tx, action)?.fact, Fact::Acted { .. }) {

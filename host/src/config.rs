@@ -28,14 +28,7 @@ pub struct ProviderConfig {
 
 impl ProviderConfig {
     pub fn is_usable(&self) -> bool {
-        let base = self.base_url.trim();
-        if base.is_empty() {
-            return false;
-        }
-        if !self.api_key.trim().is_empty() {
-            return true;
-        }
-        base.contains("127.0.0.1") || base.contains("localhost")
+        !self.base_url.trim().is_empty()
     }
 }
 
@@ -91,6 +84,10 @@ pub struct HostConfig {
     pub judge: ModelRef,
     #[serde(default)]
     pub connectors: Vec<ConnectorConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_max_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<usize>,
 }
 
 impl Default for HostConfig {
@@ -109,6 +106,8 @@ impl Default for HostConfig {
                 model: "gpt-4o".into(),
             },
             connectors: Vec::new(),
+            window_max_bytes: None,
+            max_steps: None,
         }
     }
 }
@@ -153,5 +152,15 @@ impl HostConfig {
 
     pub fn is_configured(&self) -> bool {
         self.resolve_judge().is_some()
+    }
+
+    pub fn window_max_bytes(&self) -> usize {
+        self.window_max_bytes
+            .filter(|&bytes| bytes > 0)
+            .unwrap_or(crate::llm::WINDOW_MAX_BYTES)
+    }
+
+    pub fn max_steps(&self) -> usize {
+        self.max_steps.filter(|&steps| steps > 0).unwrap_or(40)
     }
 }

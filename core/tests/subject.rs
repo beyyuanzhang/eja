@@ -56,7 +56,7 @@ fn turn_feeds_read_evidence_and_stops_naturally_without_rest() -> Result<()> {
     let mut steps = 0;
     let stop = eja.turn(
         &[],
-        3,
+        4,
         |view| {
             steps += 1;
             assert!(!view.recent.iter().any(|entry| entry.id == change));
@@ -67,30 +67,35 @@ fn turn_feeds_read_evidence_and_stops_naturally_without_rest() -> Result<()> {
                     ..Step::default()
                 });
             }
-            assert_eq!(view.reads.len(), 2);
-            assert_eq!(view.reads[0].entry.id, change);
-            assert!(view.reads[0].latest.is_none());
-            assert!(matches!(
-                &view.reads[0].entry.fact,
-                Fact::Noticed {
-                    source: Source::Person,
-                    text
-                } if text == "这阵子更想去山里"
-            ));
-            assert_eq!(view.reads[1].entry.id, concern);
-            assert_eq!(
-                view.reads[1].latest.as_ref().unwrap().id,
-                view.concerns[0].latest
-            );
-            Ok(Step {
-                keep: vec![keep(Some(concern), "周末想去山里透口气")],
-                ..Step::default()
-            })
+            if steps == 2 {
+                assert_eq!(view.reads.len(), 2);
+                assert_eq!(view.reads[0].entry.id, change);
+                assert!(view.reads[0].latest.is_none());
+                assert!(matches!(
+                    &view.reads[0].entry.fact,
+                    Fact::Noticed {
+                        source: Source::Person,
+                        text
+                    } if text == "这阵子更想去山里"
+                ));
+                assert_eq!(view.reads[1].entry.id, concern);
+                assert_eq!(
+                    view.reads[1].latest.as_ref().unwrap().id,
+                    view.concerns[0].latest
+                );
+                return Ok(Step {
+                    keep: vec![keep(Some(concern), "周末想去山里透口气")],
+                    ..Step::default()
+                });
+            }
+            assert!(view.reads.is_empty());
+            assert_eq!(view.concerns[0].text, "周末想去山里透口气");
+            Ok(Step::default())
         },
         |_| unreachable!(),
     )?;
     assert_eq!(stop, Stop::Done);
-    assert_eq!(steps, 2);
+    assert_eq!(steps, 3);
     let view = eja.view()?;
     assert!(view.reads.is_empty());
     assert_eq!(view.concerns[0].text, "周末想去山里透口气");
@@ -378,6 +383,7 @@ fn one_turn_reconsiders_a_real_receipt_and_stops_at_the_step_budget() -> Result<
                     keep: vec![keep(None, reason)],
                     ..Step::default()
                 },
+                Fact::Kept { .. } => Step::default(),
                 _ => panic!("unexpected step"),
             };
             Ok(step)

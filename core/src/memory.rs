@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::{cell::RefCell, collections::BTreeMap, sync::OnceLock};
 
 const BATCH: usize = 256;
-const TOP: usize = 4;
+const TOP: usize = 10;
 const CHARS: usize = 384;
 const STRIDE: usize = 320;
 
@@ -69,7 +69,7 @@ fn passages(text: &str) -> Vec<&str> {
 
 fn content(fact: Fact) -> Option<String> {
     match fact {
-        Fact::Noticed { text, .. } | Fact::Kept { text, .. } => Some(text),
+        Fact::Noticed { text, .. } | Fact::Said { text } | Fact::Kept { text, .. } => Some(text),
         Fact::Acted { capability, input } => Some(format!("{capability} {input}")),
         Fact::Returned {
             outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
@@ -112,33 +112,68 @@ impl Eja {
             return memory.search(self, cue, through, revision);
         }
 
-        let words: Vec<_> = cue
-            .split_whitespace()
+        let mut words: Vec<String> = cue
+            .split(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        ',' | '，'
+                            | '、'
+                            | '。'
+                            | ';'
+                            | '；'
+                            | ':'
+                            | '：'
+                            | '|'
+                            | '('
+                            | ')'
+                            | '（'
+                            | '）'
+                            | '['
+                            | ']'
+                            | '"'
+                            | '\''
+                            | '“'
+                            | '”'
+                            | '「'
+                            | '」'
+                    )
+            })
+            .filter(|part| !part.is_empty())
             .map(str::to_ascii_lowercase)
             .collect();
-        let words = serde_json::to_string(&words)?;
+        if words.is_empty() {
+            words.push(cue.trim().to_ascii_lowercase());
+        }
+        let term_count = words.len() as f64;
+        let words_json = serde_json::to_string(&words)?;
         let mut stmt = self.db.prepare_cached(
-            "SELECT id FROM (
-                 SELECT id, json_extract(body,'$.kind') AS kind,
-                        lower(coalesce(
-                            json_extract(body,'$.text'),
-                            json_extract(body,'$.outcome.detail'),
-                            json_extract(body,'$.capability') || ' ' || json_extract(body,'$.input'),
-                            ''
-                        )) AS text
-                 FROM facts WHERE id <= ?1
+            "SELECT id, hits FROM (
+                 SELECT id,
+                        (SELECT count(*) FROM json_each(?2) WHERE instr(text, value) > 0) AS hits
+                 FROM (
+                     SELECT id,
+                            lower(coalesce(
+                                json_extract(body,'$.text'),
+                                json_extract(body,'$.outcome.detail'),
+                                json_extract(body,'$.capability') || ' ' || json_extract(body,'$.input'),
+                                ''
+                            )) AS text
+                     FROM facts WHERE id <= ?1
+                 )
              )
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM json_each(?2) WHERE instr(text, value) = 0
-             )
-             ORDER BY CASE WHEN kind IN ('noticed','returned') THEN 0 ELSE 1 END, id DESC
+             WHERE hits > 0
+             ORDER BY hits DESC, id DESC
              LIMIT ?3",
         )?;
-        let ids = stmt.query_map(params![through, words, TOP], |row| row.get(0))?;
-        ids.map(|id| {
+        let rows = stmt.query_map(params![through, words_json, TOP], |row| {
+            Ok((row.get::<_, Id>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, hits) = row?;
             Ok(Match {
-                evidence: self.evidence(id?, revision)?,
-                similarity: 1.0,
+                evidence: self.evidence(id, revision)?,
+                similarity: (hits as f64) / term_count,
             })
         })
         .collect()
@@ -298,7 +333,7 @@ impl Memory {
         let chunks = passages(cue);
         let queries = self.encode(InputKind::Query, &chunks)?;
         // One fact fits in at most this many chunks. Collect enough keys for TOP distinct facts.
-        let limit = TOP * (crate::FACT_BYTES / STRIDE + 2);
+        let limit = (TOP * 32).min(256);
         let mut scores: BTreeMap<Id, f64> = BTreeMap::new();
         let mut stmt = eja.db.prepare_cached(
             "SELECT rowid,distance FROM memory_vectors

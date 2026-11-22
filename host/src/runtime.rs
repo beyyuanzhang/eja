@@ -1,20 +1,18 @@
 use crate::config::{HostConfig, ProviderConfig};
 use crate::hands::{Hands, WakeAlarm};
 use crate::llm::{
-    entries_since, project_window, render_window, window_bytes, Brain, HttpBrain, StepFeedback,
-    TurnContext, TurnSession, WINDOW_MAX_BYTES,
+    concerns_at, entries_since, project_window, Brain, HttpBrain, StepFeedback, TurnContext,
+    TurnSession,
 };
 use crate::mcp::{truncate_utf8, ConnectorStatus};
-use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, Step};
+use eja_core::{Eja, Entry, Fact, Id, Outcome, SearchHits, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
 
@@ -57,10 +55,9 @@ pub struct HostRuntime {
     data_dir: PathBuf,
     eja: Mutex<Eja>,
     config: Mutex<HostConfig>,
-    config_mtime: Mutex<Option<SystemTime>>,
+    config_bytes: Mutex<Option<Vec<u8>>>,
     hands: Mutex<Hands>,
     anchor: Mutex<Id>,
-    window_max_bytes: usize,
     local_tz: String,
     status: Mutex<(String, String)>,
     busy: Mutex<()>,
@@ -81,24 +78,16 @@ impl HostRuntime {
         fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
         let eja = open_subject(&data_dir.join("subject.db"))?;
         let config = HostConfig::load(&data_dir);
-        let mtime = file_mtime(&HostConfig::path(&data_dir));
-        let notify_emit = Arc::clone(&emit);
-        let hands = Hands::open(
-            data_dir.clone(),
-            &config.connectors,
-            Arc::new(move |title, body| {
-                notify_emit(json!({ "event": "notify", "title": title, "body": body }));
-            }),
-        );
+        let config_bytes = read_config_bytes(&data_dir);
+        let hands = Hands::open(data_dir.clone(), &config.connectors);
         let anchor = load_anchor(&data_dir);
         Ok(Self {
             data_dir,
             eja: Mutex::new(eja),
             config: Mutex::new(config),
-            config_mtime: Mutex::new(mtime),
+            config_bytes: Mutex::new(config_bytes),
             hands: Mutex::new(hands),
             anchor: Mutex::new(anchor),
-            window_max_bytes: WINDOW_MAX_BYTES,
             local_tz: detect_local_tz(),
             status: Mutex::new(("idle".into(), "在线".into())),
             busy: Mutex::new(()),
@@ -115,12 +104,11 @@ impl HostRuntime {
             (hands.connector_statuses(), hands.wakes())
         };
         let eja = self.eja.lock().unwrap();
-        let view = eja.view().ok();
+        let revision = eja.revision().unwrap_or(0);
         let entries = load_recent_entries(&eja, 80);
-        let concerns = view
-            .as_ref()
-            .map(|v| {
-                v.concerns
+        let concerns = concerns_at(&eja, revision)
+            .map(|items| {
+                items
                     .iter()
                     .map(|c| ConcernDto {
                         id: c.id,
@@ -164,7 +152,7 @@ impl HostRuntime {
             *guard = updated.clone();
             changed
         };
-        *self.config_mtime.lock().unwrap() = file_mtime(&HostConfig::path(&self.data_dir));
+        *self.config_bytes.lock().unwrap() = read_config_bytes(&self.data_dir);
         if connectors_changed {
             self.hands.lock().unwrap().reload(&updated.connectors);
         }
@@ -174,7 +162,7 @@ impl HostRuntime {
     pub fn reload_connectors(&self) {
         let config = HostConfig::load(&self.data_dir);
         *self.config.lock().unwrap() = config.clone();
-        *self.config_mtime.lock().unwrap() = file_mtime(&HostConfig::path(&self.data_dir));
+        *self.config_bytes.lock().unwrap() = read_config_bytes(&self.data_dir);
         self.hands.lock().unwrap().reload(&config.connectors);
         self.emit_state();
     }
@@ -226,11 +214,11 @@ impl HostRuntime {
     }
 
     fn sync_config_if_changed(&self) {
-        let latest_mtime = file_mtime(&HostConfig::path(&self.data_dir));
+        let latest_bytes = read_config_bytes(&self.data_dir);
         let changed = {
-            let mut guard = self.config_mtime.lock().unwrap();
-            if *guard != latest_mtime {
-                *guard = latest_mtime;
+            let mut guard = self.config_bytes.lock().unwrap();
+            if *guard != latest_bytes {
+                *guard = latest_bytes;
                 true
             } else {
                 false
@@ -259,22 +247,17 @@ impl HostRuntime {
         };
         let provider = provider.clone();
         let model = model.to_string();
-        let tools = self.hands.lock().unwrap().tools();
-        let grant_refs: Vec<&str> = tools.iter().map(|t| t.capability.as_str()).collect();
-        let terminal_caps: HashSet<&str> = tools
-            .iter()
-            .filter(|t| t.terminal)
-            .map(|t| t.capability.as_str())
-            .collect();
+        let window_max_bytes = config.window_max_bytes();
+        let max_steps = config.max_steps();
 
         self.set_status("thinking", "思考中…");
         let data_dir_str = self.data_dir.display().to_string();
-        let turn_result = {
+        let window = {
             let eja = self.eja.lock().unwrap();
             let mut anchor = self.anchor.lock().unwrap();
             let initial_anchor = *anchor;
-            let window = match project_window(&eja, &mut anchor, self.window_max_bytes) {
-                Ok(w) => w,
+            let projected = match project_window(&eja, &mut anchor, window_max_bytes) {
+                Ok(records) => records,
                 Err(err) => {
                     drop(anchor);
                     drop(eja);
@@ -286,6 +269,48 @@ impl HostRuntime {
             if *anchor != initial_anchor {
                 save_anchor(&self.data_dir, *anchor);
             }
+            projected
+        };
+
+        let mut turn = TurnSession::default();
+        let mut previous_revision: Option<Id> = None;
+        let mut step_actions: Vec<Id> = Vec::new();
+        let mut step_reads: Vec<Result<eja_core::Evidence, String>> = Vec::new();
+        let mut step_searches: Vec<Result<SearchHits, String>> = Vec::new();
+        let mut commit_error: Option<String> = None;
+        let mut completed = false;
+        let mut fatal_error: Option<String> = None;
+
+        for step_index in 0..max_steps {
+            if step_index > 0 {
+                self.sync_config_if_changed();
+            }
+            let tools = self.hands.lock().unwrap().tools();
+            let (revision, entries) = {
+                let eja = self.eja.lock().unwrap();
+                let rev = match eja.revision() {
+                    Ok(r) => r,
+                    Err(err) => {
+                        fatal_error = Some(err.to_string());
+                        break;
+                    }
+                };
+                if rev == 0 {
+                    completed = true;
+                    break;
+                }
+                let delta = match previous_revision.replace(rev) {
+                    Some(previous) => match entries_since(&eja, previous, rev) {
+                        Ok(items) => items,
+                        Err(err) => {
+                            fatal_error = Some(err.to_string());
+                            break;
+                        }
+                    },
+                    None => Vec::new(),
+                };
+                (rev, delta)
+            };
 
             let ctx = TurnContext {
                 provider: &provider,
@@ -294,71 +319,117 @@ impl HostRuntime {
                 data_dir: &data_dir_str,
                 local_tz: &self.local_tz,
                 window: &window,
-                triggered_by_person: !proactive,
             };
-            let mut turn = TurnSession::default();
-            let mut previous_revision: Option<Id> = None;
-            let actions = RefCell::new(Vec::new());
-            let terminal = Cell::new(false);
-
-            let result = eja.turn(
-                &grant_refs,
-                10,
-                |view| {
-                    if terminal.get() {
-                        return Ok(Step::default());
-                    }
-                    let entries = match previous_revision.replace(view.revision) {
-                        Some(previous) => entries_since(&eja, previous, view.revision)?,
-                        None => Vec::new(),
-                    };
-                    let step_actions = actions.take();
-                    let step = self
-                        .brain
-                        .judge(
-                            &ctx,
-                            view,
-                            &mut turn,
-                            StepFeedback {
-                                entries: &entries,
-                                actions: &step_actions,
-                            },
-                        )
-                        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
-                    let only_terminal = step.read.is_empty()
-                        && step.search.is_empty()
-                        && !step.act.is_empty()
-                        && step
-                            .act
-                            .iter()
-                            .all(|act| terminal_caps.contains(act.capability.as_str()));
-                    terminal.set(only_terminal);
-                    Ok(step)
+            let decision = match self.brain.judge(
+                &ctx,
+                &mut turn,
+                StepFeedback {
+                    entries: &entries,
+                    actions: &step_actions,
+                    reads: &step_reads,
+                    searches: &step_searches,
+                    commit_error: commit_error.as_deref(),
                 },
-                |call| {
-                    actions.borrow_mut().push(call.id);
-                    let outcome = self.hands.lock().unwrap().execute(&call, proactive);
-                    if !matches!(outcome, Outcome::Observed(_)) {
-                        terminal.set(false);
-                    }
-                    outcome
-                },
-            );
+            ) {
+                Ok(d) => d,
+                Err(err) => {
+                    fatal_error = Some(err);
+                    break;
+                }
+            };
 
-            if let Ok(head) = eja.view().map(|v| v.revision) {
-                if render_window(&eja, *anchor, head)
-                    .map(|rendered| window_bytes(&rendered) > self.window_max_bytes)
-                    .unwrap_or(false)
+            step_actions.clear();
+            step_reads.clear();
+            step_searches.clear();
+            commit_error = None;
+
+            let step = decision.step;
+            if step.is_empty() && !turn.has_pending() {
+                if let Some(text) = decision
+                    .reply
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
                 {
-                    *anchor = head;
-                    save_anchor(&self.data_dir, *anchor);
+                    if let Err(err) = self.eja.lock().unwrap().say(text) {
+                        fatal_error = Some(err.to_string());
+                        break;
+                    }
+                    if proactive {
+                        (self.emit)(json!({ "event": "notify", "title": "EJA", "body": text }));
+                    }
+                }
+                completed = true;
+                break;
+            }
+
+            let grant_refs: Vec<&str> = tools.iter().map(|t| t.capability.as_str()).collect();
+            let calls = if step.has_mutations() {
+                let commit_res = self
+                    .eja
+                    .lock()
+                    .unwrap()
+                    .commit(revision, &step, &grant_refs);
+                match commit_res {
+                    Ok(calls) => calls,
+                    Err(eja_core::Error::Invalid(msg)) => {
+                        commit_error = Some(msg);
+                        Vec::new()
+                    }
+                    Err(err) => {
+                        fatal_error = Some(err.to_string());
+                        break;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            for call in calls {
+                let id = call.id;
+                step_actions.push(id);
+                let outcome = self.hands.lock().unwrap().execute(&call);
+                if let Err(err) = self.eja.lock().unwrap().finish(id, outcome) {
+                    fatal_error = Some(err.to_string());
+                    break;
                 }
             }
-            result
-        };
+            if fatal_error.is_some() {
+                break;
+            }
 
-        if let Err(err) = turn_result {
+            if !step.read.is_empty() || !step.search.is_empty() {
+                let eja = self.eja.lock().unwrap();
+                let head = match eja.revision() {
+                    Ok(h) => h,
+                    Err(err) => {
+                        fatal_error = Some(err.to_string());
+                        break;
+                    }
+                };
+                for fact_id in step.read {
+                    if fact_id < 1 || fact_id > head {
+                        step_reads.push(Err(format!(
+                            "fact id {fact_id} 超出当前日志范围 (1..={head})"
+                        )));
+                    } else {
+                        step_reads.push(eja.evidence(fact_id, head).map_err(|err| err.to_string()));
+                    }
+                }
+                for cue in step.search {
+                    let res = eja
+                        .search(&cue)
+                        .map(|matches| SearchHits { cue, matches })
+                        .map_err(|err| err.to_string());
+                    step_searches.push(res);
+                }
+            }
+        }
+
+        if let Some(err) = fatal_error {
             self.emit_error(format!("执行回合失败: {err}"));
+        } else if !completed {
+            self.emit_error(format!("达到单回合最大步数上限 ({max_steps})，回合已暂停"));
         }
         self.sync_config_if_changed();
         self.set_status("idle", "在线");
@@ -383,14 +454,14 @@ fn open_subject(db_path: &Path) -> Result<Eja, String> {
 }
 
 fn load_recent_entries(eja: &Eja, limit: usize) -> Vec<Entry> {
-    let Ok(view) = eja.view() else {
+    let Ok(revision) = eja.revision() else {
         return Vec::new();
     };
-    if view.revision == 0 {
+    if revision == 0 {
         return Vec::new();
     }
     let mut collected = Vec::new();
-    let mut cursor = view.revision;
+    let mut cursor = revision;
     while collected.len() < limit && cursor > 0 {
         let Ok(page) = eja.history(cursor) else { break };
         if page.is_empty() {
@@ -444,16 +515,26 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
                     proactive: None,
                 });
             }
-            Fact::Acted { capability, input } if capability == "say" => {
-                if let Some(text) = input.get("text").and_then(|v| v.as_str()) {
-                    items.push(StreamItem {
-                        id: entry.id,
-                        kind: "eja".into(),
-                        text: text.to_string(),
-                        detail: None,
-                        proactive: if proactive_turn { Some(true) } else { None },
-                    });
-                }
+            Fact::Noticed {
+                source: Source::World,
+                text,
+            } => {
+                items.push(StreamItem {
+                    id: entry.id,
+                    kind: "event".into(),
+                    text: text.clone(),
+                    detail: None,
+                    proactive: None,
+                });
+            }
+            Fact::Said { text } => {
+                items.push(StreamItem {
+                    id: entry.id,
+                    kind: "eja".into(),
+                    text: text.clone(),
+                    detail: None,
+                    proactive: if proactive_turn { Some(true) } else { None },
+                });
             }
             Fact::Acted { capability, input } => {
                 let outcome_text = returns.get(&entry.id).map(|out| match out {
@@ -489,8 +570,8 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
     items
 }
 
-fn file_mtime(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).ok()?.modified().ok()
+fn read_config_bytes(data_dir: &Path) -> Option<Vec<u8>> {
+    fs::read(HostConfig::path(data_dir)).ok()
 }
 
 fn load_anchor(data_dir: &Path) -> Id {
@@ -523,7 +604,8 @@ fn detect_local_tz() -> String {
 mod tests {
     use super::*;
     use crate::config::{ConnectorConfig, ConnectorTransport, ModelRef, ProviderKind};
-    use eja_core::{Act, Keep, View};
+    use crate::llm::Decision;
+    use eja_core::{Act, Keep, Step};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -536,13 +618,12 @@ mod tests {
         fn judge(
             &self,
             ctx: &TurnContext<'_>,
-            view: &View,
             _turn: &mut TurnSession,
-            _feedback: StepFeedback<'_>,
-        ) -> Result<Step, String> {
+            feedback: StepFeedback<'_>,
+        ) -> Result<Decision, String> {
             self.judge_calls.fetch_add(1, Ordering::SeqCst);
             if self.mode == "mcp" {
-                let already_called = view.recent.iter().any(|e| {
+                let already_called = feedback.entries.iter().any(|e| {
                     matches!(&e.fact, Fact::Returned { outcome: Outcome::Observed(s), .. } if s.contains("pong:hello"))
                 });
                 if !already_called {
@@ -553,28 +634,25 @@ mod tests {
                         .unwrap()
                         .capability
                         .clone();
-                    return Ok(Step {
-                        act: vec![Act {
-                            capability: cap,
-                            input: json!({ "msg": "hello" }),
-                        }],
-                        ..Step::default()
+                    return Ok(Decision {
+                        step: Step {
+                            act: vec![Act {
+                                capability: cap,
+                                input: json!({ "msg": "hello" }),
+                            }],
+                            ..Step::default()
+                        },
+                        reply: None,
                     });
                 }
-                return Ok(Step {
-                    act: vec![Act {
-                        capability: "say".into(),
-                        input: json!({ "text": "mcp ok" }),
-                    }],
-                    ..Step::default()
+                return Ok(Decision {
+                    step: Step::default(),
+                    reply: Some("mcp ok".into()),
                 });
             }
-            Ok(Step {
-                act: vec![Act {
-                    capability: "say".into(),
-                    input: json!({ "text": "你好，我在。" }),
-                }],
-                ..Step::default()
+            Ok(Decision {
+                step: Step::default(),
+                reply: Some("你好，我在。".into()),
             })
         }
 
@@ -602,6 +680,8 @@ mod tests {
                 model: "demo".into(),
             },
             connectors,
+            window_max_bytes: None,
+            max_steps: None,
         }
     }
 
@@ -697,34 +777,41 @@ for line in sys.stdin:
     }
 
     struct WindowRecordingBrain {
-        windows: Mutex<Vec<Vec<String>>>,
+        windows: Mutex<Vec<Vec<Value>>>,
     }
 
     impl Brain for WindowRecordingBrain {
         fn judge(
             &self,
             ctx: &TurnContext<'_>,
-            _view: &View,
             _turn: &mut TurnSession,
-            _feedback: StepFeedback<'_>,
-        ) -> Result<Step, String> {
+            feedback: StepFeedback<'_>,
+        ) -> Result<Decision, String> {
+            if !feedback.entries.is_empty() {
+                return Ok(Decision {
+                    step: Step::default(),
+                    reply: Some("收到".into()),
+                });
+            }
             let mut windows = self.windows.lock().unwrap();
             let first_turn = windows.is_empty();
             windows.push(ctx.window.to_vec());
-            let mut step = Step {
-                act: vec![Act {
-                    capability: "say".into(),
-                    input: json!({ "text": "收到" }),
-                }],
-                ..Step::default()
-            };
             if first_turn {
-                step.keep.push(Keep {
-                    concern: None,
-                    text: "长期挂念".into(),
+                return Ok(Decision {
+                    step: Step {
+                        keep: vec![Keep {
+                            concern: None,
+                            text: "长期挂念".into(),
+                        }],
+                        ..Step::default()
+                    },
+                    reply: None,
                 });
             }
-            Ok(step)
+            Ok(Decision {
+                step: Step::default(),
+                reply: Some("收到".into()),
+            })
         }
 
         fn test_connection(
@@ -742,11 +829,12 @@ for line in sys.stdin:
         let brain = Arc::new(WindowRecordingBrain {
             windows: Mutex::new(Vec::new()),
         });
-        let mut rt =
+        let rt =
             HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
-        rt.window_max_bytes = 900;
-        rt.save_config(configured(vec![]));
+        let mut cfg = configured(vec![]);
+        cfg.window_max_bytes = Some(900);
+        rt.save_config(cfg);
 
         rt.handle_user_message("第一轮");
         rt.handle_user_message("第二轮");
@@ -759,6 +847,7 @@ for line in sys.stdin:
 
         // Exceed the window budget so anchor advances and persists to window.json.
         rt.handle_user_message(&"长消息".repeat(120));
+        rt.handle_user_message("推进窗口");
         drop(rt);
 
         // Reopen runtime and verify persisted anchor starts cleanly with the open concern snapshot.
@@ -769,8 +858,64 @@ for line in sys.stdin:
 
         let windows = brain.windows.lock().unwrap();
         let last = windows.last().unwrap();
-        let first_line: Value = serde_json::from_str(&last[0]).unwrap();
+        let first_line: Value = serde_json::from_str(last[0]["content"].as_str().unwrap()).unwrap();
         assert!(first_line["anchor"].as_i64().unwrap() > 0);
         assert_eq!(first_line["concerns"][0]["text"], "长期挂念");
+    }
+
+    struct SelfHealingBrain {
+        seen_error: Mutex<Option<String>>,
+    }
+
+    impl Brain for SelfHealingBrain {
+        fn judge(
+            &self,
+            _ctx: &TurnContext<'_>,
+            _turn: &mut TurnSession,
+            feedback: StepFeedback<'_>,
+        ) -> Result<Decision, String> {
+            if let Some(err) = feedback.commit_error {
+                *self.seen_error.lock().unwrap() = Some(err.to_string());
+                return Ok(Decision {
+                    step: Step::default(),
+                    reply: Some("已自行纠正".into()),
+                });
+            }
+            Ok(Decision {
+                step: Step {
+                    release: vec![99999],
+                    ..Step::default()
+                },
+                reply: None,
+            })
+        }
+
+        fn test_connection(
+            &self,
+            _provider: &ProviderConfig,
+            model: &str,
+        ) -> Result<String, String> {
+            Ok(format!("ok:{model}"))
+        }
+    }
+
+    #[test]
+    fn invalid_commit_feeds_error_back_instead_of_aborting_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(SelfHealingBrain {
+            seen_error: Mutex::new(None),
+        });
+        let rt =
+            HostRuntime::open_with_brain(dir.path().to_path_buf(), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
+        rt.save_config(configured(vec![]));
+
+        rt.handle_user_message("测试自纠");
+        assert!(brain.seen_error.lock().unwrap().is_some());
+        let snap = rt.snapshot();
+        assert!(snap
+            .stream
+            .iter()
+            .any(|item| item.kind == "eja" && item.text == "已自行纠正"));
     }
 }

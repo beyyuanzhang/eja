@@ -22,7 +22,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Each view contains at most one page of recent entries and one page of open concerns.
 pub const PAGE: usize = 8;
 /// Bound one serialized fact before it enters a model-facing history.
-pub const FACT_BYTES: usize = 8192;
+pub const FACT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum Error {
@@ -107,8 +107,8 @@ pub struct Act {
 }
 
 /// One step returned by the intelligence.
-/// Requests (`read`, `search`, `act`) feed new evidence back into the loop;
-/// pure state updates (`keep`, `release`) or an empty step close the turn naturally.
+/// Any non-empty step commits its changes and feeds receipts/evidence back into the loop;
+/// an empty step closes the turn naturally.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -129,8 +129,8 @@ impl Step {
         !self.keep.is_empty() || !self.release.is_empty() || !self.act.is_empty()
     }
 
-    pub fn needs_followup(&self) -> bool {
-        !self.read.is_empty() || !self.search.is_empty() || !self.act.is_empty()
+    pub fn is_empty(&self) -> bool {
+        !self.has_mutations() && self.read.is_empty() && self.search.is_empty()
     }
 }
 
@@ -138,6 +138,7 @@ impl Step {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fact {
     Noticed { source: Source, text: String },
+    Said { text: String },
     Kept { concern: Id, text: String },
     Released { concern: Id },
     Acted { capability: String, input: Value },
@@ -247,7 +248,19 @@ impl Eja {
             source,
             text: text.into(),
         };
-        self.append_notice(&fact)
+        self.append_fact(&fact)
+    }
+
+    pub fn say(&self, text: impl Into<String>) -> Result<Id> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(Error::invalid("reply requires non-empty text"));
+        }
+        self.append_fact(&Fact::Said { text })
+    }
+
+    pub fn revision(&self) -> Result<Id> {
+        self.head()
     }
 
     /// Pure read-only snapshot of the journal at its current revision.
@@ -285,6 +298,9 @@ impl Eja {
             view.reads = std::mem::take(&mut reads);
             view.searches = std::mem::take(&mut searches);
             let step = judge(&view).map_err(Error::External)?;
+            if step.is_empty() {
+                return Ok(Stop::Done);
+            }
             for &fact_id in &step.read {
                 if fact_id < 1 || fact_id > view.revision {
                     return Err(Error::invalid("read target must reference a recorded fact"));
@@ -302,16 +318,12 @@ impl Eja {
                 let id = call.id;
                 self.finish(id, perform(call))?;
             }
-            if !step.needs_followup() {
-                return Ok(Stop::Done);
-            }
             let head = self.head()?;
             for fact_id in step.read {
                 reads.push(self.evidence(fact_id, head)?);
             }
-            let older = head.saturating_sub(PAGE as Id);
             for cue in step.search {
-                let matches = self.search_at(&cue, older, head)?;
+                let matches = self.search_at(&cue, head, head)?;
                 searches.push(SearchHits { cue, matches });
             }
         }
