@@ -535,10 +535,12 @@ impl HostRuntime {
                 self.retry_at = Some(Instant::now() + Duration::from_secs(delay_secs));
             } else {
                 self.clear_retry();
+                completed = state::complete_turn(&self.eja, trigger_id, "").is_ok();
             }
             self.emit_error(format!("执行回合失败: {err}"));
         } else {
             self.clear_retry();
+            completed = state::complete_turn(&self.eja, trigger_id, "").is_ok();
             self.emit_error(format!("达到单回合最大步数上限 ({max_steps})，回合已暂停"));
         }
         self.set_status("idle", "在线");
@@ -1482,6 +1484,62 @@ for line in sys.stdin:
             .stream
             .iter()
             .any(|item| item.kind == "eja" && item.text == "恢复完成"));
+    }
+
+    #[test]
+    fn max_steps_and_unrecoverable_failures_settle_trigger_without_blocking_later_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(ScriptedBrain {
+            replies: Mutex::new(vec![
+                Ok(tool_reply("s1", "search", json!({ "cue": "咖啡" }))),
+                Ok(tool_reply("s2", "search", json!({ "cue": "老地方" }))),
+                Ok(text_reply("G1 之后正常回复")),
+                Err("HTTP 400: invalid_request_error".into()),
+                Ok(text_reply("400 之后正常回复")),
+            ]),
+            seen_windows: Mutex::new(Vec::new()),
+        });
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = Arc::clone(&events);
+        let mut rt = HostRuntime::open_with_brain(
+            dir.path().join("Eja"),
+            brain.clone(),
+            Box::new(move |event| sink.lock().unwrap().push(event)),
+        )
+        .unwrap();
+        let mut cfg = configured(vec![]);
+        cfg.max_steps = Some(2);
+        rt.save_config(cfg);
+
+        rt.handle_user_message("G1 连续检索触发步数上限");
+        assert!(!rt.has_pending_trigger());
+        assert!(rt.retry_at.is_none());
+        assert!(events.lock().unwrap().iter().any(|ev| {
+            ev["event"] == "error"
+                && ev["message"]
+                    .as_str()
+                    .is_some_and(|msg| msg.contains("达到单回合最大步数上限 (2)"))
+        }));
+
+        rt.handle_user_message("E1 我叫什么名字？");
+        assert!(!rt.has_pending_trigger());
+
+        rt.handle_user_message("触发不可恢复 400");
+        assert!(!rt.has_pending_trigger());
+        assert!(rt.retry_at.is_none());
+
+        rt.handle_user_message("后续消息仍可执行");
+        assert!(!rt.has_pending_trigger());
+
+        let snap = rt.snapshot();
+        assert!(snap
+            .stream
+            .iter()
+            .any(|item| item.kind == "eja" && item.text == "G1 之后正常回复"));
+        assert!(snap
+            .stream
+            .iter()
+            .any(|item| item.kind == "eja" && item.text == "400 之后正常回复"));
     }
 
     #[test]
