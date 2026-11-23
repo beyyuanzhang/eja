@@ -1,7 +1,7 @@
-use crate::sandbox::{read_file_nofollow, write_file_atomic_in_dir};
+use crate::sandbox::TrustedDir;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,23 +143,26 @@ impl Default for HostConfig {
 }
 
 impl HostConfig {
+    #[cfg(test)]
     pub fn config_path(core_dir: &Path) -> PathBuf {
         core_dir.join("config.json")
     }
 
+    #[cfg(test)]
     pub fn connectors_path(data_dir: &Path) -> PathBuf {
         data_dir.join("connectors.json")
     }
 
-    pub fn load(core_dir: &Path) -> Self {
-        fs::read(Self::config_path(core_dir))
+    pub fn load(core_dir: &TrustedDir) -> Self {
+        core_dir
+            .read_file("config.json")
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
             .unwrap_or_default()
     }
 
-    pub fn read_connectors(data_dir: &Path) -> Result<Option<Vec<u8>>, String> {
-        match read_file_nofollow(data_dir, "connectors.json") {
+    pub fn read_connectors(data_dir: &TrustedDir) -> Result<Option<Vec<u8>>, String> {
+        match data_dir.read_file("connectors.json") {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(format!("读取连接器配置失败: {err}")),
@@ -171,12 +174,12 @@ impl HostConfig {
             .map_err(|err| format!("解析 connectors.json 失败: {err}"))
     }
 
-    pub fn save_models(&self, core_dir: &Path) -> Result<(), String> {
+    pub fn save_models(&self, core_dir: &TrustedDir) -> Result<(), String> {
         let mut core_value = serde_json::to_value(self).map_err(|err| err.to_string())?;
         if let Some(map) = core_value.as_object_mut() {
             map.remove("connectors");
         }
-        write_json_atomic(&Self::config_path(core_dir), &core_value)
+        write_json_atomic(core_dir, "config.json", &core_value)
     }
 
     pub fn resolve_judge(&self) -> Option<(&ProviderConfig, &str)> {
@@ -217,7 +220,7 @@ impl HostConfig {
         copy
     }
 
-    pub fn merge_preserved(&mut self, current: &Self) {
+    pub fn preserve_api_keys(&mut self, current: &Self) {
         for provider in &mut self.providers {
             provider.has_api_key = false;
             if provider.api_key.is_empty() {
@@ -226,21 +229,15 @@ impl HostConfig {
                 }
             }
         }
-        if self.window_max_bytes.is_none() {
-            self.window_max_bytes = current.window_max_bytes;
-        }
-        if self.max_steps.is_none() {
-            self.max_steps = current.max_steps;
-        }
     }
 }
 
-pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let parent = path.parent().ok_or("无效配置路径")?;
-    let name = path
-        .file_name()
-        .and_then(|segment| segment.to_str())
-        .ok_or("无效配置路径")?;
+pub(crate) fn write_json_atomic<T: Serialize>(
+    dir: &TrustedDir,
+    name: &str,
+    value: &T,
+) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
-    write_file_atomic_in_dir(parent, name, &bytes).map_err(|err| err.to_string())
+    dir.write_file_atomic(name, &bytes)
+        .map_err(|err| err.to_string())
 }

@@ -70,7 +70,9 @@ fn passages(text: &str) -> Vec<&str> {
 
 fn content(fact: Fact) -> Option<String> {
     match fact {
-        Fact::Noticed { text, .. } | Fact::Said { text } | Fact::Kept { text, .. } => Some(text),
+        Fact::Noticed { text, .. } | Fact::Said { text, .. } | Fact::Kept { text, .. } => {
+            Some(text)
+        }
         Fact::Acted { capability, input } => Some(format!("{capability} {input}")),
         Fact::Returned {
             outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),

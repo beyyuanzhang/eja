@@ -198,14 +198,7 @@ impl StdioConnection {
             if val.get("id").and_then(|v| v.as_u64()) != Some(id) {
                 continue;
             }
-            if let Some(err) = val.get("error") {
-                let message = err
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("MCP 返回错误");
-                return Err(RequestError::Failed(message.to_string()));
-            }
-            return Ok(val.get("result").cloned().unwrap_or(Value::Null));
+            return extract_jsonrpc_result(&val, "MCP 返回错误");
         }
     }
 
@@ -282,15 +275,8 @@ impl HttpConnection {
                 }
             }
         }
-        let parsed = parse_http_jsonrpc(&body).map_err(RequestError::Unknown)?;
-        if let Some(err) = parsed.get("error") {
-            let message = err
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("MCP HTTP 返回错误");
-            return Err(RequestError::Failed(message.to_string()));
-        }
-        Ok(parsed.get("result").cloned().unwrap_or(Value::Null))
+        let parsed = parse_http_jsonrpc(&body, id).map_err(RequestError::Unknown)?;
+        extract_jsonrpc_result(&parsed, "MCP HTTP 返回错误")
     }
 
     fn post_raw(
@@ -379,8 +365,8 @@ fn split_http_response(raw: &str) -> Result<(&str, &str), RequestError> {
         if !(200..300).contains(&code) {
             let message = format!("MCP HTTP {code}: {}", truncate_utf8(rest.trim(), 240));
             return Err(match code {
-                408 | 502 | 503 | 504 => RequestError::Unknown(message),
-                _ => RequestError::Failed(message),
+                400..=407 | 409..=498 => RequestError::Failed(message),
+                _ => RequestError::Unknown(message),
             });
         }
     } else {
@@ -402,21 +388,86 @@ fn split_once_header_end(input: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn parse_http_jsonrpc(body: &str) -> Result<Value, String> {
+fn extract_jsonrpc_result(val: &Value, default_error: &str) -> Result<Value, RequestError> {
+    if let Some(err) = val.get("error").filter(|v| !v.is_null()) {
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or(default_error);
+        return Err(RequestError::Failed(message.to_string()));
+    }
+    if let Some(result) = val.get("result") {
+        return Ok(result.clone());
+    }
+    Err(RequestError::Unknown(format!(
+        "MCP 响应缺少 result 字段: {}",
+        truncate_utf8(&val.to_string(), 240)
+    )))
+}
+
+fn find_matching_jsonrpc(val: Value, id: u64) -> Option<Value> {
+    let matches_id =
+        |item: &Value| item.is_object() && item.get("id").and_then(Value::as_u64) == Some(id);
+    if matches_id(&val) {
+        return Some(val);
+    }
+    if let Value::Array(items) = val {
+        return items.into_iter().find(matches_id);
+    }
+    None
+}
+
+fn parse_http_jsonrpc(body: &str, id: u64) -> Result<Value, String> {
     let trimmed = body.trim();
     if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-        return Ok(val);
+        return find_matching_jsonrpc(val, id).ok_or_else(|| {
+            format!(
+                "MCP HTTP 响应缺少匹配请求 ID ({id}) 的结果: {}",
+                truncate_utf8(trimmed, 240)
+            )
+        });
     }
-    let mut last_json = None;
+    let mut matched: Option<Value> = None;
+    let mut event_data = String::new();
+    let flush_event = |buf: &mut String, out: &mut Option<Value>| {
+        if buf.is_empty() {
+            return;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(buf.trim()) {
+            if let Some(found) = find_matching_jsonrpc(val, id) {
+                *out = Some(found);
+            }
+        }
+        buf.clear();
+    };
     for line in trimmed.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            flush_event(&mut event_data, &mut matched);
+            continue;
+        }
         if let Some(data) = line.strip_prefix("data:") {
             let chunk = data.trim();
             if let Ok(val) = serde_json::from_str::<Value>(chunk) {
-                last_json = Some(val);
+                if let Some(found) = find_matching_jsonrpc(val, id) {
+                    matched = Some(found);
+                    event_data.clear();
+                    continue;
+                }
             }
+            if !event_data.is_empty() {
+                event_data.push('\n');
+            }
+            event_data.push_str(chunk);
         }
     }
-    last_json.ok_or_else(|| format!("无法解析 MCP HTTP 响应: {}", truncate_utf8(trimmed, 240)))
+    flush_event(&mut event_data, &mut matched);
+    matched.ok_or_else(|| {
+        format!(
+            "MCP HTTP 响应缺少匹配请求 ID ({id}) 的结果: {}",
+            truncate_utf8(trimmed, 240)
+        )
+    })
 }
 
 enum ActiveConnection {
@@ -470,18 +521,25 @@ impl ConnectorPool {
     }
 
     pub fn reload(&mut self, configs: &[ConnectorConfig], force: bool) {
-        let mut previous = if force {
+        let mut reusable = HashMap::new();
+        if force {
             self.connections.clear();
-            HashMap::new()
         } else {
-            std::mem::take(&mut self.connections)
-        };
+            let mut previous = std::mem::take(&mut self.connections);
+            for cfg in configs.iter().filter(|cfg| cfg.enabled) {
+                if let Some(mut entry) = previous.remove(&cfg.id) {
+                    if entry.transport == cfg.transport && entry.connection.is_alive() {
+                        reusable.insert(cfg.id.clone(), entry);
+                    }
+                }
+            }
+            drop(previous);
+        }
         self.statuses.clear();
         self.tools.clear();
 
         for cfg in configs {
             if !cfg.enabled {
-                previous.remove(&cfg.id);
                 self.statuses.push(ConnectorStatus {
                     id: cfg.id.clone(),
                     name: cfg.name.clone(),
@@ -493,20 +551,18 @@ impl ConnectorPool {
                 continue;
             }
 
-            if let Some(mut entry) = previous.remove(&cfg.id) {
-                if entry.transport == cfg.transport && entry.connection.is_alive() {
-                    self.tools.extend(entry.tools.iter().cloned());
-                    self.statuses.push(ConnectorStatus {
-                        id: cfg.id.clone(),
-                        name: cfg.name.clone(),
-                        enabled: true,
-                        connected: true,
-                        error: None,
-                        tools: entry.summaries.clone(),
-                    });
-                    self.connections.insert(cfg.id.clone(), entry);
-                    continue;
-                }
+            if let Some(entry) = reusable.remove(&cfg.id) {
+                self.tools.extend(entry.tools.iter().cloned());
+                self.statuses.push(ConnectorStatus {
+                    id: cfg.id.clone(),
+                    name: cfg.name.clone(),
+                    enabled: true,
+                    connected: true,
+                    error: None,
+                    tools: entry.summaries.clone(),
+                });
+                self.connections.insert(cfg.id.clone(), entry);
+                continue;
             }
 
             let connected = match &cfg.transport {
@@ -636,6 +692,22 @@ impl ConnectorPool {
             TOOL_TIMEOUT,
         ) {
             Ok(result) => {
+                if !result
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .all(|block| match block.get("type").and_then(Value::as_str) {
+                                Some("text") => block["text"].is_string(),
+                                Some(kind) => !kind.is_empty(),
+                                None => false,
+                            })
+                    })
+                    || result.get("isError").is_some_and(|v| !v.is_boolean())
+                {
+                    return Outcome::Unknown("MCP 工具返回了无效结果".into());
+                }
                 let is_error = result
                     .get("isError")
                     .and_then(|v| v.as_bool())
@@ -699,7 +771,10 @@ pub fn truncate_utf8(input: &str, max_bytes: usize) -> String {
     if input.len() <= max_bytes {
         return input.to_string();
     }
-    let mut end = max_bytes.saturating_sub(3);
+    if max_bytes < 3 {
+        return ".".repeat(max_bytes);
+    }
+    let mut end = max_bytes - 3;
     while end > 0 && !input.is_char_boundary(end) {
         end -= 1;
     }
@@ -712,15 +787,22 @@ mod tests {
 
     #[test]
     fn split_http_response_preserves_sse_blank_lines_and_handles_continue() {
-        let raw = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nMcp-Session-Id: s1\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\n\r\n";
+        let raw = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nMcp-Session-Id: s1\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\r\n\r\n";
         let (headers, body) = split_http_response(raw).unwrap();
         assert!(headers.contains("Mcp-Session-Id: s1"));
-        let parsed = parse_http_jsonrpc(body).unwrap();
-        assert_eq!(parsed["result"]["ok"], true);
+        let parsed = parse_http_jsonrpc(body, 1).unwrap();
+        let result = extract_jsonrpc_result(&parsed, "err").unwrap();
+        assert_eq!(result["ok"], true);
     }
 
     #[test]
     fn split_http_response_distinguishes_unknown_gateway_and_explicit_errors() {
+        let server_error = "HTTP/1.1 500 Internal Server Error\r\n\r\ncrashed after write";
+        assert!(matches!(
+            split_http_response(server_error),
+            Err(RequestError::Unknown(ref msg)) if msg.contains("500")
+        ));
+
         let gateway = "HTTP/1.1 502 Bad Gateway\r\n\r\nupstream failed";
         assert!(matches!(
             split_http_response(gateway),
@@ -731,6 +813,16 @@ mod tests {
         assert!(matches!(
             split_http_response(client),
             Err(RequestError::Failed(ref msg)) if msg.contains("400") && msg.contains("invalid arguments")
+        ));
+
+        assert!(parse_http_jsonrpc(r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#, 1).is_err());
+        assert!(
+            parse_http_jsonrpc("data: {\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n\n", 1).is_err()
+        );
+        let missing_result = parse_http_jsonrpc(r#"{"jsonrpc":"2.0","id":1}"#, 1).unwrap();
+        assert!(matches!(
+            extract_jsonrpc_result(&missing_result, "err"),
+            Err(RequestError::Unknown(_))
         ));
     }
 
@@ -753,7 +845,10 @@ for line in sys.stdin:
         print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"op","description":"Op","inputSchema":{"type":"object"}}]}}), flush=True)
     elif method == "tools/call":
         mode = msg["params"]["arguments"].get("mode")
-        if mode == "err":
+        if mode in ("null", "empty", "bad_flag", "bad_block"):
+            result = {"null": None, "empty": {"content":[]}, "bad_flag":{"content":[], "isError":"yes"}, "bad_block":{"content":[None]}}[mode]
+            print(json.dumps({"jsonrpc":"2.0","id":mid,"result":result}), flush=True)
+        elif mode == "err":
             print(json.dumps({"jsonrpc":"2.0","id":mid,"error":{"code":-32000,"message":"rejected"}}), flush=True)
         else:
             sys.exit(0)
@@ -776,6 +871,16 @@ for line in sys.stdin:
             false,
         );
 
+        for mode in ["null", "bad_flag", "bad_block"] {
+            assert!(matches!(
+                pool.call("mcp.flaky.op", &json!({"mode":mode})),
+                Outcome::Unknown(_)
+            ));
+        }
+        assert!(matches!(
+            pool.call("mcp.flaky.op", &json!({"mode":"empty"})),
+            Outcome::Observed(_)
+        ));
         assert_eq!(
             pool.call("mcp.flaky.op", &json!({ "mode": "err" })),
             Outcome::Failed("rejected".into())
@@ -857,5 +962,66 @@ for line in sys.stdin:
             panic!("expected observed pid after dead process reload");
         };
         assert_ne!(pid_after_crash, pid_after_force);
+    }
+
+    #[test]
+    fn renaming_connector_id_closes_old_process_before_starting_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = dir.path().join("core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let lock_file = dir.path().join("exclusive.lock");
+        let script = dir.path().join("exclusive_mcp.py");
+        std::fs::write(
+            &script,
+            r#"import fcntl, json, sys
+lock = open(sys.argv[1], "w")
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"lock","version":"1"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"ping","description":"Ping","inputSchema":{"type":"object"}}]}}), flush=True)
+    elif method == "tools/call":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"ok"}]}}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let make_cfg = |id: &str| ConnectorConfig {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            transport: ConnectorTransport::Stdio {
+                command: "/usr/bin/python3".into(),
+                args: vec![
+                    script.display().to_string(),
+                    lock_file.display().to_string(),
+                ],
+                env: BTreeMap::new(),
+            },
+        };
+
+        let mut pool = ConnectorPool::new(Sandbox::new(&core_dir).unwrap());
+        pool.reload(&[make_cfg("old_id")], false);
+        assert_eq!(
+            pool.call("mcp.old_id.ping", &json!({})),
+            Outcome::Observed("ok".into())
+        );
+
+        pool.reload(&[make_cfg("new_id")], false);
+        let statuses = pool.statuses();
+        assert_eq!(statuses.len(), 1);
+        assert!(
+            statuses[0].connected,
+            "expected new_id to connect: {:?}",
+            statuses[0].error
+        );
+        assert_eq!(
+            pool.call("mcp.new_id.ping", &json!({})),
+            Outcome::Observed("ok".into())
+        );
     }
 }

@@ -13,8 +13,11 @@ eja-host --data-dir "<data_dir>"
 ## 数据目录边界
 
 - 内核与用户数据使用同级目录。数据目录名为 `Eja` 时，内核目录为 `ai.eja.kernel`，其他目录名追加 `.kernel`。
-- 内核目录由 macOS Seatbelt 保护，沙箱内 `shell` 与本地 stdio MCP 进程无权读写。它包含 `subject.db`（主体日志和唤醒计划）、`config.json`、`window.json`（上下文窗口起点 `anchor` 与已判结触发水位线 `settled_through`）、`kernel_version` 与单实例锁 `host.lock`。升级时，宿主持有原实例锁并把旧 `core/` 整体移到新位置。
-- 能力授权采用“OS 沙箱边界 + 宿主暴露即授权”契约：宿主暴露给模型的工具列表（`wake`、`shell` 与已启用的 MCP 连接器）即为当次行动授权集合；宿主在用户数据目录内读写 `connectors.json` 与 `outputs/` 时不跟随符号链接，防止沙箱内进程借助宿主权限越界写入内核目录或应用包。
+- 内核目录保存 `subject.db`、`config.json`、`window.json`、`kernel_version` 与单实例锁 `host.lock`。macOS Seatbelt 限制 Shell 与本地 stdio MCP 进程访问该目录。宿主迁移旧 `core/` 目录时持有实例锁。
+- `subject.db` 保存主体日志、唤醒计划和已处理的触发 ID。宿主按 ID 顺序处理用户消息与到期提醒。每个回合在同一事务中写入回复并推进处理进度。主动沉默只推进进度。新回复记录本次触发的来源。
+- `window.json` 保存上下文窗口起点 `anchor`。首次升级时，宿主导入旧文件中的 `settled_through`。旧文件仅含 `anchor` 时，宿主根据日志末尾的触发记录或中断的行动恢复进度。
+- 能力授权采用“OS 沙箱边界 + 宿主暴露即授权”契约：宿主暴露给模型的工具列表（`wake`、`shell` 与已启用的 MCP 连接器）即为当次行动授权集合；宿主启动时固定数据目录与内核目录句柄，读写 `connectors.json` 与 `outputs/` 时基于固定目录句柄且不跟随符号链接，防止沙箱内进程替换目录或创建符号链接越界写入内核目录或应用包。
+- 模型回合至少需要 256 字节的上下文窗口。设置低于下限时，宿主保留待处理请求，并在设置恢复后继续处理。
 - `connectors.json` 保存 MCP 连接器数组，文件变更在运行期自动热加载。
 - `ui/` 保存用户空间前端。运行 `ui/apply.sh` 发布 `ui/Eja.app` 后，宿主在与 Shell 相同的 macOS 沙箱中启动 `Contents/MacOS/EjaApp`，并通过其标准输入输出连接同一个主体。前端读入状态和事件，向标准输出写指令，环境变量 `EJA_ATTACHED_UI=1` 表示已有宿主。自定义前端可以发消息与重载用户连接器，编辑或测试模型配置由官方设置窗口处理。启动官方 App 时按住 `Option` 键进入默认界面。
 

@@ -1,11 +1,8 @@
 use crate::config::{write_json_atomic, ConfigPatch, HostConfig, ProviderConfig};
 use crate::hands::{unix_now, Hands, ToolSpec};
-use crate::llm::{
-    append_tool_results, cap_tool_result, messages_bytes, project_window, Brain, HttpBrain,
-    ToolCall,
-};
+use crate::llm::{project_window_through, tool_messages, Brain, HttpBrain, ToolCall, ToolOutput};
 use crate::mcp::{truncate_utf8, ConnectorStatus};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, TrustedDir};
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, WakeAlarm};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -64,8 +61,8 @@ struct WindowState {
 }
 
 pub struct HostRuntime {
-    data_dir: PathBuf,
-    core_dir: PathBuf,
+    data_dir: TrustedDir,
+    core_dir: TrustedDir,
     resources_dir: Option<PathBuf>,
     _instance_lock: fs::File,
     eja: Eja,
@@ -74,7 +71,6 @@ pub struct HostRuntime {
     hands: Hands,
     sandbox: Sandbox,
     anchor: Id,
-    settled_through: Id,
     retry_at: Option<Instant>,
     retry_attempts: u8,
     local_tz: String,
@@ -94,16 +90,21 @@ impl HostRuntime {
         mut emit: EventSink,
     ) -> Result<Self, String> {
         fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
-        let data_dir = fs::canonicalize(data_dir).map_err(|err| err.to_string())?;
-        let name = data_dir.file_name().ok_or("数据目录不能是文件系统根目录")?;
+        let data_path = fs::canonicalize(data_dir).map_err(|err| err.to_string())?;
+        let data_dir =
+            TrustedDir::open(data_path).map_err(|err| format!("锁定数据目录失败: {err}"))?;
+        let name = data_dir
+            .path()
+            .file_name()
+            .ok_or("数据目录不能是文件系统根目录")?;
         let mut core_name = name.to_os_string();
         if name == "Eja" {
             core_name = "ai.eja.kernel".into();
         } else {
             core_name.push(".kernel");
         }
-        let core_dir = data_dir.with_file_name(core_name);
-        let instance_lock = match lock_core_dir(&data_dir, &core_dir) {
+        let core_path = data_dir.path().with_file_name(core_name);
+        let instance_lock = match lock_core_dir(data_dir.path(), &core_path) {
             Ok(lock) => lock,
             Err(LockError::AlreadyRunning(ui_pid)) => {
                 (emit)(json!({ "event": "already_running", "ui_pid": ui_pid }));
@@ -111,9 +112,11 @@ impl HostRuntime {
             }
             Err(LockError::Io(msg)) => return Err(msg),
         };
-        let sandbox = Sandbox::new(&core_dir)?;
-        let eja = open_subject(&core_dir.join("subject.db"))?;
-        let legacy_wakes = core_dir.join("wakes.json");
+        let core_dir =
+            TrustedDir::open(core_path).map_err(|err| format!("锁定内核目录失败: {err}"))?;
+        let sandbox = Sandbox::new(core_dir.path())?;
+        let eja = open_subject(&core_dir.path().join("subject.db"))?;
+        let legacy_wakes = core_dir.path().join("wakes.json");
         match fs::read(&legacy_wakes) {
             Ok(bytes) => {
                 let alarms: Vec<WakeAlarm> =
@@ -125,6 +128,10 @@ impl HostRuntime {
             Err(err) => return Err(err.to_string()),
         }
         let unfinished = eja.unfinished_actions().map_err(|err| err.to_string())?;
+        let window = load_window_state(&core_dir);
+        let anchor = window.anchor;
+        eja.initialize_turn_cursor(window.settled_through, unfinished.first().copied())
+            .map_err(|err| err.to_string())?;
         for &action in &unfinished {
             eja.finish(
                 action,
@@ -139,17 +146,6 @@ impl HostRuntime {
         config.connectors =
             HostConfig::parse_connectors(connectors_bytes.as_deref()).unwrap_or_default();
         let hands = Hands::open(data_dir.clone(), sandbox.clone(), &config.connectors);
-        let window = load_window_state(&core_dir);
-        let anchor = window.anchor;
-        let head = eja.revision().map_err(|err| err.to_string())?;
-        let settled_through = match window.settled_through {
-            Some(id) if id <= head => id,
-            _ => {
-                let initial = initial_settled_through(&eja, unfinished.first().copied(), head);
-                save_window_state(&core_dir, anchor, initial);
-                initial
-            }
-        };
         Ok(Self {
             data_dir,
             core_dir,
@@ -161,7 +157,6 @@ impl HostRuntime {
             hands,
             sandbox,
             anchor,
-            settled_through,
             retry_at: None,
             retry_attempts: 0,
             local_tz: detect_local_tz(),
@@ -172,10 +167,13 @@ impl HostRuntime {
     }
 
     pub fn panel_command(&self) -> Command {
-        let executable = self.data_dir.join("ui/Eja.app/Contents/MacOS/EjaApp");
+        let executable = self
+            .data_dir
+            .path()
+            .join("ui/Eja.app/Contents/MacOS/EjaApp");
         let mut command = self.sandbox.command(executable, std::iter::empty::<&str>());
         command
-            .current_dir(&self.data_dir)
+            .current_dir(self.data_dir.path())
             .env("EJA_ATTACHED_UI", "1")
             .env_remove("EJA_HOST_BIN");
         command
@@ -204,67 +202,32 @@ impl HostRuntime {
         self.retry_attempts = 0;
     }
 
-    pub fn has_pending_trigger(&self) -> bool {
-        matches!(self.pending_trigger(), Ok(Some(_)))
+    #[cfg(test)]
+    fn has_pending_trigger(&self) -> bool {
+        self.eja.next_trigger().unwrap().is_some()
     }
 
     pub fn process_pending_turn(&mut self) {
-        match self.pending_trigger() {
-            Ok(Some(proactive)) => self.run_turn(proactive),
-            Ok(None) => {}
-            Err(err) => self.emit_error(format!("检查待处理触发失败: {err}")),
+        loop {
+            match self.eja.next_trigger() {
+                Ok(Some((id, source))) => {
+                    if !self.run_turn(source == Source::Clock, id) {
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(err) => return self.emit_error(format!("检查待处理触发失败: {err}")),
+            }
         }
     }
 
-    fn pending_trigger(&self) -> Result<Option<bool>, String> {
-        let head = self.eja.revision().map_err(|err| err.to_string())?;
-        if head <= self.settled_through {
-            return Ok(None);
+    fn persist_anchor(&mut self, next_anchor: Id) -> Result<(), String> {
+        if next_anchor != self.anchor {
+            save_window_state(&self.core_dir, next_anchor)
+                .map_err(|err| format!("保存窗口状态失败: {err}"))?;
+            self.anchor = next_anchor;
         }
-        let entries = self
-            .eja
-            .entries_after(self.settled_through, head)
-            .map_err(|err| err.to_string())?;
-        let mut last_trigger: Option<(Id, bool)> = None;
-        let mut has_person = false;
-        let mut said_after_trigger = false;
-        for entry in entries {
-            match entry.fact {
-                Fact::Noticed {
-                    source: Source::Person,
-                    ..
-                } => {
-                    has_person = true;
-                    last_trigger = Some((entry.id, false));
-                    said_after_trigger = false;
-                }
-                Fact::Noticed {
-                    source: Source::Clock,
-                    ..
-                } => {
-                    last_trigger = Some((entry.id, !has_person));
-                    said_after_trigger = false;
-                }
-                Fact::Said { .. } if last_trigger.is_some() => {
-                    said_after_trigger = true;
-                }
-                _ => {}
-            }
-        }
-        if last_trigger.is_none() || said_after_trigger {
-            return Ok(None);
-        }
-        Ok(last_trigger.map(|(_, proactive)| proactive))
-    }
-
-    fn mark_settled(&mut self) {
-        self.clear_retry();
-        if let Ok(head) = self.eja.revision() {
-            if head > self.settled_through {
-                self.settled_through = head;
-                save_window_state(&self.core_dir, self.anchor, self.settled_through);
-            }
-        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> HostState {
@@ -292,7 +255,7 @@ impl HostRuntime {
                 .map(|dir| dir.display().to_string()),
             status: self.status.0.clone(),
             status_detail: self.status.1.clone(),
-            data_dir: self.data_dir.display().to_string(),
+            data_dir: self.data_dir.path().display().to_string(),
             configured: self.config.is_configured(),
             config: self.config.redacted_for_ui(),
             connector_statuses: self.hands.connector_statuses(),
@@ -328,13 +291,9 @@ impl HostRuntime {
             if let Some(judge) = patch.judge {
                 updated.judge = judge;
             }
-            if patch.window_max_bytes.is_some() {
-                updated.window_max_bytes = patch.window_max_bytes;
-            }
-            if patch.max_steps.is_some() {
-                updated.max_steps = patch.max_steps;
-            }
-            updated.merge_preserved(&self.config);
+            updated.window_max_bytes = patch.window_max_bytes.or(updated.window_max_bytes);
+            updated.max_steps = patch.max_steps.or(updated.max_steps);
+            updated.preserve_api_keys(&self.config);
             if updated != self.config {
                 match updated.save_models(&self.core_dir) {
                     Ok(()) => self.config = updated,
@@ -344,25 +303,16 @@ impl HostRuntime {
         }
         if let Some(connectors) = patch.connectors {
             if connectors != self.config.connectors {
-                let path = HostConfig::connectors_path(&self.data_dir);
-                match write_json_atomic(&path, &connectors) {
-                    Ok(()) => {
-                        self.refresh_connectors(false);
-                        self.emit_state();
-                    }
-                    Err(err) => {
-                        self.emit_error(format!("保存连接器失败: {err}"));
-                        self.emit_state();
-                    }
+                match write_json_atomic(&self.data_dir, "connectors.json", &connectors) {
+                    Ok(()) => self.refresh_connectors(false),
+                    Err(err) => self.emit_error(format!("保存连接器失败: {err}")),
                 }
-            } else {
-                self.emit_state();
             }
         } else {
             self.refresh_connectors(false);
-            self.emit_state();
         }
-        if self.config.is_configured() && self.has_pending_trigger() {
+        self.emit_state();
+        if self.config.is_configured() {
             self.clear_retry();
             self.process_pending_turn();
         }
@@ -406,7 +356,7 @@ impl HostRuntime {
             return;
         }
         self.clear_retry();
-        self.run_turn(false);
+        self.process_pending_turn();
     }
 
     pub fn tick_timers(&mut self) -> Result<(), String> {
@@ -445,21 +395,27 @@ impl HostRuntime {
         }
     }
 
-    fn run_turn(&mut self, proactive: bool) {
+    fn run_turn(&mut self, proactive: bool, trigger_id: Id) -> bool {
         self.set_status("thinking", "思考中…");
         self.refresh_connectors(false);
         let Some((provider, model)) = self.config.resolve_judge() else {
             self.clear_retry();
             self.emit_error("请先在设置中配置可用的 LLM Provider 与主模型");
             self.set_status("idle", "在线");
-            return;
+            return false;
         };
         let provider = provider.clone();
         let model = model.to_string();
         let window_max_bytes = self.config.window_max_bytes();
+        if window_max_bytes < 256 {
+            self.clear_retry();
+            self.emit_error("上下文窗口至少需要 256 字节。请调整设置，当前请求已保留。");
+            self.set_status("idle", "在线");
+            return false;
+        }
         let max_steps = self.config.max_steps();
 
-        let data_dir_str = self.data_dir.display().to_string();
+        let data_dir_str = self.data_dir.path().display().to_string();
         let resources_line = match &self.resources_dir {
             Some(dir) => format!("\n只读协议与模板参考：{}", dir.display()),
             None => String::new(),
@@ -470,20 +426,36 @@ impl HostRuntime {
             数据目录：{}\n\
             连接器配置：{}/connectors.json（变更会自动热加载）\n\
             本地时区：{}\n\n\
-            前置消息是你按时间正序排列的不可变主体日志；末尾新增的 `noticed` 记录是本次触发。不调工具时的文本回复会发送给人，留空则保持沉默。",
+            前置消息是你按时间正序排列的不可变主体日志；编号最大的用户或时钟 `noticed` 记录触发本回合。不调工具时的文本回复会发送给人，留空则保持沉默。",
             data_dir_str, data_dir_str, self.local_tz
         );
-        let initial_anchor = self.anchor;
-        let mut messages = match project_window(&self.eja, &mut self.anchor, window_max_bytes) {
+        let head = match self.eja.revision() {
+            Ok(head) => head,
+            Err(err) => {
+                self.emit_error(format!("读取日志版本失败: {err}"));
+                self.set_status("idle", "在线");
+                return false;
+            }
+        };
+        let mut next_anchor = self.anchor;
+        let mut messages = match project_window_through(
+            &self.eja,
+            &mut next_anchor,
+            head,
+            window_max_bytes,
+            trigger_id,
+        ) {
             Ok(records) => records,
             Err(err) => {
                 self.emit_error(format!("构建日志窗口失败: {err}"));
                 self.set_status("idle", "在线");
-                return;
+                return false;
             }
         };
-        if self.anchor != initial_anchor {
-            save_window_state(&self.core_dir, self.anchor, self.settled_through);
+        if let Err(err) = self.persist_anchor(next_anchor) {
+            self.emit_error(err);
+            self.set_status("idle", "在线");
+            return false;
         }
 
         let mut completed = false;
@@ -507,25 +479,25 @@ impl HostRuntime {
 
             if reply.calls.is_empty() {
                 let text = reply.text.trim();
-                if !text.is_empty() {
-                    if let Err(err) = self.eja.say(text) {
-                        fatal_error = Some(err.to_string());
-                        break;
-                    }
-                    if proactive {
-                        (self.emit)(json!({ "event": "notify", "title": "EJA", "body": text }));
-                    }
+                if let Err(err) = self.eja.complete_turn(trigger_id, text) {
+                    fatal_error = Some(format!("保存回合结算状态失败: {err}"));
+                    break;
+                }
+                if proactive && !text.is_empty() {
+                    (self.emit)(json!({ "event": "notify", "title": "EJA", "body": text }));
                 }
                 completed = true;
                 break;
             }
 
-            let step_start = messages.len();
-            let per_result_budget =
-                (window_max_bytes / 2 / reply.calls.len().max(1)).min(32 * 1024);
-            messages.push(reply.message);
-            let mut results = Vec::with_capacity(reply.calls.len());
-            for call in reply.calls {
+            let step_journal_head = match self.eja.revision() {
+                Ok(rev) => rev,
+                Err(err) => {
+                    fatal_error = Some(err.to_string());
+                    break;
+                }
+            };
+            let step = tool_messages(&provider.kind, reply, window_max_bytes, |call| {
                 let detail = match call.name.as_str() {
                     "shell" => "执行 Shell",
                     "search" | "read" => "查阅记忆",
@@ -534,41 +506,29 @@ impl HostRuntime {
                     name => name,
                 };
                 self.set_status("thinking", detail);
-                match self.execute_tool_call(&call, &tools) {
-                    Ok(val) => results.push((call.id, cap_tool_result(val, per_result_budget))),
-                    Err(err) => {
-                        fatal_error = Some(err);
-                        break;
-                    }
-                }
-            }
-            if fatal_error.is_some() {
+                self.execute_tool_call(call, &tools)
+            });
+            let mut anchor = self.anchor;
+            let applied = step.and_then(|step| {
+                step.apply(
+                    &mut messages,
+                    &self.eja,
+                    &mut anchor,
+                    step_journal_head,
+                    trigger_id,
+                    window_max_bytes,
+                )
+                .map_err(|err| format!("重投影日志窗口失败: {err}"))?;
+                self.persist_anchor(anchor)
+            });
+            if let Err(err) = applied {
+                fatal_error = Some(err);
                 break;
-            }
-            append_tool_results(&provider.kind, &mut messages, results);
-            if messages_bytes(&messages) > window_max_bytes {
-                let step_tail = messages.split_off(step_start);
-                let tail_bytes = messages_bytes(&step_tail);
-                let prefix_budget = window_max_bytes.saturating_sub(tail_bytes);
-                let prev_anchor = self.anchor;
-                match project_window(&self.eja, &mut self.anchor, prefix_budget) {
-                    Ok(mut prefix) => {
-                        if self.anchor != prev_anchor {
-                            save_window_state(&self.core_dir, self.anchor, self.settled_through);
-                        }
-                        prefix.extend(step_tail);
-                        messages = prefix;
-                    }
-                    Err(err) => {
-                        fatal_error = Some(format!("重投影日志窗口失败: {err}"));
-                        break;
-                    }
-                }
             }
         }
 
         if completed {
-            self.mark_settled();
+            self.clear_retry();
         } else if let Some(err) = fatal_error {
             if recoverable && self.retry_attempts < MAX_RETRY_ATTEMPTS {
                 let delay_secs = 5u64 * 3u64.pow(u32::from(self.retry_attempts));
@@ -583,63 +543,54 @@ impl HostRuntime {
             self.emit_error(format!("达到单回合最大步数上限 ({max_steps})，回合已暂停"));
         }
         self.set_status("idle", "在线");
+        completed
     }
 
-    fn execute_tool_call(&mut self, call: &ToolCall, tools: &[ToolSpec]) -> Result<Value, String> {
-        match call.name.as_str() {
+    fn execute_tool_call(
+        &mut self,
+        call: &ToolCall,
+        tools: &[ToolSpec],
+    ) -> Result<ToolOutput, String> {
+        let result = match call.name.as_str() {
             "keep" => {
-                let text = call
-                    .args
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
-                let concern = call.args.get("concern").and_then(Value::as_i64);
-                match self.eja.keep(concern, text) {
-                    Ok(entry) => {
+                let text = call.args["text"].as_str().unwrap_or("").trim();
+                self.eja
+                    .keep(call.args["concern"].as_i64(), text)
+                    .map(|entry| {
                         let Fact::Kept { concern, .. } = entry.fact else {
                             unreachable!()
                         };
-                        Ok(json!({ "status": "kept", "concern": concern, "fact_id": entry.id }))
-                    }
-                    Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
-                    Err(err) => Err(err.to_string()),
-                }
+                        ToolOutput::Recorded(
+                            json!({"status":"kept", "concern":concern, "fact_id":entry.id}),
+                        )
+                    })
             }
-            "release" => match call.args.get("concern").and_then(Value::as_i64) {
-                Some(id) => match self.eja.release(id) {
-                    Ok(entry) => {
-                        Ok(json!({ "status": "released", "concern": id, "fact_id": entry.id }))
-                    }
-                    Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
-                    Err(err) => Err(err.to_string()),
-                },
-                None => Ok(json!({ "error": "release 需要整数 concern" })),
+            "release" => match call.args["concern"].as_i64() {
+                Some(id) => self.eja.release(id).map(|entry| {
+                    ToolOutput::Recorded(
+                        json!({"status":"released","concern":id,"fact_id":entry.id}),
+                    )
+                }),
+                None => Err(eja_core::Error::Invalid("release 需要整数 concern".into())),
             },
-            "read" => match call.args.get("fact").and_then(Value::as_i64) {
-                Some(id) => match self.eja.evidence(id) {
-                    Ok(ev) => Ok(json!(ev)),
-                    Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
-                    Err(err) => Err(err.to_string()),
-                },
-                None => Ok(json!({ "error": "read 需要整数 fact" })),
+            "read" => match call.args["fact"].as_i64() {
+                Some(id) => {
+                    let offset = call.args["offset"].as_u64().unwrap_or(0) as usize;
+                    self.eja.evidence(id).map(|ev| ToolOutput::Read(ev, offset))
+                }
+                None => Err(eja_core::Error::Invalid("read 需要整数 fact".into())),
             },
             "search" => {
-                let cue = call
-                    .args
-                    .get("cue")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
-                match self.eja.search(cue) {
-                    Ok(matches) => Ok(json!({ "cue": cue, "matches": matches })),
-                    Err(eja_core::Error::Invalid(msg)) => Ok(json!({ "error": msg })),
-                    Err(err) => Err(err.to_string()),
-                }
+                let cue = call.args["cue"].as_str().unwrap_or("").trim();
+                self.eja
+                    .search(cue)
+                    .map(|matches| ToolOutput::Temporary(json!({"cue":cue,"matches":matches})))
             }
             other => {
                 let Some(spec) = tools.iter().find(|t| t.name == other) else {
-                    return Ok(json!({ "error": format!("未知工具: {other}") }));
+                    return Ok(ToolOutput::Temporary(
+                        json!({ "error": format!("未知工具: {other}") }),
+                    ));
                 };
                 let grants: Vec<&str> = tools.iter().map(|t| t.capability.as_str()).collect();
                 let revision = self.eja.revision().map_err(|err| err.to_string())?;
@@ -648,7 +599,9 @@ impl HostRuntime {
                     .act(revision, &spec.capability, call.args.clone(), &grants);
                 let acted = match acted {
                     Ok(c) => c,
-                    Err(eja_core::Error::Invalid(msg)) => return Ok(json!({ "error": msg })),
+                    Err(eja_core::Error::Invalid(msg)) => {
+                        return Ok(ToolOutput::Temporary(json!({ "error": msg })))
+                    }
                     Err(err) => return Err(err.to_string()),
                 };
                 let outcome = self.hands.execute(&acted, &self.eja, &self.sandbox);
@@ -662,8 +615,15 @@ impl HostRuntime {
                 let Fact::Returned { outcome, .. } = receipt.fact else {
                     unreachable!()
                 };
-                Ok(json!({ "id": receipt.id, "action": acted.id, "outcome": outcome }))
+                Ok(ToolOutput::Recorded(
+                    json!({ "id": receipt.id, "action": acted.id, "outcome": outcome }),
+                ))
             }
+        };
+        match result {
+            Ok(output) => Ok(output),
+            Err(eja_core::Error::Invalid(msg)) => Ok(ToolOutput::Temporary(json!({"error":msg}))),
+            Err(err) => Err(err.to_string()),
         }
     }
 
@@ -747,13 +707,19 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
                     proactive: None,
                 });
             }
-            Fact::Said { text } => {
+            Fact::Said {
+                text,
+                in_response_to,
+            } => {
+                let proactive = in_response_to
+                    .as_ref()
+                    .map_or(proactive_turn, |source| *source == Source::Clock);
                 items.push(StreamItem {
                     id: entry.id,
                     kind: "eja".into(),
                     text: text.clone(),
                     detail: None,
-                    proactive: if proactive_turn { Some(true) } else { None },
+                    proactive: proactive.then_some(true),
                 });
             }
             Fact::Acted { capability, input } => {
@@ -790,8 +756,9 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
     items
 }
 
-fn load_window_state(core_dir: &Path) -> WindowState {
-    fs::read(core_dir.join("window.json"))
+fn load_window_state(core_dir: &TrustedDir) -> WindowState {
+    core_dir
+        .read_file("window.json")
         .ok()
         .and_then(|bytes| serde_json::from_slice::<WindowState>(&bytes).ok())
         .map(|state| WindowState {
@@ -801,35 +768,12 @@ fn load_window_state(core_dir: &Path) -> WindowState {
         .unwrap_or_default()
 }
 
-fn save_window_state(core_dir: &Path, anchor: Id, settled_through: Id) {
+fn save_window_state(core_dir: &TrustedDir, anchor: Id) -> Result<(), String> {
     let state = WindowState {
         anchor,
-        settled_through: Some(settled_through),
+        settled_through: None,
     };
-    let _ = write_json_atomic(&core_dir.join("window.json"), &state);
-}
-
-fn initial_settled_through(eja: &Eja, first_unfinished: Option<Id>, head: Id) -> Id {
-    let Some(first_action) = first_unfinished else {
-        return head;
-    };
-    let Ok(prior) = eja.entries_after(0, first_action) else {
-        return head;
-    };
-    prior
-        .iter()
-        .rev()
-        .find(|entry| {
-            matches!(
-                entry.fact,
-                Fact::Noticed {
-                    source: Source::Person | Source::Clock,
-                    ..
-                }
-            )
-        })
-        .map(|entry| entry.id.saturating_sub(1))
-        .unwrap_or(head)
+    write_json_atomic(core_dir, "window.json", &state)
 }
 
 fn is_recoverable_llm_error(err: &str) -> bool {
@@ -917,10 +861,11 @@ fn acquire_instance_lock(core_dir: &Path) -> Result<fs::File, LockError> {
     }
 }
 
-fn sync_kernel_version(core_dir: &Path, eja: &Eja, resources_dir: Option<&Path>) {
-    let version_path = core_dir.join("kernel_version");
-    let prev = fs::read_to_string(&version_path)
+fn sync_kernel_version(core_dir: &TrustedDir, eja: &Eja, resources_dir: Option<&Path>) {
+    let prev = core_dir
+        .read_file("kernel_version")
         .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     if let Some(old) = prev.as_deref() {
@@ -938,17 +883,14 @@ fn sync_kernel_version(core_dir: &Path, eja: &Eja, resources_dir: Option<&Path>)
             return;
         }
     }
-    let tmp = core_dir.join("kernel_version.tmp");
-    if fs::write(&tmp, format!("{KERNEL_VERSION}\n")).is_ok() {
-        let _ = fs::rename(&tmp, &version_path);
-    }
+    let _ = core_dir.write_file_atomic("kernel_version", format!("{KERNEL_VERSION}\n").as_bytes());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ConnectorConfig, ConnectorTransport, ModelRef, ProviderKind};
-    use crate::llm::ModelReply;
+    use crate::llm::{messages_bytes, ModelReply};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -1594,6 +1536,8 @@ for line in sys.stdin:
             HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
         let mut cfg = configured(vec![]);
         cfg.providers[0].api_key = "sk-keep-me".into();
+        cfg.max_steps = Some(7);
+        cfg.window_max_bytes = Some(4096);
         rt.save_config(cfg);
 
         let external_connectors = vec![ConnectorConfig {
@@ -1605,11 +1549,8 @@ for line in sys.stdin:
                 headers: BTreeMap::new(),
             },
         }];
-        write_json_atomic(
-            &HostConfig::connectors_path(&dir.path().join("Eja")),
-            &external_connectors,
-        )
-        .unwrap();
+        let data_root = TrustedDir::open(dir.path().join("Eja")).unwrap();
+        write_json_atomic(&data_root, "connectors.json", &external_connectors).unwrap();
         rt.reload_connectors();
 
         let mut renamed = rt.snapshot().config.providers;
@@ -1622,6 +1563,8 @@ for line in sys.stdin:
 
         assert_eq!(rt.snapshot().config.connectors, external_connectors);
         assert_eq!(rt.snapshot().config.providers[0].name, "Renamed Local");
+        assert_eq!(rt.config.max_steps, Some(7));
+        assert_eq!(rt.config.window_max_bytes, Some(4096));
         let disk_connectors: Vec<ConnectorConfig> = serde_json::from_slice(
             &fs::read(HostConfig::connectors_path(&dir.path().join("Eja"))).unwrap(),
         )
@@ -1692,5 +1635,349 @@ for line in sys.stdin:
 
         rt.handle_user_message("检索 alpha");
         assert!(*brain.max_seen_bytes.lock().unwrap() <= 4096);
+    }
+
+    struct CompactionAuditBrain {
+        seen_windows: Mutex<Vec<Vec<Value>>>,
+        mode: &'static str,
+        step: AtomicUsize,
+    }
+
+    impl Brain for CompactionAuditBrain {
+        fn complete(
+            &self,
+            provider: &ProviderConfig,
+            _model: &str,
+            _system: &str,
+            messages: &[Value],
+            _tools: &[ToolSpec],
+        ) -> Result<ModelReply, String> {
+            self.seen_windows.lock().unwrap().push(messages.to_vec());
+            let current = self.step.fetch_add(1, Ordering::SeqCst);
+            let read_reply = |id: String, args: Value| {
+                let mut reply = tool_reply(&id, "read", args.clone());
+                if provider.kind == ProviderKind::Anthropic {
+                    reply.message = json!({"role":"assistant", "content":[{"type":"tool_use","id":id,"name":"read","input":args}]});
+                }
+                reply
+            };
+            match (self.mode, current) {
+                ("preserve_trigger", 0) => Ok(tool_reply(
+                    "c1",
+                    "shell",
+                    json!({ "command": "python3 -c 'print(\"z\" * 2500)'" }),
+                )),
+                ("oversized_call", 0) => Ok(tool_reply(
+                    "c1",
+                    "shell",
+                    json!({ "command": format!("echo {}", "a".repeat(3000)) }),
+                )),
+                ("read_large_fact", 0) => Ok(tool_reply("r1", "read", json!({ "fact": 1 }))),
+                // Exercise compact notes on the first page and native tool messages on later pages.
+                ("read_paginated", 0) => Ok(read_reply("r".repeat(8192), json!({"fact": 1}))),
+                ("read_paginated", _) => {
+                    let last = messages.last().unwrap();
+                    let body: Value = serde_json::from_str(
+                        last["content"]
+                            .as_str()
+                            .or_else(|| last["content"][0]["content"].as_str())
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let body = body.get("result").unwrap_or(&body);
+                    if body["truncated"] == true {
+                        let next = body["next_offset"].as_u64().unwrap();
+                        return Ok(read_reply(
+                            format!("r{}", current + 1),
+                            json!({ "fact": 1, "offset": next }),
+                        ));
+                    }
+                    Ok(text_reply("read complete"))
+                }
+                _ => Ok(text_reply("finished")),
+            }
+        }
+
+        fn test_connection(
+            &self,
+            _provider: &ProviderConfig,
+            model: &str,
+        ) -> Result<String, String> {
+            Ok(format!("ok:{model}"))
+        }
+    }
+
+    #[test]
+    fn mid_turn_compaction_preserves_unfinished_request_and_bounds_oversized_calls() {
+        for mode in ["preserve_trigger", "oversized_call"] {
+            let dir = tempfile::tempdir().unwrap();
+            let brain = Arc::new(CompactionAuditBrain {
+                seen_windows: Mutex::new(Vec::new()),
+                mode,
+                step: AtomicUsize::new(0),
+            });
+            let mut rt = HostRuntime::open_with_brain(
+                dir.path().join("Eja"),
+                brain.clone(),
+                Box::new(|_| {}),
+            )
+            .unwrap();
+            let mut cfg = configured(vec![]);
+            cfg.window_max_bytes = Some(2048);
+            rt.save_config(cfg);
+            for i in 0..4 {
+                rt.eja
+                    .notice(Source::World, format!("old-{i}-{}", "q".repeat(400)))
+                    .unwrap();
+            }
+
+            let marker = "CRITICAL_UNFINISHED_USER_REQUEST";
+            rt.handle_user_message(marker);
+
+            let windows = brain.seen_windows.lock().unwrap();
+            assert_eq!(windows.len(), 2, "mode {mode} should run 2 steps");
+            for (idx, win) in windows.iter().enumerate() {
+                assert!(
+                    messages_bytes(win) <= 2048,
+                    "mode {mode} step {idx} exceeded budget: {}",
+                    messages_bytes(win)
+                );
+                assert!(
+                    win.iter().any(|msg| msg["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(marker))),
+                    "mode {mode} step {idx} dropped user trigger"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_tool_returns_full_60k_fact_in_default_window_and_paginates_in_small_window() {
+        let big = "记".repeat(20_000);
+
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(CompactionAuditBrain {
+            seen_windows: Mutex::new(Vec::new()),
+            mode: "read_large_fact",
+            step: AtomicUsize::new(0),
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        rt.save_config(configured(vec![]));
+        let fact_id = rt.eja.notice(Source::World, &big).unwrap();
+        assert_eq!(fact_id, 1);
+        rt.handle_user_message("读第 1 条");
+        let windows = brain.seen_windows.lock().unwrap();
+        let tool_msg = windows[1].last().unwrap();
+        let payload: Value = serde_json::from_str(tool_msg["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["id"], 1);
+        assert_eq!(payload["fact"]["text"], big);
+
+        let escaped = "{\"id\":12,\"active\":true}\n".repeat(1000);
+        for (kind, body) in [
+            (ProviderKind::OpenAi, &big),
+            (ProviderKind::Anthropic, &escaped),
+        ] {
+            let small_dir = tempfile::tempdir().unwrap();
+            let small_brain = Arc::new(CompactionAuditBrain {
+                seen_windows: Mutex::new(Vec::new()),
+                mode: "read_paginated",
+                step: AtomicUsize::new(0),
+            });
+            let mut small_rt = HostRuntime::open_with_brain(
+                small_dir.path().join("Eja"),
+                small_brain.clone(),
+                Box::new(|_| {}),
+            )
+            .unwrap();
+            let mut cfg = configured(vec![]);
+            cfg.window_max_bytes = Some(8192);
+            cfg.providers[0].kind = kind;
+            small_rt.save_config(cfg);
+            let id = small_rt.eja.notice(Source::World, body).unwrap();
+            let original = serde_json::to_string(&small_rt.eja.evidence(id).unwrap()).unwrap();
+            small_rt.handle_user_message("分页读第 1 条");
+
+            let small_windows = small_brain.seen_windows.lock().unwrap();
+            assert!(small_windows.len() > 2);
+            for win in small_windows.iter() {
+                assert!(messages_bytes(win) <= 8192);
+            }
+            let mut reassembled = String::new();
+            for (index, window) in small_windows[1..].iter().enumerate() {
+                let content = &window.last().unwrap()["content"];
+                let page: Value = serde_json::from_str(
+                    content
+                        .as_str()
+                        .or_else(|| content[0]["content"].as_str())
+                        .unwrap(),
+                )
+                .unwrap();
+                let page = if index == 0 {
+                    assert_eq!(page["tool"], "read");
+                    &page["result"]
+                } else {
+                    &page
+                };
+                assert_eq!(page["offset"], reassembled.len());
+                reassembled.push_str(page["chunk"].as_str().unwrap());
+                if page["truncated"] == true {
+                    assert_eq!(page["next_offset"], reassembled.len());
+                }
+            }
+            assert_eq!(reassembled, original);
+        }
+    }
+
+    #[test]
+    fn silent_turn_with_wake_survives_unwritable_window_file_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("Eja");
+        let brain = Arc::new(ScriptedBrain {
+            replies: Mutex::new(vec![
+                Ok(tool_reply(
+                    "w",
+                    "wake",
+                    json!({"delay_seconds": 3600, "reason": "once"}),
+                )),
+                Ok(text_reply("")),
+            ]),
+            seen_windows: Mutex::new(Vec::new()),
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(data.clone(), brain.clone(), Box::new(|_| {})).unwrap();
+        rt.save_config(configured(vec![]));
+        fs::create_dir(dir.path().join("ai.eja.kernel/window.json")).unwrap();
+        rt.handle_user_message("请预约一次，随后保持沉默");
+        assert!(!rt.has_pending_trigger());
+        assert_eq!(rt.eja.pending_wakes().unwrap().len(), 1);
+        drop(rt);
+        let mut rt = HostRuntime::open_with_brain(data, brain.clone(), Box::new(|_| {})).unwrap();
+        rt.process_pending_turn();
+        assert_eq!(rt.eja.pending_wakes().unwrap().len(), 1);
+        assert_eq!(brain.seen_windows.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unusable_window_keeps_the_request_until_configuration_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(ScriptedBrain {
+            replies: Mutex::new(vec![Ok(text_reply("seen"))]),
+            seen_windows: Mutex::new(Vec::new()),
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        let mut cfg = configured(vec![]);
+        cfg.window_max_bytes = Some(1);
+        rt.save_config(cfg);
+        rt.handle_user_message("pending");
+        assert!(rt.has_pending_trigger());
+        assert!(brain.seen_windows.lock().unwrap().is_empty());
+        let mut cfg = configured(vec![]);
+        cfg.window_max_bytes = Some(256);
+        rt.save_config(cfg);
+        assert!(!rt.has_pending_trigger());
+        let windows = brain.seen_windows.lock().unwrap();
+        assert_eq!(windows.len(), 1);
+        assert!(messages_bytes(&windows[0]) <= 256);
+    }
+
+    #[test]
+    fn simultaneous_wakes_each_reach_the_model_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(ScriptedBrain {
+            replies: Mutex::new(vec![Ok(text_reply("first")), Ok(text_reply("second"))]),
+            seen_windows: Mutex::new(Vec::new()),
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        let mut cfg = configured(vec![]);
+        cfg.window_max_bytes = Some(2048);
+        rt.save_config(cfg);
+        let alarms = ["alarm-alpha", "alarm-beta"].map(|marker| WakeAlarm {
+            id: marker.into(),
+            fire_at_unix: 1,
+            fire_at_display: "00:00:01".into(),
+            reason: format!("{marker} {}", "x".repeat(1400)),
+        });
+        rt.eja.schedule_wakes(&alarms).unwrap();
+        rt.tick_timers().unwrap();
+        let windows = brain.seen_windows.lock().unwrap();
+        assert_eq!(windows.len(), 2);
+        let contains = |window: &[Value], marker: &str| {
+            window
+                .iter()
+                .any(|m| m["content"].as_str().is_some_and(|s| s.contains(marker)))
+        };
+        assert!(contains(&windows[0], "alarm-alpha"));
+        assert!(!contains(&windows[0], "alarm-beta"));
+        assert!(contains(&windows[1], "alarm-beta"));
+        assert_eq!(windows[1].last().unwrap()["role"], "user");
+        assert!(windows.iter().all(|w| messages_bytes(w) <= 2048));
+        assert!(!rt.has_pending_trigger());
+    }
+
+    #[test]
+    fn legacy_anchor_at_pending_trigger_restores_user_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = dir.path().join("ai.eja.kernel");
+        fs::create_dir(&core).unwrap();
+        let eja = Eja::open(core.join("subject.db")).unwrap();
+        eja.notice(Source::Person, "original request").unwrap();
+        eja.keep(None, "later concern").unwrap();
+        drop(eja);
+        fs::write(
+            core.join("window.json"),
+            r#"{"anchor":1,"settled_through":0}"#,
+        )
+        .unwrap();
+        let brain = Arc::new(ScriptedBrain {
+            replies: Mutex::new(vec![Ok(text_reply(""))]),
+            seen_windows: Mutex::new(Vec::new()),
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+                .unwrap();
+        rt.save_config(configured(vec![]));
+        assert!(brain.seen_windows.lock().unwrap()[0]
+            .iter()
+            .any(|m| m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("original request"))));
+        assert!(!rt.has_pending_trigger());
+    }
+
+    #[test]
+    fn legacy_window_json_without_settled_through_recovers_trailing_clock_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("Eja");
+        let core_dir = dir.path().join("ai.eja.kernel");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&core_dir).unwrap();
+        {
+            let eja = Eja::open(core_dir.join("subject.db")).unwrap();
+            eja.notice(Source::Person, "旧消息").unwrap();
+            eja.say("旧回复").unwrap();
+            eja.notice(Source::Clock, "定时唤醒：升级前漏掉的提醒")
+                .unwrap();
+        }
+        fs::write(core_dir.join("window.json"), r#"{"anchor":0}"#).unwrap();
+        let core_root = TrustedDir::open(&core_dir).unwrap();
+        configured(vec![]).save_models(&core_root).unwrap();
+
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let mut rt =
+            HostRuntime::open_with_brain(data_dir, brain.clone(), Box::new(|_| {})).unwrap();
+        assert!(rt.has_pending_trigger());
+        rt.process_pending_turn();
+        assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 1);
+        assert!(!rt.has_pending_trigger());
     }
 }

@@ -91,12 +91,30 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fact {
-    Noticed { source: Source, text: String },
-    Said { text: String },
-    Kept { concern: Id, text: String },
-    Released { concern: Id },
-    Acted { capability: String, input: Value },
-    Returned { action: Id, outcome: Outcome },
+    Noticed {
+        source: Source,
+        text: String,
+    },
+    Said {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_response_to: Option<Source>,
+    },
+    Kept {
+        concern: Id,
+        text: String,
+    },
+    Released {
+        concern: Id,
+    },
+    Acted {
+        capability: String,
+        input: Value,
+    },
+    Returned {
+        action: Id,
+        outcome: Outcome,
+    },
 }
 
 /// One immutable record in the subject's journal.
@@ -182,7 +200,10 @@ impl Eja {
         if text.trim().is_empty() {
             return Err(Error::invalid("reply requires non-empty text"));
         }
-        self.append_fact(&Fact::Said { text })
+        self.append_fact(&Fact::Said {
+            text,
+            in_response_to: None,
+        })
     }
 
     pub fn revision(&self) -> Result<Id> {

@@ -55,7 +55,7 @@ fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
     assert!(matches!(eja.keep(None, "   "), Err(Error::Invalid(_))));
     assert!(matches!(eja.say("   "), Err(Error::Invalid(_))));
     let said = eja.say("我记住了")?;
-    assert!(matches!(eja.read(said)?.fact, Fact::Said { ref text } if text == "我记住了"));
+    assert!(matches!(eja.read(said)?.fact, Fact::Said { ref text, .. } if text == "我记住了"));
     drop(eja);
 
     let eja = Eja::open(&path)?;
@@ -301,7 +301,7 @@ fn subject_db_sets_schema_version_and_rejects_future_versions() -> Result<()> {
 
     let conn = rusqlite::Connection::open(&path)?;
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 
     conn.execute_batch("PRAGMA user_version = 99;")?;
     drop(conn);

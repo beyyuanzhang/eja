@@ -33,7 +33,7 @@ cargo build -p eja-host
 
 内核目录默认为 `~/Library/Application Support/ai.eja.kernel/`。
 
-- `subject.db`：`eja-core` 永久主体日志与定时唤醒计划（`PRAGMA user_version` 版本迁移）
+- `subject.db`：`eja-core` 永久主体日志、定时唤醒计划与回合处理进度（`PRAGMA user_version` 版本迁移）
 - `config.json`：LLM Provider、密钥与宿主参数（Seatbelt 保护，前端仅见脱敏状态）
 - `kernel_version`：内核版本记录（升级 `Eja.app` 后自动触发版本感知）
 - `host.lock`：单实例操作系统文件锁（确保同一数据目录仅运行一个主体实例）

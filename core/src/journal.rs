@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 const UNFINISHED_ACTIONS_SQL: &str = "SELECT action.id FROM facts AS action
     WHERE json_extract(action.body, '$.kind') = 'acted'
       AND NOT EXISTS (
@@ -37,6 +37,26 @@ fn head_on(conn: &Connection) -> Result<Id> {
             row.get(0)
         })?,
     )
+}
+
+fn next_trigger_on(conn: &Connection) -> Result<Option<(Id, Source)>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, json_extract(body,'$.source')='clock' FROM facts
+        WHERE id > (SELECT through_id FROM turn_cursor WHERE singleton=1)
+          AND coalesce(json_extract(body,'$.source') IN ('person','clock'), 0) = 1
+        ORDER BY id LIMIT 1",
+            [],
+            |row| {
+                let source = if row.get::<_, bool>(1)? {
+                    Source::Clock
+                } else {
+                    Source::Person
+                };
+                Ok((row.get(0)?, source))
+            },
+        )
+        .optional()?)
 }
 
 fn read_on(conn: &Connection, id: Id) -> Result<Entry> {
@@ -231,6 +251,72 @@ impl Eja {
         })
     }
 
+    /// Import the old host checkpoint once. An anchor-only installation can
+    /// recover an interrupted action's trigger or the trailing batch of notices.
+    pub fn initialize_turn_cursor(
+        &self,
+        legacy: Option<Id>,
+        first_unfinished: Option<Id>,
+    ) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if tx.query_row("SELECT EXISTS(SELECT 1 FROM turn_cursor)", [], |row| {
+            row.get::<_, bool>(0)
+        })? {
+            return Ok(());
+        }
+        let head = head_on(&tx)?;
+        let through = if let Some(id) = legacy.filter(|id| (0..=head).contains(id)) {
+            id
+        } else if let Some(action) = first_unfinished {
+            tx.query_row(
+                "SELECT coalesce(max(id) - 1, ?2) FROM facts WHERE id < ?1
+                AND coalesce(json_extract(body,'$.source') IN ('person','clock'), 0) = 1",
+                params![action, head],
+                |row| row.get(0),
+            )?
+        } else {
+            tx.query_row("SELECT coalesce(max(id), 0) FROM facts WHERE json_extract(body,'$.kind') != 'noticed'",
+                [], |row| row.get(0))?
+        };
+        // The previous host wrote a reply before saving its checkpoint.
+        tx.execute("INSERT INTO turn_cursor(singleton, through_id)
+            SELECT 1, coalesce(max(id), ?1) FROM facts WHERE id > ?1 AND json_extract(body,'$.kind')='said'", [through])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn next_trigger(&self) -> Result<Option<(Id, Source)>> {
+        next_trigger_on(&self.db)
+    }
+
+    /// Commit the reply (including intentional silence) and consume exactly one trigger.
+    pub fn complete_turn(&self, trigger: Id, reply: &str) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let Some((id, source)) = next_trigger_on(&tx)? else {
+            return Err(Error::Conflict);
+        };
+        if id != trigger {
+            return Err(Error::Conflict);
+        }
+        if !reply.trim().is_empty() {
+            insert_fact(
+                &tx,
+                self.now_at(&tx)?,
+                &Fact::Said {
+                    text: reply.into(),
+                    in_response_to: Some(source),
+                },
+                None,
+            )?;
+        }
+        tx.execute(
+            "UPDATE turn_cursor SET through_id = ?1 WHERE singleton=1",
+            [trigger],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Read one recorded fact paired with its latest superseding receipt or concern update.
     pub fn evidence(&self, id: Id) -> Result<Evidence> {
         self.evidence_at(id, self.head()?)
@@ -357,6 +443,21 @@ impl Eja {
             .prepare("SELECT id, at, body FROM facts WHERE id > ?1 AND id <= ?2 ORDER BY id ASC")?;
         let rows = stmt.query_map(params![after, through], read_entry_row)?;
         decode_entries(rows)
+    }
+
+    /// Project one turn's history without loading later queued requests.
+    pub fn entries_for_turn(&self, after: Id, through: Id, trigger: Id) -> Result<Vec<Entry>> {
+        let mut entries = self.entries_after(after, through.min(trigger))?;
+        if through > trigger {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, at, body FROM facts
+                WHERE coalesce(json_extract(body,'$.source') IN ('person','clock'), 0) = 0
+                  AND id > ?1 AND id <= ?2 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![trigger.max(after), through], read_entry_row)?;
+            entries.extend(decode_entries(rows)?);
+        }
+        Ok(entries)
     }
 
     pub fn schedule_wakes(&self, alarms: &[WakeAlarm]) -> Result<()> {
@@ -502,12 +603,52 @@ fn migrate_schema(db: &Connection) -> Result<()> {
              COMMIT;",
         )?;
     }
+    if version < 3 {
+        db.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS turn_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1), through_id INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS turn_entries ON facts(coalesce(json_extract(body,'$.source') IN ('person','clock'), 0), id);
+            PRAGMA user_version = 3;
+            COMMIT;")?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_rolls_back_reply_and_rejects_out_of_order_completion() -> Result<()> {
+        let eja = Eja::open(":memory:")?;
+        eja.initialize_turn_cursor(None, None)?;
+        let person = eja.notice(Source::Person, "first")?;
+        let clock = eja.notice(Source::Clock, "second")?;
+        assert!(matches!(
+            eja.complete_turn(clock, "early"),
+            Err(Error::Conflict)
+        ));
+        eja.db.execute_batch("CREATE TRIGGER fail_cursor BEFORE UPDATE ON turn_cursor BEGIN SELECT RAISE(ABORT,'test failure'); END;")?;
+        assert!(eja.complete_turn(person, "reply").is_err());
+        assert_eq!(eja.revision()?, clock);
+        assert_eq!(eja.next_trigger()?, Some((person, Source::Person)));
+        eja.db.execute_batch("DROP TRIGGER fail_cursor")?;
+        eja.complete_turn(person, "reply")?;
+        assert!(matches!(
+            eja.read(clock + 1)?.fact,
+            Fact::Said {
+                in_response_to: Some(Source::Person),
+                ..
+            }
+        ));
+        assert!(matches!(
+            eja.complete_turn(person, "duplicate"),
+            Err(Error::Conflict)
+        ));
+        eja.complete_turn(clock, "")?;
+        assert_eq!(eja.revision()?, clock + 1);
+        assert_eq!(eja.next_trigger()?, None);
+        Ok(())
+    }
 
     #[test]
     fn unfinished_actions_query_searches_action_receipts_index() -> Result<()> {

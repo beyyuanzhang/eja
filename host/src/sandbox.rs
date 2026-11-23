@@ -1,6 +1,6 @@
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -12,9 +12,15 @@ use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
 use std::ffi::OsString;
 #[cfg(target_os = "macos")]
+use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::io::Read;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -59,14 +65,6 @@ fn validate_single_name(name: &str) -> io::Result<CString> {
 }
 
 #[cfg(target_os = "macos")]
-fn open_dir(dir: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(O_DIRECTORY | O_CLOEXEC)
-        .open(dir)
-}
-
-#[cfg(target_os = "macos")]
 fn openat_file(dirfd: i32, name: &CString, flags: i32, mode: Option<u32>) -> io::Result<File> {
     let fd = unsafe {
         match mode {
@@ -81,144 +79,181 @@ fn openat_file(dirfd: i32, name: &CString, flags: i32, mode: Option<u32>) -> io:
     Ok(File::from(owned))
 }
 
-pub fn read_file_nofollow(dir: &Path, name: &str) -> io::Result<Vec<u8>> {
-    let c_name = validate_single_name(name)?;
-    #[cfg(target_os = "macos")]
-    {
-        let dir_file = open_dir(dir)?;
-        let mut file = openat_file(
-            dir_file.as_raw_fd(),
-            &c_name,
-            O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
-            None,
-        )?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
+#[cfg(not(target_os = "macos"))]
+fn require_real_dir(path: &Path, message: &str) -> io::Result<()> {
+    if !fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = c_name;
-        let path = dir.join(name);
-        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "refusing to follow symlink",
-            ));
-        }
-        fs::read(path)
-    }
+    Ok(())
 }
 
-pub fn write_new_file_in_subdir(
-    dir: &Path,
-    subdir: &str,
-    name: &str,
-    bytes: &[u8],
-) -> io::Result<PathBuf> {
-    let c_subdir = validate_single_name(subdir)?;
-    let c_name = validate_single_name(name)?;
+#[derive(Debug, Clone)]
+pub struct TrustedDir {
+    path: PathBuf,
     #[cfg(target_os = "macos")]
-    {
-        let dir_file = open_dir(dir)?;
-        if unsafe { mkdirat(dir_file.as_raw_fd(), c_subdir.as_ptr(), 0o755) } < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::AlreadyExists {
+    dir: Arc<File>,
+}
+
+impl TrustedDir {
+    pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
+        let path = dir.into();
+        #[cfg(target_os = "macos")]
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                .open(&path)?;
+            Ok(Self {
+                path,
+                dir: Arc::new(file),
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            require_real_dir(&path, "root is not a real directory")?;
+            Ok(Self { path })
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn read_file(&self, name: &str) -> io::Result<Vec<u8>> {
+        let c_name = validate_single_name(name)?;
+        #[cfg(target_os = "macos")]
+        {
+            let mut file = openat_file(
+                self.dir.as_raw_fd(),
+                &c_name,
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+                None,
+            )?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = c_name;
+            require_real_dir(&self.path, "root is not a real directory")?;
+            let path = self.path.join(name);
+            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing to follow symlink",
+                ));
+            }
+            fs::read(path)
+        }
+    }
+
+    pub fn write_new_file_in_subdir(
+        &self,
+        subdir: &str,
+        name: &str,
+        mut input: impl io::Read,
+    ) -> io::Result<PathBuf> {
+        let c_subdir = validate_single_name(subdir)?;
+        let c_name = validate_single_name(name)?;
+        #[cfg(target_os = "macos")]
+        {
+            let dirfd = self.dir.as_raw_fd();
+            if unsafe { mkdirat(dirfd, c_subdir.as_ptr(), 0o755) } < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(err);
+                }
+            }
+            let sub_file = openat_file(
+                dirfd,
+                &c_subdir,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                None,
+            )?;
+            let mut file = openat_file(
+                sub_file.as_raw_fd(),
+                &c_name,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                Some(0o644),
+            )?;
+            io::copy(&mut input, &mut file)?;
+            Ok(self.path.join(subdir).join(name))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (c_subdir, c_name);
+            require_real_dir(&self.path, "root is not a real directory")?;
+            let subdir_path = self.path.join(subdir);
+            match fs::create_dir(&subdir_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+            require_real_dir(&subdir_path, "subdir is not a real directory")?;
+            let target = subdir_path.join(name);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            io::copy(&mut input, &mut file)?;
+            Ok(target)
+        }
+    }
+
+    pub fn write_file_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let c_name = validate_single_name(name)?;
+        let pid = std::process::id();
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".{name}.{pid}.{seq}.tmp");
+        let c_tmp = validate_single_name(&tmp_name)?;
+        #[cfg(target_os = "macos")]
+        {
+            let dirfd = self.dir.as_raw_fd();
+            let mut file = openat_file(
+                dirfd,
+                &c_tmp,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                Some(0o600),
+            )?;
+            if let Err(err) = file.write_all(bytes) {
+                drop(file);
+                unsafe {
+                    unlinkat(dirfd, c_tmp.as_ptr(), 0);
+                }
                 return Err(err);
             }
-        }
-        let sub_file = openat_file(
-            dir_file.as_raw_fd(),
-            &c_subdir,
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
-            None,
-        )?;
-        let mut file = openat_file(
-            sub_file.as_raw_fd(),
-            &c_name,
-            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-            Some(0o644),
-        )?;
-        file.write_all(bytes)?;
-        Ok(dir.join(subdir).join(name))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (c_subdir, c_name);
-        let subdir_path = dir.join(subdir);
-        match fs::create_dir(&subdir_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
-        }
-        if !fs::symlink_metadata(&subdir_path)?.file_type().is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "subdir is not a real directory",
-            ));
-        }
-        let target = subdir_path.join(name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)?;
-        file.write_all(bytes)?;
-        Ok(target)
-    }
-}
-
-pub fn write_file_atomic_in_dir(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
-    let c_name = validate_single_name(name)?;
-    let pid = std::process::id();
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(".{name}.{pid}.{seq}.tmp");
-    let c_tmp = validate_single_name(&tmp_name)?;
-    #[cfg(target_os = "macos")]
-    {
-        let dir_file = open_dir(dir)?;
-        let dirfd = dir_file.as_raw_fd();
-        let mut file = openat_file(
-            dirfd,
-            &c_tmp,
-            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-            Some(0o600),
-        )?;
-        if let Err(err) = file.write_all(bytes) {
             drop(file);
-            unsafe {
-                unlinkat(dirfd, c_tmp.as_ptr(), 0);
+            if unsafe { renameat(dirfd, c_tmp.as_ptr(), dirfd, c_name.as_ptr()) } < 0 {
+                let err = io::Error::last_os_error();
+                unsafe {
+                    unlinkat(dirfd, c_tmp.as_ptr(), 0);
+                }
+                return Err(err);
             }
-            return Err(err);
+            Ok(())
         }
-        drop(file);
-        if unsafe { renameat(dirfd, c_tmp.as_ptr(), dirfd, c_name.as_ptr()) } < 0 {
-            let err = io::Error::last_os_error();
-            unsafe {
-                unlinkat(dirfd, c_tmp.as_ptr(), 0);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (c_name, c_tmp);
+            require_real_dir(&self.path, "root is not a real directory")?;
+            let tmp_path = self.path.join(&tmp_name);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            if let Err(err) = file.write_all(bytes) {
+                drop(file);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
             }
-            return Err(err);
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (c_name, c_tmp);
-        let tmp_path = dir.join(&tmp_name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
-        if let Err(err) = file.write_all(bytes) {
             drop(file);
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
+            if let Err(err) = fs::rename(&tmp_path, self.path.join(name)) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+            Ok(())
         }
-        drop(file);
-        if let Err(err) = fs::rename(&tmp_path, dir.join(name)) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-        Ok(())
     }
 }
 
@@ -662,29 +697,48 @@ mod tests {
         fs::create_dir_all(&core_dir).unwrap();
         let secret = core_dir.join("config.json");
         fs::write(&secret, r#"{"secret":true}"#).unwrap();
+        let root = TrustedDir::open(&data_dir).unwrap();
 
         symlink(&secret, data_dir.join("connectors.json")).unwrap();
-        assert!(read_file_nofollow(&data_dir, "connectors.json").is_err());
+        assert!(root.read_file("connectors.json").is_err());
 
-        write_file_atomic_in_dir(&data_dir, "connectors.json", b"[]").unwrap();
+        root.write_file_atomic("connectors.json", b"[]").unwrap();
         assert_eq!(fs::read_to_string(&secret).unwrap(), r#"{"secret":true}"#);
-        assert_eq!(
-            read_file_nofollow(&data_dir, "connectors.json").unwrap(),
-            b"[]"
-        );
+        assert_eq!(root.read_file("connectors.json").unwrap(), b"[]");
 
         symlink(&core_dir, data_dir.join("outputs")).unwrap();
-        assert!(write_new_file_in_subdir(&data_dir, "outputs", "shell-1.log", b"evil").is_err());
+        assert!(root
+            .write_new_file_in_subdir("outputs", "shell-1.log", b"evil".as_slice())
+            .is_err());
         assert!(!core_dir.join("shell-1.log").exists());
 
         fs::remove_file(data_dir.join("outputs")).unwrap();
         fs::create_dir(data_dir.join("outputs")).unwrap();
         symlink(&secret, data_dir.join("outputs/shell-2.log")).unwrap();
-        assert!(write_new_file_in_subdir(&data_dir, "outputs", "shell-2.log", b"evil").is_err());
+        assert!(root
+            .write_new_file_in_subdir("outputs", "shell-2.log", b"evil".as_slice())
+            .is_err());
         assert_eq!(fs::read_to_string(&secret).unwrap(), r#"{"secret":true}"#);
 
-        let ok_path =
-            write_new_file_in_subdir(&data_dir, "outputs", "shell-3.log", b"clean").unwrap();
+        let ok_path = root
+            .write_new_file_in_subdir("outputs", "shell-3.log", b"clean".as_slice())
+            .unwrap();
         assert_eq!(fs::read_to_string(ok_path).unwrap(), "clean");
+
+        let moved = dir.path().join("Eja.moved");
+        fs::rename(&data_dir, &moved).unwrap();
+        symlink(&core_dir, &data_dir).unwrap();
+        assert!(TrustedDir::open(&data_dir).is_err());
+        assert!(root.read_file("config.json").is_err());
+        root.write_file_atomic("connectors.json", b"[1]").unwrap();
+        assert!(!core_dir.join("connectors.json").exists());
+        assert_eq!(fs::read(moved.join("connectors.json")).unwrap(), b"[1]");
+        root.write_new_file_in_subdir("outputs", "shell-4.log", b"pinned".as_slice())
+            .unwrap();
+        assert!(!core_dir.join("outputs").exists());
+        assert_eq!(
+            fs::read_to_string(moved.join("outputs/shell-4.log")).unwrap(),
+            "pinned"
+        );
     }
 }
