@@ -22,7 +22,7 @@ eja-host --data-dir "<data_dir>"
 - `keep({text, checker})` 可绑定检查规则。绑定后，`release({concern, witness_fact_id})` 要求引用当前挂念版本之后的同一规则命中记录，并在该规则不再被其他活跃挂念引用时自动清理其剩余守望。旧脚本守望在启动时停用。旧版要求验收的挂念可用 `keep` 绑定新规则。
 - 模型回合至少需要 256 字节的上下文窗口。设置低于下限时，宿主保留待处理请求，并在设置恢复后继续处理。
 - `connectors.json` 保存 MCP 连接器数组，文件变更在运行期自动热加载。
-- `ui/` 保存用户空间前端。运行 `ui/apply.sh` 发布 `ui/Eja.app` 后，宿主在与 Shell 相同的 macOS 沙箱中启动 `Contents/MacOS/EjaApp`，并通过其标准输入输出连接同一个主体。前端读入状态和事件，向标准输出写指令，环境变量 `EJA_ATTACHED_UI=1` 表示已有宿主。自定义前端可以发消息与重载用户连接器，编辑或测试模型配置由官方设置窗口处理。启动官方 App 时按住 `Option` 键进入默认界面。
+- `ui/` 保存用户空间前端源码。运行 `ui/apply.sh` 编译生成单文件可执行程序 `ui/EjaUI`（不在数据目录生成第二个 `.app` 包），运行中的 `Eja.app` 在当前回合空闲（`status == "idle"`）时自动将 `ui/EjaUI` 原地热更新至自身界面二进制并无缝重启（保留 `EjaApp.factory` 出厂备份；启动时按住 `Option` 键自动恢复出厂默认界面）。
 
 ## 兼容性约定
 
@@ -34,7 +34,6 @@ eja-host --data-dir "<data_dir>"
 - 保存配置 `{"cmd":"save_config","config":{...}}`（支持按域部分更新：省略 `connectors` 不改动 `connectors.json`，省略 `providers`/`judge` 不改动模型配置；Provider 的 `api_key` 为空字符串时自动保留内核目录中已有密钥）
 - 测试 Provider `{"cmd":"test_provider","id":"openai","provider":{...},"model":"gpt-4o"}`（`api_key` 为空时自动复用已保存密钥）
 - 立即重载连接器 `{"cmd":"reload_connectors"}`
-- 官方界面请求接入自定义前端 `{"cmd":"launch_ui"}`。自定义前端读到首个状态快照后发送 `{"cmd":"ui_ready"}`，宿主向官方界面发送 `ui_ready`（含 `pid`）或在断开时发送 `ui_closed`。自定义前端可发送 `{"cmd":"open_settings"}` 请求官方设置窗口。
 
 ## 输出事件（Host -> Frontend，每行一条 JSON）
 

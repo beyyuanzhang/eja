@@ -1,9 +1,5 @@
+import CryptoKit
 import Foundation
-
-public struct BinaryStamp: Equatable, Sendable {
-    let inode: UInt64
-    let mtime: TimeInterval
-}
 
 public enum UiRuntime {
     private static let applyScript = """
@@ -12,41 +8,22 @@ public enum UiRuntime {
     UI_DIR="$(cd "$(dirname "$0")" && pwd)"
     swift build --package-path "$UI_DIR" --product EjaApp --disable-sandbox
     BIN="$(swift build --package-path "$UI_DIR" --product EjaApp --disable-sandbox --show-bin-path)/EjaApp"
-    STAGE="$UI_DIR/Eja.app.tmp"
-    TARGET="$UI_DIR/Eja.app"
-    rm -rf "$STAGE"
-    mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
-    cp "$BIN" "$STAGE/Contents/MacOS/EjaApp"
-    if [ -f "$UI_DIR/AppIcon.icns" ]; then
-        cp "$UI_DIR/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
-    fi
-    if [ -f "$UI_DIR/Info.plist" ]; then
-        cp "$UI_DIR/Info.plist" "$STAGE/Contents/Info.plist"
-    else
-        cat > "$STAGE/Contents/Info.plist" <<'EOF'
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0"><dict>
-        <key>CFBundleExecutable</key><string>EjaApp</string>
-        <key>CFBundleIconFile</key><string>AppIcon</string>
-        <key>CFBundleIdentifier</key><string>ai.eja.origin</string>
-        <key>CFBundleName</key><string>EJA</string>
-        <key>CFBundlePackageType</key><string>APPL</string>
-        <key>NSHighResolutionCapable</key><true/>
-    </dict></plist>
-    EOF
-    fi
+    rm -rf "$UI_DIR/Eja.app" "$UI_DIR/Eja.app.tmp"
+    STAGE="$UI_DIR/EjaUI.tmp"
+    TARGET="$UI_DIR/EjaUI"
+    rm -f "$STAGE"
+    cp "$BIN" "$STAGE"
+    chmod 755 "$STAGE"
     codesign --force --sign - "$STAGE" >/dev/null 2>&1 || true
-    rm -rf "$TARGET"
     mv "$STAGE" "$TARGET"
     """
 
-    public static func evolvedAppBundle(in dataDir: URL) -> URL {
-        dataDir.appendingPathComponent("ui/Eja.app", isDirectory: true)
+    public static func evolvedExecutable(in dataDir: URL) -> URL {
+        dataDir.appendingPathComponent("ui/EjaUI")
     }
 
-    public static func evolvedExecutable(in dataDir: URL) -> URL {
-        evolvedAppBundle(in: dataDir).appendingPathComponent("Contents/MacOS/EjaApp")
+    public static func reloadBaselineFile(in dataDir: URL) -> URL {
+        dataDir.appendingPathComponent("ui/.reload-baseline")
     }
 
     public static func resolveTemplateDir() -> URL? {
@@ -70,9 +47,19 @@ public enum UiRuntime {
     @discardableResult
     public static func bootstrapIfNeeded(dataDir: URL, templateDir: URL? = nil) -> Bool {
         let uiDir = dataDir.appendingPathComponent("ui", isDirectory: true)
-        if !FileManager.default.fileExists(atPath: uiDir.appendingPathComponent("Package.swift").path) {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: uiDir.appendingPathComponent("Package.swift").path) {
             guard let source = templateDir ?? resolveTemplateDir(),
                   (try? copyTemplate(from: source, to: uiDir)) != nil else { return false }
+        }
+        let legacyBundle = uiDir.appendingPathComponent("Eja.app", isDirectory: true)
+        if fm.fileExists(atPath: legacyBundle.path) {
+            let legacyExec = legacyBundle.appendingPathComponent("Contents/MacOS/EjaApp")
+            let targetExec = evolvedExecutable(in: dataDir)
+            if fm.isExecutableFile(atPath: legacyExec.path) && !fm.fileExists(atPath: targetExec.path) {
+                try? fm.copyItem(at: legacyExec, to: targetExec)
+            }
+            try? fm.removeItem(at: legacyBundle)
         }
         writeApplyScript(in: uiDir)
         return true
@@ -92,7 +79,8 @@ public enum UiRuntime {
 
     private static func writeApplyScript(in uiDir: URL) {
         let script = uiDir.appendingPathComponent("apply.sh")
-        if !FileManager.default.fileExists(atPath: script.path) {
+        let existing = try? String(contentsOf: script, encoding: .utf8)
+        if existing != applyScript {
             try? applyScript.write(to: script, atomically: true, encoding: .utf8)
         }
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
@@ -103,11 +91,102 @@ public enum UiRuntime {
             && fm.fileExists(atPath: url.appendingPathComponent("Sources/EjaApp").path)
     }
 
-    public static func binaryStamp(at url: URL) -> BinaryStamp? {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value,
-              let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 else { return nil }
-        return BinaryStamp(inode: inode, mtime: mtime)
+    public static func binaryDigest(at url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func needsHotSwap(in dataDir: URL) -> Bool {
+        guard Bundle.main.bundleURL.pathExtension == "app",
+              let currentExec = Bundle.main.executableURL else { return false }
+        let staged = evolvedExecutable(in: dataDir)
+        guard FileManager.default.isExecutableFile(atPath: staged.path),
+              let stagedDigest = binaryDigest(at: staged),
+              let currentDigest = binaryDigest(at: currentExec) else { return false }
+        return stagedDigest != currentDigest
+    }
+
+    @discardableResult
+    public static func restoreFactoryIfNeeded(in dataDir: URL, shutdown: () -> Void) -> Bool {
+        guard Bundle.main.bundleURL.pathExtension == "app",
+              let currentExec = Bundle.main.executableURL else { return false }
+        let fm = FileManager.default
+        let factoryExec = currentExec.deletingLastPathComponent().appendingPathComponent("EjaApp.factory")
+        let staged = evolvedExecutable(in: dataDir)
+        try? fm.removeItem(at: staged)
+        guard fm.isExecutableFile(atPath: factoryExec.path),
+              let factoryDigest = binaryDigest(at: factoryExec),
+              let currentDigest = binaryDigest(at: currentExec),
+              factoryDigest != currentDigest else { return false }
+        return replaceAndRelaunch(sourceBinary: factoryExec, currentExec: currentExec, shutdown: shutdown)
+    }
+
+    @discardableResult
+    public static func installAndRelaunch(
+        in dataDir: URL,
+        baselineId: Int64,
+        shutdown: () -> Void
+    ) -> Bool {
+        guard Bundle.main.bundleURL.pathExtension == "app",
+              let currentExec = Bundle.main.executableURL else { return false }
+        let staged = evolvedExecutable(in: dataDir)
+        let fm = FileManager.default
+        guard fm.isExecutableFile(atPath: staged.path) else { return false }
+        let factoryExec = currentExec.deletingLastPathComponent().appendingPathComponent("EjaApp.factory")
+        if !fm.fileExists(atPath: factoryExec.path) {
+            try? fm.copyItem(at: currentExec, to: factoryExec)
+        }
+        if baselineId >= 0 {
+            try? "\(baselineId)".write(
+                to: reloadBaselineFile(in: dataDir),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        return replaceAndRelaunch(sourceBinary: staged, currentExec: currentExec, shutdown: shutdown)
+    }
+
+    private static func replaceAndRelaunch(
+        sourceBinary: URL,
+        currentExec: URL,
+        shutdown: () -> Void
+    ) -> Bool {
+        let fm = FileManager.default
+        let tmpExec = currentExec.deletingLastPathComponent().appendingPathComponent("EjaApp.next")
+        try? fm.removeItem(at: tmpExec)
+        do {
+            try fm.copyItem(at: sourceBinary, to: tmpExec)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tmpExec.path)
+            let sign = Process()
+            sign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+            sign.arguments = ["--force", "--sign", "-", tmpExec.path]
+            try? sign.run()
+            sign.waitUntilExit()
+            if sourceBinary != currentExec {
+                try? fm.removeItem(at: sourceBinary)
+                try? fm.copyItem(at: tmpExec, to: sourceBinary)
+            }
+            _ = try fm.replaceItemAt(currentExec, withItemAt: tmpExec)
+        } catch {
+            try? fm.removeItem(at: tmpExec)
+            return false
+        }
+
+        shutdown()
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let appPath = Bundle.main.bundleURL.path
+        let relaunch = Process()
+        relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+        relaunch.arguments = [
+            "-c",
+            "while kill -0 \"$1\" 2>/dev/null; do sleep 0.05; done; open \"$2\"",
+            "--",
+            "\(pid)",
+            appPath,
+        ]
+        try? relaunch.run()
+        exit(0)
     }
 
 }

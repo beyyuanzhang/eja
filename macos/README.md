@@ -42,4 +42,4 @@ cargo build --release -p eja-host
 用户数据目录默认为 `~/Library/Application Support/Eja/`。
 
 - `connectors.json`：MCP 连接器列表（变更自动热加载）
-- `ui/`：可由 EJA 直接修改的前端目录（默认原生 SwiftUI 源码，运行 `ui/apply.sh` 编译并封装为完整 `ui/Eja.app` 后热切；启动 `Eja.app` 时按住 `Option` 可进入官方默认安全模式）
+- `ui/`：可由 EJA 直接修改的前端目录（默认原生 SwiftUI 源码，运行 `ui/apply.sh` 编译生成 `ui/EjaUI` 后由 `Eja.app` 原地热更新；启动 `Eja.app` 时按住 `Option` 可恢复官方默认安全模式）

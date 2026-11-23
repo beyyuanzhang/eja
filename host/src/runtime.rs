@@ -155,19 +155,6 @@ impl HostRuntime {
         })
     }
 
-    pub fn panel_command(&self) -> Command {
-        let executable = self
-            .data_dir
-            .path()
-            .join("ui/Eja.app/Contents/MacOS/EjaApp");
-        let mut command = self.sandbox.command(executable, std::iter::empty::<&str>());
-        command
-            .current_dir(self.data_dir.path())
-            .env("EJA_ATTACHED_UI", "1")
-            .env_remove("EJA_HOST_BIN");
-        command
-    }
-
     fn next_wake_delay(&self) -> Result<Option<Duration>, String> {
         let now = self
             .eja

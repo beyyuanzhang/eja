@@ -8,15 +8,24 @@ final class ContentUIState: ObservableObject {
     @Published var baselineId: Int64 = -1
     @Published var sendHovered: Bool = false
 
-    func captureBaselineIfNeeded(isReady: Bool, from stream: [StreamItemDTO]) {
+    func captureBaselineIfNeeded(isReady: Bool, dataDir: String, from stream: [StreamItemDTO]) {
         guard isReady, baselineId < 0 else { return }
+        if !dataDir.isEmpty {
+            let file = UiRuntime.reloadBaselineFile(in: URL(fileURLWithPath: dataDir, isDirectory: true))
+            if let raw = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let saved = Int64(raw) {
+                try? FileManager.default.removeItem(at: file)
+                baselineId = saved
+                return
+            }
+        }
         baselineId = stream.last?.id ?? 0
     }
 }
 
 struct ContentView: View {
     @ObservedObject var client: HostClient
-    @StateObject private var ui = ContentUIState()
+    @ObservedObject var ui: ContentUIState
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -135,19 +144,15 @@ struct ContentView: View {
         }
         .onAppear {
             composerFocused = true
-            ui.captureBaselineIfNeeded(isReady: client.isReady, from: client.stream)
+            ui.captureBaselineIfNeeded(isReady: client.isReady, dataDir: client.dataDir, from: client.stream)
         }
         .onChange(of: client.isReady) { _, ready in
-            ui.captureBaselineIfNeeded(isReady: ready, from: client.stream)
+            ui.captureBaselineIfNeeded(isReady: ready, dataDir: client.dataDir, from: client.stream)
         }
     }
 
     private func showSettings() {
-        if client.isAttachedUI {
-            client.requestOwnerSettings()
-        } else {
-            ui.showSettingsSheet = true
-        }
+        ui.showSettingsSheet = true
     }
 
     private var topFade: some View {

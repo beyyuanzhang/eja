@@ -4,7 +4,6 @@ import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var onTerminate: (() -> Void)?
-    var runningStamp: BinaryStamp?
     var safeMode = ProcessInfo.processInfo.environment["EJA_SAFE_MODE"] == "1"
         || NSEvent.modifierFlags.contains(.option)
     private var uiWatch: DispatchSourceFileSystemObject?
@@ -32,10 +31,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         watch.resume()
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        ProcessInfo.processInfo.environment["EJA_ATTACHED_UI"] == "1"
-    }
-
     func applicationWillTerminate(_ notification: Notification) {
         uiWatch?.cancel()
         onTerminate?()
@@ -46,12 +41,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct EjaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var client = HostClient()
+    @StateObject private var ui = ContentUIState()
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.openSettings) private var openSettings
 
     var body: some Scene {
         Window("EJA", id: "main") {
-            ContentView(client: client)
+            ContentView(client: client, ui: ui)
                 .frame(minWidth: 520, minHeight: 460)
                 .onAppear {
                     let hostClient = client
@@ -66,22 +61,15 @@ struct EjaApp: App {
                 .onChange(of: client.dataDir) { _, newDir in
                     bootstrapUI(dataDirPath: newDir)
                 }
-                .onChange(of: client.panelPid) { old, pid in
-                    if pid != nil {
-                        NSApp.hide(nil)
-                    } else if old != nil {
-                        NSApp.unhide(nil)
-                        NSApp.activate(ignoringOtherApps: true)
-                    }
-                }
-                .onChange(of: client.isReady) { wasReady, ready in
-                    if client.isAttachedUI && wasReady && !ready {
-                        NSApp.terminate(nil)
+                .onChange(of: client.status) { _, newStatus in
+                    if newStatus == "idle", !client.dataDir.isEmpty {
+                        checkHotReload(in: URL(fileURLWithPath: client.dataDir, isDirectory: true))
                     }
                 }
                 .onChange(of: client.settingsRequests) { _, _ in
                     NSApp.activate(ignoringOtherApps: true)
-                    openSettings()
+                    openWindow(id: "main")
+                    ui.showSettingsSheet = true
                 }
                 .onChange(of: client.alreadyRunning) { _, _ in
                     handleAlreadyRunning()
@@ -89,12 +77,16 @@ struct EjaApp: App {
         }
         .defaultSize(width: 780, height: 600)
         .windowStyle(.hiddenTitleBar)
-
-        Settings {
-            SettingsView(client: client)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("设置…") {
+                    client.requestSettingsSheet()
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
         }
 
-        MenuBarExtra(isInserted: .constant(!client.isAttachedUI)) {
+        MenuBarExtra {
             Text(client.kernelVersion.isEmpty ? "EJA · \(client.statusDetail)" : "EJA \(client.kernelVersion) · \(client.statusDetail)")
             if let nextWake = client.wakes.first {
                 Text("下次唤醒：\(nextWake.fireAtDisplay)")
@@ -108,15 +100,14 @@ struct EjaApp: App {
             }
             Divider()
             Button("打开 EJA") {
-                if let pid = client.panelPid,
-                   let panel = NSRunningApplication(processIdentifier: pid) {
-                    panel.activate()
-                } else {
-                    NSApp.activate(ignoringOtherApps: true)
-                    openWindow(id: "main")
-                }
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "main")
             }
             .keyboardShortcut("o")
+            Button("设置…") {
+                client.requestSettingsSheet()
+            }
+            .keyboardShortcut(",")
             Divider()
             Button("退出 EJA") {
                 client.shutdown(wait: false)
@@ -142,8 +133,14 @@ struct EjaApp: App {
 
     @MainActor
     private func bootstrapUI(dataDirPath: String) {
-        guard !client.isAttachedUI, !dataDirPath.isEmpty, !appDelegate.safeMode else { return }
+        guard !dataDirPath.isEmpty else { return }
         let dataDir = URL(fileURLWithPath: dataDirPath, isDirectory: true)
+        if appDelegate.safeMode {
+            UiRuntime.restoreFactoryIfNeeded(in: dataDir) {
+                client.shutdown(wait: true)
+            }
+            return
+        }
         guard UiRuntime.bootstrapIfNeeded(dataDir: dataDir) else { return }
         appDelegate.watchUI(at: dataDir.appendingPathComponent("ui")) {
             checkHotReload(in: dataDir)
@@ -153,11 +150,12 @@ struct EjaApp: App {
 
     @MainActor
     private func checkHotReload(in dataDir: URL) {
-        let target = UiRuntime.evolvedExecutable(in: dataDir)
-        guard FileManager.default.isExecutableFile(atPath: target.path),
-              let stamp = UiRuntime.binaryStamp(at: target),
-              stamp != appDelegate.runningStamp else { return }
-        appDelegate.runningStamp = stamp
-        client.launchUserInterface()
+        guard !appDelegate.safeMode,
+              client.isReady,
+              client.status == "idle",
+              UiRuntime.needsHotSwap(in: dataDir) else { return }
+        UiRuntime.installAndRelaunch(in: dataDir, baselineId: ui.baselineId) {
+            client.shutdown(wait: true)
+        }
     }
 }

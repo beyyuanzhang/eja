@@ -232,9 +232,7 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var wakes: [WakeAlarmDTO] = []
     @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
-    @Published public private(set) var panelPid: Int32?
     @Published public private(set) var settingsRequests = 0
-    public let isAttachedUI = ProcessInfo.processInfo.environment["EJA_ATTACHED_UI"] == "1"
 
     private var process: Process?
     private var stdinHandle: FileHandle?
@@ -245,13 +243,8 @@ public final class HostClient: ObservableObject {
     }
 
     public init(hostExecutableURL: URL? = nil, dataDir: URL? = nil) {
-        if !isAttachedUI && Bundle.main.bundleURL.pathExtension == "app" {
+        if Bundle.main.bundleURL.pathExtension == "app" {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        }
-        if isAttachedUI {
-            stdinHandle = .standardOutput
-            readEvents(from: .standardInput, process: nil)
-            return
         }
         let resolvedHost = hostExecutableURL ?? Self.resolveHostExecutable()
         let resolvedDataDir = dataDir ?? ProcessInfo.processInfo.environment["EJA_DATA_DIR"]
@@ -265,12 +258,8 @@ public final class HostClient: ObservableObject {
         if wait { process?.waitUntilExit() }
     }
 
-    public func requestOwnerSettings() {
-        sendCommand(["cmd": "open_settings"])
-    }
-
-    public func launchUserInterface() {
-        sendCommand(["cmd": "launch_ui"])
+    public func requestSettingsSheet() {
+        settingsRequests &+= 1
     }
 
     public func sendMessage(_ text: String) {
@@ -403,9 +392,6 @@ public final class HostClient: ObservableObject {
         switch event {
         case "state":
             if let state = try? decoder.decode(StateEventDTO.self, from: data) {
-                if !isReady && isAttachedUI {
-                    sendCommand(["cmd": "ui_ready"])
-                }
                 isReady = true
                 protocolVersion = state.protocolVersion ?? 1
                 kernelVersion = state.kernelVersion ?? ""
@@ -424,12 +410,6 @@ public final class HostClient: ObservableObject {
             if let detail = json["status_detail"] as? String {
                 statusDetail = detail
             }
-        case "ui_ready":
-            panelPid = (json["pid"] as? NSNumber)?.int32Value
-        case "ui_closed":
-            panelPid = nil
-        case "open_settings":
-            settingsRequests &+= 1
         case "already_running":
             alreadyRunning = true
             alreadyRunningPid = (json["ui_pid"] as? Int).map { Int32($0) }
@@ -444,7 +424,7 @@ public final class HostClient: ObservableObject {
                 providerTestResults[id] = ProviderTestResult(ok: ok, message: msg)
             }
         case "notify":
-            if !isAttachedUI, Bundle.main.bundleURL.pathExtension == "app",
+            if Bundle.main.bundleURL.pathExtension == "app",
                let title = json["title"] as? String,
                let body = json["body"] as? String {
                 let content = UNMutableNotificationContent()
