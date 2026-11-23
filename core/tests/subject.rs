@@ -93,6 +93,53 @@ fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
 }
 
 #[test]
+fn tx_read_and_evidence_reflect_in_tx_settlement() -> Result<()> {
+    let eja = Eja::open(":memory:")?;
+    let act = eja.act(eja.revision()?, "shell", json!({"command": "check"}))?;
+    let unk = eja.finish(act.id, Outcome::Unknown("timeout".into()))?;
+    eja.transaction(|tx| {
+        assert_eq!(tx.read(unk.id)?.id, unk.id);
+        assert!(tx.evidence(unk.id)?.latest.is_none());
+        let obs = tx.finish(act.id, Outcome::Observed("green".into()))?;
+        let ev = tx.evidence(unk.id)?;
+        assert_eq!(ev.latest.as_ref().map(|e| e.id), Some(obs.id));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn unsettled_unknowns_tracks_only_unresolved_unknown_receipts_at_revision() -> Result<()> {
+    let eja = Eja::open(":memory:")?;
+    let a1 = eja.act(eja.revision()?, "shell", json!({"command": "a1"}))?;
+    let u1 = eja.finish(a1.id, Outcome::Unknown("timeout 1".into()))?;
+    let a2 = eja.act(eja.revision()?, "shell", json!({"command": "a2"}))?;
+    let u2 = eja.finish(a2.id, Outcome::Unknown("disconnect 2".into()))?;
+    let rev_before_settle = eja.revision()?;
+    assert_eq!(
+        eja.unsettled_unknowns(rev_before_settle, 10)?
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
+        vec![u1.id, u2.id]
+    );
+    eja.finish(a1.id, Outcome::Observed("done".into()))?;
+    let rev_after_settle = eja.revision()?;
+    assert_eq!(
+        eja.unsettled_unknowns(rev_after_settle, 10)?
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
+        vec![u2.id]
+    );
+    assert_eq!(
+        eja.unsettled_unknowns(rev_before_settle, 10)?.len(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
 fn only_a_fresh_granted_act_can_issue_a_call() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");

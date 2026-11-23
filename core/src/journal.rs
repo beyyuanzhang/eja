@@ -93,6 +93,29 @@ fn receipt_at_on(conn: &Connection, action: Id, through: Id) -> Result<Option<En
     .transpose()
 }
 
+fn evidence_at_on(conn: &Connection, id: Id, revision: Id) -> Result<Evidence> {
+    let entry = read_on(conn, id)?;
+    let latest = match &entry.fact {
+        Fact::Returned { action, .. } => receipt_at_on(conn, *action, revision)?,
+        Fact::Acted { .. } => receipt_at_on(conn, id, revision)?,
+        Fact::Kept { concern, .. } => conn
+            .query_row(
+                "SELECT id FROM facts WHERE live IS NOT NULL AND ref_id = ?1 AND id > ?2 AND id <= ?3
+                 ORDER BY id DESC LIMIT 1",
+                params![concern, id, revision],
+                |r| r.get(0),
+            )
+            .optional()?
+            .map(|later| read_on(conn, later))
+            .transpose()?,
+        Fact::Noticed { .. } | Fact::Said { .. } | Fact::Released { .. } => None,
+    };
+    Ok(Evidence {
+        latest: latest.filter(|later| later.id > id),
+        entry,
+    })
+}
+
 fn unfinished_actions_on(conn: &Connection) -> Result<Vec<Id>> {
     let mut stmt = conn.prepare_cached(UNFINISHED_ACTIONS_SQL)?;
     let ids = stmt.query_map([], |r| r.get(0))?;
@@ -200,6 +223,14 @@ impl Tx<'_> {
 
     pub fn entries_after(&self, after: Id, through: Id) -> Result<Vec<Entry>> {
         entries_after_on(&self.tx, after, through)
+    }
+
+    pub fn read(&self, id: Id) -> Result<Entry> {
+        read_on(&self.tx, id)
+    }
+
+    pub fn evidence(&self, id: Id) -> Result<Evidence> {
+        evidence_at_on(&self.tx, id, self.revision()?)
     }
 
     pub fn unfinished_actions(&self) -> Result<Vec<Id>> {
@@ -412,27 +443,7 @@ impl Eja {
     }
 
     pub fn evidence_at(&self, id: Id, revision: Id) -> Result<Evidence> {
-        let entry = read_on(&self.db, id)?;
-        let latest = match &entry.fact {
-            Fact::Returned { action, .. } => receipt_at_on(&self.db, *action, revision)?,
-            Fact::Acted { .. } => receipt_at_on(&self.db, id, revision)?,
-            Fact::Kept { concern, .. } => self
-                .db
-                .query_row(
-                    "SELECT id FROM facts WHERE live IS NOT NULL AND ref_id = ?1 AND id > ?2 AND id <= ?3
-                     ORDER BY id DESC LIMIT 1",
-                    params![concern, id, revision],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .map(|later| read_on(&self.db, later))
-                .transpose()?,
-            Fact::Noticed { .. } | Fact::Said { .. } | Fact::Released { .. } => None,
-        };
-        Ok(Evidence {
-            latest: latest.filter(|later| later.id > id),
-            entry,
-        })
+        evidence_at_on(&self.db, id, revision)
     }
 
     pub fn entries_after(&self, after: Id, through: Id) -> Result<Vec<Entry>> {
@@ -476,6 +487,32 @@ impl Eja {
 
     pub fn unfinished_actions(&self) -> Result<Vec<Id>> {
         unfinished_actions_on(&self.db)
+    }
+
+    /// Return the latest unsettled `Outcome::Unknown` receipts at or before `revision`,
+    /// ordered oldest-to-newest (bounded by `limit`).
+    pub fn unsettled_unknowns(&self, revision: Id, limit: usize) -> Result<Vec<Entry>> {
+        if limit == 0 || revision <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut entries = query_entries(
+            &self.db,
+            "SELECT r.id, r.at, r.body
+             FROM facts AS r
+             WHERE r.kind = 'returned'
+               AND r.id <= ?1
+               AND json_extract(r.body, '$.outcome.status') = 'unknown'
+               AND NOT EXISTS (
+                   SELECT 1 FROM facts AS later
+                   WHERE later.kind = 'returned' AND later.ref_id = r.ref_id
+                     AND later.id > r.id AND later.id <= ?1
+               )
+             ORDER BY r.id DESC
+             LIMIT ?2",
+            params![revision, limit as i64],
+        )?;
+        entries.reverse();
+        Ok(entries)
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {

@@ -119,6 +119,37 @@ impl TrustedDir {
         &self.path
     }
 
+    pub fn open_subdir(&self, name: &str) -> io::Result<Self> {
+        let c_name = validate_single_name(name)?;
+        let sub_path = self.path.join(name);
+        #[cfg(target_os = "macos")]
+        {
+            let file = openat_file(
+                self.dir.as_raw_fd(),
+                &c_name,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                None,
+            )?;
+            Ok(Self {
+                path: sub_path,
+                dir: Arc::new(file),
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = c_name;
+            require_real_dir(&self.path, "root is not a real directory")?;
+            let meta = fs::symlink_metadata(&sub_path)?;
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing to follow symlink",
+                ));
+            }
+            Ok(Self { path: sub_path })
+        }
+    }
+
     pub fn read_file(&self, name: &str) -> io::Result<Vec<u8>> {
         let c_name = validate_single_name(name)?;
         #[cfg(target_os = "macos")]

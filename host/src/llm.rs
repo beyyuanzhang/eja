@@ -2,7 +2,7 @@ use crate::config::{ProviderConfig, ProviderKind};
 use crate::hands::ToolSpec;
 use crate::http::{post_bytes, truncate_utf8, HttpError};
 use crate::state::entries_for_turn;
-use eja_core::{Eja, Entry, Evidence, Fact, Id};
+use eja_core::{Eja, Entry, Evidence, Fact, Id, Outcome};
 use serde_json::{json, Value};
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
@@ -292,12 +292,28 @@ fn cap_tool_result(provider: &ProviderKind, value: Value, max_bytes: usize) -> V
         return value;
     }
     let total_bytes = serialized.len();
+    let receipt_id = value.get("id").and_then(Value::as_i64);
+    let action_id = value.get("action").and_then(Value::as_i64);
+    let outcome_status = value
+        .pointer("/outcome/status")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let make = |preview: &str| {
-        json!({
+        let mut obj = json!({
             "truncated": true,
             "total_bytes": total_bytes,
             "preview": preview
-        })
+        });
+        if let Some(id) = receipt_id {
+            obj["id"] = json!(id);
+        }
+        if let Some(action) = action_id {
+            obj["action"] = json!(action);
+        }
+        if let Some(ref status) = outcome_status {
+            obj["outcome_status"] = json!(status);
+        }
+        obj
     };
     if !result_fits(&make("").to_string(), provider, max_bytes) {
         let minimal = json!({ "truncated": true });
@@ -380,7 +396,17 @@ fn bound_entry_message(entry: &Entry, message: Value, budget: usize) -> Value {
     let content_budget = budget.saturating_sub(1);
     let role = message["role"].as_str().unwrap_or("user");
     let raw = message["content"].as_str().unwrap_or("");
-    let suffix = format!(" [truncated; read fact {}]", entry.id);
+    let suffix = match &entry.fact {
+        Fact::Returned { outcome, .. } => {
+            let status = match outcome {
+                Outcome::Observed(_) => "observed",
+                Outcome::Failed(_) => "failed",
+                Outcome::Unknown(_) => "unknown",
+            };
+            format!(" [status={status}; truncated; read fact {}]", entry.id)
+        }
+        _ => format!(" [truncated; read fact {}]", entry.id),
+    };
     let bounded = if content_budget <= suffix.len() {
         truncate_utf8(&suffix, content_budget)
     } else {
@@ -394,20 +420,55 @@ fn bound_entry_message(entry: &Entry, message: Value, budget: usize) -> Value {
 
 fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Result<Option<Value>> {
     let content_budget = budget.saturating_sub(1);
-    let encode = |items: &[Value], omitted: usize| {
+    let unknowns: Vec<Value> = eja
+        .unsettled_unknowns(anchor, 8)?
+        .into_iter()
+        .filter_map(|entry| match entry.fact {
+            Fact::Returned {
+                action,
+                outcome: Outcome::Unknown(detail),
+            } => Some(json!({
+                "id": entry.id,
+                "action": action,
+                "at": entry.at,
+                "detail": truncate_utf8(&detail, 120)
+            })),
+            _ => None,
+        })
+        .collect();
+    let encode = |items: &[Value], omitted: usize, unk: &[Value]| {
         let mut obj = json!({ "anchor": anchor, "concerns": items });
         if omitted > 0 {
             obj["omitted_concerns"] = json!(omitted);
         }
+        if !unk.is_empty() {
+            obj["unsettled_unknowns"] = json!(unk);
+        }
         obj.to_string()
     };
-    if content_budget == 0 || encode(&[], 0).len() > content_budget {
+    if content_budget == 0 || encode(&[], 0, &[]).len() > content_budget {
         return Ok(None);
     }
     let concerns = eja.concerns(anchor)?;
-    let full = serde_json::to_string(&json!({ "anchor": anchor, "concerns": concerns }))?;
-    if full.len() <= content_budget {
-        return Ok(Some(user_message(full)));
+    let full_items: Vec<Value> = concerns
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<_>>()?;
+    let full_with_unk = encode(&full_items, 0, &unknowns);
+    if full_with_unk.len() <= content_budget {
+        return Ok(Some(user_message(full_with_unk)));
+    }
+    let full_no_unk = encode(&full_items, 0, &[]);
+    if full_no_unk.len() <= content_budget {
+        let mut kept_unk: Vec<Value> = Vec::new();
+        for item in unknowns.iter().rev() {
+            kept_unk.insert(0, item.clone());
+            if encode(&full_items, 0, &kept_unk).len() > content_budget {
+                kept_unk.remove(0);
+                break;
+            }
+        }
+        return Ok(Some(user_message(encode(&full_items, 0, &kept_unk))));
     }
 
     let max_each = (content_budget / concerns.len().max(1)).clamp(48, 2048);
@@ -422,28 +483,37 @@ fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Resul
         };
         if concern.text.len() <= max_each {
             packed.push(serde_json::to_value(concern)?);
-            if encode(&packed, rest).len() <= content_budget {
+            if encode(&packed, rest, &[]).len() <= content_budget {
                 continue;
             }
             packed.pop();
         }
         packed.push(trunc(""));
-        let fits_empty = encode(&packed, rest).len() <= content_budget;
+        let fits_empty = encode(&packed, rest, &[]).len() <= content_budget;
         packed.pop();
         if !fits_empty {
             break;
         }
         let prefix = fit_utf8_prefix(&concern.text, max_each, |slice| {
             packed.push(trunc(slice));
-            let ok = encode(&packed, rest).len() <= content_budget;
+            let ok = encode(&packed, rest, &[]).len() <= content_budget;
             packed.pop();
             ok
         });
         packed.push(trunc(prefix));
     }
-    let mut rendered = encode(&packed, concerns.len() - packed.len());
+    let omitted = concerns.len() - packed.len();
+    let mut kept_unk: Vec<Value> = Vec::new();
+    for item in unknowns.iter().rev() {
+        kept_unk.insert(0, item.clone());
+        if encode(&packed, omitted, &kept_unk).len() > content_budget {
+            kept_unk.remove(0);
+            break;
+        }
+    }
+    let mut rendered = encode(&packed, omitted, &kept_unk);
     if rendered.len() > content_budget {
-        rendered = encode(&packed, 0);
+        rendered = encode(&packed, 0, &[]);
     }
     Ok(Some(user_message(rendered)))
 }
@@ -826,6 +896,65 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains("keep this unfinished user request"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn anchor_header_surfaces_unsettled_unknowns_and_capped_receipts_keep_status()
+    -> eja_core::Result<()> {
+        let eja = Eja::open(":memory:")?;
+        let act = eja.act(eja.revision()?, "shell", json!({"command": "deploy"}))?;
+        let unk = eja.finish(act.id, Outcome::Unknown("宿主中断未完成".into()))?;
+        for i in 0..4 {
+            eja.notice(Source::World, format!("filler-{i}-{}", "z".repeat(400)))?;
+        }
+        let trigger = eja.notice(Source::Person, "继续检查状态")?;
+        let mut anchor = 0;
+        let window = project_window_through(&eja, &mut anchor, trigger, 1024, trigger)?;
+        assert!(anchor >= unk.id);
+        let header: Value = serde_json::from_str(window[0]["content"].as_str().unwrap()).unwrap();
+        let unknowns = header["unsettled_unknowns"].as_array().unwrap();
+        assert_eq!(unknowns.len(), 1);
+        assert_eq!(unknowns[0]["id"], unk.id);
+        assert_eq!(unknowns[0]["action"], act.id);
+
+        eja.finish(act.id, Outcome::Observed("deploy ok".into()))?;
+        let trigger2 = eja.notice(Source::Person, "再看一次")?;
+        let mut anchor2 = anchor;
+        let window2 = project_window_through(&eja, &mut anchor2, trigger2, 1024, trigger2)?;
+        assert_eq!(anchor2, anchor);
+        assert_eq!(window2[0], window[0]);
+        assert!(window2
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|s| s.contains("deploy ok"))));
+
+        for i in 0..4 {
+            eja.notice(
+                Source::World,
+                format!("after-settle-{i}-{}", "w".repeat(400)),
+            )?;
+        }
+        let trigger3 = eja.notice(Source::Person, "重置后检查")?;
+        let mut anchor3 = anchor2;
+        let window3 = project_window_through(&eja, &mut anchor3, trigger3, 1024, trigger3)?;
+        assert!(anchor3 > trigger2);
+        let header3: Value =
+            serde_json::from_str(window3[0]["content"].as_str().unwrap()).unwrap();
+        assert!(header3.get("unsettled_unknowns").is_none());
+
+        let capped = cap_tool_result(
+            &ProviderKind::OpenAi,
+            json!({
+                "id": 99,
+                "action": 98,
+                "outcome": { "status": "unknown", "detail": "x".repeat(1000) }
+            }),
+            260,
+        );
+        assert_eq!(capped["truncated"], true);
+        assert_eq!(capped["id"], 99);
+        assert_eq!(capped["action"], 98);
+        assert_eq!(capped["outcome_status"], "unknown");
         Ok(())
     }
 }

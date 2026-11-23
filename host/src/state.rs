@@ -1,21 +1,90 @@
 //! Host-owned scheduling, turn settlement, window anchor, and upgrade state stored
 //! atomically alongside `eja-core` facts via `host_meta`.
+use crate::http::truncate_utf8;
 use crate::sandbox::TrustedDir;
 use eja_core::{Eja, Entry, Error, Fact, Id, Outcome, Source, Tx, FACT_BYTES};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 const META_STATE: &str = "host.state";
 const MAX_PROACTIVE_HISTORY: usize = 256;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+fn default_guard_interval() -> i64 {
+    60
+}
+
+fn default_failure_threshold() -> u32 {
+    3
+}
+
+fn default_probe_input() -> Value {
+    serde_json::json!({})
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConcernCheckMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_criteria: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_fact_id: Option<Id>,
+    #[serde(default)]
+    pub require_witness: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_witness_fact_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardTrigger {
+    #[default]
+    Changed,
+    ExitZero,
+    NonEmpty,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GuardProbe {
+    Command {
+        command: String,
+    },
+    Tool {
+        capability: String,
+        #[serde(default = "default_probe_input")]
+        input: Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WakeGuard {
+    pub probe: GuardProbe,
+    #[serde(default = "default_guard_interval")]
+    pub interval_seconds: i64,
+    #[serde(default)]
+    pub trigger_on: GuardTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_checks: Option<u32>,
+    #[serde(default)]
+    pub checks_done: u32,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WakeAlarm {
     pub id: String,
     pub fire_at_unix: i64,
     pub fire_at_display: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<WakeGuard>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -30,6 +99,10 @@ struct HostState {
     kernel_version: Option<String>,
     #[serde(default)]
     proactive_replies: Vec<Id>,
+    #[serde(default)]
+    world_triggers: Vec<Id>,
+    #[serde(default)]
+    concern_checks: BTreeMap<Id, ConcernCheckMeta>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -58,24 +131,28 @@ fn update_state<T>(
     })
 }
 
-fn find_trigger(entries: &[Entry]) -> Option<(Id, Source)> {
-    entries
-        .iter()
-        .find_map(|entry| trigger_source(&entry.fact).map(|source| (entry.id, source)))
-}
-
-fn wake_notice_text(reason: &str) -> String {
-    format!("定时唤醒：{reason}")
-}
-
-pub fn trigger_source(fact: &Fact) -> Option<Source> {
-    match fact {
+fn is_trigger_entry(entry: &Entry, world_triggers: &[Id]) -> Option<Source> {
+    match &entry.fact {
         Fact::Noticed {
             source: source @ (Source::Person | Source::Clock),
             ..
         } => Some(source.clone()),
+        Fact::Noticed {
+            source: Source::World,
+            ..
+        } if world_triggers.contains(&entry.id) => Some(Source::World),
         _ => None,
     }
+}
+
+fn find_trigger(entries: &[Entry], world_triggers: &[Id]) -> Option<(Id, Source)> {
+    entries
+        .iter()
+        .find_map(|entry| is_trigger_entry(entry, world_triggers).map(|source| (entry.id, source)))
+}
+
+fn wake_notice_text(reason: &str) -> String {
+    format!("定时唤醒：{reason}")
 }
 
 pub fn entries_for_turn(
@@ -84,8 +161,9 @@ pub fn entries_for_turn(
     through: Id,
     trigger: Id,
 ) -> eja_core::Result<Vec<Entry>> {
+    let world_triggers = decode_state(eja.get_meta(META_STATE)?)?.world_triggers;
     let mut entries = eja.entries_after(after, through)?;
-    entries.retain(|entry| entry.id <= trigger || trigger_source(&entry.fact).is_none());
+    entries.retain(|entry| entry.id <= trigger || is_trigger_entry(entry, &world_triggers).is_none());
     Ok(entries)
 }
 
@@ -128,6 +206,7 @@ pub fn bootstrap(
                 tx,
                 legacy_settled,
                 unfinished.first().copied(),
+                &state.world_triggers,
             )?);
         }
 
@@ -183,6 +262,7 @@ fn compute_initial_cursor(
     tx: &Tx<'_>,
     legacy: Option<Id>,
     first_unfinished: Option<Id>,
+    world_triggers: &[Id],
 ) -> eja_core::Result<Id> {
     let head = tx.revision()?;
     let all = tx.entries_after(0, head)?;
@@ -191,7 +271,7 @@ fn compute_initial_cursor(
     } else if let Some(action) = first_unfinished {
         all.iter()
             .rev()
-            .find(|entry| entry.id < action && trigger_source(&entry.fact).is_some())
+            .find(|entry| entry.id < action && is_trigger_entry(entry, world_triggers).is_some())
             .map_or(head, |entry| entry.id - 1)
     } else {
         all.iter()
@@ -216,11 +296,13 @@ pub fn save_anchor(eja: &Eja, anchor: Id) -> Result<(), String> {
 }
 
 pub fn next_trigger(eja: &Eja) -> eja_core::Result<Option<(Id, Source)>> {
-    let cursor = decode_state(eja.get_meta(META_STATE)?)?
-        .turn_cursor
-        .unwrap_or(0);
+    let state = decode_state(eja.get_meta(META_STATE)?)?;
+    let cursor = state.turn_cursor.unwrap_or(0);
     let head = eja.revision()?;
-    Ok(find_trigger(&eja.entries_after(cursor, head)?))
+    Ok(find_trigger(
+        &eja.entries_after(cursor, head)?,
+        &state.world_triggers,
+    ))
 }
 
 /// Atomically record an optional reply and advance the host turn cursor for `trigger`.
@@ -228,7 +310,9 @@ pub fn complete_turn(eja: &Eja, trigger: Id, reply: &str) -> eja_core::Result<()
     update_state(eja, |tx, state| {
         let cursor = state.turn_cursor.unwrap_or(0);
         let head = tx.revision()?;
-        let Some((expected, source)) = find_trigger(&tx.entries_after(cursor, head)?) else {
+        let Some((expected, source)) =
+            find_trigger(&tx.entries_after(cursor, head)?, &state.world_triggers)
+        else {
             return Err(Error::Conflict);
         };
         if expected != trigger {
@@ -236,7 +320,7 @@ pub fn complete_turn(eja: &Eja, trigger: Id, reply: &str) -> eja_core::Result<()
         }
         if !reply.trim().is_empty() {
             let said_id = tx.say(reply)?;
-            if source == Source::Clock {
+            if source != Source::Person {
                 state.proactive_replies.push(said_id);
                 if state.proactive_replies.len() > MAX_PROACTIVE_HISTORY {
                     let excess = state.proactive_replies.len() - MAX_PROACTIVE_HISTORY;
@@ -245,6 +329,7 @@ pub fn complete_turn(eja: &Eja, trigger: Id, reply: &str) -> eja_core::Result<()
             }
         }
         state.turn_cursor = Some(trigger);
+        state.world_triggers.retain(|&id| id > trigger);
         Ok(())
     })
 }
@@ -254,6 +339,131 @@ pub fn proactive_reply_ids(eja: &Eja) -> HashSet<Id> {
         .ok()
         .map(|state| state.proactive_replies.into_iter().collect())
         .unwrap_or_default()
+}
+
+pub fn concern_check_metas(eja: &Eja) -> BTreeMap<Id, ConcernCheckMeta> {
+    decode_state(eja.get_meta(META_STATE).ok().flatten())
+        .ok()
+        .map(|state| state.concern_checks)
+        .unwrap_or_default()
+}
+
+/// Atomically keep/revise a concern together with optional evidence/verification metadata.
+pub fn keep_with_check(
+    eja: &Eja,
+    concern: Option<Id>,
+    text: &str,
+    evidence_fact_id: Option<Id>,
+    verify_criteria: Option<String>,
+    require_witness: Option<bool>,
+) -> eja_core::Result<(Entry, ConcernCheckMeta)> {
+    update_state(eja, |tx, state| {
+        if let Some(ev_id) = evidence_fact_id {
+            tx.read(ev_id)
+                .map_err(|_| Error::Invalid(format!("evidence_fact_id {ev_id} 不存在")))?;
+        }
+        let entry = tx.keep(concern, text)?;
+        let Fact::Kept { concern: cid, .. } = entry.fact else {
+            unreachable!()
+        };
+        let meta = state.concern_checks.entry(cid).or_default();
+        if let Some(ev_id) = evidence_fact_id {
+            meta.evidence_fact_id = Some(ev_id);
+        }
+        if let Some(criteria) = verify_criteria
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            meta.verify_criteria = Some(criteria);
+            if require_witness.is_none() {
+                meta.require_witness = true;
+            }
+        }
+        if let Some(req) = require_witness {
+            meta.require_witness = req;
+        }
+        Ok((entry, meta.clone()))
+    })
+}
+
+fn validate_witness(tx: &Tx<'_>, concern: Id, witness_id: Id) -> eja_core::Result<()> {
+    if witness_id < concern {
+        return Err(Error::Invalid(format!(
+            "witness_fact_id ({witness_id}) 早于挂念创建记录 ({concern})，不能作为后续验收证据"
+        )));
+    }
+    let ev = tx
+        .evidence(witness_id)
+        .map_err(|_| Error::Invalid(format!("witness_fact_id {witness_id} 不存在")))?;
+    let effective = ev.latest.as_ref().unwrap_or(&ev.entry);
+    match &effective.fact {
+        Fact::Returned {
+            outcome: Outcome::Observed(_),
+            ..
+        } => Ok(()),
+        Fact::Noticed {
+            source: Source::Person | Source::World,
+            ..
+        } => Ok(()),
+        Fact::Acted { .. } => Err(Error::Invalid(format!(
+            "fact {witness_id} 是尚未完成回执的动作，不能作为验收证据"
+        ))),
+        Fact::Returned {
+            outcome: Outcome::Failed(_),
+            ..
+        } => Err(Error::Invalid(format!(
+            "fact {witness_id} 的回执为 failed，不能作为完成验收证据"
+        ))),
+        Fact::Returned {
+            outcome: Outcome::Unknown(_),
+            ..
+        } => Err(Error::Invalid(format!(
+            "fact {witness_id} 的回执为 unknown（未证实），不能作为完成验收证据"
+        ))),
+        Fact::Said { .. } => Err(Error::Invalid(format!(
+            "fact {witness_id} 是主体自身发言（said），自述不能替代客观验收证据"
+        ))),
+        Fact::Noticed {
+            source: Source::Clock,
+            ..
+        }
+        | Fact::Kept { .. }
+        | Fact::Released { .. } => Err(Error::Invalid(format!(
+            "fact {witness_id} 不是客观实测（observed）或外部/人工确认，不能作为验收证据"
+        ))),
+    }
+}
+
+/// Atomically verify witness (when required or supplied) and release an open concern.
+pub fn release_with_witness(
+    eja: &Eja,
+    concern: Id,
+    witness_fact_id: Option<Id>,
+) -> eja_core::Result<Entry> {
+    update_state(eja, |tx, state| {
+        let requires = state
+            .concern_checks
+            .get(&concern)
+            .is_some_and(|meta| meta.require_witness);
+        match witness_fact_id {
+            Some(wid) => validate_witness(tx, concern, wid)?,
+            None if requires => {
+                return Err(Error::Invalid(format!(
+                    "挂念 {concern} 绑定了验收约束，release 必须提供指向实测 observed 或用户/世界确认的 witness_fact_id"
+                )));
+            }
+            None => {}
+        }
+        let entry = tx.release(concern)?;
+        if let Some(wid) = witness_fact_id {
+            state
+                .concern_checks
+                .entry(concern)
+                .or_default()
+                .release_witness_fact_id = Some(wid);
+        }
+        Ok(entry)
+    })
 }
 
 fn merge_wakes(existing: &mut Vec<WakeAlarm>, alarms: &[WakeAlarm]) -> eja_core::Result<()> {
@@ -288,6 +498,7 @@ pub fn next_wake_at(eja: &Eja) -> eja_core::Result<Option<i64>> {
 }
 
 /// Atomically record all wakes due at or before `eja.now()` and remove them from the queue.
+#[cfg(test)]
 pub fn record_due_wakes(eja: &Eja) -> eja_core::Result<bool> {
     eja.transaction(|tx| {
         let mut state = decode_state(tx.get_meta(META_STATE)?)?;
@@ -305,6 +516,93 @@ pub fn record_due_wakes(eja: &Eja) -> eja_core::Result<bool> {
         state.wakes = remaining;
         tx.set_meta(META_STATE, &serde_json::to_string(&state)?)?;
         Ok(true)
+    })
+}
+
+/// Atomically record due unguarded wakes and return due guarded wakes for out-of-tx probe evaluation.
+pub fn collect_due_wakes(eja: &Eja) -> eja_core::Result<(bool, Vec<WakeAlarm>, i64)> {
+    eja.transaction(|tx| {
+        let mut state = decode_state(tx.get_meta(META_STATE)?)?;
+        let now = tx.now()?.as_unix();
+        let mut fired_plain = false;
+        let mut due_guarded = Vec::new();
+        let mut remaining = Vec::with_capacity(state.wakes.len());
+        for alarm in state.wakes.drain(..) {
+            if alarm.fire_at_unix <= now {
+                if alarm.guard.is_some() {
+                    due_guarded.push(alarm.clone());
+                    remaining.push(alarm);
+                } else {
+                    tx.notice(Source::Clock, wake_notice_text(&alarm.reason))?;
+                    fired_plain = true;
+                }
+            } else {
+                remaining.push(alarm);
+            }
+        }
+        state.wakes = remaining;
+        if fired_plain {
+            tx.set_meta(META_STATE, &serde_json::to_string(&state)?)?;
+        }
+        Ok((fired_plain, due_guarded, now))
+    })
+}
+
+pub enum GuardResolution {
+    Triggered(String),
+    Rearm {
+        next_fire_at_unix: i64,
+        next_fire_at_display: String,
+        guard: WakeGuard,
+    },
+    Expired,
+}
+
+/// Atomically settle one guarded wake after its probe finishes.
+/// Rearming or expiring writes zero journal facts.
+/// Triggering records a `Source::World` fact and queues its ID as an explicit proactive turn trigger.
+pub fn settle_guarded_wake(
+    eja: &Eja,
+    alarm_id: &str,
+    resolution: GuardResolution,
+) -> eja_core::Result<bool> {
+    eja.transaction(|tx| {
+        let mut state = decode_state(tx.get_meta(META_STATE)?)?;
+        let Some(pos) = state.wakes.iter().position(|item| item.id == alarm_id) else {
+            return Ok(false);
+        };
+        let fired = match resolution {
+            GuardResolution::Triggered(notice) => {
+                state.wakes.remove(pos);
+                let bounded = truncate_utf8(&notice, FACT_BYTES.saturating_sub(256));
+                let fact_id = tx.notice(Source::World, bounded)?;
+                if !state.world_triggers.contains(&fact_id) {
+                    state.world_triggers.push(fact_id);
+                    state.world_triggers.sort_unstable();
+                }
+                true
+            }
+            GuardResolution::Rearm {
+                next_fire_at_unix,
+                next_fire_at_display,
+                guard,
+            } => {
+                let alarm = &mut state.wakes[pos];
+                alarm.fire_at_unix = next_fire_at_unix;
+                alarm.fire_at_display = next_fire_at_display;
+                alarm.guard = Some(guard);
+                state
+                    .wakes
+                    .sort_by(|a, b| a.fire_at_unix.cmp(&b.fire_at_unix).then(a.id.cmp(&b.id)));
+                false
+            }
+            GuardResolution::Expired => {
+                state.wakes.remove(pos);
+                false
+            }
+        };
+        tx.set_meta(META_STATE, &serde_json::to_string(&state)?)?;
+        Ok(fired)
     })
 }
 
@@ -354,12 +652,14 @@ mod tests {
                     fire_at_unix: 100,
                     fire_at_display: "00:01:40".into(),
                     reason: "due now".into(),
+                    guard: None,
                 },
                 WakeAlarm {
                     id: "w-2".into(),
                     fire_at_unix: 200,
                     fire_at_display: "00:03:20".into(),
                     reason: "later".into(),
+                    guard: None,
                 },
             ],
         )
