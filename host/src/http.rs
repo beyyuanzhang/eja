@@ -20,6 +20,42 @@ pub enum HttpError {
     InvalidResponse(String),
 }
 
+pub fn get_bytes(
+    url: &str,
+    headers: &[(String, String)],
+    timeout_secs: u64,
+) -> Result<HttpResponse, HttpError> {
+    let mut cmd = Command::new("/usr/bin/curl");
+    cmd.args([
+        "-sS",
+        "-i",
+        "-L",
+        "-X",
+        "GET",
+        "--max-time",
+        &timeout_secs.max(1).to_string(),
+    ]);
+    for (key, value) in headers {
+        cmd.arg("-H").arg(format!("{key}: {value}"));
+    }
+    cmd.arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd
+        .output()
+        .map_err(|err| HttpError::Launch(format!("启动 curl 失败: {err}")))?;
+    if !output.status.success() {
+        return Err(HttpError::Transport {
+            exit_code: output.status.code(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    parse_http_response(&raw)
+}
+
 pub fn post_bytes(
     url: &str,
     headers: &[(String, String)],
@@ -86,7 +122,9 @@ pub fn parse_http_response(raw: &str) -> Result<HttpResponse, HttpError> {
         last_headers = head;
         status_code = Some(code);
         rest = tail;
-        if !(100..200).contains(&code) {
+        if !(100..200).contains(&code)
+            && !((300..400).contains(&code) && rest.starts_with("HTTP/"))
+        {
             break;
         }
     }

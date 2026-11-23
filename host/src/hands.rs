@@ -1,6 +1,7 @@
 use crate::config::ConnectorConfig;
 use crate::http::truncate_utf8;
 use crate::mcp::{ConnectorPool, ConnectorStatus};
+use crate::oauth::OAuthToken;
 use crate::sandbox::{kill_process_tree, Sandbox, TrustedDir};
 use crate::state::{self, schedule_wakes, WakeAlarm, WakeGuard};
 use eja_core::{Call, Eja, Outcome};
@@ -50,8 +51,13 @@ pub struct Hands {
 }
 
 impl Hands {
-    pub fn open(data_dir: TrustedDir, sandbox: Sandbox, connectors: &[ConnectorConfig]) -> Self {
-        let mut pool = ConnectorPool::new(sandbox);
+    pub fn open(
+        data_dir: TrustedDir,
+        core_dir: TrustedDir,
+        sandbox: Sandbox,
+        connectors: &[ConnectorConfig],
+    ) -> Self {
+        let mut pool = ConnectorPool::with_core_dir(sandbox, core_dir);
         pool.reload(connectors, false);
         Self {
             data_dir,
@@ -61,6 +67,21 @@ impl Hands {
 
     pub fn reload(&mut self, connectors: &[ConnectorConfig], force: bool) {
         self.connectors.reload(connectors, force);
+    }
+
+    pub fn set_oauth_code(&mut self, id: &str, code: Option<String>) {
+        self.connectors.set_oauth_code(id, code);
+    }
+
+    pub fn save_oauth_token(
+        &mut self,
+        id: &str,
+        token: OAuthToken,
+        connectors: &[ConnectorConfig],
+    ) -> Result<(), String> {
+        self.connectors.save_oauth_token(id, token)?;
+        self.connectors.reload(connectors, false);
+        Ok(())
     }
 
     pub fn connector_statuses(&self) -> Vec<ConnectorStatus> {

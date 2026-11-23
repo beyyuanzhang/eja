@@ -1,5 +1,7 @@
 use crate::config::{ConnectorConfig, ConnectorTransport};
 use crate::http::{post_bytes, truncate_utf8, HttpError, HttpResponse};
+use crate::oauth::{is_auth_error, OAuthStore, OAuthToken};
+use crate::sandbox::TrustedDir;
 use crate::sandbox::{kill_process_tree, Sandbox};
 use eja_core::Outcome;
 use serde::{Deserialize, Serialize};
@@ -65,15 +67,25 @@ pub struct ConnectorStatus {
     pub name: String,
     pub enabled: bool,
     pub connected: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auth_required: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub authorized: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub tools: Vec<McpToolSummary>,
 }
 
 impl ConnectorStatus {
+    #[allow(clippy::too_many_arguments)]
     fn from_cfg(
         cfg: &ConnectorConfig,
         connected: bool,
+        auth_required: bool,
+        authorized: bool,
+        oauth_code: Option<String>,
         error: Option<String>,
         tools: &[McpTool],
     ) -> Self {
@@ -82,6 +94,9 @@ impl ConnectorStatus {
             name: cfg.name.clone(),
             enabled: cfg.enabled,
             connected,
+            auth_required,
+            authorized,
+            oauth_code,
             error,
             tools: tools.iter().map(McpTool::summary).collect(),
         }
@@ -263,6 +278,13 @@ impl HttpConnection {
             Duration::from_secs(5),
         );
         Ok(conn)
+    }
+
+    fn set_bearer_token(&mut self, token: &str) {
+        self.headers
+            .retain(|k, _| !k.eq_ignore_ascii_case("authorization"));
+        self.headers
+            .insert("Authorization".to_string(), format!("Bearer {token}"));
     }
 
     fn request(
@@ -472,18 +494,63 @@ struct ConnectedEntry {
 
 pub struct ConnectorPool {
     sandbox: Sandbox,
+    oauth: OAuthStore,
+    oauth_codes: HashMap<String, String>,
     connections: HashMap<String, ConnectedEntry>,
     statuses: Vec<ConnectorStatus>,
     tools: Vec<McpTool>,
 }
 
 impl ConnectorPool {
+    #[cfg(test)]
     pub fn new(sandbox: Sandbox) -> Self {
         Self {
             sandbox,
+            oauth: OAuthStore::load(None),
+            oauth_codes: HashMap::new(),
             connections: HashMap::new(),
             statuses: Vec::new(),
             tools: Vec::new(),
+        }
+    }
+
+    pub fn with_core_dir(sandbox: Sandbox, core_dir: TrustedDir) -> Self {
+        Self {
+            sandbox,
+            oauth: OAuthStore::load(Some(core_dir)),
+            oauth_codes: HashMap::new(),
+            connections: HashMap::new(),
+            statuses: Vec::new(),
+            tools: Vec::new(),
+        }
+    }
+
+    pub fn set_oauth_code(&mut self, id: &str, code: Option<String>) {
+        match &code {
+            Some(c) => {
+                self.oauth_codes.insert(id.to_string(), c.clone());
+            }
+            None => {
+                self.oauth_codes.remove(id);
+            }
+        }
+        if let Some(status) = self.statuses.iter_mut().find(|s| s.id == id) {
+            status.oauth_code = code;
+        }
+    }
+
+    pub fn save_oauth_token(&mut self, id: &str, token: OAuthToken) -> Result<(), String> {
+        self.oauth_codes.remove(id);
+        self.connections.remove(id);
+        self.oauth.save(id, token)
+    }
+
+    fn is_cfg_authorized(&self, cfg: &ConnectorConfig) -> bool {
+        match &cfg.transport {
+            ConnectorTransport::Http { url, headers } => {
+                has_authorization_header(headers) || self.oauth.is_authorized(&cfg.id, url)
+            }
+            ConnectorTransport::Stdio { .. } => false,
         }
     }
 
@@ -506,25 +573,46 @@ impl ConnectorPool {
         self.tools.clear();
 
         for cfg in configs {
+            let authorized = self.is_cfg_authorized(cfg);
+            let oauth_code = self.oauth_codes.get(&cfg.id).cloned();
             if !cfg.enabled {
                 self.statuses
-                    .push(ConnectorStatus::from_cfg(cfg, false, None, &[]));
+                    .push(ConnectorStatus::from_cfg(
+                        cfg, false, false, authorized, oauth_code, None, &[],
+                    ));
                 continue;
             }
 
             if let Some(entry) = reusable.remove(&cfg.id) {
                 self.tools.extend(entry.tools.iter().cloned());
                 self.statuses
-                    .push(ConnectorStatus::from_cfg(cfg, true, None, &entry.tools));
+                    .push(ConnectorStatus::from_cfg(
+                        cfg,
+                        true,
+                        false,
+                        authorized,
+                        oauth_code,
+                        None,
+                        &entry.tools,
+                    ));
                 self.connections.insert(cfg.id.clone(), entry);
                 continue;
             }
 
-            match connect_and_list(&self.sandbox, cfg) {
+            match connect_and_list(&self.sandbox, &mut self.oauth, cfg) {
                 Ok((connection, entry_tools)) => {
+                    let authorized = self.is_cfg_authorized(cfg);
                     self.tools.extend(entry_tools.iter().cloned());
                     self.statuses
-                        .push(ConnectorStatus::from_cfg(cfg, true, None, &entry_tools));
+                        .push(ConnectorStatus::from_cfg(
+                            cfg,
+                            true,
+                            false,
+                            authorized,
+                            oauth_code,
+                            None,
+                            &entry_tools,
+                        ));
                     self.connections.insert(
                         cfg.id.clone(),
                         ConnectedEntry {
@@ -535,8 +623,18 @@ impl ConnectorPool {
                     );
                 }
                 Err(err) => {
+                    let auth_required = matches!(cfg.transport, ConnectorTransport::Http { .. })
+                        && is_auth_error(&err);
                     self.statuses
-                        .push(ConnectorStatus::from_cfg(cfg, false, Some(err), &[]));
+                        .push(ConnectorStatus::from_cfg(
+                            cfg,
+                            false,
+                            auth_required,
+                            authorized,
+                            oauth_code,
+                            Some(err),
+                            &[],
+                        ));
                 }
             }
         }
@@ -567,11 +665,22 @@ impl ConnectorPool {
         } else {
             json!({})
         };
-        match entry.connection.request(
-            "tools/call",
-            json!({ "name": tool.name, "arguments": args }),
-            TOOL_TIMEOUT,
-        ) {
+        let call_params = json!({ "name": tool.name, "arguments": args });
+        let mut response = entry
+            .connection
+            .request("tools/call", call_params.clone(), TOOL_TIMEOUT);
+        if let Err(RequestError::Failed(ref err)) = response {
+            if is_auth_error(err) {
+                if let ActiveConnection::Http(ref mut http_conn) = entry.connection {
+                    if let Some(new_token) = self.oauth.refresh(&tool.connector_id, &http_conn.url)
+                    {
+                        http_conn.set_bearer_token(&new_token);
+                        response = http_conn.request("tools/call", call_params, TOOL_TIMEOUT);
+                    }
+                }
+            }
+        }
+        match response {
             Ok(result) => {
                 if !result
                     .get("content")
@@ -613,6 +722,7 @@ impl ConnectorPool {
 
 fn connect_and_list(
     sandbox: &Sandbox,
+    oauth: &mut OAuthStore,
     cfg: &ConnectorConfig,
 ) -> Result<(ActiveConnection, Vec<McpTool>), String> {
     let mut conn = match &cfg.transport {
@@ -620,7 +730,26 @@ fn connect_and_list(
             StdioConnection::connect(sandbox, command, args, env).map(ActiveConnection::Stdio)?
         }
         ConnectorTransport::Http { url, headers } => {
-            HttpConnection::connect(url, headers).map(ActiveConnection::Http)?
+            let mut effective = headers.clone();
+            let manual_auth = has_authorization_header(&effective);
+            if !manual_auth {
+                if let Some(token) = oauth.access_token(&cfg.id, url) {
+                    effective.insert("Authorization".to_string(), format!("Bearer {token}"));
+                }
+            }
+            match HttpConnection::connect(url, &effective) {
+                Ok(http) => ActiveConnection::Http(http),
+                Err(err) if !manual_auth && is_auth_error(&err) => {
+                    if let Some(refreshed) = oauth.refresh(&cfg.id, url) {
+                        effective
+                            .insert("Authorization".to_string(), format!("Bearer {refreshed}"));
+                        HttpConnection::connect(url, &effective).map(ActiveConnection::Http)?
+                    } else {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
         }
     };
     let result = conn
@@ -670,6 +799,12 @@ fn extract_mcp_result_text(result: &Value) -> String {
         }
     }
     serde_json::to_string(result).unwrap_or_else(|_| "ok".to_string())
+}
+
+fn has_authorization_header(headers: &BTreeMap<String, String>) -> bool {
+    headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && !v.trim().is_empty())
 }
 
 fn sanitize_id(raw: &str) -> String {

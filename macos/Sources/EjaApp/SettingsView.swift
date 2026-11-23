@@ -849,6 +849,8 @@ struct SettingsView: View {
         let conn = draft.connectors[index]
         let expanded = draft.expandedConnector == conn.id
         let status = client.connectorStatuses.first { $0.id == conn.id }
+        let isHTTP = conn.transport.type == "http"
+        let hasURL = !(conn.transport.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let dotColor: Color = {
             if !conn.enabled { return EjaTheme.inkMuted.opacity(0.35) }
             if status?.connected == true { return EjaTheme.positive }
@@ -880,7 +882,7 @@ struct SettingsView: View {
                             .font(.system(size: 12.5, weight: .medium))
                             .foregroundStyle(conn.enabled ? EjaTheme.ink : EjaTheme.inkSecondary)
                             .lineLimit(1)
-                        if conn.enabled, let err = status?.error, !err.isEmpty {
+                        if conn.enabled, status?.authRequired != true, let err = status?.error, !err.isEmpty {
                             Text(err)
                                 .font(.system(size: 11))
                                 .foregroundStyle(EjaTheme.warning)
@@ -896,7 +898,56 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.plain)
 
+                if let code = status?.oauthCode, !code.isEmpty {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(code, forType: .string)
+                    } label: {
+                        Text(code)
+                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                            .foregroundStyle(EjaTheme.ink)
+                            .padding(.horizontal, 6.5)
+                            .padding(.vertical, 2.5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                    .fill(EjaTheme.canvas)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                    .stroke(EjaTheme.hairlineStrong, lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                } else if isHTTP && hasURL && status?.authRequired == true {
+                    Button {
+                        draft.flushSave()
+                        client.oauthConnector(id: conn.id)
+                    } label: {
+                        Text("授权")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(EjaTheme.canvas)
+                            .padding(.horizontal, 7.5)
+                            .padding(.vertical, 2.5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                    .fill(EjaTheme.ink)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 if expanded {
+                    if isHTTP && hasURL && status?.authRequired != true && (status?.oauthCode ?? "").isEmpty {
+                        Button {
+                            draft.flushSave()
+                            client.oauthConnector(id: conn.id)
+                        } label: {
+                            Image(systemName: "key")
+                                .font(.system(size: 10.5, weight: .medium))
+                        }
+                        .buttonStyle(EjaIconButtonStyle(size: 22))
+                    }
+
                     Button {
                         draft.flushSave()
                         client.reloadConnectors()

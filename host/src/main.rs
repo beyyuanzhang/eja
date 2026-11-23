@@ -3,6 +3,7 @@ mod hands;
 mod http;
 mod llm;
 mod mcp;
+mod oauth;
 mod runtime;
 mod sandbox;
 mod state;
@@ -30,6 +31,9 @@ enum Command {
         id: String,
         provider: ProviderConfig,
         model: String,
+    },
+    OauthConnector {
+        id: String,
     },
     ReloadConnectors,
 }
@@ -126,6 +130,7 @@ fn main() {
                 provider,
                 model,
             }) => runtime.test_provider(id, provider, model),
+            Ok(Command::OauthConnector { id }) => runtime.oauth_connector(id),
             Ok(Command::ReloadConnectors) => runtime.reload_connectors(),
             Err(err) => runtime.emit_error(format!("无效指令: {err}")),
         }

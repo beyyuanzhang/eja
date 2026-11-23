@@ -133,8 +133,31 @@ public struct ConnectorStatusDTO: Codable, Equatable, Identifiable, Sendable {
     public var name: String
     public var enabled: Bool
     public var connected: Bool
+    public var authRequired: Bool
+    public var authorized: Bool
+    public var oauthCode: String?
     public var error: String?
     public var tools: [McpToolSummaryDTO]
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, enabled, connected, error, tools
+        case authRequired = "auth_required"
+        case authorized
+        case oauthCode = "oauth_code"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        connected = try c.decode(Bool.self, forKey: .connected)
+        authRequired = try c.decodeIfPresent(Bool.self, forKey: .authRequired) ?? false
+        authorized = try c.decodeIfPresent(Bool.self, forKey: .authorized) ?? false
+        oauthCode = try c.decodeIfPresent(String.self, forKey: .oauthCode)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+        tools = try c.decodeIfPresent([McpToolSummaryDTO].self, forKey: .tools) ?? []
+    }
 }
 
 public struct StreamItemDTO: Codable, Equatable, Identifiable, Sendable {
@@ -248,6 +271,11 @@ public final class HostClient: ObservableObject {
     public func reloadConnectors() {
         errorBanner = nil
         sendCommand(["cmd": "reload_connectors"])
+    }
+
+    public func oauthConnector(id: String) {
+        errorBanner = nil
+        sendCommand(["cmd": "oauth_connector", "id": id])
     }
 
     private func startHost(executableURL: URL?, dataDir: URL?) {

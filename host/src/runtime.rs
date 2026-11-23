@@ -1,4 +1,6 @@
-use crate::config::{write_json_atomic, ConfigPatch, HostConfig, ProviderConfig};
+use crate::config::{
+    write_json_atomic, ConfigPatch, ConnectorTransport, HostConfig, ProviderConfig,
+};
 use crate::hands::{activity_label, format_local_unix, Hands, ToolSpec};
 use crate::http::truncate_utf8;
 use crate::llm::{
@@ -6,6 +8,7 @@ use crate::llm::{
     ToolOutput,
 };
 use crate::mcp::ConnectorStatus;
+use crate::oauth::{spawn_oauth_flow, OAuthEvent};
 use crate::sandbox::{Sandbox, TrustedDir};
 use crate::state::{self, WakeAlarm};
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, Timestamp};
@@ -17,7 +20,11 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, Sender},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 pub type EventSink = Box<dyn FnMut(Value)>;
@@ -73,6 +80,9 @@ pub struct HostRuntime {
     config: HostConfig,
     connectors_bytes: Option<Vec<u8>>,
     hands: Hands,
+    oauth_tx: Sender<OAuthEvent>,
+    oauth_rx: Receiver<OAuthEvent>,
+    oauth_cancels: HashMap<String, Arc<AtomicBool>>,
     sandbox: Sandbox,
     anchor: Id,
     retry_at: Option<Instant>,
@@ -133,7 +143,13 @@ impl HostRuntime {
         let connectors_bytes = HostConfig::read_connectors(&data_dir).ok().flatten();
         config.connectors =
             HostConfig::parse_connectors(connectors_bytes.as_deref()).unwrap_or_default();
-        let hands = Hands::open(data_dir.clone(), sandbox.clone(), &config.connectors);
+        let hands = Hands::open(
+            data_dir.clone(),
+            core_dir.clone(),
+            sandbox.clone(),
+            &config.connectors,
+        );
+        let (oauth_tx, oauth_rx) = mpsc::channel();
         Ok(Self {
             data_dir,
             core_dir,
@@ -144,6 +160,9 @@ impl HostRuntime {
             config,
             connectors_bytes,
             hands,
+            oauth_tx,
+            oauth_rx,
+            oauth_cancels: HashMap::new(),
             sandbox,
             anchor,
             retry_at: None,
@@ -171,10 +190,15 @@ impl HostRuntime {
         let retry = self
             .retry_at
             .map(|at| at.saturating_duration_since(Instant::now()));
-        Ok(match (wake, retry) {
+        let base = match (wake, retry) {
             (Some(wake_delay), Some(retry_delay)) => Some(wake_delay.min(retry_delay)),
             (wake_delay, retry_delay) => wake_delay.or(retry_delay),
-        })
+        };
+        if !self.oauth_cancels.is_empty() {
+            let poll = Duration::from_millis(100);
+            return Ok(Some(base.map_or(poll, |d| d.min(poll))));
+        }
+        Ok(base)
     }
 
     fn clear_retry(&mut self) {
@@ -304,6 +328,65 @@ impl HostRuntime {
         self.emit_state();
     }
 
+    pub fn oauth_connector(&mut self, id: String) {
+        self.refresh_connectors(false);
+        let Some(cfg) = self.config.connectors.iter().find(|c| c.id == id).cloned() else {
+            self.emit_error(format!("未找到连接器: {id}"));
+            return;
+        };
+        let ConnectorTransport::Http { url, headers } = cfg.transport else {
+            self.emit_error("仅 HTTP 连接器支持 OAuth 授权");
+            return;
+        };
+        if url.trim().is_empty() {
+            self.emit_error("请先填写连接器 URL");
+            return;
+        }
+        if let Some(prev) = self.oauth_cancels.remove(&id) {
+            prev.store(true, Ordering::Relaxed);
+        }
+        self.hands.set_oauth_code(&id, None);
+        let cancel = spawn_oauth_flow(id.clone(), url, headers, self.oauth_tx.clone());
+        self.oauth_cancels.insert(id, cancel);
+        self.emit_state();
+    }
+
+    pub fn poll_oauth_events(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(ev) = self.oauth_rx.try_recv() {
+            match ev {
+                OAuthEvent::Started { id, oauth_code, .. } => {
+                    if self.oauth_cancels.contains_key(&id) {
+                        self.hands.set_oauth_code(&id, oauth_code);
+                        changed = true;
+                    }
+                }
+                OAuthEvent::Finished { id, result } => {
+                    self.oauth_cancels.remove(&id);
+                    self.hands.set_oauth_code(&id, None);
+                    match result {
+                        Ok(token) => {
+                            if let Err(err) =
+                                self.hands
+                                    .save_oauth_token(&id, token, &self.config.connectors)
+                            {
+                                self.emit_error(format!("保存 OAuth 凭证失败: {err}"));
+                            }
+                        }
+                        Err(err) => {
+                            self.emit_error(err);
+                        }
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.emit_state();
+        }
+        changed
+    }
+
     pub fn test_provider(&mut self, id: String, mut provider: ProviderConfig, model: String) {
         if provider.api_key.is_empty() {
             if let Some(existing) = self.config.providers.iter().find(|p| p.id == provider.id) {
@@ -331,6 +414,7 @@ impl HostRuntime {
     }
 
     pub fn tick_timers(&mut self) -> Result<(), String> {
+        self.poll_oauth_events();
         let (mut fired, due_guarded, now) =
             state::collect_due_wakes(&self.eja).map_err(|err| err.to_string())?;
         let checked_watches = !due_guarded.is_empty();
@@ -463,6 +547,8 @@ impl HostRuntime {
         let mut recoverable = false;
         for _ in 0..max_steps {
             self.set_status("thinking", "思考中…");
+            self.poll_oauth_events();
+            self.refresh_connectors(false);
             let tools = self.hands.tools();
             let reply = match self
                 .brain
@@ -2298,5 +2384,245 @@ for line in sys.stdin:
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn http_mcp_connector_oauth_flow_persists_kernel_token_and_auto_refreshes() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let base_srv = base.clone();
+        let active_token = Arc::new(Mutex::new("tok_initial".to_string()));
+        let active_token_srv = Arc::clone(&active_token);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_srv = Arc::clone(&stop);
+
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            while !stop_srv.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let body_part = req
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b)
+                    .unwrap_or("")
+                    .trim();
+
+                let (status, extra_hdr, resp_body) = if first_line
+                    .contains("/.well-known/oauth-protected-resource")
+                {
+                    (
+                        "200 OK",
+                        String::new(),
+                        json!({
+                            "authorization_servers": [format!("{base_srv}/login/oauth")],
+                            "scopes_supported": ["repo"]
+                        })
+                        .to_string(),
+                    )
+                } else if first_line.contains("/.well-known/oauth-authorization-server") {
+                    (
+                        "200 OK",
+                        String::new(),
+                        json!({
+                            "issuer": format!("{base_srv}/login/oauth"),
+                            "device_authorization_endpoint": format!("{base_srv}/login/device/code"),
+                            "token_endpoint": format!("{base_srv}/login/oauth/access_token")
+                        })
+                        .to_string(),
+                    )
+                } else if first_line.contains("/login/device/code") {
+                    (
+                        "200 OK",
+                        String::new(),
+                        json!({
+                            "device_code": "dev_code_1",
+                            "user_code": "1111-2222",
+                            "verification_uri": format!("{base_srv}/login/device"),
+                            "interval": 1,
+                            "expires_in": 60
+                        })
+                        .to_string(),
+                    )
+                } else if first_line.contains("/login/oauth/access_token") {
+                    if body_part.contains("grant_type=refresh_token") {
+                        *active_token_srv.lock().unwrap() = "tok_refreshed".into();
+                        (
+                            "200 OK",
+                            String::new(),
+                            json!({
+                                "access_token": "tok_refreshed",
+                                "refresh_token": "ref_2"
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            String::new(),
+                            json!({
+                                "access_token": "tok_initial",
+                                "refresh_token": "ref_1"
+                            })
+                            .to_string(),
+                        )
+                    }
+                } else if first_line.contains("/mcp") {
+                    let expected_auth =
+                        format!("authorization: bearer {}", active_token_srv.lock().unwrap());
+                    let authorized = req
+                        .lines()
+                        .any(|line| line.trim().to_ascii_lowercase() == expected_auth);
+                    if !authorized {
+                        (
+                            "401 Unauthorized",
+                            format!(
+                                "WWW-Authenticate: Bearer resource_metadata=\"{base_srv}/.well-known/oauth-protected-resource/mcp\"\r\n"
+                            ),
+                            json!({"error": "unauthorized"}).to_string(),
+                        )
+                    } else {
+                        let rpc: Value = serde_json::from_str(body_part).unwrap_or_default();
+                        let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                        let method = rpc.get("method").and_then(Value::as_str).unwrap_or("");
+                        let body = match method {
+                            "initialize" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "protocolVersion": "2024-11-05",
+                                    "capabilities": {},
+                                    "serverInfo": { "name": "mock-http", "version": "1" }
+                                }
+                            })
+                            .to_string(),
+                            "tools/list" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "tools": [{
+                                        "name": "whoami",
+                                        "description": "Return current identity",
+                                        "inputSchema": { "type": "object", "properties": {} }
+                                    }]
+                                }
+                            })
+                            .to_string(),
+                            "tools/call" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "content": [{
+                                        "type": "text",
+                                        "text": format!("authed:{}", active_token_srv.lock().unwrap())
+                                    }]
+                                }
+                            })
+                            .to_string(),
+                            _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}).to_string(),
+                        };
+                        ("200 OK", String::new(), body)
+                    }
+                } else {
+                    ("404 Not Found", String::new(), "{}".to_string())
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\n{extra_hdr}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("Eja");
+        let brain = Arc::new(ScriptedBrain {
+            replies: Mutex::new(Vec::new()),
+            seen_windows: Mutex::new(Vec::new()),
+        });
+        let mut rt = HostRuntime::open_with_brain(
+            data_dir.clone(),
+            brain.clone(),
+            Box::new(|_| {}),
+        )
+        .unwrap();
+
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("X-OAuth-Client-Id".into(), "cli_test".into());
+        let cfg = configured(vec![ConnectorConfig {
+            id: "gh".into(),
+            name: "GitHub".into(),
+            enabled: true,
+            transport: ConnectorTransport::Http {
+                url: format!("{base}/mcp"),
+                headers,
+            },
+        }]);
+        rt.save_config(cfg);
+
+        let snap0 = rt.snapshot();
+        assert_eq!(snap0.connector_statuses.len(), 1);
+        assert!(!snap0.connector_statuses[0].connected);
+        assert!(snap0.connector_statuses[0].auth_required);
+        assert!(!snap0.connector_statuses[0].authorized);
+
+        rt.oauth_connector("gh".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            rt.tick_timers().unwrap();
+            if rt.snapshot().connector_statuses[0].connected {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let snap1 = rt.snapshot();
+        assert!(snap1.connector_statuses[0].connected);
+        assert!(snap1.connector_statuses[0].authorized);
+        assert!(!snap1.connector_statuses[0].auth_required);
+        assert_eq!(snap1.connector_statuses[0].tools.len(), 1);
+
+        let core_oauth_path = dir.path().join("ai.eja.kernel").join("oauth.json");
+        assert!(core_oauth_path.exists(), "oauth.json must live in kernel dir");
+        let connectors_raw = fs::read_to_string(data_dir.join("connectors.json")).unwrap();
+        assert!(
+            !connectors_raw.contains("tok_initial"),
+            "connectors.json must not contain OAuth access token"
+        );
+
+        // Rotate server token to force 401 -> automatic refresh_token exchange during tool call!
+        *active_token.lock().unwrap() = "rotated_away".into();
+        brain.replies.lock().unwrap().extend([
+            Ok(tool_reply("c1", "mcp_gh_whoami", json!({}))),
+            Ok(text_reply("调用成功")),
+        ]);
+        rt.handle_user_message("测试刷新");
+
+        let seen = brain.seen_windows.lock().unwrap();
+        let last_win = seen.last().unwrap();
+        assert!(
+            last_win
+                .iter()
+                .any(|m| m.to_string().contains("authed:tok_refreshed")),
+            "expected auto-refreshed token in tool output: {last_win:?}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = server.join();
     }
 }
