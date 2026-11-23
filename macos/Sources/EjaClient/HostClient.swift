@@ -143,6 +143,11 @@ public struct StreamItemDTO: Codable, Equatable, Identifiable, Sendable {
     public var text: String
 }
 
+public struct ProviderTestResult: Equatable, Sendable {
+    public var ok: Bool
+    public var message: String
+}
+
 private struct StateEventDTO: Decodable {
     let status: String
     let dataDir: String
@@ -169,6 +174,7 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var config: HostConfigDTO = HostConfigDTO()
     @Published public private(set) var connectorStatuses: [ConnectorStatusDTO] = []
     @Published public private(set) var stream: [StreamItemDTO] = []
+    @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
 
     private var process: Process?
@@ -230,6 +236,13 @@ public final class HostClient: ObservableObject {
         guard !patch.isEmpty else { return }
         errorBanner = nil
         sendCommand(["cmd": "save_config", "config": patch])
+    }
+
+    public func testProvider(_ provider: ProviderConfigDTO, model: String) {
+        providerTestResults[provider.id] = ProviderTestResult(ok: true, message: "…")
+        guard let data = try? JSONEncoder().encode(provider),
+              let obj = try? JSONSerialization.jsonObject(with: data) else { return }
+        sendCommand(["cmd": "test_provider", "id": provider.id, "provider": obj, "model": model])
     }
 
     public func reloadConnectors() {
@@ -327,6 +340,12 @@ public final class HostClient: ObservableObject {
         case "error":
             if let msg = json["message"] as? String {
                 errorBanner = msg
+            }
+        case "provider_test":
+            if let id = json["id"] as? String,
+               let ok = json["ok"] as? Bool,
+               let msg = json["message"] as? String {
+                providerTestResults[id] = ProviderTestResult(ok: ok, message: msg)
             }
         case "notify":
             if Bundle.main.bundleURL.pathExtension == "app",

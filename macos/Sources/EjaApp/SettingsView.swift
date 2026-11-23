@@ -420,14 +420,14 @@ struct ProviderPreset: Identifiable {
     }
 
     static let all: [ProviderPreset] = [
-        .init(id: "magpie", name: "Magpie", kind: "openai", baseUrl: detectMagpieBaseUrl(), models: []),
-        .init(id: "openai", name: "OpenAI", kind: "openai", baseUrl: "https://api.openai.com/v1", models: ["gpt-4o", "gpt-4o-mini"]),
         .init(id: "anthropic", name: "Anthropic", kind: "anthropic", baseUrl: "https://api.anthropic.com", models: ["claude-sonnet-4-5", "claude-haiku-4-5"]),
         .init(id: "deepseek", name: "DeepSeek", kind: "openai", baseUrl: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"]),
         .init(id: "kimi", name: "Kimi", kind: "openai", baseUrl: "https://api.kimi.com/coding/v1", models: ["k2.5", "k2-thinking"]),
-        .init(id: "qwen", name: "Qwen", kind: "openai", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-max", "qwen-plus"]),
-        .init(id: "openrouter", name: "OpenRouter", kind: "openai", baseUrl: "https://openrouter.ai/api/v1", models: ["openai/gpt-4o", "anthropic/claude-sonnet-4-5"]),
+        .init(id: "magpie", name: "Magpie", kind: "openai", baseUrl: detectMagpieBaseUrl(), models: []),
         .init(id: "ollama", name: "Ollama", kind: "openai", baseUrl: "http://127.0.0.1:11434/v1", models: []),
+        .init(id: "openai", name: "OpenAI", kind: "openai", baseUrl: "https://api.openai.com/v1", models: ["gpt-4o", "gpt-4o-mini"]),
+        .init(id: "openrouter", name: "OpenRouter", kind: "openai", baseUrl: "https://openrouter.ai/api/v1", models: ["openai/gpt-4o", "anthropic/claude-sonnet-4-5"]),
+        .init(id: "qwen", name: "Qwen", kind: "openai", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-max", "qwen-plus"]),
         .init(id: "custom", name: "自定义", kind: "openai", baseUrl: "", models: []),
     ]
 }
@@ -559,6 +559,7 @@ struct SettingsView: View {
         let provider = draft.providers[index]
         let expanded = draft.expandedProvider == provider.id
         let isFetching = draft.fetchingProviders.contains(provider.id)
+        let testResult = client.providerTestResults[provider.id]
         let needsInlineKey = !expanded &&
             !SettingsDraft.isLocalEndpoint(provider.baseUrl) &&
             !provider.hasApiKey &&
@@ -585,6 +586,25 @@ struct SettingsView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+
+                if let testResult {
+                    Text(testResult.message)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(testResult.ok ? EjaTheme.positive : EjaTheme.danger)
+                        .lineLimit(1)
+                        .frame(maxWidth: 140, alignment: .trailing)
+                }
+
+                Button {
+                    let active = draft.judge.providerId == provider.id ? draft.judge.model : ""
+                    let model = !active.isEmpty ? active : (provider.models.first ?? "gpt-4o")
+                    client.testProvider(provider, model: model)
+                } label: {
+                    Image(systemName: "bolt")
+                        .font(.system(size: 10.5, weight: .medium))
+                }
+                .buttonStyle(EjaIconButtonStyle(size: 22))
+                .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty)
 
                 Button {
                     draft.fetchModels(for: provider.id)
@@ -669,6 +689,9 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.plain)
                 .contextMenu {
+                    Button("测试") {
+                        client.testProvider(provider, model: model)
+                    }
                     Button("移除", role: .destructive) {
                         draft.removeModel(providerId: provider.id, model: model)
                     }
