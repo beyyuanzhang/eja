@@ -1,12 +1,18 @@
 use crate::config::{write_json_atomic, ConfigPatch, HostConfig, ProviderConfig};
-use crate::hands::{unix_now, Hands, ToolSpec};
-use crate::llm::{project_window_through, tool_messages, Brain, HttpBrain, ToolCall, ToolOutput};
-use crate::mcp::{truncate_utf8, ConnectorStatus};
+use crate::hands::{activity_label, Hands, ToolSpec};
+use crate::http::truncate_utf8;
+use crate::llm::{
+    apply_tool_exchange, project_window_through, tool_messages, Brain, HttpBrain, ToolCall,
+    ToolOutput,
+};
+use crate::mcp::ConnectorStatus;
 use crate::sandbox::{Sandbox, TrustedDir};
-use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, WakeAlarm};
+use crate::state::{self, WakeAlarm};
+use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, Timestamp};
+use eja_memory::MemoryIndex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -53,19 +59,13 @@ pub struct HostState {
     pub wakes: Vec<WakeAlarm>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct WindowState {
-    anchor: Id,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    settled_through: Option<Id>,
-}
-
 pub struct HostRuntime {
     data_dir: TrustedDir,
     core_dir: TrustedDir,
     resources_dir: Option<PathBuf>,
     _instance_lock: fs::File,
     eja: Eja,
+    memory: MemoryIndex,
     config: HostConfig,
     connectors_bytes: Option<Vec<u8>>,
     hands: Hands,
@@ -115,32 +115,16 @@ impl HostRuntime {
         let core_dir =
             TrustedDir::open(core_path).map_err(|err| format!("锁定内核目录失败: {err}"))?;
         let sandbox = Sandbox::new(core_dir.path())?;
-        let eja = open_subject(&core_dir.path().join("subject.db"))?;
-        let legacy_wakes = core_dir.path().join("wakes.json");
-        match fs::read(&legacy_wakes) {
-            Ok(bytes) => {
-                let alarms: Vec<WakeAlarm> =
-                    serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
-                eja.schedule_wakes(&alarms).map_err(|err| err.to_string())?;
-                fs::remove_file(legacy_wakes).map_err(|err| err.to_string())?;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.to_string()),
-        }
-        let unfinished = eja.unfinished_actions().map_err(|err| err.to_string())?;
-        let window = load_window_state(&core_dir);
-        let anchor = window.anchor;
-        eja.initialize_turn_cursor(window.settled_through, unfinished.first().copied())
-            .map_err(|err| err.to_string())?;
-        for &action in &unfinished {
-            eja.finish(
-                action,
-                Outcome::Unknown("上次执行因宿主中断而未完成".into()),
-            )
-            .map_err(|err| err.to_string())?;
-        }
+        let eja = Eja::open(core_dir.path().join("subject.db")).map_err(|err| err.to_string())?;
+        let memory = open_memory(&core_dir.path().join("memory.db"))?;
         let resources_dir = resolve_resources_dir();
-        sync_kernel_version(&core_dir, &eja, resources_dir.as_deref());
+        let anchor = state::bootstrap(
+            &eja,
+            &core_dir,
+            resources_dir.as_deref(),
+            KERNEL_VERSION,
+            PROTOCOL_VERSION,
+        )?;
         let mut config = HostConfig::load(&core_dir);
         let connectors_bytes = HostConfig::read_connectors(&data_dir).ok().flatten();
         config.connectors =
@@ -152,6 +136,7 @@ impl HostRuntime {
             resources_dir,
             _instance_lock: instance_lock,
             eja,
+            memory,
             config,
             connectors_bytes,
             hands,
@@ -180,9 +165,13 @@ impl HostRuntime {
     }
 
     fn next_wake_delay(&self) -> Result<Option<Duration>, String> {
-        self.eja
-            .next_wake_at()
-            .map(|at| at.map(|at| Duration::from_secs(at.saturating_sub(unix_now()).max(0) as u64)))
+        let now = self
+            .eja
+            .now()
+            .unwrap_or_else(|_| Timestamp::now())
+            .as_unix();
+        state::next_wake_at(&self.eja)
+            .map(|at| at.map(|at| Duration::from_secs(at.saturating_sub(now).max(0) as u64)))
             .map_err(|err| err.to_string())
     }
 
@@ -204,12 +193,12 @@ impl HostRuntime {
 
     #[cfg(test)]
     fn has_pending_trigger(&self) -> bool {
-        self.eja.next_trigger().unwrap().is_some()
+        state::next_trigger(&self.eja).unwrap().is_some()
     }
 
     pub fn process_pending_turn(&mut self) {
         loop {
-            match self.eja.next_trigger() {
+            match state::next_trigger(&self.eja) {
                 Ok(Some((id, source))) => {
                     if !self.run_turn(source == Source::Clock, id) {
                         return;
@@ -223,7 +212,7 @@ impl HostRuntime {
 
     fn persist_anchor(&mut self, next_anchor: Id) -> Result<(), String> {
         if next_anchor != self.anchor {
-            save_window_state(&self.core_dir, next_anchor)
+            state::save_anchor(&self.eja, next_anchor)
                 .map_err(|err| format!("保存窗口状态失败: {err}"))?;
             self.anchor = next_anchor;
         }
@@ -246,6 +235,7 @@ impl HostRuntime {
                     .collect()
             })
             .unwrap_or_default();
+        let proactive_replies = state::proactive_reply_ids(&self.eja);
         HostState {
             protocol_version: PROTOCOL_VERSION,
             kernel_version: KERNEL_VERSION.to_string(),
@@ -259,9 +249,9 @@ impl HostRuntime {
             configured: self.config.is_configured(),
             config: self.config.redacted_for_ui(),
             connector_statuses: self.hands.connector_statuses(),
-            stream: build_stream(&entries),
+            stream: build_stream(&entries, &proactive_replies),
             concerns,
-            wakes: self.eja.pending_wakes().unwrap_or_default(),
+            wakes: state::pending_wakes(&self.eja).unwrap_or_default(),
         }
     }
 
@@ -329,21 +319,11 @@ impl HostRuntime {
                 provider.api_key = existing.api_key.clone();
             }
         }
-        let result = self.brain.test_connection(&provider, &model);
-        match result {
-            Ok(message) => (self.emit)(json!({
-                "event": "provider_test",
-                "id": id,
-                "ok": true,
-                "message": message
-            })),
-            Err(err) => (self.emit)(json!({
-                "event": "provider_test",
-                "id": id,
-                "ok": false,
-                "message": err
-            })),
-        }
+        let (ok, message) = match self.brain.test_connection(&provider, &model) {
+            Ok(message) => (true, message),
+            Err(err) => (false, err),
+        };
+        (self.emit)(json!({ "event": "provider_test", "id": id, "ok": ok, "message": message }));
     }
 
     pub fn handle_user_message(&mut self, raw: &str) {
@@ -360,11 +340,7 @@ impl HostRuntime {
     }
 
     pub fn tick_timers(&mut self) -> Result<(), String> {
-        if self
-            .eja
-            .record_due_wakes(unix_now())
-            .map_err(|err| err.to_string())?
-        {
+        if state::record_due_wakes(&self.eja).map_err(|err| err.to_string())? {
             self.clear_retry();
             self.process_pending_turn();
             return Ok(());
@@ -398,65 +374,62 @@ impl HostRuntime {
     fn run_turn(&mut self, proactive: bool, trigger_id: Id) -> bool {
         self.set_status("thinking", "思考中…");
         self.refresh_connectors(false);
-        let Some((provider, model)) = self.config.resolve_judge() else {
-            self.clear_retry();
-            self.emit_error("请先在设置中配置可用的 LLM Provider 与主模型");
-            self.set_status("idle", "在线");
-            return false;
-        };
-        let provider = provider.clone();
-        let model = model.to_string();
         let window_max_bytes = self.config.window_max_bytes();
-        if window_max_bytes < 256 {
-            self.clear_retry();
-            self.emit_error("上下文窗口至少需要 256 字节。请调整设置，当前请求已保留。");
-            self.set_status("idle", "在线");
-            return false;
-        }
         let max_steps = self.config.max_steps();
-
-        let data_dir_str = self.data_dir.path().display().to_string();
-        let resources_line = match &self.resources_dir {
-            Some(dir) => format!("\n只读协议与模板参考：{}", dir.display()),
-            None => String::new(),
+        let setup = (|| -> Result<(ProviderConfig, String, Vec<Value>), (bool, String)> {
+            let Some((provider, model)) = self.config.resolve_judge() else {
+                return Err((true, "请先在设置中配置可用的 LLM Provider 与主模型".into()));
+            };
+            let (provider, model) = (provider.clone(), model.to_string());
+            if window_max_bytes < 256 {
+                return Err((
+                    true,
+                    "上下文窗口至少需要 256 字节。请调整设置，当前请求已保留。".into(),
+                ));
+            }
+            let head = self
+                .eja
+                .revision()
+                .map_err(|err| (false, format!("读取日志版本失败: {err}")))?;
+            let mut next_anchor = self.anchor;
+            let messages = project_window_through(
+                &self.eja,
+                &mut next_anchor,
+                head,
+                window_max_bytes,
+                trigger_id,
+            )
+            .map_err(|err| (false, format!("构建日志窗口失败: {err}")))?;
+            self.persist_anchor(next_anchor)
+                .map_err(|err| (false, err))?;
+            Ok((provider, model, messages))
+        })();
+        let (provider, model, mut messages) = match setup {
+            Ok(ready) => ready,
+            Err((clear_retry, msg)) => {
+                if clear_retry {
+                    self.clear_retry();
+                }
+                self.emit_error(msg);
+                self.set_status("idle", "在线");
+                return false;
+            }
         };
+        let data_dir_str = self.data_dir.path().display().to_string();
+        let resources_line = self
+            .resources_dir
+            .as_ref()
+            .map(|dir| format!("\n只读协议与模板参考：{}", dir.display()))
+            .unwrap_or_default();
         let system = format!(
             "你是 EJA，一个持续存在的自我同一性主体。\n\
             内核版本：{KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）{resources_line}\n\
-            数据目录：{}\n\
-            连接器配置：{}/connectors.json（变更会自动热加载）\n\
+            数据目录：{data_dir_str}\n\
+            连接器配置：{data_dir_str}/connectors.json（变更会自动热加载）\n\
             本地时区：{}\n\n\
             前置消息是你按时间正序排列的不可变主体日志；编号最大的用户或时钟 `noticed` 记录触发本回合。不调工具时的文本回复会发送给人，留空则保持沉默。",
-            data_dir_str, data_dir_str, self.local_tz
+            self.local_tz
         );
-        let head = match self.eja.revision() {
-            Ok(head) => head,
-            Err(err) => {
-                self.emit_error(format!("读取日志版本失败: {err}"));
-                self.set_status("idle", "在线");
-                return false;
-            }
-        };
-        let mut next_anchor = self.anchor;
-        let mut messages = match project_window_through(
-            &self.eja,
-            &mut next_anchor,
-            head,
-            window_max_bytes,
-            trigger_id,
-        ) {
-            Ok(records) => records,
-            Err(err) => {
-                self.emit_error(format!("构建日志窗口失败: {err}"));
-                self.set_status("idle", "在线");
-                return false;
-            }
-        };
-        if let Err(err) = self.persist_anchor(next_anchor) {
-            self.emit_error(err);
-            self.set_status("idle", "在线");
-            return false;
-        }
 
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
@@ -479,7 +452,7 @@ impl HostRuntime {
 
             if reply.calls.is_empty() {
                 let text = reply.text.trim();
-                if let Err(err) = self.eja.complete_turn(trigger_id, text) {
+                if let Err(err) = state::complete_turn(&self.eja, trigger_id, text) {
                     fatal_error = Some(format!("保存回合结算状态失败: {err}"));
                     break;
                 }
@@ -498,19 +471,13 @@ impl HostRuntime {
                 }
             };
             let step = tool_messages(&provider.kind, reply, window_max_bytes, |call| {
-                let detail = match call.name.as_str() {
-                    "shell" => "执行 Shell",
-                    "search" | "read" => "查阅记忆",
-                    "keep" | "release" => "更新挂念",
-                    "wake" => "预约唤醒",
-                    name => name,
-                };
-                self.set_status("thinking", detail);
+                self.set_status("thinking", activity_label(&call.name));
                 self.execute_tool_call(call, &tools)
             });
             let mut anchor = self.anchor;
             let applied = step.and_then(|step| {
-                step.apply(
+                apply_tool_exchange(
+                    step,
                     &mut messages,
                     &self.eja,
                     &mut anchor,
@@ -560,16 +527,14 @@ impl HostRuntime {
                         let Fact::Kept { concern, .. } = entry.fact else {
                             unreachable!()
                         };
-                        ToolOutput::Recorded(
+                        ToolOutput::Value(
                             json!({"status":"kept", "concern":concern, "fact_id":entry.id}),
                         )
                     })
             }
             "release" => match call.args["concern"].as_i64() {
                 Some(id) => self.eja.release(id).map(|entry| {
-                    ToolOutput::Recorded(
-                        json!({"status":"released","concern":id,"fact_id":entry.id}),
-                    )
+                    ToolOutput::Value(json!({"status":"released","concern":id,"fact_id":entry.id}))
                 }),
                 None => Err(eja_core::Error::Invalid("release 需要整数 concern".into())),
             },
@@ -582,25 +547,26 @@ impl HostRuntime {
             },
             "search" => {
                 let cue = call.args["cue"].as_str().unwrap_or("").trim();
-                self.eja
-                    .search(cue)
-                    .map(|matches| ToolOutput::Temporary(json!({"cue":cue,"matches":matches})))
+                return match self.memory.search(&self.eja, cue) {
+                    Ok(matches) => Ok(ToolOutput::Value(json!({"cue":cue,"matches":matches}))),
+                    Err(eja_memory::Error::Invalid(msg)) => {
+                        Ok(ToolOutput::Value(json!({"error": msg})))
+                    }
+                    Err(err) => Err(err.to_string()),
+                };
             }
             other => {
-                let Some(spec) = tools.iter().find(|t| t.name == other) else {
-                    return Ok(ToolOutput::Temporary(
+                let Some(spec) = tools.iter().find(|t| !t.is_kernel && t.name == other) else {
+                    return Ok(ToolOutput::Value(
                         json!({ "error": format!("未知工具: {other}") }),
                     ));
                 };
-                let grants: Vec<&str> = tools.iter().map(|t| t.capability.as_str()).collect();
                 let revision = self.eja.revision().map_err(|err| err.to_string())?;
-                let acted = self
-                    .eja
-                    .act(revision, &spec.capability, call.args.clone(), &grants);
+                let acted = self.eja.act(revision, &spec.capability, call.args.clone());
                 let acted = match acted {
                     Ok(c) => c,
                     Err(eja_core::Error::Invalid(msg)) => {
-                        return Ok(ToolOutput::Temporary(json!({ "error": msg })))
+                        return Ok(ToolOutput::Value(json!({ "error": msg })))
                     }
                     Err(err) => return Err(err.to_string()),
                 };
@@ -615,14 +581,14 @@ impl HostRuntime {
                 let Fact::Returned { outcome, .. } = receipt.fact else {
                     unreachable!()
                 };
-                Ok(ToolOutput::Recorded(
+                Ok(ToolOutput::Value(
                     json!({ "id": receipt.id, "action": acted.id, "outcome": outcome }),
                 ))
             }
         };
         match result {
             Ok(output) => Ok(output),
-            Err(eja_core::Error::Invalid(msg)) => Ok(ToolOutput::Temporary(json!({"error":msg}))),
+            Err(eja_core::Error::Invalid(msg)) => Ok(ToolOutput::Value(json!({"error":msg}))),
             Err(err) => Err(err.to_string()),
         }
     }
@@ -646,19 +612,20 @@ impl Drop for HostRuntime {
     }
 }
 
-fn open_subject(db_path: &Path) -> Result<Eja, String> {
+fn open_memory(index_path: &Path) -> Result<MemoryIndex, String> {
     #[cfg(feature = "onnx")]
     if let Ok(model_dir) = std::env::var("EJA_ONNX_MODEL_DIR") {
         if Path::new(&model_dir).exists() {
-            if let Ok(enc) = eja_core::OnnxEncoder::load(&model_dir) {
-                return Eja::open_with_encoder(db_path, enc).map_err(|err| err.to_string());
+            if let Ok(enc) = eja_memory::OnnxEncoder::load(&model_dir) {
+                return MemoryIndex::open(index_path, enc).map_err(|err| err.to_string());
             }
         }
     }
-    Eja::open(db_path).map_err(|err| err.to_string())
+    let _ = index_path;
+    Ok(MemoryIndex::keyword())
 }
 
-fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
+fn build_stream(entries: &[Entry], proactive_replies: &HashSet<Id>) -> Vec<StreamItem> {
     let mut returns: HashMap<Id, &Outcome> = HashMap::new();
     for entry in entries {
         if let Fact::Returned { action, outcome } = &entry.fact {
@@ -666,54 +633,24 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
         }
     }
     let mut items = Vec::new();
-    let mut proactive_turn = false;
     for entry in entries {
         match &entry.fact {
-            Fact::Noticed {
-                source: Source::Person,
-                text,
-            } => {
-                proactive_turn = false;
+            Fact::Noticed { source, text } => {
+                let kind = if *source == Source::Person {
+                    "person"
+                } else {
+                    "event"
+                };
                 items.push(StreamItem {
                     id: entry.id,
-                    kind: "person".into(),
+                    kind: kind.into(),
                     text: text.clone(),
                     detail: None,
                     proactive: None,
                 });
             }
-            Fact::Noticed {
-                source: Source::Clock,
-                text,
-            } => {
-                proactive_turn = true;
-                items.push(StreamItem {
-                    id: entry.id,
-                    kind: "event".into(),
-                    text: text.clone(),
-                    detail: None,
-                    proactive: None,
-                });
-            }
-            Fact::Noticed {
-                source: Source::World,
-                text,
-            } => {
-                items.push(StreamItem {
-                    id: entry.id,
-                    kind: "event".into(),
-                    text: text.clone(),
-                    detail: None,
-                    proactive: None,
-                });
-            }
-            Fact::Said {
-                text,
-                in_response_to,
-            } => {
-                let proactive = in_response_to
-                    .as_ref()
-                    .map_or(proactive_turn, |source| *source == Source::Clock);
+            Fact::Said { text } => {
+                let proactive = proactive_replies.contains(&entry.id);
                 items.push(StreamItem {
                     id: entry.id,
                     kind: "eja".into(),
@@ -754,26 +691,6 @@ fn build_stream(entries: &[Entry]) -> Vec<StreamItem> {
         }
     }
     items
-}
-
-fn load_window_state(core_dir: &TrustedDir) -> WindowState {
-    core_dir
-        .read_file("window.json")
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<WindowState>(&bytes).ok())
-        .map(|state| WindowState {
-            anchor: state.anchor.max(0),
-            settled_through: state.settled_through.map(|id| id.max(0)),
-        })
-        .unwrap_or_default()
-}
-
-fn save_window_state(core_dir: &TrustedDir, anchor: Id) -> Result<(), String> {
-    let state = WindowState {
-        anchor,
-        settled_through: None,
-    };
-    write_json_atomic(core_dir, "window.json", &state)
 }
 
 fn is_recoverable_llm_error(err: &str) -> bool {
@@ -859,31 +776,6 @@ fn acquire_instance_lock(core_dir: &Path) -> Result<fs::File, LockError> {
         }
         Err(fs::TryLockError::Error(err)) => Err(LockError::Io(format!("获取实例锁失败: {err}"))),
     }
-}
-
-fn sync_kernel_version(core_dir: &TrustedDir, eja: &Eja, resources_dir: Option<&Path>) {
-    let prev = core_dir
-        .read_file("kernel_version")
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    if let Some(old) = prev.as_deref() {
-        if old == KERNEL_VERSION {
-            return;
-        }
-        let notice = match resources_dir {
-            Some(dir) => format!(
-                "内核已从 {old} 升级到 {KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）。协议文档与默认界面参考位于 {}，可按需对照调整本地前端或连接器。",
-                dir.display()
-            ),
-            None => format!("内核已从 {old} 升级到 {KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）。"),
-        };
-        if eja.notice(Source::World, notice).is_err() {
-            return;
-        }
-    }
-    let _ = core_dir.write_file_atomic("kernel_version", format!("{KERNEL_VERSION}\n").as_bytes());
 }
 
 #[cfg(test)]
@@ -1287,20 +1179,11 @@ for line in sys.stdin:
             HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
                 .unwrap();
         assert!(rt.snapshot().stream.is_empty());
-        let version_file = dir.path().join("ai.eja.kernel/kernel_version");
-        assert_eq!(
-            fs::read_to_string(&version_file).unwrap().trim(),
-            KERNEL_VERSION
-        );
+        state::set_kernel_version_for_test(&rt.eja, "0.9.0").unwrap();
         drop(rt);
 
-        fs::write(&version_file, "0.9.0\n").unwrap();
         let upgraded =
             HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
-        assert_eq!(
-            fs::read_to_string(&version_file).unwrap().trim(),
-            KERNEL_VERSION
-        );
         assert!(upgraded
             .snapshot()
             .stream
@@ -1347,7 +1230,7 @@ for line in sys.stdin:
         let eja = Eja::open(old_dir.join("subject.db")).unwrap();
         let rev = eja.revision().unwrap();
         let dangling = eja
-            .act(rev, "shell", json!({ "command": "sleep 999" }), &["shell"])
+            .act(rev, "shell", json!({ "command": "sleep 999" }))
             .unwrap();
         drop(eja);
 
@@ -1428,14 +1311,16 @@ for line in sys.stdin:
             window_max_bytes: None,
             max_steps: None,
         });
-        rt.eja
-            .schedule_wakes(&[WakeAlarm {
+        state::schedule_wakes(
+            &rt.eja,
+            &[WakeAlarm {
                 id: "w-1".into(),
                 fire_at_unix: 1,
                 fire_at_display: "00:00:01".into(),
                 reason: "喝水提醒".into(),
-            }])
-            .unwrap();
+            }],
+        )
+        .unwrap();
         rt.tick_timers().unwrap();
         assert!(rt.has_pending_trigger());
         assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 0);
@@ -1500,7 +1385,7 @@ for line in sys.stdin:
         let rev = rt.eja.revision().unwrap();
         let acted = rt
             .eja
-            .act(rev, "shell", json!({ "command": "echo once" }), &["shell"])
+            .act(rev, "shell", json!({ "command": "echo once" }))
             .unwrap();
         drop(rt);
 
@@ -1673,8 +1558,7 @@ for line in sys.stdin:
                     json!({ "command": format!("echo {}", "a".repeat(3000)) }),
                 )),
                 ("read_large_fact", 0) => Ok(tool_reply("r1", "read", json!({ "fact": 1 }))),
-                // Exercise compact notes on the first page and native tool messages on later pages.
-                ("read_paginated", 0) => Ok(read_reply("r".repeat(8192), json!({"fact": 1}))),
+                ("read_paginated", 0) => Ok(read_reply("r1".into(), json!({"fact": 1}))),
                 ("read_paginated", _) => {
                     let last = messages.last().unwrap();
                     let body: Value = serde_json::from_str(
@@ -1684,7 +1568,6 @@ for line in sys.stdin:
                             .unwrap(),
                     )
                     .unwrap();
-                    let body = body.get("result").unwrap_or(&body);
                     if body["truncated"] == true {
                         let next = body["next_offset"].as_u64().unwrap();
                         return Ok(read_reply(
@@ -1806,7 +1689,7 @@ for line in sys.stdin:
                 assert!(messages_bytes(win) <= 8192);
             }
             let mut reassembled = String::new();
-            for (index, window) in small_windows[1..].iter().enumerate() {
+            for window in &small_windows[1..] {
                 let content = &window.last().unwrap()["content"];
                 let page: Value = serde_json::from_str(
                     content
@@ -1815,12 +1698,6 @@ for line in sys.stdin:
                         .unwrap(),
                 )
                 .unwrap();
-                let page = if index == 0 {
-                    assert_eq!(page["tool"], "read");
-                    &page["result"]
-                } else {
-                    &page
-                };
                 assert_eq!(page["offset"], reassembled.len());
                 reassembled.push_str(page["chunk"].as_str().unwrap());
                 if page["truncated"] == true {
@@ -1852,11 +1729,11 @@ for line in sys.stdin:
         fs::create_dir(dir.path().join("ai.eja.kernel/window.json")).unwrap();
         rt.handle_user_message("请预约一次，随后保持沉默");
         assert!(!rt.has_pending_trigger());
-        assert_eq!(rt.eja.pending_wakes().unwrap().len(), 1);
+        assert_eq!(state::pending_wakes(&rt.eja).unwrap().len(), 1);
         drop(rt);
         let mut rt = HostRuntime::open_with_brain(data, brain.clone(), Box::new(|_| {})).unwrap();
         rt.process_pending_turn();
-        assert_eq!(rt.eja.pending_wakes().unwrap().len(), 1);
+        assert_eq!(state::pending_wakes(&rt.eja).unwrap().len(), 1);
         assert_eq!(brain.seen_windows.lock().unwrap().len(), 2);
     }
 
@@ -1904,7 +1781,7 @@ for line in sys.stdin:
             fire_at_display: "00:00:01".into(),
             reason: format!("{marker} {}", "x".repeat(1400)),
         });
-        rt.eja.schedule_wakes(&alarms).unwrap();
+        state::schedule_wakes(&rt.eja, &alarms).unwrap();
         rt.tick_timers().unwrap();
         let windows = brain.seen_windows.lock().unwrap();
         assert_eq!(windows.len(), 2);

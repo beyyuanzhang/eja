@@ -287,12 +287,10 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 name = "eja-core"
 version = "1.0.0"
 dependencies = [
- "fastembed",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
- "sqlite-vec",
  "tempfile",
 ]
 
@@ -301,8 +299,23 @@ name = "eja-host"
 version = "1.0.0"
 dependencies = [
  "eja-core",
+ "eja-memory",
  "serde",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "eja-memory"
+version = "1.0.0"
+dependencies = [
+ "eja-core",
+ "fastembed",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlite-vec",
  "tempfile",
 ]
 

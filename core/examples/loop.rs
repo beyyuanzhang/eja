@@ -23,16 +23,19 @@ fn step(eja: &Eja, draft: &Path, grants: &[&str]) -> AppResult<()> {
             source: Source::Clock,
             ..
         } if concerns.first().is_some_and(|c| c.text == REQUEST) => {
-            let call = eja.act(head, "draft.lines", Value::Null, grants)?;
-            let outcome = perform(call, draft);
-            eja.finish(head + 1, outcome)?;
+            if !grants.contains(&"draft.lines") {
+                return Ok(());
+            }
+            let call = eja.act(head, "draft.lines", Value::Null)?;
+            let outcome = perform(&call, draft);
+            eja.finish(call.id, outcome)?;
         }
         _ => {}
     }
     Ok(())
 }
 
-fn perform(call: Call, draft: &Path) -> Outcome {
+fn perform(call: &Call, draft: &Path) -> Outcome {
     match call.capability.as_str() {
         "draft.lines" => match fs::read_to_string(draft) {
             Ok(text) => Outcome::Observed(format!("{} lines", text.lines().count())),

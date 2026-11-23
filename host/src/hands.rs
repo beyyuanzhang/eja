@@ -1,16 +1,17 @@
 use crate::config::ConnectorConfig;
-use crate::mcp::{truncate_utf8, ConnectorPool, ConnectorStatus};
+use crate::http::truncate_utf8;
+use crate::mcp::{ConnectorPool, ConnectorStatus};
 use crate::sandbox::{kill_process_tree, Sandbox, TrustedDir};
-use eja_core::{Call, Eja, Outcome, WakeAlarm};
+use crate::state::{schedule_wakes, WakeAlarm};
+use eja_core::{Call, Eja, Outcome, Timestamp};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-const KERNEL_TOOL_NAMES: &[&str] = &["keep", "release", "read", "search"];
 const DEFAULT_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SHELL_BYTES: usize = 32 * 1024;
 
@@ -20,6 +21,27 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub schema: Value,
+    pub is_kernel: bool,
+}
+
+fn builtin_spec(name: &str, description: &str, schema: Value, is_kernel: bool) -> ToolSpec {
+    ToolSpec {
+        capability: name.into(),
+        name: name.into(),
+        description: description.into(),
+        schema,
+        is_kernel,
+    }
+}
+
+pub fn activity_label(tool_name: &str) -> &str {
+    match tool_name {
+        "shell" => "执行 Shell",
+        "search" | "read" => "查阅记忆",
+        "keep" | "release" => "更新挂念",
+        "wake" => "预约唤醒",
+        other => other,
+    }
 }
 
 pub struct Hands {
@@ -47,11 +69,56 @@ impl Hands {
 
     pub fn tools(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
-            ToolSpec {
-                capability: "wake".into(),
-                name: "wake".into(),
-                description: "预约未来主动唤醒。".into(),
-                schema: json!({
+            builtin_spec(
+                "keep",
+                "新建或修订一条跨窗口挂念。",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "concern": { "type": "integer", "description": "修订已有挂念时传入其 id；新建时省略" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"]
+                }),
+                true,
+            ),
+            builtin_spec(
+                "release",
+                "放下不再需要关注的开放挂念。",
+                json!({
+                    "type": "object",
+                    "properties": { "concern": { "type": "integer" } },
+                    "required": ["concern"]
+                }),
+                true,
+            ),
+            builtin_spec(
+                "read",
+                "按事实 id 读取完整历史记录及其最新回执/修订。",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "fact": { "type": "integer" },
+                        "offset": { "type": "integer", "minimum": 0, "description": "分页续读时的字节偏移，默认 0" }
+                    },
+                    "required": ["fact"]
+                }),
+                true,
+            ),
+            builtin_spec(
+                "search",
+                "从全历史主体日志中检索相关旧事实。",
+                json!({
+                    "type": "object",
+                    "properties": { "cue": { "type": "string" } },
+                    "required": ["cue"]
+                }),
+                true,
+            ),
+            builtin_spec(
+                "wake",
+                "预约未来主动唤醒。",
+                json!({
                     "type": "object",
                     "properties": {
                         "delay_seconds": { "type": "integer", "minimum": 1 },
@@ -59,12 +126,12 @@ impl Hands {
                     },
                     "required": ["delay_seconds", "reason"]
                 }),
-            },
-            ToolSpec {
-                capability: "shell".into(),
-                name: "shell".into(),
-                description: "执行本机 shell 命令。".into(),
-                schema: json!({
+                false,
+            ),
+            builtin_spec(
+                "shell",
+                "执行本机 shell 命令。",
+                json!({
                     "type": "object",
                     "properties": {
                         "command": { "type": "string" },
@@ -73,14 +140,11 @@ impl Hands {
                     },
                     "required": ["command"]
                 }),
-            },
+                false,
+            ),
         ];
 
-        let mut used: HashSet<String> = KERNEL_TOOL_NAMES
-            .iter()
-            .map(|name| (*name).to_string())
-            .chain(specs.iter().map(|spec| spec.name.clone()))
-            .collect();
+        let mut used: HashSet<String> = specs.iter().map(|spec| spec.name.clone()).collect();
 
         for tool in self.connectors.tools() {
             let name = safe_tool_name(&tool.capability, &mut used);
@@ -94,6 +158,7 @@ impl Hands {
                 name,
                 description,
                 schema: tool.input_schema,
+                is_kernel: false,
             });
         }
         specs
@@ -146,7 +211,8 @@ fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
     if delay < 1 || reason.is_empty() {
         return Outcome::Failed("wake 需要 delay_seconds >= 1 且非空 reason".into());
     }
-    let Some(fire_at) = unix_now().checked_add(delay) else {
+    let now = eja.now().unwrap_or_else(|_| Timestamp::now()).as_unix();
+    let Some(fire_at) = now.checked_add(delay) else {
         return Outcome::Failed("唤醒时间超出范围".into());
     };
     let display = format_local_unix(fire_at);
@@ -156,7 +222,7 @@ fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
         fire_at_display: display.clone(),
         reason: reason.to_string(),
     };
-    match eja.schedule_wakes(&[alarm]) {
+    match schedule_wakes(eja, &[alarm]) {
         Ok(()) => Outcome::Observed(format!("scheduled at {display} ({reason})")),
         Err(err) => Outcome::Failed(format!("保存唤醒失败: {err}")),
     }
@@ -281,13 +347,6 @@ fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
         idx += 1;
     }
     candidate
-}
-
-pub(crate) fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 fn format_local_unix(secs: i64) -> String {

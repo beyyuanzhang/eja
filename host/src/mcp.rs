@@ -1,11 +1,12 @@
 use crate::config::{ConnectorConfig, ConnectorTransport};
+use crate::http::{post_bytes, truncate_utf8, HttpError, HttpResponse};
 use crate::sandbox::{kill_process_tree, Sandbox};
 use eja_core::Outcome;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{
     mpsc::{self, Receiver},
     Arc, Mutex,
@@ -48,6 +49,16 @@ pub struct McpTool {
     pub capability: String,
 }
 
+impl McpTool {
+    fn summary(&self) -> McpToolSummary {
+        McpToolSummary {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            capability: self.capability.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorStatus {
     pub id: String,
@@ -57,6 +68,32 @@ pub struct ConnectorStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub tools: Vec<McpToolSummary>,
+}
+
+impl ConnectorStatus {
+    fn from_cfg(
+        cfg: &ConnectorConfig,
+        connected: bool,
+        error: Option<String>,
+        tools: &[McpTool],
+    ) -> Self {
+        Self {
+            id: cfg.id.clone(),
+            name: cfg.name.clone(),
+            enabled: cfg.enabled,
+            connected,
+            error,
+            tools: tools.iter().map(McpTool::summary).collect(),
+        }
+    }
+}
+
+fn init_params() -> Value {
+    json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
+    })
 }
 
 struct StdioConnection {
@@ -106,15 +143,9 @@ impl StdioConnection {
         }
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(text) => {
-                        if tx.send(text).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
                 }
             }
         });
@@ -127,16 +158,8 @@ impl StdioConnection {
             next_id: 1,
             broken: false,
         };
-        conn.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
-            }),
-            MCP_TIMEOUT,
-        )
-        .map_err(RequestError::into_message)?;
+        conn.request("initialize", init_params(), MCP_TIMEOUT)
+            .map_err(RequestError::into_message)?;
         conn.notify("notifications/initialized", json!({}))?;
         Ok(conn)
     }
@@ -233,16 +256,8 @@ impl HttpConnection {
             session_id: None,
             next_id: 1,
         };
-        conn.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
-            }),
-            MCP_TIMEOUT,
-        )
-        .map_err(RequestError::into_message)?;
+        conn.request("initialize", init_params(), MCP_TIMEOUT)
+            .map_err(RequestError::into_message)?;
         let _ = conn.post_raw(
             &json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
             Duration::from_secs(5),
@@ -286,106 +301,59 @@ impl HttpConnection {
     ) -> Result<(String, String), RequestError> {
         let body_bytes =
             serde_json::to_vec(payload).map_err(|err| RequestError::Failed(err.to_string()))?;
-        let mut cmd = Command::new("/usr/bin/curl");
-        cmd.args([
-            "-sS",
-            "-i",
-            "-X",
-            "POST",
-            "--max-time",
-            &timeout.as_secs().max(1).to_string(),
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            "Accept: application/json, text/event-stream",
-        ]);
+        let mut headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            (
+                "Accept".to_string(),
+                "application/json, text/event-stream".to_string(),
+            ),
+        ];
         if let Some(sid) = &self.session_id {
-            cmd.arg("-H").arg(format!("Mcp-Session-Id: {sid}"));
+            headers.push(("Mcp-Session-Id".to_string(), sid.clone()));
         }
         for (key, value) in &self.headers {
-            cmd.arg("-H").arg(format!("{key}: {value}"));
+            headers.push((key.clone(), value.clone()));
         }
-        cmd.args(["--data-binary", "@-", &self.url])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|err| RequestError::Failed(format!("调用 curl 失败: {err}")))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            thread::spawn(move || {
-                let _ = stdin.write_all(&body_bytes);
-            });
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|err| RequestError::Unknown(format!("等待 MCP HTTP 响应失败: {err}")))?;
-        if !output.status.success() {
-            let err_text = String::from_utf8_lossy(&output.stderr);
-            let message = format!("MCP HTTP 请求失败: {}", err_text.trim());
-            return Err(match output.status.code() {
-                Some(3 | 6 | 7) => RequestError::Failed(message),
-                _ => RequestError::Unknown(message),
-            });
-        }
-        let raw = String::from_utf8_lossy(&output.stdout);
-        let (headers, body) = split_http_response(&raw)?;
-        Ok((headers.to_string(), body.to_string()))
+        let resp = post_bytes(&self.url, &headers, &body_bytes, timeout.as_secs().max(1)).map_err(
+            |err| match err {
+                HttpError::Launch(msg) => RequestError::Failed(msg),
+                HttpError::Wait(msg) => RequestError::Unknown(format!("MCP {msg}")),
+                HttpError::Transport { exit_code, message } => {
+                    let msg = format!("MCP HTTP 请求失败: {message}");
+                    match exit_code {
+                        Some(3 | 6 | 7) => RequestError::Failed(msg),
+                        _ => RequestError::Unknown(msg),
+                    }
+                }
+                HttpError::InvalidResponse(msg) => RequestError::Unknown(msg),
+            },
+        )?;
+        check_mcp_http_status(resp)
     }
 }
 
-fn split_http_response(raw: &str) -> Result<(&str, &str), RequestError> {
-    let mut rest = raw;
-    let mut last_headers = "";
-    let mut status_code: Option<u16> = None;
-
-    while rest.starts_with("HTTP/") {
-        let Some((head, tail)) = split_once_header_end(rest) else {
-            return Err(RequestError::Unknown(format!(
-                "无效 MCP HTTP 响应: {}",
-                truncate_utf8(rest, 240)
-            )));
-        };
-        let code = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(0);
-        last_headers = head;
-        status_code = Some(code);
-        rest = tail;
-        if !(100..200).contains(&code) {
-            break;
-        }
+fn check_mcp_http_status(resp: HttpResponse) -> Result<(String, String), RequestError> {
+    if !(200..300).contains(&resp.status) {
+        let message = format!(
+            "MCP HTTP {}: {}",
+            resp.status,
+            truncate_utf8(resp.body.trim(), 240)
+        );
+        return Err(match resp.status {
+            400..=407 | 409..=498 => RequestError::Failed(message),
+            _ => RequestError::Unknown(message),
+        });
     }
-
-    if let Some(code) = status_code {
-        if !(200..300).contains(&code) {
-            let message = format!("MCP HTTP {code}: {}", truncate_utf8(rest.trim(), 240));
-            return Err(match code {
-                400..=407 | 409..=498 => RequestError::Failed(message),
-                _ => RequestError::Unknown(message),
-            });
-        }
-    } else {
-        return Err(RequestError::Unknown(format!(
-            "缺少 MCP HTTP 状态行: {}",
-            truncate_utf8(raw.trim(), 240)
-        )));
-    }
-    Ok((last_headers, rest))
+    Ok((resp.headers, resp.body))
 }
 
-fn split_once_header_end(input: &str) -> Option<(&str, &str)> {
-    match (input.find("\r\n\r\n"), input.find("\n\n")) {
-        (Some(a), Some(b)) if a <= b => Some((&input[..a], &input[a + 4..])),
-        (Some(_), Some(b)) => Some((&input[..b], &input[b + 2..])),
-        (Some(a), None) => Some((&input[..a], &input[a + 4..])),
-        (None, Some(b)) => Some((&input[..b], &input[b + 2..])),
-        (None, None) => None,
-    }
+#[cfg(test)]
+fn split_http_response(raw: &str) -> Result<(String, String), RequestError> {
+    let resp = crate::http::parse_http_response(raw).map_err(|err| match err {
+        HttpError::InvalidResponse(msg) => RequestError::Unknown(msg),
+        other => RequestError::Unknown(format!("{other:?}")),
+    })?;
+    check_mcp_http_status(resp)
 }
 
 fn extract_jsonrpc_result(val: &Value, default_error: &str) -> Result<Value, RequestError> {
@@ -499,7 +467,6 @@ impl ActiveConnection {
 struct ConnectedEntry {
     transport: ConnectorTransport,
     connection: ActiveConnection,
-    summaries: Vec<McpToolSummary>,
     tools: Vec<McpTool>,
 }
 
@@ -540,122 +507,36 @@ impl ConnectorPool {
 
         for cfg in configs {
             if !cfg.enabled {
-                self.statuses.push(ConnectorStatus {
-                    id: cfg.id.clone(),
-                    name: cfg.name.clone(),
-                    enabled: false,
-                    connected: false,
-                    error: None,
-                    tools: Vec::new(),
-                });
+                self.statuses
+                    .push(ConnectorStatus::from_cfg(cfg, false, None, &[]));
                 continue;
             }
 
             if let Some(entry) = reusable.remove(&cfg.id) {
                 self.tools.extend(entry.tools.iter().cloned());
-                self.statuses.push(ConnectorStatus {
-                    id: cfg.id.clone(),
-                    name: cfg.name.clone(),
-                    enabled: true,
-                    connected: true,
-                    error: None,
-                    tools: entry.summaries.clone(),
-                });
+                self.statuses
+                    .push(ConnectorStatus::from_cfg(cfg, true, None, &entry.tools));
                 self.connections.insert(cfg.id.clone(), entry);
                 continue;
             }
 
-            let connected = match &cfg.transport {
-                ConnectorTransport::Stdio { command, args, env } => {
-                    StdioConnection::connect(&self.sandbox, command, args, env)
-                        .map(ActiveConnection::Stdio)
+            match connect_and_list(&self.sandbox, cfg) {
+                Ok((connection, entry_tools)) => {
+                    self.tools.extend(entry_tools.iter().cloned());
+                    self.statuses
+                        .push(ConnectorStatus::from_cfg(cfg, true, None, &entry_tools));
+                    self.connections.insert(
+                        cfg.id.clone(),
+                        ConnectedEntry {
+                            transport: cfg.transport.clone(),
+                            connection,
+                            tools: entry_tools,
+                        },
+                    );
                 }
-                ConnectorTransport::Http { url, headers } => {
-                    HttpConnection::connect(url, headers).map(ActiveConnection::Http)
-                }
-            };
-
-            match connected {
-                Ok(mut conn) => match conn
-                    .request("tools/list", json!({}), MCP_TIMEOUT)
-                    .map_err(RequestError::into_message)
-                {
-                    Ok(result) => {
-                        let raw_tools = result
-                            .get("tools")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        let mut summaries = Vec::new();
-                        let mut entry_tools = Vec::new();
-                        let safe_id = sanitize_id(&cfg.id);
-                        for item in raw_tools {
-                            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
-                                continue;
-                            };
-                            let description = item
-                                .get("description")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let input_schema = item
-                                .get("inputSchema")
-                                .cloned()
-                                .filter(|v| v.is_object())
-                                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-                            let capability = format!("mcp.{safe_id}.{name}");
-                            summaries.push(McpToolSummary {
-                                name: name.to_string(),
-                                description: description.clone(),
-                                capability: capability.clone(),
-                            });
-                            entry_tools.push(McpTool {
-                                connector_id: cfg.id.clone(),
-                                name: name.to_string(),
-                                description,
-                                input_schema,
-                                capability,
-                            });
-                        }
-                        self.tools.extend(entry_tools.iter().cloned());
-                        self.connections.insert(
-                            cfg.id.clone(),
-                            ConnectedEntry {
-                                transport: cfg.transport.clone(),
-                                connection: conn,
-                                summaries: summaries.clone(),
-                                tools: entry_tools,
-                            },
-                        );
-                        self.statuses.push(ConnectorStatus {
-                            id: cfg.id.clone(),
-                            name: cfg.name.clone(),
-                            enabled: true,
-                            connected: true,
-                            error: None,
-                            tools: summaries,
-                        });
-                    }
-                    Err(err) => {
-                        self.statuses.push(ConnectorStatus {
-                            id: cfg.id.clone(),
-                            name: cfg.name.clone(),
-                            enabled: true,
-                            connected: false,
-                            error: Some(err),
-                            tools: Vec::new(),
-                        });
-                    }
-                },
                 Err(err) => {
-                    self.statuses.push(ConnectorStatus {
-                        id: cfg.id.clone(),
-                        name: cfg.name.clone(),
-                        enabled: true,
-                        connected: false,
-                        error: Some(err),
-                        tools: Vec::new(),
-                    });
+                    self.statuses
+                        .push(ConnectorStatus::from_cfg(cfg, false, Some(err), &[]));
                 }
             }
         }
@@ -730,6 +611,48 @@ impl ConnectorPool {
     }
 }
 
+fn connect_and_list(
+    sandbox: &Sandbox,
+    cfg: &ConnectorConfig,
+) -> Result<(ActiveConnection, Vec<McpTool>), String> {
+    let mut conn = match &cfg.transport {
+        ConnectorTransport::Stdio { command, args, env } => {
+            StdioConnection::connect(sandbox, command, args, env).map(ActiveConnection::Stdio)?
+        }
+        ConnectorTransport::Http { url, headers } => {
+            HttpConnection::connect(url, headers).map(ActiveConnection::Http)?
+        }
+    };
+    let result = conn
+        .request("tools/list", json!({}), MCP_TIMEOUT)
+        .map_err(RequestError::into_message)?;
+    let safe_id = sanitize_id(&cfg.id);
+    let tools = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let name = item.get("name")?.as_str()?.to_string();
+            let description = item["description"].as_str().unwrap_or("").to_string();
+            let input_schema = item
+                .get("inputSchema")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+            let capability = format!("mcp.{safe_id}.{name}");
+            Some(McpTool {
+                connector_id: cfg.id.clone(),
+                name,
+                description,
+                input_schema,
+                capability,
+            })
+        })
+        .collect();
+    Ok((conn, tools))
+}
+
 fn extract_mcp_result_text(result: &Value) -> String {
     if let Some(items) = result.get("content").and_then(|v| v.as_array()) {
         let parts: Vec<String> = items
@@ -767,20 +690,6 @@ fn sanitize_id(raw: &str) -> String {
     }
 }
 
-pub fn truncate_utf8(input: &str, max_bytes: usize) -> String {
-    if input.len() <= max_bytes {
-        return input.to_string();
-    }
-    if max_bytes < 3 {
-        return ".".repeat(max_bytes);
-    }
-    let mut end = max_bytes - 3;
-    while end > 0 && !input.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &input[..end])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,7 +699,7 @@ mod tests {
         let raw = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nMcp-Session-Id: s1\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\r\n\r\n";
         let (headers, body) = split_http_response(raw).unwrap();
         assert!(headers.contains("Mcp-Session-Id: s1"));
-        let parsed = parse_http_jsonrpc(body, 1).unwrap();
+        let parsed = parse_http_jsonrpc(&body, 1).unwrap();
         let result = extract_jsonrpc_result(&parsed, "err").unwrap();
         assert_eq!(result["ok"], true);
     }

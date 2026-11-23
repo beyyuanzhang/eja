@@ -1,4 +1,4 @@
-use eja_core::{Eja, Error, Fact, Outcome, Source, Timestamp, WakeAlarm, FACT_BYTES};
+use eja_core::{Eja, Error, Fact, Outcome, Source, Timestamp, FACT_BYTES};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
@@ -8,39 +8,35 @@ use std::sync::{
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
-fn wake_notice_and_removal_roll_back_together() -> Result<()> {
+fn migrates_v3_subject_db_to_v4_preserving_concerns_and_actions() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
-    let eja = Eja::open(&path)?;
-    let alarms = [WakeAlarm {
-        id: "wake-1".into(),
-        fire_at_unix: 10,
-        fire_at_display: "00:00:10".into(),
-        reason: "检查事务".into(),
-    }];
-    eja.schedule_wakes(&alarms)?;
     let db = rusqlite::Connection::open(&path)?;
     db.execute_batch(
-        "CREATE TRIGGER fail_delete BEFORE DELETE ON wakes
-         BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;",
+        "CREATE TABLE facts (
+             id INTEGER PRIMARY KEY,
+             at INTEGER NOT NULL,
+             body TEXT NOT NULL,
+             concern INTEGER,
+             live INTEGER
+         );
+         INSERT INTO facts(id, at, body, concern, live) VALUES
+             (1, 100, '{\"kind\":\"kept\",\"concern\":1,\"text\":\"watch\"}', 1, 1),
+             (2, 101, '{\"kind\":\"acted\",\"capability\":\"shell\",\"input\":null}', NULL, NULL),
+             (3, 102, '{\"kind\":\"returned\",\"action\":2,\"outcome\":{\"status\":\"observed\",\"detail\":\"ok\"}}', NULL, NULL),
+             (4, 103, '{\"kind\":\"acted\",\"capability\":\"shell\",\"input\":null}', NULL, NULL),
+             (5, 104, '{\"kind\":\"said\",\"text\":\"hi\",\"in_response_to\":\"person\"}', NULL, NULL);
+         PRAGMA user_version = 3;",
     )?;
-    assert!(eja.record_due_wakes(10).is_err());
-    drop(eja);
+    drop(db);
 
     let reopened = Eja::open(&path)?;
-    assert_eq!(reopened.revision()?, 0);
-    assert_eq!(reopened.pending_wakes()?.len(), 1);
-    db.execute_batch("DROP TRIGGER fail_delete")?;
-    assert!(reopened.record_due_wakes(10)?);
-    assert!(reopened.pending_wakes()?.is_empty());
-    assert!(!reopened.record_due_wakes(10)?);
-    assert!(matches!(
-        reopened.read(1)?.fact,
-        Fact::Noticed {
-            source: Source::Clock,
-            ..
-        }
-    ));
+    assert_eq!(reopened.concerns(reopened.revision()?)?.len(), 1);
+    assert_eq!(reopened.unfinished_actions()?, vec![4]);
+    assert_eq!(reopened.evidence(2)?.latest.unwrap().id, 3);
+    assert!(matches!(reopened.read(5)?.fact, Fact::Said { ref text } if text == "hi"));
+    reopened.set_meta("host.anchor", "5")?;
+    assert_eq!(reopened.get_meta("host.anchor")?.as_deref(), Some("5"));
     Ok(())
 }
 
@@ -104,18 +100,18 @@ fn only_a_fresh_granted_act_can_issue_a_call() -> Result<()> {
     let second = Eja::open(&path)?;
     let basis = first.notice(Source::World, "an observation")?;
     assert!(matches!(
-        first.act(basis, "new.tool", json!({"x": 1}), &[]),
+        first.act(basis, "", json!({"x": 1})),
         Err(Error::Invalid(_))
     ));
     let rev = second.notice(Source::Person, "one more thing")?;
     assert!(matches!(
-        first.act(basis, "new.tool", json!({"x": 1}), &["new.tool"]),
+        first.act(basis, "new.tool", json!({"x": 1})),
         Err(Error::Conflict)
     ));
-    let call = first.act(rev, "new.tool", json!({"x": 1}), &["new.tool"])?;
+    let call = first.act(rev, "new.tool", json!({"x": 1}))?;
     assert_eq!(call.input, json!({"x":1}));
     assert!(matches!(
-        second.act(rev, "new.tool", json!({"x": 1}), &["new.tool"]),
+        second.act(rev, "new.tool", json!({"x": 1})),
         Err(Error::Conflict)
     ));
     assert!(matches!(
@@ -178,7 +174,7 @@ fn simultaneous_acts_issue_only_one_call() -> Result<()> {
     std::thread::scope(|scope| {
         let run = |eja: Eja| {
             barrier.wait();
-            match eja.act(revision, "one", json!(null), &["one"]) {
+            match eja.act(revision, "one", json!(null)) {
                 Ok(_) => true,
                 Err(Error::Conflict) => false,
                 other => panic!("unexpected result: {other:?}"),
@@ -197,7 +193,7 @@ fn oversized_receipt_truncates_to_fact_budget_and_stays_idempotent() -> Result<(
     let eja = Eja::open(":memory:")?;
     assert_eq!(eja.revision()?, 0);
     let basis = eja.notice(Source::Person, "test")?;
-    let call = eja.act(basis, "read", json!(null), &["read"])?;
+    let call = eja.act(basis, "read", json!(null))?;
     let detail = "雨\0\"".repeat(FACT_BYTES);
     let receipt = eja.finish(call.id, Outcome::Observed(detail.clone()))?;
     assert!(serde_json::to_vec(&receipt.fact)?.len() <= FACT_BYTES);
@@ -220,7 +216,7 @@ fn an_unknown_receipt_can_be_settled_only_once_by_competing_hosts() -> Result<()
     let db = dir.path().join("subject.db");
     let seed = Eja::open(&db)?;
     let notice = seed.notice(Source::World, "tick")?;
-    let call = seed.act(notice, "read", json!(null), &["read"])?;
+    let call = seed.act(notice, "read", json!(null))?;
     let unknown = seed.finish(call.id, Outcome::Unknown("lost".into()))?;
     drop(seed);
     let a = Eja::open(&db)?;
@@ -301,7 +297,7 @@ fn subject_db_sets_schema_version_and_rejects_future_versions() -> Result<()> {
 
     let conn = rusqlite::Connection::open(&path)?;
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 
     conn.execute_batch("PRAGMA user_version = 99;")?;
     drop(conn);
@@ -315,11 +311,11 @@ fn unfinished_actions_finds_only_unsettled_actions_on_long_journal() -> Result<(
     let eja = Eja::open(":memory:")?;
     for index in 0..300 {
         let rev = eja.revision()?;
-        let call = eja.act(rev, "shell", json!({ "n": index }), &["shell"])?;
+        let call = eja.act(rev, "shell", json!({ "n": index }))?;
         eja.finish(call.id, Outcome::Observed("ok".into()))?;
     }
     let rev = eja.revision()?;
-    let pending = eja.act(rev, "shell", json!({ "n": 300 }), &["shell"])?;
+    let pending = eja.act(rev, "shell", json!({ "n": 300 }))?;
 
     assert_eq!(eja.unfinished_actions()?, vec![pending.id]);
     Ok(())

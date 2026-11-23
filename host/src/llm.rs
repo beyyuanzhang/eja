@@ -1,11 +1,9 @@
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::hands::ToolSpec;
-use crate::mcp::truncate_utf8;
+use crate::http::{post_bytes, truncate_utf8, HttpError};
+use crate::state::entries_for_turn;
 use eja_core::{Eja, Entry, Evidence, Fact, Id};
 use serde_json::{json, Value};
-use std::io::Write;
-use std::process::{Command, Stdio};
-use std::thread;
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
 
@@ -47,8 +45,7 @@ impl Brain for HttpBrain {
         messages: &[Value],
         tools: &[ToolSpec],
     ) -> Result<ModelReply, String> {
-        let defs = build_tool_defs(tools);
-        complete_wire(provider, model, system, messages, Some(&defs))
+        complete_wire(provider, model, system, messages, Some(tools))
     }
 
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String> {
@@ -68,14 +65,8 @@ impl Brain for HttpBrain {
 }
 
 pub enum ToolOutput {
-    Recorded(Value),
-    Temporary(Value),
+    Value(Value),
     Read(Evidence, usize),
-}
-
-pub enum ToolMessages {
-    Exchange(Vec<Value>),
-    Notes(Vec<Value>),
 }
 
 pub fn tool_messages(
@@ -83,7 +74,7 @@ pub fn tool_messages(
     reply: ModelReply,
     window_bytes: usize,
     mut execute: impl FnMut(&ToolCall) -> Result<ToolOutput, String>,
-) -> Result<ToolMessages, String> {
+) -> Result<Option<Vec<Value>>, String> {
     let count = reply.calls.len();
     let blocks: Vec<_> = reply
         .calls
@@ -103,7 +94,7 @@ pub fn tool_messages(
     let reserve = (window_bytes / 4).min(64 * 1024);
     let per_call =
         window_bytes.saturating_sub(reserve + msg_bytes(&reply.message) + framing) / count;
-    let exchange = per_call >= 128;
+    let keep_exchange = per_call >= 128;
     let slots = match provider {
         ProviderKind::OpenAi => tail.as_mut_slice(),
         ProviderKind::Anthropic => tail[0]["content"]
@@ -111,69 +102,49 @@ pub fn tool_messages(
             .expect("tool result blocks")
             .as_mut_slice(),
     };
-    let mut notes = Vec::new();
     for (call, slot) in reply.calls.into_iter().zip(slots) {
         let output = execute(&call)?;
-        let (kind, budget) = if exchange {
-            (provider, per_call)
-        } else {
-            // Journal projection already includes durable effects. Keep transient results as text.
-            let framing =
-                json!({"tool": call.name, "result": null}).to_string().len() + 1 - "null".len();
-            let available = (window_bytes / 2 / count).saturating_sub(framing);
-            if matches!(output, ToolOutput::Recorded(_)) || available < "null".len() {
-                continue;
-            }
-            (&ProviderKind::OpenAi, available)
-        };
+        if !keep_exchange {
+            continue;
+        }
         let value = match output {
             ToolOutput::Read(evidence, offset) => {
-                format_read_result(kind, &evidence, offset, budget)
+                format_read_result(provider, &evidence, offset, per_call)
             }
-            ToolOutput::Recorded(v) | ToolOutput::Temporary(v) => cap_tool_result(kind, v, budget),
+            ToolOutput::Value(v) => cap_tool_result(provider, v, per_call),
         };
-        if exchange {
-            slot["content"] = Value::String(value.to_string());
-        } else {
-            notes.push(user_message(
-                json!({"tool": call.name, "result": value}).to_string(),
-            ));
-        }
+        slot["content"] = Value::String(value.to_string());
     }
-    if exchange {
+    if keep_exchange {
         tail.insert(0, reply.message);
-        Ok(ToolMessages::Exchange(tail))
+        Ok(Some(tail))
     } else {
-        Ok(ToolMessages::Notes(notes))
+        Ok(None)
     }
 }
 
-impl ToolMessages {
-    pub fn apply(
-        self,
-        messages: &mut Vec<Value>,
-        eja: &Eja,
-        anchor: &mut Id,
-        before: Id,
-        trigger: Id,
-        max_bytes: usize,
-    ) -> eja_core::Result<()> {
-        let (head, tail) = match self {
-            Self::Exchange(tail)
-                if messages_bytes(messages) + messages_bytes(&tail) <= max_bytes =>
-            {
-                messages.extend(tail);
-                return Ok(());
-            }
-            Self::Exchange(tail) => (before, tail),
-            Self::Notes(tail) => (eja.revision()?, tail),
-        };
-        let budget = max_bytes.saturating_sub(messages_bytes(&tail));
-        let mut prefix = project_window_through(eja, anchor, head, budget, trigger)?;
-        prefix.extend(tail);
-        *messages = prefix;
-        Ok(())
-    }
+pub fn apply_tool_exchange(
+    exchange: Option<Vec<Value>>,
+    messages: &mut Vec<Value>,
+    eja: &Eja,
+    anchor: &mut Id,
+    before: Id,
+    trigger: Id,
+    max_bytes: usize,
+) -> eja_core::Result<()> {
+    let (head, tail) = match exchange {
+        Some(tail) if messages_bytes(messages) + messages_bytes(&tail) <= max_bytes => {
+            messages.extend(tail);
+            return Ok(());
+        }
+        Some(tail) => (before, tail),
+        None => (eja.revision()?, Vec::new()),
+    };
+    let budget = max_bytes.saturating_sub(messages_bytes(&tail));
+    let mut prefix = project_window_through(eja, anchor, head, budget, trigger)?;
+    prefix.extend(tail);
+    *messages = prefix;
+    Ok(())
 }
 
 /// Project a turn at a fixed revision, keeping its triggering notice in the window.
@@ -191,7 +162,7 @@ pub fn project_window_through(
         *anchor = 0;
     }
     *anchor = (*anchor).min(trigger.saturating_sub(1));
-    let entries = eja.entries_for_turn(*anchor, through, trigger)?;
+    let entries = entries_for_turn(eja, *anchor, through, trigger)?;
     let entry_msgs: Vec<Value> = entries
         .iter()
         .map(|entry| {
@@ -285,45 +256,27 @@ pub fn messages_bytes(messages: &[Value]) -> usize {
     messages.iter().map(msg_bytes).sum()
 }
 
-fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
-    let mut end = max_bytes.min(s.len());
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
-
-fn ceil_char_boundary(s: &str, min_bytes: usize) -> usize {
-    let mut end = min_bytes.min(s.len());
-    while end < s.len() && !s.is_char_boundary(end) {
-        end += 1;
-    }
-    end
-}
-
-fn fit_utf8_prefix_len(text: &str, max_prefix: usize, fits: impl Fn(&str) -> bool) -> usize {
-    let hi_max = floor_char_boundary(text, max_prefix);
-    if fits(&text[..hi_max]) {
-        return hi_max;
+fn fit_utf8_prefix(text: &str, max_prefix: usize, mut fits: impl FnMut(&str) -> bool) -> &str {
+    let mut hi = text.floor_char_boundary(max_prefix.min(text.len()));
+    if fits(&text[..hi]) {
+        return &text[..hi];
     }
     let mut lo = 0usize;
-    let mut hi = hi_max;
     while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        let mut cut = floor_char_boundary(text, mid);
-        if cut <= lo {
-            cut = ceil_char_boundary(text, lo + 1);
-            if cut > hi {
+        let mut mid = text.floor_char_boundary(lo + (hi - lo) / 2);
+        if mid <= lo {
+            mid = text.ceil_char_boundary(lo + 1);
+            if mid >= hi {
                 break;
             }
         }
-        if fits(&text[..cut]) {
-            lo = cut;
+        if fits(&text[..mid]) {
+            lo = mid;
         } else {
-            hi = floor_char_boundary(text, cut - 1);
+            hi = mid;
         }
     }
-    lo
+    &text[..lo]
 }
 
 // Anthropic nests the serialized result in a JSON string inside a content block.
@@ -354,10 +307,10 @@ fn cap_tool_result(provider: &ProviderKind, value: Value, max_bytes: usize) -> V
             Value::Null
         };
     }
-    let len = fit_utf8_prefix_len(&serialized, max_bytes, |slice| {
+    let prefix = fit_utf8_prefix(&serialized, max_bytes, |slice| {
         result_fits(&make(slice).to_string(), provider, max_bytes)
     });
-    make(&serialized[..len])
+    make(prefix)
 }
 
 fn format_read_result(
@@ -376,7 +329,7 @@ fn format_read_result(
     if offset == 0 && result_fits(&raw, provider, max_bytes) {
         return json!(evidence);
     }
-    let start = floor_char_boundary(&raw, offset.min(raw.len()));
+    let start = raw.floor_char_boundary(offset.min(raw.len()));
     let remaining = &raw[start..];
     let total_bytes = raw.len();
     let build_page = |chunk: &str| {
@@ -397,17 +350,17 @@ fn format_read_result(
             max_bytes,
         );
     }
-    let len = fit_utf8_prefix_len(remaining, max_bytes, |slice| {
+    let chunk = fit_utf8_prefix(remaining, max_bytes, |slice| {
         result_fits(&build_page(slice).to_string(), provider, max_bytes)
     });
-    if len == 0 && !remaining.is_empty() {
+    if chunk.is_empty() && !remaining.is_empty() {
         return cap_tool_result(
             provider,
             json!({"error": "窗口不足以容纳分页数据"}),
             max_bytes,
         );
     }
-    build_page(&remaining[..len])
+    build_page(chunk)
 }
 
 pub fn msg_bytes(msg: &Value) -> usize {
@@ -441,97 +394,58 @@ fn bound_entry_message(entry: &Entry, message: Value, budget: usize) -> Value {
 
 fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Result<Option<Value>> {
     let content_budget = budget.saturating_sub(1);
-    if content_budget == 0 {
+    let encode = |items: &[Value], omitted: usize| {
+        let mut obj = json!({ "anchor": anchor, "concerns": items });
+        if omitted > 0 {
+            obj["omitted_concerns"] = json!(omitted);
+        }
+        obj.to_string()
+    };
+    if content_budget == 0 || encode(&[], 0).len() > content_budget {
         return Ok(None);
     }
     let concerns = eja.concerns(anchor)?;
-    let total_concerns = concerns.len();
-    let prefix = format!("{{\"anchor\":{anchor},\"concerns\":[");
-    let base_len = prefix.len() + 2;
-    if base_len > content_budget {
-        return Ok(None);
-    }
-    let est_min_bytes: usize = base_len
-        + concerns
-            .iter()
-            .map(|c| c.text.len().saturating_add(36))
-            .sum::<usize>();
-    if est_min_bytes <= content_budget {
-        let full = serde_json::to_string(&json!({
-            "anchor": anchor,
-            "concerns": concerns
-        }))?;
-        if full.len() <= content_budget {
-            return Ok(Some(user_message(full)));
-        }
+    let full = serde_json::to_string(&json!({ "anchor": anchor, "concerns": concerns }))?;
+    if full.len() <= content_budget {
+        return Ok(Some(user_message(full)));
     }
 
-    let omitted_len = |omitted: usize| {
-        if omitted == 0 {
-            0
-        } else {
-            format!(",\"omitted_concerns\":{omitted}").len()
-        }
-    };
-    let max_text_each = (content_budget / total_concerns.max(1)).clamp(48, 2048);
-    let mut packed: Vec<String> = Vec::new();
-    let mut items_bytes = 0usize;
+    let max_each = (content_budget / concerns.len().max(1)).clamp(48, 2048);
+    let mut packed: Vec<Value> = Vec::new();
     for (index, concern) in concerns.iter().enumerate() {
-        let remaining_after = total_concerns - index - 1;
-        let comma = usize::from(!packed.is_empty());
-        let overhead = base_len + items_bytes + comma + omitted_len(remaining_after);
-        if overhead >= content_budget {
-            break;
-        }
-        let item_budget = content_budget - overhead;
-        if concern.text.len() <= max_text_each {
-            let full_item = serde_json::to_string(concern)?;
-            if full_item.len() <= item_budget {
-                items_bytes += comma + full_item.len();
-                packed.push(full_item);
+        let rest = concerns.len() - index - 1;
+        let trunc = |text: &str| {
+            json!({
+                "id": concern.id, "latest": concern.latest, "at": concern.at,
+                "text": text, "truncated": true
+            })
+        };
+        if concern.text.len() <= max_each {
+            packed.push(serde_json::to_value(concern)?);
+            if encode(&packed, rest).len() <= content_budget {
                 continue;
             }
+            packed.pop();
         }
-        let make_truncated = |text: &str| {
-            serde_json::to_string(&json!({
-                "id": concern.id,
-                "latest": concern.latest,
-                "at": concern.at,
-                "text": text,
-                "truncated": true
-            }))
-            .unwrap_or_default()
-        };
-        if make_truncated("").len() > item_budget {
+        packed.push(trunc(""));
+        let fits_empty = encode(&packed, rest).len() <= content_budget;
+        packed.pop();
+        if !fits_empty {
             break;
         }
-        let limit = fit_utf8_prefix_len(&concern.text, max_text_each, |slice| {
-            make_truncated(slice).len() <= item_budget
+        let prefix = fit_utf8_prefix(&concern.text, max_each, |slice| {
+            packed.push(trunc(slice));
+            let ok = encode(&packed, rest).len() <= content_budget;
+            packed.pop();
+            ok
         });
-        let item_json = make_truncated(&concern.text[..limit]);
-        items_bytes += comma + item_json.len();
-        packed.push(item_json);
+        packed.push(trunc(prefix));
     }
-    let omitted = total_concerns - packed.len();
-    let omitted_suffix = if omitted > 0 {
-        format!(",\"omitted_concerns\":{omitted}")
-    } else {
-        String::new()
-    };
-    let mut out = String::with_capacity(base_len + items_bytes + omitted_suffix.len());
-    out.push_str(&prefix);
-    for (index, item) in packed.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(item);
+    let mut rendered = encode(&packed, concerns.len() - packed.len());
+    if rendered.len() > content_budget {
+        rendered = encode(&packed, 0);
     }
-    out.push(']');
-    if !omitted_suffix.is_empty() && out.len() + omitted_suffix.len() < content_budget {
-        out.push_str(&omitted_suffix);
-    }
-    out.push('}');
-    Ok(Some(user_message(out)))
+    Ok(Some(user_message(rendered)))
 }
 
 fn render_entry(entry: &Entry) -> eja_core::Result<Value> {
@@ -539,67 +453,6 @@ fn render_entry(entry: &Entry) -> eja_core::Result<Value> {
         Fact::Said { text, .. } => Ok(json!({ "role": "assistant", "content": text })),
         _ => Ok(user_message(serde_json::to_string(entry)?)),
     }
-}
-
-struct WireToolDef {
-    name: String,
-    description: String,
-    schema: Value,
-}
-
-fn build_tool_defs(hands_tools: &[ToolSpec]) -> Vec<WireToolDef> {
-    let mut defs = vec![
-        WireToolDef {
-            name: "keep".into(),
-            description: "新建或修订一条跨窗口挂念。".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "concern": { "type": "integer", "description": "要更新的挂念 ID，新建则省略" },
-                    "text": { "type": "string" }
-                },
-                "required": ["text"]
-            }),
-        },
-        WireToolDef {
-            name: "release".into(),
-            description: "放下不再需要的挂念。".into(),
-            schema: json!({
-                "type": "object",
-                "properties": { "concern": { "type": "integer" } },
-                "required": ["concern"]
-            }),
-        },
-        WireToolDef {
-            name: "read".into(),
-            description: "按 ID 读取历史日志条目原文。".into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "fact": { "type": "integer" },
-                    "offset": { "type": "integer", "minimum": 0, "description": "可选，按字节偏移续读超长事实" }
-                },
-                "required": ["fact"]
-            }),
-        },
-        WireToolDef {
-            name: "search".into(),
-            description: "在完整历史日志中检索相关条目。".into(),
-            schema: json!({
-                "type": "object",
-                "properties": { "cue": { "type": "string" } },
-                "required": ["cue"]
-            }),
-        },
-    ];
-    for spec in hands_tools {
-        defs.push(WireToolDef {
-            name: spec.name.clone(),
-            description: spec.description.clone(),
-            schema: spec.schema.clone(),
-        });
-    }
-    defs
 }
 
 fn user_message(content: impl Into<String>) -> Value {
@@ -611,7 +464,7 @@ fn complete_wire(
     model: &str,
     system: &str,
     messages: &[Value],
-    tools: Option<&[WireToolDef]>,
+    tools: Option<&[ToolSpec]>,
 ) -> Result<ModelReply, String> {
     match provider.kind {
         ProviderKind::OpenAi => call_openai(provider, model, system, messages, tools),
@@ -624,7 +477,7 @@ fn call_openai(
     model: &str,
     system: &str,
     messages: &[Value],
-    tools: Option<&[WireToolDef]>,
+    tools: Option<&[ToolSpec]>,
 ) -> Result<ModelReply, String> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/chat/completions") {
@@ -634,32 +487,17 @@ fn call_openai(
     };
     let system_message = json!({ "role": "system", "content": system });
     let messages: Vec<_> = std::iter::once(&system_message).chain(messages).collect();
-    let mut body = json!({
-        "model": model,
-        "messages": messages
-    });
+    let mut body = json!({ "model": model, "messages": messages });
     if let Some(list) = tools {
-        let mapped: Vec<Value> = list
+        body["tools"] = json!(list
             .iter()
-            .map(|spec| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": spec.name,
-                        "description": spec.description,
-                        "parameters": spec.schema
-                    }
-                })
-            })
-            .collect();
-        body["tools"] = Value::Array(mapped);
+            .map(|s| json!({"type": "function", "function": {"name": s.name, "description": s.description, "parameters": s.schema}}))
+            .collect::<Vec<_>>());
     }
-    let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-    if !provider.api_key.trim().is_empty() {
-        headers.push((
-            "Authorization".to_string(),
-            format!("Bearer {}", provider.api_key.trim()),
-        ));
+    let mut headers = vec![("Content-Type".into(), "application/json".into())];
+    let api_key = provider.api_key.trim();
+    if !api_key.is_empty() {
+        headers.push(("Authorization".into(), format!("Bearer {api_key}")));
     }
     let resp = post_json(&url, &headers, &body)?;
     let msg = resp.pointer("/choices/0/message").ok_or_else(|| {
@@ -668,16 +506,9 @@ fn call_openai(
             truncate_utf8(&resp.to_string(), 240)
         )
     })?;
-    let text = msg
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let text = msg["content"].as_str().unwrap_or("").to_string();
     let mut message = json!({ "role": "assistant", "content": msg["content"] });
-    if let Some(reasoning) = msg
-        .get("reasoning_content")
-        .filter(|value| value.is_string())
-    {
+    if let Some(reasoning) = msg.get("reasoning_content").filter(|v| v.is_string()) {
         message["reasoning_content"] = reasoning.clone();
     }
     let mut calls = Vec::new();
@@ -725,7 +556,7 @@ fn call_anthropic(
     model: &str,
     system: &str,
     messages: &[Value],
-    tools: Option<&[WireToolDef]>,
+    tools: Option<&[ToolSpec]>,
 ) -> Result<ModelReply, String> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/messages") {
@@ -736,28 +567,20 @@ fn call_anthropic(
         format!("{base}/v1/messages")
     };
     let mut body = json!({
-        "model": model,
-        "max_tokens": 16384,
-        "system": system,
-        "messages": messages
+        "model": model, "max_tokens": 16384, "system": system, "messages": messages
     });
     if let Some(list) = tools {
-        let mapped: Vec<Value> = list
+        body["tools"] = json!(list
             .iter()
-            .map(|spec| {
-                json!({
-                    "name": spec.name,
-                    "description": spec.description,
-                    "input_schema": spec.schema
-                })
-            })
-            .collect();
-        body["tools"] = Value::Array(mapped);
+            .map(
+                |s| json!({"name": s.name, "description": s.description, "input_schema": s.schema})
+            )
+            .collect::<Vec<_>>());
     }
     let headers = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-        ("x-api-key".to_string(), provider.api_key.trim().to_string()),
-        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ("Content-Type".into(), "application/json".into()),
+        ("x-api-key".into(), provider.api_key.trim().into()),
+        ("anthropic-version".into(), "2023-06-01".into()),
     ];
     let resp = post_json(&url, &headers, &body)?;
     let blocks = resp
@@ -772,10 +595,10 @@ fn call_anthropic(
     let mut texts = Vec::new();
     let mut calls = Vec::new();
     for block in blocks {
-        match block.get("type").and_then(|v| v.as_str()) {
+        match block["type"].as_str() {
             Some("text") => {
-                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                    texts.push(t.to_string());
+                if let Some(text) = block["text"].as_str() {
+                    texts.push(text.to_string());
                 }
             }
             Some("tool_use") => {
@@ -799,52 +622,25 @@ fn call_anthropic(
 
 fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
-    let mut cmd = Command::new("/usr/bin/curl");
-    cmd.args([
-        "-sS",
-        "-X",
-        "POST",
-        "--max-time",
-        "300",
-        "-w",
-        "\n%{http_code}",
-    ]);
-    for (k, v) in headers {
-        cmd.arg("-H").arg(format!("{k}: {v}"));
-    }
-    cmd.args(["--data-binary", "@-", url])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("启动 curl 失败: {err}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        thread::spawn(move || {
-            let _ = stdin.write_all(&bytes);
-        });
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| format!("等待 LLM 响应失败: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "网络请求失败: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let (resp_body, code_str) = raw.rsplit_once('\n').unwrap_or((&raw, "0"));
-    let status: u16 = code_str.trim().parse().unwrap_or(0);
+    let resp = post_bytes(url, headers, &bytes, 300).map_err(|err| match err {
+        HttpError::Launch(msg) => msg,
+        HttpError::Wait(msg) => format!("等待 LLM 响应失败: {msg}"),
+        HttpError::Transport { message, .. } => format!("网络请求失败: {message}"),
+        HttpError::InvalidResponse(msg) => format!("无效 LLM 响应: {msg}"),
+    })?;
     let parsed: Value =
-        serde_json::from_str(resp_body).unwrap_or_else(|_| json!({ "raw": resp_body }));
-    if !(200..300).contains(&status) {
+        serde_json::from_str(&resp.body).unwrap_or_else(|_| json!({ "raw": resp.body }));
+    if !(200..300).contains(&resp.status) {
         let detail = parsed
             .pointer("/error/message")
             .and_then(|v| v.as_str())
             .or_else(|| parsed.get("message").and_then(|v| v.as_str()))
-            .unwrap_or(resp_body);
-        return Err(format!("HTTP {status}: {}", truncate_utf8(detail, 280)));
+            .unwrap_or(&resp.body);
+        return Err(format!(
+            "HTTP {}: {}",
+            resp.status,
+            truncate_utf8(detail, 280)
+        ));
     }
     Ok(parsed)
 }
@@ -901,12 +697,10 @@ mod tests {
                 text: String::new(),
                 calls,
             };
-            let ToolMessages::Exchange(messages) =
-                tool_messages(&provider, reply, WINDOW_MAX_BYTES, |call| {
-                    Ok(ToolOutput::Temporary(call.args.clone()))
-                })
-                .unwrap()
-            else {
+            let Some(messages) = tool_messages(&provider, reply, WINDOW_MAX_BYTES, |call| {
+                Ok(ToolOutput::Value(call.args.clone()))
+            })
+            .unwrap() else {
                 panic!("expected tool exchange");
             };
             let (results, id_key) = match provider {
@@ -1016,12 +810,7 @@ mod tests {
             eja.keep(None, format!("concern-{index}-{}", "x".repeat(80)))?;
         }
         let trigger = eja.notice(Source::Person, "keep this unfinished user request")?;
-        let act = eja.act(
-            trigger,
-            "shell",
-            json!({ "command": "echo hi" }),
-            &["shell"],
-        )?;
+        let act = eja.act(trigger, "shell", json!({ "command": "echo hi" }))?;
         eja.finish(act.id, eja_core::Outcome::Observed("y".repeat(2000)))?;
 
         let mut anchor = 0;

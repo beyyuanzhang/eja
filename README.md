@@ -1,9 +1,10 @@
 # EJA
 
-EJA 是一个连续的、有自我同一性的主体。仓库采用极简三层结构：
+EJA 是一个连续的、有自我同一性的主体。仓库采用清晰分层结构：
 
-- `core/`（`eja-core`）：主体内核，负责 SQLite 主体日志、物理时间、关切、授权行动回执与可选语义召回（`onnx` + `sqlite-vec`）。详见 `core/README.md`。
-- `host/`（`eja-host`）：Rust 驱动循环与统一能力层，由三块组成：`llm.rs` 基于 `anchor` 将只追加主体日志确定性投影到模型上下文（超限时推进 `anchor` 重置窗口，单回合内附着工具结果），`hands.rs` 与 `mcp.rs` 将 `wake` / `shell` 和热加载 MCP 连接器统一到同一工具注册与执行接口，`runtime.rs` 负责直接驱动判断回合、事件桥接与配置同步。
+- `core/`（`eja-core`）：最小闭合主体内核（零 ML/向量扩展依赖，零宿主调度策略），仅负责 SQLite 只追加事实日志、单调物理时间、关切与行动-回执状态机，以及供宿主共享原子事务的 `host_meta` 元数据槽。详见 `core/README.md`。
+- `memory/`（`eja-memory`）：独立的可选全历史检索层，仅消费 `eja-core` 公开只读 API；默认支持无磁盘缓存的关键词召回，启用 `onnx` feature 后可在独立 `memory.db` 中维护可丢弃的 `sqlite-vec` 衍生语义索引。
+- `host/`（`eja-host`）：Rust 驱动循环与统一能力层：`state.rs` 通过 `core` 原子事务统一管理回合游标、定时唤醒、窗口锚点与版本升级；`llm.rs` 基于锚点将日志确定性投影到模型上下文；`hands.rs` 与 `mcp.rs` 统一注册并执行内核工具、`wake` / `shell` 与热加载 MCP 连接器；`http.rs` 统一封装 HTTP 传输与文本截断；`runtime.rs` 驱动判断回合与前端事件桥接。
 - `macos/`（`EjaClient` + `EjaApp`）：纯薄 macOS 原生 SwiftUI 交互壳（对话、关切与唤醒查看、LLM 与 MCP 设置、菜单栏常驻）。详见 `macos/README.md`。
 
 默认支持本地关键词查找旧事实，可选语义编码器。
@@ -33,11 +34,10 @@ cargo build -p eja-host
 
 内核目录默认为 `~/Library/Application Support/ai.eja.kernel/`。
 
-- `subject.db`：`eja-core` 永久主体日志、定时唤醒计划与回合处理进度（`PRAGMA user_version` 版本迁移）
+- `subject.db`：`eja-core` 永久事实日志与宿主原子元数据槽（回合游标、定时唤醒、上下文窗口锚点与内核版本，`PRAGMA user_version` 版本迁移）
+- `memory.db`：`eja-memory` 在启用语义编码器时按需生成的衍生向量索引缓存（可随时删除重建）
 - `config.json`：LLM Provider、密钥与宿主参数（Seatbelt 保护，前端仅见脱敏状态）
-- `kernel_version`：内核版本记录（升级 `Eja.app` 后自动触发版本感知）
 - `host.lock`：单实例操作系统文件锁（确保同一数据目录仅运行一个主体实例）
-- `window.json`：当前上下文窗口起点 `anchor`
 
 用户数据目录默认为 `~/Library/Application Support/Eja/`。
 

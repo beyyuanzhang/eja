@@ -1,4 +1,4 @@
-//! Optional local adapter. Model-specific instructions and pooling live in encoder.json.
+//! Optional local ONNX adapter. Model-specific instructions and pooling live in encoder.json.
 use crate::{Encoder, Error, InputKind, Result};
 use fastembed::{
     AutoDevicePolicy, InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles,
@@ -46,7 +46,7 @@ impl OnnxEncoder {
         let mut digest = Sha256::new();
         let mut read = |name: &str| -> Result<Vec<u8>> {
             let data = fs::read(dir.join(name))
-                .map_err(|err| Error::invalid(format!("reading memory model {name}: {err}")))?;
+                .map_err(|err| Error::Invalid(format!("reading memory model {name}: {err}")))?;
             digest.update((data.len() as u64).to_le_bytes());
             digest.update(&data);
             Ok(data)
@@ -61,7 +61,9 @@ impl OnnxEncoder {
         let profile_data = read("encoder.json")?;
         let profile: Profile = serde_json::from_slice(&profile_data)?;
         if profile.max_tokens == 0 {
-            return Err(Error::invalid("model profile needs a positive token limit"));
+            return Err(Error::Invalid(
+                "model profile needs a positive token limit".into(),
+            ));
         }
         let identity = format!("onnx-v1:{:x}", digest.finalize());
         let pooling = match profile.pooling {
@@ -75,7 +77,7 @@ impl OnnxEncoder {
                 .with_intra_threads(4)
                 .with_max_length(profile.max_tokens),
         )
-        .map_err(|err| Error::External(err.into()))?;
+        .map_err(|err| Error::Backend(err.to_string()))?;
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
             profile: Arc::new(profile),
