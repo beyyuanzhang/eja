@@ -25,35 +25,7 @@ pub fn get_bytes(
     headers: &[(String, String)],
     timeout_secs: u64,
 ) -> Result<HttpResponse, HttpError> {
-    let mut cmd = Command::new("/usr/bin/curl");
-    cmd.args([
-        "-sS",
-        "-i",
-        "-L",
-        "-X",
-        "GET",
-        "--max-time",
-        &timeout_secs.max(1).to_string(),
-    ]);
-    for (key, value) in headers {
-        cmd.arg("-H").arg(format!("{key}: {value}"));
-    }
-    cmd.arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = cmd
-        .output()
-        .map_err(|err| HttpError::Launch(format!("启动 curl 失败: {err}")))?;
-    if !output.status.success() {
-        return Err(HttpError::Transport {
-            exit_code: output.status.code(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
-    parse_http_response(&raw)
+    request_bytes("GET", true, url, headers, None, timeout_secs)
 }
 
 pub fn post_bytes(
@@ -62,27 +34,48 @@ pub fn post_bytes(
     body: &[u8],
     timeout_secs: u64,
 ) -> Result<HttpResponse, HttpError> {
+    request_bytes("POST", false, url, headers, Some(body), timeout_secs)
+}
+
+fn request_bytes(
+    method: &str,
+    follow_redirects: bool,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    timeout_secs: u64,
+) -> Result<HttpResponse, HttpError> {
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
         "-sS",
         "-i",
         "-X",
-        "POST",
+        method,
         "--max-time",
         &timeout_secs.max(1).to_string(),
     ]);
+    if follow_redirects {
+        cmd.arg("-L");
+    }
     for (key, value) in headers {
         cmd.arg("-H").arg(format!("{key}: {value}"));
     }
-    cmd.args(["--data-binary", "@-", url])
-        .stdin(Stdio::piped())
+    if body.is_some() {
+        cmd.args(["--data-binary", "@-"]);
+    }
+    cmd.arg(url)
+        .stdin(if body.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
         .map_err(|err| HttpError::Launch(format!("启动 curl 失败: {err}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
+    if let (Some(mut stdin), Some(body)) = (child.stdin.take(), body) {
         let payload = body.to_vec();
         thread::spawn(move || {
             let _ = stdin.write_all(&payload);

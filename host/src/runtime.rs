@@ -348,16 +348,15 @@ impl HostRuntime {
         self.hands.set_oauth_code(&id, None);
         let cancel = spawn_oauth_flow(id.clone(), url, headers, self.oauth_tx.clone());
         self.oauth_cancels.insert(id, cancel);
-        self.emit_state();
     }
 
     pub fn poll_oauth_events(&mut self) -> bool {
         let mut changed = false;
         while let Ok(ev) = self.oauth_rx.try_recv() {
             match ev {
-                OAuthEvent::Started { id, oauth_code, .. } => {
+                OAuthEvent::DeviceCode { id, code } => {
                     if self.oauth_cancels.contains_key(&id) {
-                        self.hands.set_oauth_code(&id, oauth_code);
+                        self.hands.set_oauth_code(&id, Some(code));
                         changed = true;
                     }
                 }
@@ -2579,7 +2578,6 @@ for line in sys.stdin:
         assert_eq!(snap0.connector_statuses.len(), 1);
         assert!(!snap0.connector_statuses[0].connected);
         assert!(snap0.connector_statuses[0].auth_required);
-        assert!(!snap0.connector_statuses[0].authorized);
 
         rt.oauth_connector("gh".into());
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2593,7 +2591,6 @@ for line in sys.stdin:
 
         let snap1 = rt.snapshot();
         assert!(snap1.connector_statuses[0].connected);
-        assert!(snap1.connector_statuses[0].authorized);
         assert!(!snap1.connector_statuses[0].auth_required);
         assert_eq!(snap1.connector_statuses[0].tools.len(), 1);
 

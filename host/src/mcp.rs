@@ -69,38 +69,11 @@ pub struct ConnectorStatus {
     pub connected: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auth_required: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub authorized: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub tools: Vec<McpToolSummary>,
-}
-
-impl ConnectorStatus {
-    #[allow(clippy::too_many_arguments)]
-    fn from_cfg(
-        cfg: &ConnectorConfig,
-        connected: bool,
-        auth_required: bool,
-        authorized: bool,
-        oauth_code: Option<String>,
-        error: Option<String>,
-        tools: &[McpTool],
-    ) -> Self {
-        Self {
-            id: cfg.id.clone(),
-            name: cfg.name.clone(),
-            enabled: cfg.enabled,
-            connected,
-            auth_required,
-            authorized,
-            oauth_code,
-            error,
-            tools: tools.iter().map(McpTool::summary).collect(),
-        }
-    }
 }
 
 fn init_params() -> Value {
@@ -504,20 +477,17 @@ pub struct ConnectorPool {
 impl ConnectorPool {
     #[cfg(test)]
     pub fn new(sandbox: Sandbox) -> Self {
-        Self {
-            sandbox,
-            oauth: OAuthStore::load(None),
-            oauth_codes: HashMap::new(),
-            connections: HashMap::new(),
-            statuses: Vec::new(),
-            tools: Vec::new(),
-        }
+        Self::open(sandbox, None)
     }
 
     pub fn with_core_dir(sandbox: Sandbox, core_dir: TrustedDir) -> Self {
+        Self::open(sandbox, Some(core_dir))
+    }
+
+    fn open(sandbox: Sandbox, core_dir: Option<TrustedDir>) -> Self {
         Self {
             sandbox,
-            oauth: OAuthStore::load(Some(core_dir)),
+            oauth: OAuthStore::load(core_dir),
             oauth_codes: HashMap::new(),
             connections: HashMap::new(),
             statuses: Vec::new(),
@@ -545,12 +515,24 @@ impl ConnectorPool {
         self.oauth.save(id, token)
     }
 
-    fn is_cfg_authorized(&self, cfg: &ConnectorConfig) -> bool {
-        match &cfg.transport {
-            ConnectorTransport::Http { url, headers } => {
-                has_authorization_header(headers) || self.oauth.is_authorized(&cfg.id, url)
-            }
-            ConnectorTransport::Stdio { .. } => false,
+    fn status_for(
+        &self,
+        cfg: &ConnectorConfig,
+        connected: bool,
+        error: Option<String>,
+        tools: &[McpTool],
+    ) -> ConnectorStatus {
+        let auth_required = matches!(cfg.transport, ConnectorTransport::Http { .. })
+            && error.as_deref().is_some_and(is_auth_error);
+        ConnectorStatus {
+            id: cfg.id.clone(),
+            name: cfg.name.clone(),
+            enabled: cfg.enabled,
+            connected,
+            auth_required,
+            oauth_code: self.oauth_codes.get(&cfg.id).cloned(),
+            error,
+            tools: tools.iter().map(McpTool::summary).collect(),
         }
     }
 
@@ -573,46 +555,25 @@ impl ConnectorPool {
         self.tools.clear();
 
         for cfg in configs {
-            let authorized = self.is_cfg_authorized(cfg);
-            let oauth_code = self.oauth_codes.get(&cfg.id).cloned();
             if !cfg.enabled {
                 self.statuses
-                    .push(ConnectorStatus::from_cfg(
-                        cfg, false, false, authorized, oauth_code, None, &[],
-                    ));
+                    .push(self.status_for(cfg, false, None, &[]));
                 continue;
             }
 
             if let Some(entry) = reusable.remove(&cfg.id) {
                 self.tools.extend(entry.tools.iter().cloned());
                 self.statuses
-                    .push(ConnectorStatus::from_cfg(
-                        cfg,
-                        true,
-                        false,
-                        authorized,
-                        oauth_code,
-                        None,
-                        &entry.tools,
-                    ));
+                    .push(self.status_for(cfg, true, None, &entry.tools));
                 self.connections.insert(cfg.id.clone(), entry);
                 continue;
             }
 
             match connect_and_list(&self.sandbox, &mut self.oauth, cfg) {
                 Ok((connection, entry_tools)) => {
-                    let authorized = self.is_cfg_authorized(cfg);
                     self.tools.extend(entry_tools.iter().cloned());
                     self.statuses
-                        .push(ConnectorStatus::from_cfg(
-                            cfg,
-                            true,
-                            false,
-                            authorized,
-                            oauth_code,
-                            None,
-                            &entry_tools,
-                        ));
+                        .push(self.status_for(cfg, true, None, &entry_tools));
                     self.connections.insert(
                         cfg.id.clone(),
                         ConnectedEntry {
@@ -623,18 +584,8 @@ impl ConnectorPool {
                     );
                 }
                 Err(err) => {
-                    let auth_required = matches!(cfg.transport, ConnectorTransport::Http { .. })
-                        && is_auth_error(&err);
                     self.statuses
-                        .push(ConnectorStatus::from_cfg(
-                            cfg,
-                            false,
-                            auth_required,
-                            authorized,
-                            oauth_code,
-                            Some(err),
-                            &[],
-                        ));
+                        .push(self.status_for(cfg, false, Some(err), &[]));
                 }
             }
         }

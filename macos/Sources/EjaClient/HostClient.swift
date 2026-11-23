@@ -134,7 +134,6 @@ public struct ConnectorStatusDTO: Codable, Equatable, Identifiable, Sendable {
     public var enabled: Bool
     public var connected: Bool
     public var authRequired: Bool
-    public var authorized: Bool
     public var oauthCode: String?
     public var error: String?
     public var tools: [McpToolSummaryDTO]
@@ -142,7 +141,6 @@ public struct ConnectorStatusDTO: Codable, Equatable, Identifiable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, name, enabled, connected, error, tools
         case authRequired = "auth_required"
-        case authorized
         case oauthCode = "oauth_code"
     }
 
@@ -153,7 +151,6 @@ public struct ConnectorStatusDTO: Codable, Equatable, Identifiable, Sendable {
         enabled = try c.decode(Bool.self, forKey: .enabled)
         connected = try c.decode(Bool.self, forKey: .connected)
         authRequired = try c.decodeIfPresent(Bool.self, forKey: .authRequired) ?? false
-        authorized = try c.decodeIfPresent(Bool.self, forKey: .authorized) ?? false
         oauthCode = try c.decodeIfPresent(String.self, forKey: .oauthCode)
         error = try c.decodeIfPresent(String.self, forKey: .error)
         tools = try c.decodeIfPresent([McpToolSummaryDTO].self, forKey: .tools) ?? []

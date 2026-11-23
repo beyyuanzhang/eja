@@ -1,5 +1,5 @@
 use crate::config::write_json_atomic;
-use crate::http::{get_bytes, post_bytes, truncate_utf8};
+use crate::http::{get_bytes, post_bytes, truncate_utf8, HttpResponse};
 use crate::sandbox::TrustedDir;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -59,12 +59,6 @@ impl OAuthStore {
         Self { core_dir, tokens }
     }
 
-    pub fn is_authorized(&self, id: &str, url: &str) -> bool {
-        self.tokens
-            .get(id)
-            .is_some_and(|token| token.matches_url(url))
-    }
-
     pub fn access_token(&mut self, id: &str, url: &str) -> Option<String> {
         let token = self.tokens.get(id)?.clone();
         if !token.matches_url(url) {
@@ -100,11 +94,9 @@ impl OAuthStore {
 
 #[derive(Debug, Clone)]
 pub enum OAuthEvent {
-    Started {
+    DeviceCode {
         id: String,
-        #[allow(dead_code)]
-        auth_url: String,
-        oauth_code: Option<String>,
+        code: String,
     },
     Finished {
         id: String,
@@ -114,7 +106,6 @@ pub enum OAuthEvent {
 
 #[derive(Debug, Clone)]
 pub struct OAuthMetadata {
-    pub issuer: String,
     pub authorization_endpoint: Option<String>,
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
@@ -147,33 +138,22 @@ pub fn discover_oauth_metadata(
     let (origin, path) = split_origin_and_path(mcp_url)
         .ok_or_else(|| format!("无效的 MCP URL: {}", mcp_url.trim()))?;
     let json_headers = vec![("Accept".to_string(), "application/json".to_string())];
-
-    let mut resource_urls = Vec::new();
     let trimmed_path = path.trim_end_matches('/');
-    if !trimmed_path.is_empty() {
-        push_unique(
-            &mut resource_urls,
-            format!("{origin}/.well-known/oauth-protected-resource{path}"),
-        );
-        push_unique(
-            &mut resource_urls,
-            format!("{origin}/.well-known/oauth-protected-resource{trimmed_path}"),
-        );
-    }
-    push_unique(
-        &mut resource_urls,
-        format!("{origin}/.well-known/oauth-protected-resource"),
-    );
-
-    let mut resource_meta: Option<Value> = None;
-    for candidate in &resource_urls {
-        if let Some(val) = fetch_json_object(candidate, &json_headers) {
-            if val.get("authorization_servers").is_some() || val.get("resource").is_some() {
-                resource_meta = Some(val);
-                break;
-            }
-        }
-    }
+    let resource_candidates = [
+        (!trimmed_path.is_empty())
+            .then(|| format!("{origin}/.well-known/oauth-protected-resource{path}")),
+        (path != trimmed_path && !trimmed_path.is_empty())
+            .then(|| format!("{origin}/.well-known/oauth-protected-resource{trimmed_path}")),
+        Some(format!("{origin}/.well-known/oauth-protected-resource")),
+    ];
+    let mut resource_meta = resource_candidates
+        .into_iter()
+        .flatten()
+        .find_map(|url| {
+            fetch_json_object(&url, &json_headers).filter(|val| {
+                val.get("authorization_servers").is_some() || val.get("resource").is_some()
+            })
+        });
 
     if resource_meta.is_none() {
         let mut probe_headers = vec![
@@ -210,71 +190,33 @@ pub fn discover_oauth_metadata(
     let (iss_origin, iss_path) =
         split_origin_and_path(&issuer).unwrap_or_else(|| (origin.clone(), String::new()));
     let iss_path_trimmed = iss_path.trim_end_matches('/');
-    let mut auth_server_urls = Vec::new();
-    if !iss_path_trimmed.is_empty() {
-        push_unique(
-            &mut auth_server_urls,
-            format!("{iss_origin}/.well-known/oauth-authorization-server{iss_path_trimmed}"),
-        );
-        push_unique(
-            &mut auth_server_urls,
-            format!("{iss_origin}/.well-known/openid-configuration{iss_path_trimmed}"),
-        );
-        push_unique(
-            &mut auth_server_urls,
-            format!("{iss_origin}{iss_path_trimmed}/.well-known/openid-configuration"),
-        );
-    }
-    push_unique(
-        &mut auth_server_urls,
-        format!("{iss_origin}/.well-known/oauth-authorization-server"),
-    );
-    push_unique(
-        &mut auth_server_urls,
-        format!("{iss_origin}/.well-known/openid-configuration"),
-    );
-    if iss_origin != origin {
-        push_unique(
-            &mut auth_server_urls,
-            format!("{origin}/.well-known/oauth-authorization-server"),
-        );
-    }
+    let has_iss_path = !iss_path_trimmed.is_empty();
+    let auth_candidates = [
+        has_iss_path
+            .then(|| format!("{iss_origin}/.well-known/oauth-authorization-server{iss_path_trimmed}")),
+        has_iss_path
+            .then(|| format!("{iss_origin}/.well-known/openid-configuration{iss_path_trimmed}")),
+        has_iss_path
+            .then(|| format!("{iss_origin}{iss_path_trimmed}/.well-known/openid-configuration")),
+        Some(format!("{iss_origin}/.well-known/oauth-authorization-server")),
+        Some(format!("{iss_origin}/.well-known/openid-configuration")),
+        (iss_origin != origin).then(|| format!("{origin}/.well-known/oauth-authorization-server")),
+    ];
 
-    for candidate in &auth_server_urls {
-        if let Some(val) = fetch_json_object(candidate, &json_headers) {
-            let token_ep = val
-                .get("token_endpoint")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let auth_ep = val
-                .get("authorization_endpoint")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string);
-            let reg_ep = val
-                .get("registration_endpoint")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string);
-            let device_ep = val
-                .get("device_authorization_endpoint")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string);
-            if let Some(token_endpoint) = token_ep {
+    for candidate in auth_candidates.into_iter().flatten() {
+        if let Some(val) = fetch_json_object(&candidate, &json_headers) {
+            if let Some(token_endpoint) = str_field(&val, "token_endpoint") {
                 if scopes.is_empty() {
                     scopes = extract_string_array(val.get("scopes_supported"));
                 }
                 return Ok(OAuthMetadata {
-                    issuer,
-                    authorization_endpoint: auth_ep,
+                    authorization_endpoint: str_field(&val, "authorization_endpoint")
+                        .map(ToString::to_string),
                     token_endpoint: token_endpoint.to_string(),
-                    registration_endpoint: reg_ep,
-                    device_authorization_endpoint: device_ep,
+                    registration_endpoint: str_field(&val, "registration_endpoint")
+                        .map(ToString::to_string),
+                    device_authorization_endpoint: str_field(&val, "device_authorization_endpoint")
+                        .map(ToString::to_string),
                     scopes,
                 });
             }
@@ -282,7 +224,6 @@ pub fn discover_oauth_metadata(
     }
 
     Ok(OAuthMetadata {
-        issuer: iss_origin.clone(),
         authorization_endpoint: Some(format!("{iss_origin}/authorize")),
         token_endpoint: format!("{iss_origin}/token"),
         registration_endpoint: Some(format!("{iss_origin}/register")),
@@ -321,7 +262,6 @@ fn run_oauth_flow(
     }
 
     let custom_client_id = find_header_ci(headers, &["x-oauth-client-id", "client_id"]);
-    let custom_client_secret = find_header_ci(headers, &["x-oauth-client-secret", "client_secret"]);
 
     if let Some(auth_endpoint) = &meta.authorization_endpoint {
         if custom_client_id.is_some() || meta.registration_endpoint.is_some() {
@@ -334,7 +274,7 @@ fn run_oauth_flow(
             let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
             let registered = if let Some(cid) = custom_client_id.clone() {
-                Some((cid, custom_client_secret.clone()))
+                Some((cid, None))
             } else if let Some(reg_endpoint) = &meta.registration_endpoint {
                 register_dynamic_client(reg_endpoint, &redirect_uri).ok()
             } else {
@@ -343,7 +283,6 @@ fn run_oauth_flow(
 
             if let Some((client_id, client_secret)) = registered {
                 return run_pkce_loopback_flow(
-                    id,
                     mcp_url,
                     &meta,
                     auth_endpoint,
@@ -352,7 +291,6 @@ fn run_oauth_flow(
                     client_id,
                     client_secret,
                     cancel,
-                    tx,
                 );
             }
         }
@@ -361,11 +299,9 @@ fn run_oauth_flow(
     if let Some(device_endpoint) = &meta.device_authorization_endpoint {
         let client_id = custom_client_id
             .or_else(|| {
-                if meta.issuer.contains("github.com") || device_endpoint.contains("github.com") {
-                    Some(GITHUB_PUBLIC_CLIENT_ID.to_string())
-                } else {
-                    None
-                }
+                device_endpoint
+                    .contains("github.com")
+                    .then(|| GITHUB_PUBLIC_CLIENT_ID.to_string())
             })
             .ok_or_else(|| {
                 "该连接器要求预注册 OAuth Client ID（可在连接器键值中填入 X-OAuth-Client-Id=...）"
@@ -377,7 +313,6 @@ fn run_oauth_flow(
             &meta,
             device_endpoint,
             &client_id,
-            custom_client_secret.as_deref(),
             cancel,
             tx,
         );
@@ -386,9 +321,7 @@ fn run_oauth_flow(
     Err("该连接器未提供可用的 OAuth 动态注册或设备码授权端点".into())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_pkce_loopback_flow(
-    id: &str,
     mcp_url: &str,
     meta: &OAuthMetadata,
     auth_endpoint: &str,
@@ -397,11 +330,10 @@ fn run_pkce_loopback_flow(
     client_id: String,
     client_secret: Option<String>,
     cancel: &AtomicBool,
-    tx: &Sender<OAuthEvent>,
 ) -> Result<OAuthToken, String> {
-    let verifier = random_code_verifier();
+    let verifier = base64url_encode(&random_bytes(32));
     let challenge = pkce_s256_challenge(&verifier);
-    let state = random_hex(16);
+    let state = base64url_encode(&random_bytes(16));
     let sep = if auth_endpoint.contains('?') {
         '&'
     } else {
@@ -416,11 +348,6 @@ fn run_pkce_loopback_flow(
     );
 
     open_browser(&auth_url);
-    let _ = tx.send(OAuthEvent::Started {
-        id: id.to_string(),
-        auth_url,
-        oauth_code: None,
-    });
 
     let code = wait_for_loopback_code(listener, &state, cancel)?;
     if cancel.load(Ordering::Relaxed) {
@@ -437,20 +364,8 @@ fn run_pkce_loopback_flow(
     if let Some(secret) = &client_secret {
         form.push(("client_secret", secret.clone()));
     }
-    let body = encode_form(&form);
-    let resp = post_bytes(
-        &meta.token_endpoint,
-        &[
-            (
-                "Content-Type".to_string(),
-                "application/x-www-form-urlencoded".to_string(),
-            ),
-            ("Accept".to_string(), "application/json".to_string()),
-        ],
-        body.as_bytes(),
-        OAUTH_HTTP_TIMEOUT_SECS,
-    )
-    .map_err(|err| format!("OAuth 换取 Token 请求失败: {err:?}"))?;
+    let resp = post_form(&meta.token_endpoint, &form)
+        .map_err(|err| format!("OAuth 换取 Token 请求失败: {err}"))?;
     if !(200..300).contains(&resp.status) {
         return Err(format!(
             "OAuth 换取 Token 失败 (HTTP {}): {}",
@@ -467,14 +382,12 @@ fn run_pkce_loopback_flow(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_device_code_flow(
     id: &str,
     mcp_url: &str,
     meta: &OAuthMetadata,
     device_endpoint: &str,
     client_id: &str,
-    client_secret: Option<&str>,
     cancel: &AtomicBool,
     tx: &Sender<OAuthEvent>,
 ) -> Result<OAuthToken, String> {
@@ -482,20 +395,8 @@ fn run_device_code_flow(
     if !meta.scopes.is_empty() {
         form.push(("scope", meta.scopes.join(" ")));
     }
-    let body = encode_form(&form);
-    let resp = post_bytes(
-        device_endpoint,
-        &[
-            (
-                "Content-Type".to_string(),
-                "application/x-www-form-urlencoded".to_string(),
-            ),
-            ("Accept".to_string(), "application/json".to_string()),
-        ],
-        body.as_bytes(),
-        OAUTH_HTTP_TIMEOUT_SECS,
-    )
-    .map_err(|err| format!("请求 OAuth 设备码失败: {err:?}"))?;
+    let resp = post_form(device_endpoint, &form)
+        .map_err(|err| format!("请求 OAuth 设备码失败: {err}"))?;
     if !(200..300).contains(&resp.status) {
         return Err(format!(
             "请求 OAuth 设备码失败 (HTTP {}): {}",
@@ -503,25 +404,16 @@ fn run_device_code_flow(
             truncate_utf8(resp.body.trim(), 200)
         ));
     }
-    let payload = parse_json_or_form(&resp.body)
-        .ok_or_else(|| "无法解析 OAuth 设备码响应".to_string())?;
-    let device_code = payload
-        .get("device_code")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
+    let payload = serde_json::from_str::<Value>(resp.body.trim())
+        .map_err(|_| "无法解析 OAuth 设备码响应".to_string())?;
+    let device_code = str_field(&payload, "device_code")
         .ok_or("设备码响应缺少 device_code")?
         .to_string();
-    let user_code = payload
-        .get("user_code")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
+    let user_code = str_field(&payload, "user_code")
         .ok_or("设备码响应缺少 user_code")?
         .to_string();
-    let verification_uri = payload
-        .get("verification_uri_complete")
-        .or_else(|| payload.get("verification_uri"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
+    let verification_uri = str_field(&payload, "verification_uri_complete")
+        .or_else(|| str_field(&payload, "verification_uri"))
         .ok_or("设备码响应缺少 verification_uri")?
         .to_string();
     let mut interval_secs = payload
@@ -537,10 +429,9 @@ fn run_device_code_flow(
 
     copy_to_clipboard(&user_code);
     open_browser(&verification_uri);
-    let _ = tx.send(OAuthEvent::Started {
+    let _ = tx.send(OAuthEvent::DeviceCode {
         id: id.to_string(),
-        auth_url: verification_uri,
-        oauth_code: Some(user_code),
+        code: user_code,
     });
 
     let deadline = Instant::now() + Duration::from_secs(expires_in);
@@ -556,7 +447,7 @@ fn run_device_code_flow(
             return Err("授权已取消".into());
         }
 
-        let mut poll_form = vec![
+        let poll_form = [
             ("client_id", client_id.to_string()),
             ("device_code", device_code.clone()),
             (
@@ -564,41 +455,22 @@ fn run_device_code_flow(
                 "urn:ietf:params:oauth:grant-type:device_code".to_string(),
             ),
         ];
-        if let Some(secret) = client_secret {
-            poll_form.push(("client_secret", secret.to_string()));
-        }
-        let poll_body = encode_form(&poll_form);
-        let Ok(poll_resp) = post_bytes(
-            &meta.token_endpoint,
-            &[
-                (
-                    "Content-Type".to_string(),
-                    "application/x-www-form-urlencoded".to_string(),
-                ),
-                ("Accept".to_string(), "application/json".to_string()),
-            ],
-            poll_body.as_bytes(),
-            OAUTH_HTTP_TIMEOUT_SECS,
-        ) else {
+        let Ok(poll_resp) = post_form(&meta.token_endpoint, &poll_form) else {
             continue;
         };
-        let Some(val) = parse_json_or_form(&poll_resp.body) else {
+        let Ok(val) = serde_json::from_str::<Value>(poll_resp.body.trim()) else {
             continue;
         };
-        if val
-            .get("access_token")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
-        {
+        if str_field(&val, "access_token").is_some() {
             return parse_token_response(
                 &poll_resp.body,
                 mcp_url,
                 &meta.token_endpoint,
                 Some(client_id.to_string()),
-                client_secret.map(ToString::to_string),
+                None,
             );
         }
-        match val.get("error").and_then(Value::as_str) {
+        match str_field(&val, "error") {
             Some("authorization_pending") => continue,
             Some("slow_down") => {
                 interval_secs += 5;
@@ -607,10 +479,7 @@ fn run_device_code_flow(
             Some("expired_token") => return Err("OAuth 设备授权码已过期，请重新点击授权".into()),
             Some("access_denied") => return Err("OAuth 授权被拒绝".into()),
             Some(other) => {
-                let desc = val
-                    .get("error_description")
-                    .and_then(Value::as_str)
-                    .unwrap_or(other);
+                let desc = str_field(&val, "error_description").unwrap_or(other);
                 return Err(format!("OAuth 授权失败: {desc}"));
             }
             None => continue,
@@ -646,19 +515,10 @@ fn register_dynamic_client(
     }
     let val = serde_json::from_str::<Value>(&resp.body)
         .map_err(|err| format!("解析动态注册响应失败: {err}"))?;
-    let client_id = val
-        .get("client_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    let client_id = str_field(&val, "client_id")
         .ok_or("动态注册响应缺少 client_id")?
         .to_string();
-    let client_secret = val
-        .get("client_secret")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
+    let client_secret = str_field(&val, "client_secret").map(ToString::to_string);
     Ok((client_id, client_secret))
 }
 
@@ -758,20 +618,8 @@ fn refresh_oauth_token(current: &OAuthToken) -> Result<OAuthToken, String> {
     if let Some(secret) = &current.client_secret {
         form.push(("client_secret", secret.clone()));
     }
-    let body = encode_form(&form);
-    let resp = post_bytes(
-        token_endpoint,
-        &[
-            (
-                "Content-Type".to_string(),
-                "application/x-www-form-urlencoded".to_string(),
-            ),
-            ("Accept".to_string(), "application/json".to_string()),
-        ],
-        body.as_bytes(),
-        OAUTH_HTTP_TIMEOUT_SECS,
-    )
-    .map_err(|err| format!("刷新 OAuth Token 请求失败: {err:?}"))?;
+    let resp = post_form(token_endpoint, &form)
+        .map_err(|err| format!("刷新 OAuth Token 请求失败: {err}"))?;
     if !(200..300).contains(&resp.status) {
         return Err(format!("刷新 OAuth Token 失败 (HTTP {})", resp.status));
     }
@@ -795,28 +643,17 @@ fn parse_token_response(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<OAuthToken, String> {
-    let val = parse_json_or_form(raw_body)
-        .ok_or_else(|| format!("无法解析 OAuth Token 响应: {}", truncate_utf8(raw_body, 200)))?;
-    let access_token = val
-        .get("access_token")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    let val = serde_json::from_str::<Value>(raw_body.trim())
+        .map_err(|_| format!("无法解析 OAuth Token 响应: {}", truncate_utf8(raw_body, 200)))?;
+    let access_token = str_field(&val, "access_token")
         .ok_or_else(|| {
-            let err = val
-                .get("error_description")
-                .or_else(|| val.get("error"))
-                .and_then(Value::as_str)
+            let err = str_field(&val, "error_description")
+                .or_else(|| str_field(&val, "error"))
                 .unwrap_or("响应缺少 access_token");
             format!("OAuth 获取 Token 失败: {err}")
         })?
         .to_string();
-    let refresh_token = val
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
+    let refresh_token = str_field(&val, "refresh_token").map(ToString::to_string);
     let expires_in = val
         .get("expires_in")
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse::<i64>().ok()))
@@ -834,22 +671,28 @@ fn parse_token_response(
     })
 }
 
-fn parse_json_or_form(raw: &str) -> Option<Value> {
-    let trimmed = raw.trim();
-    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-        if val.is_object() {
-            return Some(val);
-        }
-    }
-    let params = parse_query_params(trimmed);
-    if params.is_empty() {
-        return None;
-    }
-    let mut map = serde_json::Map::new();
-    for (k, v) in params {
-        map.insert(k, Value::String(v));
-    }
-    Some(Value::Object(map))
+fn post_form(url: &str, pairs: &[(&str, String)]) -> Result<HttpResponse, String> {
+    let body = encode_form(pairs);
+    post_bytes(
+        url,
+        &[
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            ("Accept".to_string(), "application/json".to_string()),
+        ],
+        body.as_bytes(),
+        OAUTH_HTTP_TIMEOUT_SECS,
+    )
+    .map_err(|err| format!("{err:?}"))
+}
+
+fn str_field<'a>(val: &'a Value, key: &str) -> Option<&'a str> {
+    val.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 fn fetch_json_object(url: &str, headers: &[(String, String)]) -> Option<Value> {
@@ -926,12 +769,6 @@ fn find_header_ci(headers: &BTreeMap<String, String>, names: &[&str]) -> Option<
     None
 }
 
-fn push_unique(list: &mut Vec<String>, item: String) {
-    if !list.contains(&item) {
-        list.push(item);
-    }
-}
-
 fn encode_form(pairs: &[(&str, String)]) -> String {
     pairs
         .iter()
@@ -1003,26 +840,9 @@ fn parse_query_params(query: &str) -> BTreeMap<String, String> {
 fn random_bytes(len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        if file.read_exact(&mut buf).is_ok() {
-            return buf;
-        }
-    }
-    let seed = now_unix() as u64 ^ (std::process::id() as u64);
-    for (i, byte) in buf.iter_mut().enumerate() {
-        *byte = ((seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64)) >> 24) as u8;
+        let _ = file.read_exact(&mut buf);
     }
     buf
-}
-
-fn random_code_verifier() -> String {
-    base64url_encode(&random_bytes(32))
-}
-
-fn random_hex(bytes_len: usize) -> String {
-    random_bytes(bytes_len)
-        .into_iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 pub fn pkce_s256_challenge(verifier: &str) -> String {
@@ -1137,7 +957,12 @@ fn open_browser(url: &str) {
 }
 
 #[cfg(test)]
-fn open_browser(_url: &str) {}
+fn open_browser(url: &str) {
+    * TEST_BROWSER_URL.lock().unwrap() = Some(url.to_string());
+}
+
+#[cfg(test)]
+static TEST_BROWSER_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(not(test))]
 fn copy_to_clipboard(text: &str) {
@@ -1201,112 +1026,15 @@ mod tests {
             .unwrap();
 
         let mut reloaded = OAuthStore::load(Some(core));
-        assert!(reloaded.is_authorized("notion", "https://mcp.notion.com/mcp"));
         assert_eq!(
             reloaded
                 .access_token("notion", "https://mcp.notion.com/mcp")
                 .as_deref(),
             Some("sec_123")
         );
-        assert!(!reloaded.is_authorized("notion", "https://evil.example.com/mcp"));
         assert!(reloaded
             .access_token("notion", "https://evil.example.com/mcp")
             .is_none());
-    }
-
-    #[test]
-    fn device_code_flow_discovers_metadata_emits_code_and_exchanges_token() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let base = format!("http://127.0.0.1:{port}");
-        let base_srv = base.clone();
-
-        let server = thread::spawn(move || {
-            for _ in 0..4 {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    break;
-                };
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let first_line = req.lines().next().unwrap_or("");
-                let (status, body) = if first_line.contains("/.well-known/oauth-protected-resource")
-                {
-                    (
-                        "200 OK",
-                        json!({
-                            "authorization_servers": [format!("{base_srv}/login/oauth")],
-                            "scopes_supported": ["repo", "read:user"]
-                        })
-                        .to_string(),
-                    )
-                } else if first_line
-                    .contains("/.well-known/oauth-authorization-server/login/oauth")
-                {
-                    (
-                        "200 OK",
-                        json!({
-                            "issuer": format!("{base_srv}/login/oauth"),
-                            "device_authorization_endpoint": format!("{base_srv}/login/device/code"),
-                            "token_endpoint": format!("{base_srv}/login/oauth/access_token")
-                        })
-                        .to_string(),
-                    )
-                } else if first_line.contains("/login/device/code") {
-                    (
-                        "200 OK",
-                        json!({
-                            "device_code": "dev_999",
-                            "user_code": "EFGH-5678",
-                            "verification_uri": format!("{base_srv}/login/device"),
-                            "interval": 1,
-                            "expires_in": 60
-                        })
-                        .to_string(),
-                    )
-                } else {
-                    (
-                        "200 OK",
-                        json!({
-                            "access_token": "gho_test_token_123",
-                            "token_type": "bearer"
-                        })
-                        .to_string(),
-                    )
-                };
-                let resp = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-            }
-        });
-
-        let mut headers = BTreeMap::new();
-        headers.insert("X-OAuth-Client-Id".into(), "test_cli_id".into());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _cancel = spawn_oauth_flow("gh".into(), format!("{base}/mcp"), headers, tx);
-
-        let started = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(matches!(
-            started,
-            OAuthEvent::Started {
-                ref id,
-                oauth_code: Some(ref code),
-                ..
-            } if id == "gh" && code == "EFGH-5678"
-        ));
-
-        let finished = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        match finished {
-            OAuthEvent::Finished { id, result } => {
-                assert_eq!(id, "gh");
-                let token = result.expect("expected device token");
-                assert_eq!(token.access_token, "gho_test_token_123");
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-        let _ = server.join();
     }
 
     #[test]
@@ -1386,6 +1114,7 @@ mod tests {
         });
 
         let (tx, rx) = std::sync::mpsc::channel();
+        *TEST_BROWSER_URL.lock().unwrap() = None;
         let _cancel = spawn_oauth_flow(
             "notion".into(),
             format!("{base}/mcp"),
@@ -1393,16 +1122,12 @@ mod tests {
             tx,
         );
 
-        let OAuthEvent::Started {
-            id,
-            auth_url,
-            oauth_code,
-        } = rx.recv_timeout(Duration::from_secs(5)).unwrap()
-        else {
-            panic!("expected Started event");
+        let auth_url = loop {
+            if let Some(url) = TEST_BROWSER_URL.lock().unwrap().take() {
+                break url;
+            }
+            thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(id, "notion");
-        assert!(oauth_code.is_none());
 
         let query = auth_url.split_once('?').unwrap().1;
         let params = parse_query_params(query);

@@ -937,17 +937,6 @@ struct SettingsView: View {
                 }
 
                 if expanded {
-                    if isHTTP && hasURL && status?.authRequired != true && (status?.oauthCode ?? "").isEmpty {
-                        Button {
-                            draft.flushSave()
-                            client.oauthConnector(id: conn.id)
-                        } label: {
-                            Image(systemName: "key")
-                                .font(.system(size: 10.5, weight: .medium))
-                        }
-                        .buttonStyle(EjaIconButtonStyle(size: 22))
-                    }
-
                     Button {
                         draft.flushSave()
                         client.reloadConnectors()
