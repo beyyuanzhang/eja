@@ -43,7 +43,9 @@ struct ContentView: View {
                                         .transition(.opacity.combined(with: .offset(y: 4)))
                                 }
                                 if client.status != "idle" {
-                                    ActivityPill(detail: client.statusDetail)
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .padding(.leading, 4)
                                         .id("eja-busy")
                                 }
                             }
@@ -105,19 +107,6 @@ struct ContentView: View {
                         .transition(.opacity.combined(with: .offset(y: 4)))
                     }
 
-                    if client.isReady && !client.isConfigured {
-                        HStack(spacing: 6) {
-                            Text("尚未配置模型")
-                                .font(.system(size: 12))
-                                .foregroundStyle(EjaTheme.inkSecondary)
-                            Button("前往设置", action: showSettings)
-                                .buttonStyle(.plain)
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(EjaTheme.ink)
-                        }
-                        .transition(.opacity)
-                    }
-
                     composer
                 }
                 .frame(maxWidth: 640)
@@ -133,7 +122,6 @@ struct ContentView: View {
                     .font(.system(size: 13, weight: .regular))
             }
             .buttonStyle(EjaIconButtonStyle(size: 28))
-            .help("设置")
             .padding(.top, 10)
             .padding(.trailing, 14)
             .ignoresSafeArea(edges: .top)
@@ -173,12 +161,7 @@ struct ContentView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextField(
-                "",
-                text: $ui.draftText,
-                prompt: Text("对 EJA 说点什么…").foregroundStyle(EjaTheme.inkMuted),
-                axis: .vertical
-            )
+            TextField("", text: $ui.draftText, axis: .vertical)
             .font(.system(size: 13.5))
             .foregroundStyle(EjaTheme.ink)
             .textFieldStyle(.plain)
@@ -231,6 +214,10 @@ struct ContentView: View {
     private func sendDraft() {
         let text = ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        if !client.isConfigured {
+            ui.showSettingsSheet = true
+            return
+        }
         ui.draftText = ""
         client.sendMessage(text)
     }
@@ -253,19 +240,12 @@ struct ContentView: View {
             }
         default:
             HStack {
-                VStack(alignment: .leading, spacing: 6) {
-                    if item.proactive == true {
-                        Text("主动唤醒")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(EjaTheme.inkMuted)
-                    }
-                    markdownText(item.text)
-                        .font(.system(size: 13.5))
-                        .lineSpacing(4.5)
-                        .foregroundStyle(EjaTheme.ink)
-                        .textSelection(.enabled)
-                }
-                .padding(.leading, 2)
+                markdownText(item.text)
+                    .font(.system(size: 13.5))
+                    .lineSpacing(4.5)
+                    .foregroundStyle(EjaTheme.ink)
+                    .textSelection(.enabled)
+                    .padding(.leading, 2)
                 Spacer(minLength: 36)
             }
         }
@@ -287,25 +267,5 @@ private struct SendScaleButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.92 : 1.0)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
-    }
-}
-
-private struct ActivityPill: View {
-    let detail: String
-
-    var body: some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.mini)
-                .accessibilityHidden(true)
-            Text(detail)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(EjaTheme.inkSecondary)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(EjaTheme.surface, in: Capsule())
-        .overlay(Capsule().strokeBorder(EjaTheme.hairline, lineWidth: 1))
     }
 }

@@ -141,73 +141,18 @@ public struct StreamItemDTO: Codable, Equatable, Identifiable, Sendable {
     public var id: Int64
     public var kind: String
     public var text: String
-    public var detail: String?
-    public var proactive: Bool?
-    public var outcomeStatus: String?
-    public var truncated: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case id, kind, text, detail, proactive, truncated
-        case outcomeStatus = "outcome_status"
-    }
-}
-
-public struct ConcernDTO: Codable, Equatable, Identifiable, Sendable {
-    public var id: Int64
-    public var text: String
-}
-
-public struct WakeGuardDTO: Codable, Equatable, Sendable {
-    public var checker: String
-    public var intervalSeconds: Int64
-    public var remaining: UInt32
-
-    enum CodingKeys: String, CodingKey {
-        case checker, remaining
-        case intervalSeconds = "interval_seconds"
-    }
-}
-
-public struct WakeAlarmDTO: Codable, Equatable, Identifiable, Sendable {
-    public var id: String
-    public var fireAtUnix: Int64
-    public var fireAtDisplay: String
-    public var reason: String
-    public var guardRule: WakeGuardDTO?
-
-    enum CodingKeys: String, CodingKey {
-        case id, reason
-        case fireAtUnix = "fire_at_unix"
-        case fireAtDisplay = "fire_at_display"
-        case guardRule = "guard"
-    }
-}
-
-public struct ProviderTestResult: Equatable, Sendable {
-    public var ok: Bool
-    public var message: String
 }
 
 private struct StateEventDTO: Decodable {
-    let protocolVersion: Int?
-    let kernelVersion: String?
-    let resourcesDir: String?
     let status: String
-    let statusDetail: String
     let dataDir: String
     let configured: Bool
     let config: HostConfigDTO
     let connectorStatuses: [ConnectorStatusDTO]
     let stream: [StreamItemDTO]
-    let concerns: [ConcernDTO]
-    let wakes: [WakeAlarmDTO]
 
     enum CodingKeys: String, CodingKey {
-        case status, config, stream, concerns, wakes, configured
-        case protocolVersion = "protocol_version"
-        case kernelVersion = "kernel_version"
-        case resourcesDir = "resources_dir"
-        case statusDetail = "status_detail"
+        case status, config, stream, configured
         case dataDir = "data_dir"
         case connectorStatuses = "connector_statuses"
     }
@@ -218,29 +163,17 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var isReady: Bool = false
     @Published public private(set) var alreadyRunning: Bool = false
     @Published public private(set) var alreadyRunningPid: Int32?
-    @Published public private(set) var protocolVersion: Int = 1
-    @Published public private(set) var kernelVersion: String = ""
-    @Published public private(set) var resourcesDir: String?
     @Published public private(set) var status: String = "idle"
-    @Published public private(set) var statusDetail: String = "启动中…"
     @Published public private(set) var dataDir: String = ""
     @Published public private(set) var isConfigured: Bool = false
     @Published public private(set) var config: HostConfigDTO = HostConfigDTO()
     @Published public private(set) var connectorStatuses: [ConnectorStatusDTO] = []
     @Published public private(set) var stream: [StreamItemDTO] = []
-    @Published public private(set) var concerns: [ConcernDTO] = []
-    @Published public private(set) var wakes: [WakeAlarmDTO] = []
-    @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
-    @Published public private(set) var settingsRequests = 0
 
     private var process: Process?
     private var stdinHandle: FileHandle?
     private let decoder = JSONDecoder()
-
-    public var connectedToolCount: Int {
-        connectorStatuses.filter(\.connected).reduce(0) { $0 + $1.tools.count }
-    }
 
     public init(hostExecutableURL: URL? = nil, dataDir: URL? = nil) {
         if Bundle.main.bundleURL.pathExtension == "app" {
@@ -256,10 +189,6 @@ public final class HostClient: ObservableObject {
         try? stdinHandle?.close()
         stdinHandle = nil
         if wait { process?.waitUntilExit() }
-    }
-
-    public func requestSettingsSheet() {
-        settingsRequests &+= 1
     }
 
     public func sendMessage(_ text: String) {
@@ -301,13 +230,6 @@ public final class HostClient: ObservableObject {
         guard !patch.isEmpty else { return }
         errorBanner = nil
         sendCommand(["cmd": "save_config", "config": patch])
-    }
-
-    public func testProvider(_ provider: ProviderConfigDTO, model: String) {
-        providerTestResults[provider.id] = ProviderTestResult(ok: true, message: "测试中…")
-        guard let data = try? JSONEncoder().encode(provider),
-              let obj = try? JSONSerialization.jsonObject(with: data) else { return }
-        sendCommand(["cmd": "test_provider", "id": provider.id, "provider": obj, "model": model])
     }
 
     public func reloadConnectors() {
@@ -372,7 +294,6 @@ public final class HostClient: ObservableObject {
         stdinHandle = nil
         isReady = false
         status = "idle"
-        statusDetail = "已断开"
         if !alreadyRunning && errorBanner == nil {
             errorBanner = "eja-host 已退出（退出码 \(exitCode)）"
         }
@@ -393,22 +314,12 @@ public final class HostClient: ObservableObject {
         case "state":
             if let state = try? decoder.decode(StateEventDTO.self, from: data) {
                 isReady = true
-                protocolVersion = state.protocolVersion ?? 1
-                kernelVersion = state.kernelVersion ?? ""
-                resourcesDir = state.resourcesDir
                 status = state.status
-                statusDetail = state.statusDetail
                 dataDir = state.dataDir
                 isConfigured = state.configured
                 config = state.config
                 connectorStatuses = state.connectorStatuses
                 stream = state.stream
-                concerns = state.concerns
-                wakes = state.wakes
-            }
-        case "activity":
-            if let detail = json["status_detail"] as? String {
-                statusDetail = detail
             }
         case "already_running":
             alreadyRunning = true
@@ -416,12 +327,6 @@ public final class HostClient: ObservableObject {
         case "error":
             if let msg = json["message"] as? String {
                 errorBanner = msg
-            }
-        case "provider_test":
-            if let id = json["id"] as? String,
-               let ok = json["ok"] as? Bool,
-               let msg = json["message"] as? String {
-                providerTestResults[id] = ProviderTestResult(ok: ok, message: msg)
             }
         case "notify":
             if Bundle.main.bundleURL.pathExtension == "app",

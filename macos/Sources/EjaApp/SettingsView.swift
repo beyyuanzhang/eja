@@ -15,9 +15,7 @@ final class SettingsDraft: ObservableObject {
     @Published var connectors: [ConnectorConfigDTO] = []
     @Published var expandedProvider: String?
     @Published var expandedConnector: String?
-    @Published var savedFlash = false
     @Published var fetchingProviders: Set<String> = []
-    @Published var fetchStatus: [String: String] = [:]
     @Published var addingModelProvider: String?
     @Published var newModelInput: String = ""
     @Published var rawCommandLines: [String: String] = [:]
@@ -54,7 +52,9 @@ final class SettingsDraft: ObservableObject {
         }
         if !hasAutoSynced {
             hasAutoSynced = true
-            autoSyncLocalProviders()
+            for provider in providers where Self.isLocalEndpoint(provider.baseUrl) {
+                fetchModels(for: provider.id)
+            }
         }
     }
 
@@ -66,7 +66,7 @@ final class SettingsDraft: ObservableObject {
             rawCommandLines[conn.id] = Self.formatCommandLine(conn.transport)
         }
         if let id = expandedConnector, !latest.contains(where: { $0.id == id }) {
-            expandedConnector = latest.first?.id
+            expandedConnector = nil
         }
     }
 
@@ -129,7 +129,11 @@ final class SettingsDraft: ObservableObject {
     func addModel(providerId: String, model: String) {
         let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
-              let idx = providers.firstIndex(where: { $0.id == providerId }) else { return }
+              let idx = providers.firstIndex(where: { $0.id == providerId }) else {
+            addingModelProvider = nil
+            newModelInput = ""
+            return
+        }
         if !providers[idx].models.contains(trimmed) {
             providers[idx].models.append(trimmed)
         }
@@ -155,20 +159,17 @@ final class SettingsDraft: ObservableObject {
             uniqueId = "\(preset.id)-\(n)"
             n += 1
         }
-        let newProvider = ProviderConfigDTO(
-            id: uniqueId,
-            name: preset.name,
-            kind: preset.kind,
-            baseUrl: preset.baseUrl,
-            apiKey: "",
-            models: preset.models
+        providers.append(
+            ProviderConfigDTO(
+                id: uniqueId,
+                name: preset.name,
+                kind: preset.kind,
+                baseUrl: preset.baseUrl,
+                apiKey: "",
+                models: preset.models
+            )
         )
-        providers.append(newProvider)
-        if preset.baseUrl.isEmpty || (!Self.isLocalEndpoint(preset.baseUrl) && preset.models.isEmpty) {
-            expandedProvider = uniqueId
-        } else {
-            expandedProvider = nil
-        }
+        expandedProvider = preset.baseUrl.isEmpty ? uniqueId : nil
         if judge.providerId.isEmpty || judge.model.isEmpty, let firstModel = preset.models.first {
             judge = ModelRefDTO(providerId: uniqueId, model: firstModel)
         }
@@ -197,9 +198,9 @@ final class SettingsDraft: ObservableObject {
             uniqueId = "mcp-\(n)"
             n += 1
         }
-        let transport = ConnectorTransportDTO.stdio(command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", NSHomeDirectory()])
-        rawCommandLines[uniqueId] = Self.formatCommandLine(transport)
-        connectors.append(ConnectorConfigDTO(id: uniqueId, name: "新连接器", enabled: true, transport: transport))
+        let transport = ConnectorTransportDTO.stdio(command: "npx", args: [])
+        rawCommandLines[uniqueId] = ""
+        connectors.append(ConnectorConfigDTO(id: uniqueId, name: "MCP", enabled: true, transport: transport))
         expandedConnector = uniqueId
     }
 
@@ -214,7 +215,7 @@ final class SettingsDraft: ObservableObject {
         guard isDirty else { return }
         saveTask?.cancel()
         saveTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 380_000_000)
+            try? await Task.sleep(nanoseconds: 350_000_000)
             guard !Task.isCancelled else { return }
             self?.flushSave()
         }
@@ -230,40 +231,22 @@ final class SettingsDraft: ObservableObject {
         guard providers != nil || connectors != nil else { return }
         client.saveConfigPatch(providers: providers, judge: judge, connectors: connectors)
         markSaved()
-        savedFlash = true
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            self?.savedFlash = false
-        }
     }
 
-    func autoSyncLocalProviders() {
-        for provider in providers where Self.isLocalEndpoint(provider.baseUrl) {
-            fetchModels(for: provider.id, silent: true)
-        }
-    }
-
-    func fetchModels(for providerId: String, selectFirstIfNeeded: Bool = false, silent: Bool = false) {
+    func fetchModels(for providerId: String, selectFirstIfNeeded: Bool = false) {
         guard let index = providers.firstIndex(where: { $0.id == providerId }) else { return }
         let provider = providers[index]
         let rawBase = provider.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawBase.isEmpty else { return }
 
         let cleanBase = rawBase.hasSuffix("/") ? String(rawBase.dropLast()) : rawBase
-        let modelsURLString: String
-        if provider.kind == "anthropic" && !cleanBase.hasSuffix("/v1") {
-            modelsURLString = "\(cleanBase)/v1/models"
-        } else {
-            modelsURLString = "\(cleanBase)/models"
-        }
-        guard let url = URL(string: modelsURLString) else {
-            if !silent { fetchStatus[providerId] = "URL 无效" }
-            return
-        }
+        let urlString = (provider.kind == "anthropic" && !cleanBase.hasSuffix("/v1"))
+            ? "\(cleanBase)/v1/models"
+            : "\(cleanBase)/models"
+        guard let url = URL(string: urlString) else { return }
 
         let apiKey = resolveApiKey(for: provider)
         fetchingProviders.insert(providerId)
-        if !silent { fetchStatus[providerId] = "同步中…" }
 
         Task { @MainActor [weak self] in
             defer { self?.fetchingProviders.remove(providerId) }
@@ -279,51 +262,36 @@ final class SettingsDraft: ObservableObject {
                 }
             }
 
-            do {
-                let (data, response) = try await URLSession.shared.data(for: req)
-                guard let http = response as? HTTPURLResponse else {
-                    if !silent { self?.fetchStatus[providerId] = "无响应" }
-                    return
-                }
-                guard (200..<300).contains(http.statusCode) else {
-                    if !silent { self?.fetchStatus[providerId] = "HTTP \(http.statusCode)" }
-                    return
-                }
-                let discovered = Self.parseModelIds(from: data)
-                guard !discovered.isEmpty else {
-                    if !silent { self?.fetchStatus[providerId] = "未发现模型" }
-                    return
-                }
-                guard let self,
-                      let idx = self.providers.firstIndex(where: { $0.id == providerId }) else { return }
+            guard let (data, response) = try? await URLSession.shared.data(for: req),
+                  let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode) else { return }
 
-                var merged: [String] = []
-                for m in discovered where !merged.contains(m) {
-                    merged.append(m)
-                }
-                for existing in self.providers[idx].models where !merged.contains(existing) {
-                    let hasSuffixed = merged.contains { $0.lowercased().hasSuffix("/" + existing.lowercased()) }
-                    if !hasSuffixed {
-                        merged.append(existing)
-                    }
-                }
+            let discovered = Self.parseModelIds(from: data)
+            guard !discovered.isEmpty,
+                  let self,
+                  let idx = self.providers.firstIndex(where: { $0.id == providerId }) else { return }
 
-                if self.providers[idx].models != merged {
-                    self.providers[idx].models = merged
-                }
-                _ = self.healJudgeModelIfNeeded()
-                if selectFirstIfNeeded || self.judge.providerId.isEmpty || (self.judge.providerId == providerId && self.judge.model.isEmpty) {
-                    if let first = merged.first {
-                        self.judge = ModelRefDTO(providerId: providerId, model: first)
-                    }
-                }
-                self.fetchStatus[providerId] = "\(merged.count) 个模型"
-                self.flushSave()
-            } catch {
-                if !silent {
-                    self?.fetchStatus[providerId] = "连接失败"
+            var merged: [String] = []
+            for m in discovered where !merged.contains(m) {
+                merged.append(m)
+            }
+            for existing in self.providers[idx].models where !merged.contains(existing) {
+                let hasSuffixed = merged.contains { $0.lowercased().hasSuffix("/" + existing.lowercased()) }
+                if !hasSuffixed {
+                    merged.append(existing)
                 }
             }
+
+            if self.providers[idx].models != merged {
+                self.providers[idx].models = merged
+            }
+            _ = self.healJudgeModelIfNeeded()
+            if selectFirstIfNeeded || self.judge.providerId.isEmpty || (self.judge.providerId == providerId && self.judge.model.isEmpty) {
+                if let first = merged.first {
+                    self.judge = ModelRefDTO(providerId: providerId, model: first)
+                }
+            }
+            self.flushSave()
         }
     }
 
@@ -370,18 +338,6 @@ final class SettingsDraft: ObservableObject {
     static func isLocalEndpoint(_ baseUrl: String) -> Bool {
         let lower = baseUrl.lowercased()
         return lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("0.0.0.0")
-    }
-
-    static func hostSummary(_ baseUrl: String) -> String {
-        let trimmed = baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "未配置地址" }
-        if let url = URL(string: trimmed), let host = url.host {
-            if let port = url.port {
-                return "\(host):\(port)"
-            }
-            return host
-        }
-        return trimmed
     }
 
     static func formatCommandLine(_ transport: ConnectorTransportDTO) -> String {
@@ -464,14 +420,14 @@ struct ProviderPreset: Identifiable {
     }
 
     static let all: [ProviderPreset] = [
-        .init(id: "magpie", name: "Magpie 本地网关", kind: "openai", baseUrl: detectMagpieBaseUrl(), models: []),
+        .init(id: "magpie", name: "Magpie", kind: "openai", baseUrl: detectMagpieBaseUrl(), models: []),
         .init(id: "openai", name: "OpenAI", kind: "openai", baseUrl: "https://api.openai.com/v1", models: ["gpt-4o", "gpt-4o-mini"]),
         .init(id: "anthropic", name: "Anthropic", kind: "anthropic", baseUrl: "https://api.anthropic.com", models: ["claude-sonnet-4-5", "claude-haiku-4-5"]),
         .init(id: "deepseek", name: "DeepSeek", kind: "openai", baseUrl: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"]),
-        .init(id: "kimi", name: "Kimi Code", kind: "openai", baseUrl: "https://api.kimi.com/coding/v1", models: ["k2.5", "k2-thinking"]),
+        .init(id: "kimi", name: "Kimi", kind: "openai", baseUrl: "https://api.kimi.com/coding/v1", models: ["k2.5", "k2-thinking"]),
         .init(id: "qwen", name: "Qwen", kind: "openai", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-max", "qwen-plus"]),
         .init(id: "openrouter", name: "OpenRouter", kind: "openai", baseUrl: "https://openrouter.ai/api/v1", models: ["openai/gpt-4o", "anthropic/claude-sonnet-4-5"]),
-        .init(id: "ollama", name: "Ollama 本地", kind: "openai", baseUrl: "http://127.0.0.1:11434/v1", models: []),
+        .init(id: "ollama", name: "Ollama", kind: "openai", baseUrl: "http://127.0.0.1:11434/v1", models: []),
         .init(id: "custom", name: "自定义", kind: "openai", baseUrl: "", models: []),
     ]
 }
@@ -490,7 +446,7 @@ struct SettingsView: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 660, height: 470)
+        .frame(width: 560, height: 420)
         .background(EjaTheme.canvas)
         .tint(EjaTheme.ink)
         .onAppear {
@@ -507,70 +463,43 @@ struct SettingsView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            sideItem(.models, title: "模型", icon: "cpu")
-            sideItem(.connectors, title: "连接器", icon: "cable.connector")
+        VStack(alignment: .leading, spacing: 2) {
+            sideItem(.models, title: "模型")
+            sideItem(.connectors, title: "连接器")
             Spacer(minLength: 0)
-
-            HStack(spacing: 5) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 10))
-                Text("已保存")
-                    .font(.system(size: 11))
-            }
-            .foregroundStyle(EjaTheme.positive)
-            .opacity(draft.savedFlash ? 1 : 0)
-            .padding(.horizontal, 9)
-            .animation(.easeOut(duration: 0.18), value: draft.savedFlash)
-
             Button {
                 draft.flushSave()
                 dismiss()
             } label: {
-                Text("完成")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(EjaTheme.inkSecondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(EjaTheme.surface)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .stroke(EjaTheme.hairline, lineWidth: 1)
-                    )
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .medium))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(EjaIconButtonStyle(size: 24))
             .keyboardShortcut(.cancelAction)
-            .padding(.bottom, 12)
+            .padding(.leading, 4)
+            .padding(.bottom, 10)
         }
         .padding(.horizontal, 10)
         .padding(.top, 14)
-        .frame(width: 144)
+        .frame(width: 112)
     }
 
-    private func sideItem(_ section: SettingsSection, title: String, icon: String) -> some View {
+    private func sideItem(_ section: SettingsSection, title: String) -> some View {
         let active = draft.section == section
         return Button {
             withAnimation(.easeOut(duration: 0.14)) { draft.section = section }
         } label: {
-            HStack(spacing: 7) {
-                Image(systemName: icon)
-                    .font(.system(size: 11.5, weight: active ? .medium : .regular))
-                    .frame(width: 15)
-                Text(title)
-                    .font(.system(size: 12.5, weight: active ? .medium : .regular))
-            }
-            .foregroundStyle(active ? EjaTheme.ink : EjaTheme.inkSecondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 6.5)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(active ? EjaTheme.surfaceSubtle : .clear)
-            )
-            .contentShape(Rectangle())
+            Text(title)
+                .font(.system(size: 12.5, weight: active ? .medium : .regular))
+                .foregroundStyle(active ? EjaTheme.ink : EjaTheme.inkSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(active ? EjaTheme.surfaceSubtle : .clear)
+                )
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -585,370 +514,208 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 模型 (Magpie Core Logic)
+    // MARK: - 模型
 
     private var modelsPane: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                modelsHeaderBar
-                if draft.providers.isEmpty {
-                    emptyProvidersCard
-                } else {
-                    ForEach(Array(draft.providers.enumerated()), id: \.element.id) { idx, _ in
-                        providerCard(index: idx)
-                    }
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(draft.providers.enumerated()), id: \.element.id) { idx, _ in
+                    providerCard(index: idx)
                 }
+                addProviderMenu
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, 16)
             .padding(.top, 14)
-            .padding(.bottom, 20)
+            .padding(.bottom, 16)
         }
         .scrollIndicators(.never)
     }
 
-    private var modelsHeaderBar: some View {
-        let activeProvider = draft.providers.first { $0.id == draft.judge.providerId }
-        let hasSelection = activeProvider != nil && !draft.judge.model.trimmingCharacters(in: .whitespaces).isEmpty
-        return HStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(hasSelection ? EjaTheme.positive : EjaTheme.inkMuted.opacity(0.45))
-                    .frame(width: 6.5, height: 6.5)
-                if let activeProvider, hasSelection {
-                    Text(draft.judge.model)
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
-                        .foregroundStyle(EjaTheme.ink)
-                        .lineLimit(1)
-                    Text("· \(activeProvider.name.isEmpty ? activeProvider.id : activeProvider.name)")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(EjaTheme.inkSecondary)
-                        .lineLimit(1)
-                } else {
-                    Text("点击下方任意模型标签即可切换主模型")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(EjaTheme.inkMuted)
-                }
-            }
-
-            Spacer(minLength: 8)
-
-            addProviderMenu
-        }
-        .padding(.bottom, 2)
-    }
-
     private var addProviderMenu: some View {
         Menu {
-            Section("本地网关") {
-                Button("Magpie 本地网关") {
-                    draft.addProvider(ProviderPreset.all[0])
-                }
-                Button("Ollama 本地") {
-                    if let ollama = ProviderPreset.all.first(where: { $0.id == "ollama" }) {
-                        draft.addProvider(ollama)
-                    }
-                }
-            }
-            Section("常用云端") {
-                ForEach(ProviderPreset.all.filter { !["magpie", "ollama", "custom"].contains($0.id) }) { preset in
-                    Button(preset.name) { draft.addProvider(preset) }
-                }
-            }
-            Section {
-                if let custom = ProviderPreset.all.first(where: { $0.id == "custom" }) {
-                    Button(custom.name) { draft.addProvider(custom) }
-                }
+            ForEach(ProviderPreset.all) { preset in
+                Button(preset.name) { draft.addProvider(preset) }
             }
         } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "plus")
-                    .font(.system(size: 10, weight: .semibold))
-                Text("添加供应商")
-                    .font(.system(size: 11.5, weight: .medium))
-            }
-            .foregroundStyle(EjaTheme.ink)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(EjaTheme.surface)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(EjaTheme.hairline, lineWidth: 1)
-            )
+            Image(systemName: "plus")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(EjaTheme.inkMuted)
+                .frame(width: 26, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(EjaTheme.surface)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(EjaTheme.hairline, lineWidth: 1)
+                )
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
     }
 
-    private var emptyProvidersCard: some View {
-        VStack(spacing: 8) {
-            Text("尚未配置模型供应商")
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(EjaTheme.ink)
-            Text("如果本机运行了 Magpie 网关，点击右上角「添加供应商 → Magpie 本地网关」即可自动拉取全部模型。")
-                .font(.system(size: 11.5))
-                .foregroundStyle(EjaTheme.inkMuted)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 32)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(EjaTheme.surface)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(EjaTheme.hairline, lineWidth: 1)
-        )
-    }
-
     private func providerCard(index: Int) -> some View {
         let provider = draft.providers[index]
         let expanded = draft.expandedProvider == provider.id
         let isFetching = draft.fetchingProviders.contains(provider.id)
-        let testResult = client.providerTestResults[provider.id]
-        let syncText = draft.fetchStatus[provider.id]
         let needsInlineKey = !expanded &&
             !SettingsDraft.isLocalEndpoint(provider.baseUrl) &&
             !provider.hasApiKey &&
             provider.apiKey.trimmingCharacters(in: .whitespaces).isEmpty
 
         return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 7) {
-                Text(provider.name.isEmpty ? provider.id : provider.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(EjaTheme.ink)
-                    .lineLimit(1)
-
-                Text(SettingsDraft.hostSummary(provider.baseUrl))
-                    .font(.system(size: 10.5, design: .monospaced))
-                    .foregroundStyle(EjaTheme.inkMuted)
-                    .lineLimit(1)
-
-                if provider.kind == "anthropic" {
-                    Text("Anthropic")
-                        .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(EjaTheme.inkSecondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1.5)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(EjaTheme.surfaceSubtle)
-                        )
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.14)) {
+                        draft.expandedProvider = expanded ? nil : provider.id
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(provider.name.isEmpty ? provider.id : provider.name)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(EjaTheme.ink)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundStyle(EjaTheme.inkMuted)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                        Spacer(minLength: 4)
+                    }
+                    .contentShape(Rectangle())
                 }
-
-                Spacer(minLength: 4)
-
-                if let testResult {
-                    Text(testResult.message)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(testResult.ok ? EjaTheme.positive : EjaTheme.danger)
-                        .lineLimit(1)
-                        .frame(maxWidth: 130, alignment: .trailing)
-                } else if let syncText {
-                    Text(syncText)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(EjaTheme.inkMuted)
-                        .lineLimit(1)
-                }
+                .buttonStyle(.plain)
 
                 Button {
                     draft.fetchModels(for: provider.id)
                 } label: {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 10.5, weight: .medium))
                         .rotationEffect(.degrees(isFetching ? 180 : 0))
                         .animation(.easeInOut(duration: 0.25), value: isFetching)
                 }
-                .buttonStyle(EjaIconButtonStyle(size: 24))
+                .buttonStyle(EjaIconButtonStyle(size: 22))
                 .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty || isFetching)
-                .help("从接口同步模型列表 (/models)")
 
-                Button("测试") {
-                    let activeOnThis = draft.judge.providerId == provider.id ? draft.judge.model : ""
-                    let testModel = !activeOnThis.isEmpty ? activeOnThis : (provider.models.first ?? "gpt-4o")
-                    client.testProvider(provider, model: testModel)
-                }
-                .font(.system(size: 11))
-                .foregroundStyle(EjaTheme.inkSecondary)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3.5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(EjaTheme.canvas)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .stroke(EjaTheme.hairline, lineWidth: 1)
-                )
-                .buttonStyle(.plain)
-                .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty)
-
-                Button {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        draft.expandedProvider = expanded ? nil : provider.id
+                if expanded {
+                    Button {
+                        draft.removeProvider(id: provider.id)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 10.5))
                     }
-                } label: {
-                    Image(systemName: expanded ? "chevron.up" : "slider.horizontal.3")
-                        .font(.system(size: 11, weight: .medium))
+                    .buttonStyle(EjaIconButtonStyle(size: 22, destructive: true))
                 }
-                .buttonStyle(EjaIconButtonStyle(size: 24))
-                .help("编辑接口与密钥")
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 8)
+            .padding(.horizontal, 11)
+            .padding(.top, 9)
+            .padding(.bottom, 7)
 
             if needsInlineKey {
-                HStack(spacing: 6) {
-                    Image(systemName: "key")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(EjaTheme.inkMuted)
-                    SecureField("", text: providerBinding(index, \.apiKey, ""), prompt: Text("输入 API Key…").foregroundStyle(EjaTheme.inkMuted))
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(EjaTheme.ink)
-                        .textFieldStyle(.plain)
-                        .onSubmit {
-                            draft.flushSave()
-                            draft.fetchModels(for: provider.id)
-                        }
-                }
-                .modifier(CardField())
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
+                SecureField("", text: providerBinding(index, \.apiKey, ""), prompt: Text("API Key").foregroundStyle(EjaTheme.inkMuted))
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundStyle(EjaTheme.ink)
+                    .textFieldStyle(.plain)
+                    .onSubmit {
+                        draft.flushSave()
+                        draft.fetchModels(for: provider.id)
+                    }
+                    .modifier(CardField())
+                    .padding(.horizontal, 11)
+                    .padding(.bottom, 7)
             }
 
             providerModelPills(index: index)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 11)
+                .padding(.horizontal, 11)
+                .padding(.bottom, 10)
 
             if expanded {
                 providerEditor(index: index)
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(EjaTheme.surface)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(draft.judge.providerId == provider.id ? EjaTheme.hairlineStrong : EjaTheme.hairline, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(EjaTheme.hairline, lineWidth: 1)
         )
     }
 
     private func providerModelPills(index: Int) -> some View {
         let provider = draft.providers[index]
         let isAdding = draft.addingModelProvider == provider.id
-        return FlowLayout(spacing: 6, lineSpacing: 6) {
+        return FlowLayout(spacing: 5, lineSpacing: 5) {
             ForEach(provider.models, id: \.self) { model in
                 let selected = draft.judge.providerId == provider.id && draft.judge.model == model
                 Button {
                     draft.selectModel(providerId: provider.id, model: model)
                 } label: {
-                    HStack(spacing: 4.5) {
-                        if selected {
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 9, weight: .bold))
-                        }
-                        Text(model)
-                            .font(.system(size: 11.5, weight: selected ? .medium : .regular, design: .monospaced))
-                            .lineLimit(1)
-                    }
-                    .foregroundStyle(selected ? EjaTheme.canvas : EjaTheme.ink)
-                    .padding(.horizontal, 8.5)
-                    .padding(.vertical, 4.5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(selected ? EjaTheme.ink : EjaTheme.canvas)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .stroke(selected ? .clear : EjaTheme.hairline, lineWidth: 1)
-                    )
+                    Text(model)
+                        .font(.system(size: 11.5, weight: selected ? .medium : .regular, design: .monospaced))
+                        .lineLimit(1)
+                        .foregroundStyle(selected ? EjaTheme.canvas : EjaTheme.ink)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                                .fill(selected ? EjaTheme.ink : EjaTheme.canvas)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                                .stroke(selected ? .clear : EjaTheme.hairline, lineWidth: 1)
+                        )
                 }
                 .buttonStyle(.plain)
                 .contextMenu {
-                    Button("设为当前主模型") {
-                        draft.selectModel(providerId: provider.id, model: model)
-                    }
-                    Button("测试此模型") {
-                        client.testProvider(provider, model: model)
-                    }
-                    Button("复制模型 ID") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(model, forType: .string)
-                    }
-                    Divider()
-                    Button("移除模型", role: .destructive) {
+                    Button("移除", role: .destructive) {
                         draft.removeModel(providerId: provider.id, model: model)
                     }
                 }
             }
 
             if isAdding {
-                HStack(spacing: 4) {
-                    TextField("", text: $draft.newModelInput, prompt: Text("输入模型 ID 回车").foregroundStyle(EjaTheme.inkMuted))
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(EjaTheme.ink)
-                        .textFieldStyle(.plain)
-                        .frame(width: 155)
-                        .onSubmit {
-                            draft.addModel(providerId: provider.id, model: draft.newModelInput)
-                        }
-                    Button {
+                TextField("", text: $draft.newModelInput, prompt: Text("模型 ID").foregroundStyle(EjaTheme.inkMuted))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(EjaTheme.ink)
+                    .textFieldStyle(.plain)
+                    .frame(width: 130)
+                    .onSubmit {
                         draft.addModel(providerId: provider.id, model: draft.newModelInput)
-                    } label: {
-                        Image(systemName: "return")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(EjaTheme.inkSecondary)
                     }
-                    .buttonStyle(.plain)
-                    Button {
+                    .onExitCommand {
                         draft.addingModelProvider = nil
                         draft.newModelInput = ""
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(EjaTheme.inkMuted)
                     }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(EjaTheme.canvas)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(EjaTheme.hairlineStrong, lineWidth: 1)
-                )
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                            .fill(EjaTheme.canvas)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                            .stroke(EjaTheme.hairlineStrong, lineWidth: 1)
+                    )
             } else {
                 Button {
                     draft.newModelInput = ""
                     draft.addingModelProvider = provider.id
                 } label: {
-                    HStack(spacing: 3) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 9.5, weight: .semibold))
-                        Text("模型")
-                            .font(.system(size: 11))
-                    }
-                    .foregroundStyle(EjaTheme.inkMuted)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4.5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(EjaTheme.canvas.opacity(0.6))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .stroke(EjaTheme.hairline, lineWidth: 1)
-                    )
+                    Image(systemName: "plus")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(EjaTheme.inkMuted)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 5.5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                                .fill(EjaTheme.canvas)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 5.5, style: .continuous)
+                                .stroke(EjaTheme.hairline, lineWidth: 1)
+                        )
                 }
                 .buttonStyle(.plain)
             }
@@ -960,20 +727,15 @@ struct SettingsView: View {
         let nameBinding = providerBinding(index, \.name, "")
         let urlBinding = providerBinding(index, \.baseUrl, "")
         let keyBinding = providerBinding(index, \.apiKey, "")
-        let keyPrompt = provider.hasApiKey
-            ? "已保存密钥，留空沿用"
-            : (SettingsDraft.isLocalEndpoint(provider.baseUrl) ? "本地网关通常无需密钥" : "sk-…")
 
-        return VStack(alignment: .leading, spacing: 8) {
+        return VStack(alignment: .leading, spacing: 6) {
             divider
-            HStack(spacing: 8) {
-                labeled("名称") {
-                    TextField("", text: nameBinding, prompt: Text("供应商名称").foregroundStyle(EjaTheme.inkMuted))
-                        .font(.system(size: 12))
-                        .foregroundStyle(EjaTheme.ink)
-                        .textFieldStyle(.plain)
-                        .modifier(CardField())
-                }
+            HStack(spacing: 6) {
+                TextField("", text: nameBinding, prompt: Text("名称").foregroundStyle(EjaTheme.inkMuted))
+                    .font(.system(size: 12))
+                    .foregroundStyle(EjaTheme.ink)
+                    .textFieldStyle(.plain)
+                    .modifier(CardField())
 
                 HStack(spacing: 2) {
                     kindSegment("OpenAI", tag: "openai", index: index)
@@ -987,44 +749,20 @@ struct SettingsView: View {
                 .fixedSize()
             }
 
-            labeled("地址") {
-                TextField("", text: urlBinding, prompt: Text("http://127.0.0.1:3425/v1").foregroundStyle(EjaTheme.inkMuted))
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(EjaTheme.ink)
-                    .textFieldStyle(.plain)
-                    .modifier(CardField())
-            }
+            TextField("", text: urlBinding, prompt: Text("URL").foregroundStyle(EjaTheme.inkMuted))
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundStyle(EjaTheme.ink)
+                .textFieldStyle(.plain)
+                .modifier(CardField())
 
-            labeled("密钥") {
-                SecureField("", text: keyBinding, prompt: Text(keyPrompt).foregroundStyle(EjaTheme.inkMuted))
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(EjaTheme.ink)
-                    .textFieldStyle(.plain)
-                    .modifier(CardField())
-            }
-
-            HStack(spacing: 6) {
-                Text("右键任意模型标签可测试或移除")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(EjaTheme.inkMuted)
-
-                Spacer(minLength: 0)
-
-                Button("同步模型") {
-                    draft.fetchModels(for: provider.id)
-                }
-                .buttonStyle(EjaSecondaryButtonStyle(bordered: true))
-                .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty)
-
-                Button("删除供应商") {
-                    draft.removeProvider(id: provider.id)
-                }
-                .buttonStyle(EjaSecondaryButtonStyle(destructive: true))
-            }
-            .padding(.top, 2)
+            SecureField("", text: keyBinding, prompt: Text(provider.hasApiKey ? "密钥已保存" : "API Key").foregroundStyle(EjaTheme.inkMuted))
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundStyle(EjaTheme.ink)
+                .textFieldStyle(.plain)
+                .modifier(CardField())
         }
-        .padding(.horizontal, 12)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 11)
+        .padding(.bottom, 10)
     }
 
     private func kindSegment(_ label: String, tag: String, index: Int) -> some View {
@@ -1051,122 +789,37 @@ struct SettingsView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - 连接器 (ChatGPT Connectors Logic)
+    // MARK: - 连接器
 
     private var connectorsPane: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                connectorsHeaderBar
-                if draft.connectors.isEmpty {
-                    emptyConnectorsCard
-                } else {
-                    ForEach(Array(draft.connectors.enumerated()), id: \.element.id) { idx, _ in
-                        connectorCard(index: idx)
-                    }
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(draft.connectors.enumerated()), id: \.element.id) { idx, _ in
+                    connectorCard(index: idx)
                 }
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 14)
-            .padding(.bottom, 20)
-        }
-        .scrollIndicators(.never)
-    }
-
-    private var connectorsHeaderBar: some View {
-        let enabledCount = draft.connectors.filter(\.enabled).count
-        let connectedCount = client.connectorStatuses.filter(\.connected).count
-        let toolCount = client.connectedToolCount
-        return HStack(spacing: 8) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(connectedCount > 0 ? EjaTheme.positive : EjaTheme.inkMuted.opacity(0.45))
-                    .frame(width: 6.5, height: 6.5)
-                if draft.connectors.isEmpty {
-                    Text("连接 MCP 工具扩展本地与外部能力")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(EjaTheme.inkMuted)
-                } else {
-                    Text("已启用 \(enabledCount) 个连接器 · \(toolCount) 个工具可用")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(EjaTheme.inkSecondary)
-                }
-            }
-
-            Spacer(minLength: 8)
-
-            if !draft.connectors.isEmpty {
                 Button {
-                    draft.flushSave()
-                    client.reloadConnectors()
+                    draft.addConnector()
                 } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 10, weight: .medium))
-                        Text("重连")
-                            .font(.system(size: 11.5))
-                    }
-                    .foregroundStyle(EjaTheme.inkSecondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(EjaTheme.surface)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .stroke(EjaTheme.hairline, lineWidth: 1)
-                    )
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(EjaTheme.inkMuted)
+                        .frame(width: 26, height: 26)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(EjaTheme.surface)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .stroke(EjaTheme.hairline, lineWidth: 1)
+                        )
                 }
                 .buttonStyle(.plain)
             }
-
-            Button {
-                draft.addConnector()
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 10, weight: .semibold))
-                    Text("添加连接器")
-                        .font(.system(size: 11.5, weight: .medium))
-                }
-                .foregroundStyle(EjaTheme.ink)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(EjaTheme.surface)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(EjaTheme.hairline, lineWidth: 1)
-                )
-            }
-            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 16)
         }
-        .padding(.bottom, 2)
-    }
-
-    private var emptyConnectorsCard: some View {
-        VStack(spacing: 8) {
-            Text("尚未添加任何连接器")
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(EjaTheme.ink)
-            Text("支持标准 MCP 本地命令（如 npx / uvx / python）与远程 HTTP 服务，连接后工具将自动开放给内核。")
-                .font(.system(size: 11.5))
-                .foregroundStyle(EjaTheme.inkMuted)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 32)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(EjaTheme.surface)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(EjaTheme.hairline, lineWidth: 1)
-        )
+        .scrollIndicators(.never)
     }
 
     private func connectorCard(index: Int) -> some View {
@@ -1179,7 +832,6 @@ struct SettingsView: View {
             if let err = status?.error, !err.isEmpty { return EjaTheme.warning }
             return EjaTheme.inkMuted
         }()
-        let subtitleInfo = connectorSubtitle(conn: conn, status: status)
         let enabledBinding = Binding<Bool>(
             get: { draft.connectors.indices.contains(index) ? draft.connectors[index].enabled : false },
             set: {
@@ -1191,76 +843,83 @@ struct SettingsView: View {
         )
 
         return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Button {
-                    withAnimation(.easeOut(duration: 0.16)) {
+                    withAnimation(.easeOut(duration: 0.14)) {
                         draft.expandedConnector = expanded ? nil : conn.id
                     }
                 } label: {
-                    HStack(spacing: 9) {
+                    HStack(spacing: 7) {
                         Circle()
                             .fill(dotColor)
-                            .frame(width: 7, height: 7)
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(conn.name.isEmpty ? conn.id : conn.name)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(conn.enabled ? EjaTheme.ink : EjaTheme.inkSecondary)
-                                .lineLimit(1)
-                            Text(subtitleInfo.text)
+                            .frame(width: 6, height: 6)
+                        Text(conn.name.isEmpty ? conn.id : conn.name)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(conn.enabled ? EjaTheme.ink : EjaTheme.inkSecondary)
+                            .lineLimit(1)
+                        if conn.enabled, let err = status?.error, !err.isEmpty {
+                            Text(err)
                                 .font(.system(size: 11))
-                                .foregroundStyle(subtitleInfo.color)
+                                .foregroundStyle(EjaTheme.warning)
                                 .lineLimit(1)
                         }
-
-                        Spacer(minLength: 4)
-
                         Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
+                            .font(.system(size: 8.5, weight: .semibold))
                             .foregroundStyle(EjaTheme.inkMuted)
                             .rotationEffect(.degrees(expanded ? 90 : 0))
+                        Spacer(minLength: 4)
                     }
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
+                if expanded {
+                    Button {
+                        draft.flushSave()
+                        client.reloadConnectors()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10.5, weight: .medium))
+                    }
+                    .buttonStyle(EjaIconButtonStyle(size: 22))
+
+                    Button {
+                        draft.removeConnector(id: conn.id)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 10.5))
+                    }
+                    .buttonStyle(EjaIconButtonStyle(size: 22, destructive: true))
+                }
+
                 Toggle("", isOn: enabledBinding)
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .controlSize(.small)
+                    .controlSize(.mini)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 9)
 
             if let status, status.connected, !status.tools.isEmpty {
-                let visibleTools = expanded ? status.tools : Array(status.tools.prefix(6))
                 FlowLayout(spacing: 5, lineSpacing: 5) {
-                    ForEach(visibleTools) { tool in
+                    ForEach(status.tools) { tool in
                         Text(tool.name)
                             .font(.system(size: 10.5, design: .monospaced))
                             .foregroundStyle(EjaTheme.inkSecondary)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 3)
+                            .padding(.horizontal, 6.5)
+                            .padding(.vertical, 2.5)
                             .background(
-                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
                                     .fill(EjaTheme.canvas)
                             )
                             .overlay(
-                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
                                     .stroke(EjaTheme.hairline, lineWidth: 1)
                             )
-                            .help(tool.description)
-                    }
-                    if !expanded && status.tools.count > 6 {
-                        Text("+\(status.tools.count - 6)")
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(EjaTheme.inkMuted)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 10)
+                .padding(.horizontal, 11)
+                .padding(.bottom, 9)
             }
 
             if expanded {
@@ -1268,43 +927,17 @@ struct SettingsView: View {
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(EjaTheme.surface)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .stroke(EjaTheme.hairline, lineWidth: 1)
         )
     }
 
-    private func connectorSubtitle(conn: ConnectorConfigDTO, status: ConnectorStatusDTO?) -> (text: String, color: Color) {
-        let summary = transportSummary(conn.transport)
-        if !conn.enabled {
-            return ("已停用 · \(summary)", EjaTheme.inkMuted)
-        }
-        if let status {
-            if status.connected {
-                return ("已连接 · \(status.tools.count) 个工具 · \(summary)", EjaTheme.positive)
-            }
-            if let err = status.error, !err.isEmpty {
-                return (err, EjaTheme.warning)
-            }
-        }
-        return ("正在连接 · \(summary)", EjaTheme.inkMuted)
-    }
-
-    private func transportSummary(_ transport: ConnectorTransportDTO) -> String {
-        if transport.type == "http" {
-            let url = (transport.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            return url.isEmpty ? "远程 HTTP" : url
-        }
-        let cmd = SettingsDraft.formatCommandLine(transport)
-        return cmd.isEmpty ? "本地命令" : cmd
-    }
-
     private func connectorEditor(index: Int) -> some View {
         let conn = draft.connectors[index]
-        let status = client.connectorStatuses.first { $0.id == conn.id }
         let nameBinding = Binding<String>(
             get: { draft.connectors.indices.contains(index) ? draft.connectors[index].name : "" },
             set: { if draft.connectors.indices.contains(index) { draft.connectors[index].name = $0 } }
@@ -1314,39 +947,18 @@ struct SettingsView: View {
         let kvBinding = transportKVBinding(index)
         let isHTTP = conn.transport.type == "http"
 
-        return VStack(alignment: .leading, spacing: 8) {
+        return VStack(alignment: .leading, spacing: 6) {
             divider
-
-            if let err = status?.error, !err.isEmpty, conn.enabled {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(EjaTheme.warning)
-                    Text(err)
-                        .font(.system(size: 11))
-                        .foregroundStyle(EjaTheme.warning)
-                        .textSelection(.enabled)
-                    Spacer(minLength: 4)
-                }
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(EjaTheme.canvas)
-                )
-            }
-
-            HStack(spacing: 8) {
-                labeled("名称") {
-                    TextField("", text: nameBinding, prompt: Text("例如：Filesystem / GitHub").foregroundStyle(EjaTheme.inkMuted))
-                        .font(.system(size: 12))
-                        .foregroundStyle(EjaTheme.ink)
-                        .textFieldStyle(.plain)
-                        .modifier(CardField())
-                }
+            HStack(spacing: 6) {
+                TextField("", text: nameBinding, prompt: Text("名称").foregroundStyle(EjaTheme.inkMuted))
+                    .font(.system(size: 12))
+                    .foregroundStyle(EjaTheme.ink)
+                    .textFieldStyle(.plain)
+                    .modifier(CardField())
 
                 HStack(spacing: 2) {
-                    transportSegment("本地命令", tag: "stdio", index: index)
-                    transportSegment("远程地址", tag: "http", index: index)
+                    transportSegment("Stdio", tag: "stdio", index: index)
+                    transportSegment("HTTP", tag: "http", index: index)
                 }
                 .padding(2)
                 .background(
@@ -1357,61 +969,28 @@ struct SettingsView: View {
             }
 
             if isHTTP {
-                labeled("地址") {
-                    TextField("", text: urlBinding, prompt: Text("http://127.0.0.1:8080/mcp").foregroundStyle(EjaTheme.inkMuted))
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(EjaTheme.ink)
-                        .textFieldStyle(.plain)
-                        .modifier(CardField())
-                }
-                labeled("头部") {
-                    TextField("", text: kvBinding, prompt: Text("可选，KEY=VALUE 每行一项").foregroundStyle(EjaTheme.inkMuted), axis: .vertical)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(EjaTheme.ink)
-                        .textFieldStyle(.plain)
-                        .lineLimit(1...4)
-                        .modifier(CardField())
-                }
+                TextField("", text: urlBinding, prompt: Text("URL").foregroundStyle(EjaTheme.inkMuted))
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundStyle(EjaTheme.ink)
+                    .textFieldStyle(.plain)
+                    .modifier(CardField())
             } else {
-                labeled("命令") {
-                    TextField("", text: cmdLineBinding, prompt: Text("npx -y @modelcontextprotocol/server-filesystem /Users/bey").foregroundStyle(EjaTheme.inkMuted))
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(EjaTheme.ink)
-                        .textFieldStyle(.plain)
-                        .modifier(CardField())
-                }
-                labeled("环境") {
-                    TextField("", text: kvBinding, prompt: Text("可选，KEY=VALUE 每行一项").foregroundStyle(EjaTheme.inkMuted), axis: .vertical)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(EjaTheme.ink)
-                        .textFieldStyle(.plain)
-                        .lineLimit(1...4)
-                        .modifier(CardField())
-                }
+                TextField("", text: cmdLineBinding, prompt: Text("命令").foregroundStyle(EjaTheme.inkMuted))
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundStyle(EjaTheme.ink)
+                    .textFieldStyle(.plain)
+                    .modifier(CardField())
             }
 
-            HStack(spacing: 6) {
-                Text(isHTTP ? "连接远程 Streamable HTTP / SSE MCP 服务" : "直接粘贴完整命令与参数，空格自动解析")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(EjaTheme.inkMuted)
-
-                Spacer(minLength: 0)
-
-                Button("保存并重连") {
-                    draft.flushSave()
-                    client.reloadConnectors()
-                }
-                .buttonStyle(EjaSecondaryButtonStyle(bordered: true))
-
-                Button("删除") {
-                    draft.removeConnector(id: conn.id)
-                }
-                .buttonStyle(EjaSecondaryButtonStyle(destructive: true))
-            }
-            .padding(.top, 2)
+            TextField("", text: kvBinding, prompt: Text("KEY=VALUE").foregroundStyle(EjaTheme.inkMuted), axis: .vertical)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(EjaTheme.ink)
+                .textFieldStyle(.plain)
+                .lineLimit(1...4)
+                .modifier(CardField())
         }
-        .padding(.horizontal, 12)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 11)
+        .padding(.bottom, 10)
     }
 
     private func transportSegment(_ label: String, tag: String, index: Int) -> some View {
@@ -1421,9 +1000,9 @@ struct SettingsView: View {
                   draft.connectors[index].transport.type != tag else { return }
             withAnimation(.easeOut(duration: 0.14)) {
                 draft.connectors[index].transport = tag == "http"
-                    ? ConnectorTransportDTO.http(url: draft.connectors[index].transport.url ?? "http://127.0.0.1:8080/mcp")
+                    ? ConnectorTransportDTO.http(url: draft.connectors[index].transport.url ?? "")
                     : ConnectorTransportDTO.stdio(
-                        command: draft.connectors[index].transport.command ?? "npx",
+                        command: draft.connectors[index].transport.command ?? "",
                         args: draft.connectors[index].transport.args ?? []
                     )
                 let conn = draft.connectors[index]
@@ -1452,16 +1031,6 @@ struct SettingsView: View {
         Rectangle()
             .fill(EjaTheme.hairline)
             .frame(height: 1)
-    }
-
-    private func labeled<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        HStack(spacing: 10) {
-            Text(title)
-                .font(.system(size: 10))
-                .foregroundStyle(EjaTheme.inkMuted)
-                .frame(width: 34, alignment: .leading)
-            content()
-        }
     }
 
     private func providerBinding<T>(
@@ -1538,7 +1107,6 @@ struct SettingsView: View {
     }
 }
 
-/// 自适应换行流式布局（用于模型胶囊与工具标签）。
 struct FlowLayout: Layout {
     var spacing: CGFloat = 6
     var lineSpacing: CGFloat = 6
@@ -1587,12 +1155,11 @@ struct FlowLayout: Layout {
     }
 }
 
-/// 卡片内输入框：画布色底、细描边。
 private struct CardField: ViewModifier {
     func body(content: Content) -> some View {
         content
             .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.vertical, 5.5)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(EjaTheme.canvas)

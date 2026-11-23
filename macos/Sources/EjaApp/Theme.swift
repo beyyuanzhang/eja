@@ -80,145 +80,38 @@ final class HoverState: ObservableObject {
     @Published var hovered = false
 }
 
-struct EjaPrimaryButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        BodyView(configuration: configuration)
-    }
-
-    private struct BodyView: View {
-        let configuration: Configuration
-        @Environment(\.isEnabled) private var isEnabled
-        @StateObject private var hover = HoverState()
-
-        var body: some View {
-            configuration.label
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(EjaTheme.canvas)
-                .padding(.horizontal, 13)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(EjaTheme.ink.opacity(hover.hovered ? 0.88 : 1.0))
-                )
-                .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
-                .opacity(isEnabled ? 1.0 : 0.35)
-                .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
-                .animation(.easeOut(duration: 0.14), value: hover.hovered)
-                .onHover { hover.hovered = $0 }
-        }
-    }
-}
-
-struct EjaSecondaryButtonStyle: ButtonStyle {
-    var destructive: Bool = false
-    var bordered: Bool = false
-
-    func makeBody(configuration: Configuration) -> some View {
-        BodyView(configuration: configuration, destructive: destructive, bordered: bordered)
-    }
-
-    private struct BodyView: View {
-        let configuration: Configuration
-        let destructive: Bool
-        let bordered: Bool
-        @Environment(\.isEnabled) private var isEnabled
-        @StateObject private var hover = HoverState()
-
-        var body: some View {
-            let fg: Color = destructive
-                ? (hover.hovered ? EjaTheme.danger : EjaTheme.inkSecondary)
-                : (hover.hovered ? EjaTheme.ink : EjaTheme.inkSecondary)
-            let bg: Color = {
-                if destructive && hover.hovered { return EjaTheme.dangerTint }
-                if hover.hovered { return EjaTheme.surfaceSubtle }
-                return bordered ? EjaTheme.surface : .clear
-            }()
-            configuration.label
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(fg)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5.5)
-                .background(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(bg)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .stroke(bordered ? EjaTheme.hairline : .clear, lineWidth: 1)
-                )
-                .scaleEffect(configuration.isPressed ? 0.97 : 1.0)
-                .opacity(isEnabled ? 1.0 : 0.38)
-                .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
-                .animation(.easeOut(duration: 0.14), value: hover.hovered)
-                .onHover { hover.hovered = $0 }
-        }
-    }
-}
-
 struct EjaIconButtonStyle: ButtonStyle {
     var size: CGFloat = 28
+    var destructive: Bool = false
 
     func makeBody(configuration: Configuration) -> some View {
-        BodyView(configuration: configuration, size: size)
+        BodyView(configuration: configuration, size: size, destructive: destructive)
     }
 
     private struct BodyView: View {
         let configuration: Configuration
         let size: CGFloat
+        let destructive: Bool
         @StateObject private var hover = HoverState()
 
         var body: some View {
+            let fg: Color = destructive
+                ? (hover.hovered ? EjaTheme.danger : EjaTheme.inkMuted)
+                : (hover.hovered ? EjaTheme.ink : EjaTheme.inkSecondary)
+            let bg: Color = hover.hovered
+                ? (destructive ? EjaTheme.dangerTint : EjaTheme.surfaceSubtle)
+                : .clear
             configuration.label
-                .foregroundStyle(hover.hovered ? EjaTheme.ink : EjaTheme.inkSecondary)
+                .foregroundStyle(fg)
                 .frame(width: size, height: size)
                 .background(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(hover.hovered ? EjaTheme.surfaceSubtle : .clear)
+                        .fill(bg)
                 )
                 .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
                 .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
                 .animation(.easeOut(duration: 0.14), value: hover.hovered)
                 .onHover { hover.hovered = $0 }
         }
-    }
-}
-
-struct EjaFieldContainer: ViewModifier {
-    var focused: Bool
-    var cornerRadius: CGFloat = 7
-    var horizontalPadding: CGFloat = 9
-    var verticalPadding: CGFloat = 6
-
-    func body(content: Content) -> some View {
-        content
-            .padding(.horizontal, horizontalPadding)
-            .padding(.vertical, verticalPadding)
-            .background(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(EjaTheme.surface)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(focused ? EjaTheme.hairlineStrong : EjaTheme.hairline, lineWidth: 1)
-            )
-            .animation(.easeOut(duration: 0.15), value: focused)
-    }
-}
-
-extension View {
-    func ejaField(
-        focused: Bool = false,
-        cornerRadius: CGFloat = 7,
-        horizontalPadding: CGFloat = 9,
-        verticalPadding: CGFloat = 6
-    ) -> some View {
-        modifier(
-            EjaFieldContainer(
-                focused: focused,
-                cornerRadius: cornerRadius,
-                horizontalPadding: horizontalPadding,
-                verticalPadding: verticalPadding
-            )
-        )
     }
 }

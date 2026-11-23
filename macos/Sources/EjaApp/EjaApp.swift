@@ -42,7 +42,6 @@ struct EjaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var client = HostClient()
     @StateObject private var ui = ContentUIState()
-    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         Window("EJA", id: "main") {
@@ -66,11 +65,6 @@ struct EjaApp: App {
                         checkHotReload(in: URL(fileURLWithPath: client.dataDir, isDirectory: true))
                     }
                 }
-                .onChange(of: client.settingsRequests) { _, _ in
-                    NSApp.activate(ignoringOtherApps: true)
-                    openWindow(id: "main")
-                    ui.showSettingsSheet = true
-                }
                 .onChange(of: client.alreadyRunning) { _, _ in
                     handleAlreadyRunning()
                 }
@@ -80,43 +74,10 @@ struct EjaApp: App {
         .commands {
             CommandGroup(replacing: .appSettings) {
                 Button("设置…") {
-                    client.requestSettingsSheet()
+                    ui.showSettingsSheet = true
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
-        }
-
-        MenuBarExtra {
-            Text(client.kernelVersion.isEmpty ? "EJA · \(client.statusDetail)" : "EJA \(client.kernelVersion) · \(client.statusDetail)")
-            if let nextWake = client.wakes.first {
-                Text("下次唤醒：\(nextWake.fireAtDisplay)")
-            }
-            if !client.concerns.isEmpty {
-                Divider()
-                Text("挂念 (\(client.concerns.count))")
-                ForEach(client.concerns) { concern in
-                    Text("• \(concern.text)")
-                }
-            }
-            Divider()
-            Button("打开 EJA") {
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "main")
-            }
-            .keyboardShortcut("o")
-            Button("设置…") {
-                client.requestSettingsSheet()
-            }
-            .keyboardShortcut(",")
-            Divider()
-            Button("退出 EJA") {
-                client.shutdown(wait: false)
-                NSApp.terminate(nil)
-            }
-            .keyboardShortcut("q")
-        } label: {
-            Image(systemName: client.status == "thinking" ? "sparkles" : "circle.inset.filled")
-                .accessibilityLabel("EJA")
         }
     }
 
