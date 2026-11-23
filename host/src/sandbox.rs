@@ -1,5 +1,7 @@
 use std::ffi::{CString, OsStr};
 use std::fs::{self, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io::Read;
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -14,8 +16,6 @@ use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::fs::File;
 #[cfg(target_os = "macos")]
-use std::io::Read;
-#[cfg(target_os = "macos")]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
@@ -26,6 +26,8 @@ use std::sync::Arc;
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 #[cfg(target_os = "macos")]
 const O_RDONLY: i32 = 0x0000;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x0004;
 #[cfg(target_os = "macos")]
 const O_WRONLY: i32 = 0x0001;
 #[cfg(target_os = "macos")]
@@ -54,7 +56,7 @@ extern "C" {
     fn unlinkat(dirfd: i32, path: *const std::ffi::c_char, flag: i32) -> i32;
 }
 
-fn validate_single_name(name: &str) -> io::Result<CString> {
+pub fn validate_single_name(name: &str) -> io::Result<CString> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -119,34 +121,33 @@ impl TrustedDir {
         &self.path
     }
 
-    pub fn open_subdir(&self, name: &str) -> io::Result<Self> {
-        let c_name = validate_single_name(name)?;
-        let sub_path = self.path.join(name);
+    pub fn read_check_file(&self, name: &str, limit: usize) -> io::Result<Vec<u8>> {
+        let name = validate_single_name(name)?;
         #[cfg(target_os = "macos")]
         {
             let file = openat_file(
                 self.dir.as_raw_fd(),
-                &c_name,
-                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                &name,
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
                 None,
             )?;
-            Ok(Self {
-                path: sub_path,
-                dir: Arc::new(file),
-            })
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other("checker requires a regular file"));
+            }
+            let mut bytes = Vec::new();
+            file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > limit {
+                return Err(io::Error::other("checker file exceeds size limit"));
+            }
+            Ok(bytes)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = c_name;
-            require_real_dir(&self.path, "root is not a real directory")?;
-            let meta = fs::symlink_metadata(&sub_path)?;
-            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "refusing to follow symlink",
-                ));
-            }
-            Ok(Self { path: sub_path })
+            let _ = (name, limit);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "file checks require macOS",
+            ))
         }
     }
 

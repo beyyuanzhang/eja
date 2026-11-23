@@ -6,7 +6,6 @@ mod mcp;
 mod runtime;
 mod sandbox;
 mod state;
-mod tools;
 
 use config::{ConfigPatch, ProviderConfig};
 use runtime::{EventSink, HostRuntime};

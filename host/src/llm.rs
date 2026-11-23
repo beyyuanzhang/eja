@@ -449,26 +449,24 @@ fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Resul
     if content_budget == 0 || encode(&[], 0, &[]).len() > content_budget {
         return Ok(None);
     }
+    let pack_with_unknowns = |items: &[Value], omitted: usize| {
+        let mut kept: Vec<Value> = Vec::new();
+        for item in unknowns.iter().rev() {
+            kept.insert(0, item.clone());
+            if encode(items, omitted, &kept).len() > content_budget {
+                kept.remove(0);
+                break;
+            }
+        }
+        encode(items, omitted, &kept)
+    };
     let concerns = eja.concerns(anchor)?;
     let full_items: Vec<Value> = concerns
         .iter()
         .map(serde_json::to_value)
         .collect::<serde_json::Result<_>>()?;
-    let full_with_unk = encode(&full_items, 0, &unknowns);
-    if full_with_unk.len() <= content_budget {
-        return Ok(Some(user_message(full_with_unk)));
-    }
-    let full_no_unk = encode(&full_items, 0, &[]);
-    if full_no_unk.len() <= content_budget {
-        let mut kept_unk: Vec<Value> = Vec::new();
-        for item in unknowns.iter().rev() {
-            kept_unk.insert(0, item.clone());
-            if encode(&full_items, 0, &kept_unk).len() > content_budget {
-                kept_unk.remove(0);
-                break;
-            }
-        }
-        return Ok(Some(user_message(encode(&full_items, 0, &kept_unk))));
+    if encode(&full_items, 0, &[]).len() <= content_budget {
+        return Ok(Some(user_message(pack_with_unknowns(&full_items, 0))));
     }
 
     let max_each = (content_budget / concerns.len().max(1)).clamp(48, 2048);
@@ -502,16 +500,7 @@ fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Resul
         });
         packed.push(trunc(prefix));
     }
-    let omitted = concerns.len() - packed.len();
-    let mut kept_unk: Vec<Value> = Vec::new();
-    for item in unknowns.iter().rev() {
-        kept_unk.insert(0, item.clone());
-        if encode(&packed, omitted, &kept_unk).len() > content_budget {
-            kept_unk.remove(0);
-            break;
-        }
-    }
-    let mut rendered = encode(&packed, omitted, &kept_unk);
+    let mut rendered = pack_with_unknowns(&packed, concerns.len() - packed.len());
     if rendered.len() > content_budget {
         rendered = encode(&packed, 0, &[]);
     }
@@ -900,8 +889,8 @@ mod tests {
     }
 
     #[test]
-    fn anchor_header_surfaces_unsettled_unknowns_and_capped_receipts_keep_status()
-    -> eja_core::Result<()> {
+    fn anchor_header_surfaces_unsettled_unknowns_and_capped_receipts_keep_status(
+    ) -> eja_core::Result<()> {
         let eja = Eja::open(":memory:")?;
         let act = eja.act(eja.revision()?, "shell", json!({"command": "deploy"}))?;
         let unk = eja.finish(act.id, Outcome::Unknown("宿主中断未完成".into()))?;
@@ -924,9 +913,9 @@ mod tests {
         let window2 = project_window_through(&eja, &mut anchor2, trigger2, 1024, trigger2)?;
         assert_eq!(anchor2, anchor);
         assert_eq!(window2[0], window[0]);
-        assert!(window2
-            .iter()
-            .any(|m| m["content"].as_str().is_some_and(|s| s.contains("deploy ok"))));
+        assert!(window2.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("deploy ok"))));
 
         for i in 0..4 {
             eja.notice(
@@ -938,8 +927,7 @@ mod tests {
         let mut anchor3 = anchor2;
         let window3 = project_window_through(&eja, &mut anchor3, trigger3, 1024, trigger3)?;
         assert!(anchor3 > trigger2);
-        let header3: Value =
-            serde_json::from_str(window3[0]["content"].as_str().unwrap()).unwrap();
+        let header3: Value = serde_json::from_str(window3[0]["content"].as_str().unwrap()).unwrap();
         assert!(header3.get("unsettled_unknowns").is_none());
 
         let capped = cap_tool_result(

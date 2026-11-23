@@ -1,7 +1,5 @@
 use crate::config::{write_json_atomic, ConfigPatch, HostConfig, ProviderConfig};
-use crate::hands::{
-    activity_label, format_wake_display, run_guard_probe, GuardProbeOutcome, Hands, ToolSpec,
-};
+use crate::hands::{activity_label, format_local_unix, Hands, ToolSpec};
 use crate::http::truncate_utf8;
 use crate::llm::{
     apply_tool_exchange, project_window_through, tool_messages, Brain, HttpBrain, ToolCall,
@@ -9,7 +7,7 @@ use crate::llm::{
 };
 use crate::mcp::ConnectorStatus;
 use crate::sandbox::{Sandbox, TrustedDir};
-use crate::state::{self, GuardResolution, GuardTrigger, WakeAlarm, WakeGuard};
+use crate::state::{self, WakeAlarm};
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, Timestamp};
 use eja_memory::MemoryIndex;
 use serde::{Deserialize, Serialize};
@@ -46,12 +44,6 @@ pub struct StreamItem {
 pub struct ConcernDto {
     pub id: Id,
     pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verify_criteria: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence_fact_id: Option<Id>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub require_witness: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,24 +226,15 @@ impl HostRuntime {
     pub fn snapshot(&self) -> HostState {
         let revision = self.eja.revision().unwrap_or(0);
         let entries = self.eja.recent(80).unwrap_or_default();
-        let check_metas = state::concern_check_metas(&self.eja);
         let concerns = self
             .eja
             .concerns(revision)
             .map(|items| {
                 items
                     .iter()
-                    .map(|c| {
-                        let meta = check_metas.get(&c.id);
-                        ConcernDto {
-                            id: c.id,
-                            text: c.text.clone(),
-                            verify_criteria: meta.and_then(|m| m.verify_criteria.clone()),
-                            evidence_fact_id: meta.and_then(|m| m.evidence_fact_id),
-                            require_witness: meta
-                                .filter(|m| m.require_witness)
-                                .map(|_| true),
-                        }
+                    .map(|concern| ConcernDto {
+                        id: concern.id,
+                        text: concern.text.clone(),
                     })
                     .collect()
             })
@@ -363,17 +346,31 @@ impl HostRuntime {
     pub fn tick_timers(&mut self) -> Result<(), String> {
         let (mut fired, due_guarded, now) =
             state::collect_due_wakes(&self.eja).map_err(|err| err.to_string())?;
+        let checked_watches = !due_guarded.is_empty();
         for alarm in due_guarded {
-            let Some(guard) = alarm.guard else {
-                continue;
+            let Some(guard) = &alarm.guard else { continue };
+            let observation = state::registered_check(&self.eja, &guard.checker)
+                .map_err(|err| err.to_string())
+                .and_then(|check| check.matches(&self.data_dir).map_err(|err| err.to_string()));
+            let retry = match &observation {
+                Ok(false) if guard.remaining > 1 => now
+                    .checked_add(guard.interval_seconds)
+                    .map(|at| (at, format_local_unix(at))),
+                _ => None,
             };
-            let probe = run_guard_probe(&self.data_dir, &self.eja, &self.sandbox, &guard.probe);
-            let resolution = evaluate_guard(&alarm.reason, guard, probe, now);
-            if state::settle_guarded_wake(&self.eja, &alarm.id, resolution)
-                .map_err(|err| err.to_string())?
-            {
-                fired = true;
+            fired |= state::settle_guarded_wake(
+                &self.eja,
+                &alarm,
+                matches!(observation, Ok(true)),
+                retry,
+            )
+            .map_err(|err| err.to_string())?;
+            if let Err(err) = observation {
+                self.emit_error(format!("守望「{}」已停止：{err}", alarm.reason));
             }
+        }
+        if checked_watches && !fired {
+            self.emit_state();
         }
         if fired {
             self.clear_retry();
@@ -462,19 +459,17 @@ impl HostRuntime {
             数据目录：{data_dir_str}\n\
             连接器配置：{data_dir_str}/connectors.json（变更会自动热加载）\n\
             本地时区：{}\n\n\
-            前置消息是你按时间正序排列的不可变主体日志；编号最大的触发 `noticed` 记录（用户消息、时钟提醒或条件守望命中）触发本回合。不调工具时的文本回复会发送给人，留空则保持沉默。\n\
-            证据纪律：严格区分 `observed`（实测事实）、`failed`（明确失败）、`unknown`（状态未知/超时/中断）与个人推断，绝不将 `unknown` 或截断输出当作成功结论；写 `keep` 挂念时尽量附带来源 `fact_id` 或客观验收标准；主动唤醒若无新增实证则保持沉默。",
+            前置消息是主体日志。最后一条用户消息、定时提醒或检查命中触发本回合。不调工具时的文本回复会发送给人，留空则保持沉默。\n\
+            工具回执记录工具返回的内容。区分实测、失败、未知与推断。若要宣告检查通过，请引用对应规则的命中记录。",
             self.local_tz
         );
 
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
         let mut recoverable = false;
-        let mut proactive_gate_warned = false;
-
-        for step_idx in 0..max_steps {
+        for _ in 0..max_steps {
             self.set_status("thinking", "思考中…");
-            let tools = self.hands.tools(&self.eja);
+            let tools = self.hands.tools();
             let reply = match self
                 .brain
                 .complete(&provider, &model, &system, &messages, &tools)
@@ -489,35 +484,12 @@ impl HostRuntime {
 
             if reply.calls.is_empty() {
                 let text = reply.text.trim();
-                let mut suppress_notify = false;
-                if proactive && !text.is_empty() {
-                    let stats = turn_action_evidence(&self.eja, trigger_id).unwrap_or_default();
-                    if stats.attempted > 0 && stats.observed == 0 && stats.failed_or_unknown > 0 {
-                        if !proactive_gate_warned && step_idx + 1 < max_steps {
-                            proactive_gate_warned = true;
-                            messages.push(reply.message);
-                            messages.push(json!({
-                                "role": "user",
-                                "content": "[checker-gate] 本次主动回合中已执行动作均未获得 observed 实证（仅出现 failed/unknown）。请先补充实测验证，或记录挂念后保持沉默（留空回复），不要向人推送未证实结论。"
-                            }));
-                            continue;
-                        }
-                        suppress_notify = true;
-                    }
-                }
                 if let Err(err) = state::complete_turn(&self.eja, trigger_id, text) {
                     fatal_error = Some(format!("保存回合结算状态失败: {err}"));
                     break;
                 }
                 if proactive && !text.is_empty() {
-                    if suppress_notify {
-                        (self.emit)(json!({
-                            "event": "proactive_suppressed",
-                            "reason": "no_observed_evidence_after_failed_or_unknown_actions"
-                        }));
-                    } else {
-                        (self.emit)(json!({ "event": "notify", "title": "EJA", "body": text }));
-                    }
+                    (self.emit)(json!({ "event": "notify", "title": "EJA", "body": text }));
                 }
                 completed = true;
                 break;
@@ -581,32 +553,25 @@ impl HostRuntime {
         let result = match call.name.as_str() {
             "keep" => {
                 let text = call.args["text"].as_str().unwrap_or("").trim();
-                let evidence_fact_id = call.args["evidence_fact_id"].as_i64();
-                let verify_criteria = call.args["verify_criteria"]
-                    .as_str()
-                    .map(str::to_string);
-                let require_witness = call.args["require_witness"].as_bool();
-                state::keep_with_check(
-                    &self.eja,
-                    call.args["concern"].as_i64(),
-                    text,
-                    evidence_fact_id,
-                    verify_criteria,
-                    require_witness,
+                let checker = match call.args.get("checker") {
+                    None => None,
+                    Some(value) => match value.as_str() {
+                        Some(name) => Some(name),
+                        None => {
+                            return Ok(ToolOutput::Value(json!({"error":"checker 需要规则名称"})))
+                        }
+                    },
+                };
+                state::keep_with_check(&self.eja, call.args["concern"].as_i64(), text, checker).map(
+                    |entry| {
+                        let Fact::Kept { concern, .. } = entry.fact else {
+                            unreachable!()
+                        };
+                        ToolOutput::Value(
+                            json!({"status":"kept", "concern":concern, "fact_id":entry.id}),
+                        )
+                    },
                 )
-                .map(|(entry, meta)| {
-                    let Fact::Kept { concern, .. } = entry.fact else {
-                        unreachable!()
-                    };
-                    ToolOutput::Value(json!({
-                        "status": "kept",
-                        "concern": concern,
-                        "fact_id": entry.id,
-                        "require_witness": meta.require_witness,
-                        "verify_criteria": meta.verify_criteria,
-                        "evidence_fact_id": meta.evidence_fact_id
-                    }))
-                })
             }
             "release" => match call.args["concern"].as_i64() {
                 Some(id) => {
@@ -811,111 +776,6 @@ fn is_recoverable_llm_error(err: &str) -> bool {
         return matches!(code, 408 | 429 | 500..=599);
     }
     err.starts_with("网络请求失败") || err.starts_with("等待 LLM 响应失败")
-}
-
-#[derive(Default)]
-struct TurnEvidenceStats {
-    attempted: usize,
-    observed: usize,
-    failed_or_unknown: usize,
-}
-
-fn turn_action_evidence(eja: &Eja, trigger_id: Id) -> eja_core::Result<TurnEvidenceStats> {
-    let head = eja.revision()?;
-    let mut stats = TurnEvidenceStats::default();
-    for entry in eja.entries_after(trigger_id, head)? {
-        match entry.fact {
-            Fact::Acted { .. } => stats.attempted += 1,
-            Fact::Returned {
-                outcome: Outcome::Observed(_),
-                ..
-            } => stats.observed += 1,
-            Fact::Returned {
-                outcome: Outcome::Failed(_) | Outcome::Unknown(_),
-                ..
-            } => stats.failed_or_unknown += 1,
-            _ => {}
-        }
-    }
-    Ok(stats)
-}
-
-fn evaluate_guard(
-    reason: &str,
-    mut guard: WakeGuard,
-    probe: GuardProbeOutcome,
-    now: i64,
-) -> GuardResolution {
-    guard.checks_done = guard.checks_done.saturating_add(1);
-    let rearm_or_expire = |guard: WakeGuard| {
-        if guard.max_checks.is_some_and(|max| guard.checks_done >= max) {
-            return GuardResolution::Expired;
-        }
-        let next = now.saturating_add(guard.interval_seconds.max(1));
-        GuardResolution::Rearm {
-            next_fire_at_unix: next,
-            next_fire_at_display: format_wake_display(next),
-            guard,
-        }
-    };
-    match (guard.trigger_on, probe) {
-        (GuardTrigger::Changed, GuardProbeOutcome::Ok { output, digest }) => {
-            guard.consecutive_failures = 0;
-            if guard.last_digest.as_deref() == Some(digest.as_str()) {
-                rearm_or_expire(guard)
-            } else {
-                GuardResolution::Triggered(format!(
-                    "条件守望命中（{reason}）：状态已变化\n{output}"
-                ))
-            }
-        }
-        (GuardTrigger::ExitZero, GuardProbeOutcome::Ok { output, .. }) => {
-            let detail = if output.is_empty() {
-                "(exit 0)".to_string()
-            } else {
-                output
-            };
-            GuardResolution::Triggered(format!(
-                "条件守望命中（{reason}）：探针返回 0\n{detail}"
-            ))
-        }
-        (GuardTrigger::ExitZero, GuardProbeOutcome::NonZero { .. }) => {
-            guard.consecutive_failures = 0;
-            rearm_or_expire(guard)
-        }
-        (GuardTrigger::NonEmpty, GuardProbeOutcome::Ok { output, .. }) => {
-            guard.consecutive_failures = 0;
-            if output.trim().is_empty() {
-                rearm_or_expire(guard)
-            } else {
-                GuardResolution::Triggered(format!(
-                    "条件守望命中（{reason}）：检测到非空输出\n{output}"
-                ))
-            }
-        }
-        (_, GuardProbeOutcome::NonZero { code, output }) => {
-            guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
-            if guard.consecutive_failures >= guard.failure_threshold.max(1) {
-                GuardResolution::Triggered(format!(
-                    "条件守望异常（{reason}）：探针连续失败 {} 次 (exit {code})\n{output}",
-                    guard.consecutive_failures
-                ))
-            } else {
-                rearm_or_expire(guard)
-            }
-        }
-        (_, GuardProbeOutcome::Unknown(msg)) => {
-            guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
-            if guard.consecutive_failures >= guard.failure_threshold.max(1) {
-                GuardResolution::Triggered(format!(
-                    "条件守望异常（{reason}）：探针连续异常 {} 次\n{msg}",
-                    guard.consecutive_failures
-                ))
-            } else {
-                rearm_or_expire(guard)
-            }
-        }
-    }
 }
 
 fn detect_local_tz() -> String {
@@ -2073,780 +1933,121 @@ for line in sys.stdin:
         assert!(!rt.has_pending_trigger());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn guarded_wake_suppresses_unchanged_polls_and_triggers_as_source_world() {
+    fn registered_check_drives_silent_watch_and_verified_release_across_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
-        fs::create_dir_all(&data_dir).unwrap();
-        let target = data_dir.join("status.txt");
-        fs::write(&target, "v1").unwrap();
-
-        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let events_sink = events.clone();
+        let data = dir.path().join("Eja");
         let brain = Arc::new(ScriptedBrain {
             replies: Mutex::new(vec![
-                Ok(ModelReply {
-                    message: json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "call_wake_1",
-                            "type": "function",
-                            "function": {
-                                "name": "wake",
-                                "arguments": json!({
-                                    "delay_seconds": 1,
-                                    "interval_seconds": 1,
-                                    "reason": "观察 status.txt 变化",
-                                    "guard_command": format!("cat '{}'", target.display()),
-                                    "trigger_on": "changed"
-                                }).to_string()
-                            }
-                        }]
+                Ok(tool_reply(
+                    "register",
+                    "promote_tool",
+                    json!({
+                        "name":"ready", "file":"status.txt", "equals":"ready"
                     }),
-                    text: String::new(),
-                    calls: vec![ToolCall {
-                        id: "call_wake_1".into(),
-                        name: "wake".into(),
-                        args: json!({
-                            "delay_seconds": 1,
-                            "interval_seconds": 1,
-                            "reason": "观察 status.txt 变化",
-                            "guard_command": format!("cat '{}'", target.display()),
-                            "trigger_on": "changed"
-                        }),
-                    }],
-                }),
-                Ok(text_reply("已开始静默守望")),
-                Ok(text_reply("检测到 status.txt 变为 v2-ready")),
+                )),
+                Ok(tool_reply(
+                    "keep",
+                    "keep",
+                    json!({"text":"等状态就绪","checker":"ready"}),
+                )),
+                Ok(tool_reply(
+                    "wake",
+                    "wake",
+                    json!({
+                        "delay_seconds":10, "reason":"检查状态", "guard_tool":"ready","max_checks":3
+                    }),
+                )),
+                Ok(text_reply("已守望")),
             ]),
             seen_windows: Mutex::new(Vec::new()),
         });
-        let mut rt = HostRuntime::open_with_brain(
-            data_dir,
-            brain.clone(),
-            Box::new(move |ev| events_sink.lock().unwrap().push(ev)),
-        )
-        .unwrap();
-        rt.save_config(configured(vec![]));
-        rt.handle_user_message("帮我盯着 status.txt");
-
-        // A passive Source::World notice must NOT trigger a turn.
-        rt.eja.notice(Source::World, "被动系统提示").unwrap();
-        assert!(!rt.has_pending_trigger());
-        let rev_after_passive = rt.eja.revision().unwrap();
-        assert_eq!(brain.seen_windows.lock().unwrap().len(), 2);
-
-        // 5 unchanged ticks -> 0 journal writes, 0 LLM calls.
-        for _ in 0..5 {
-            let wakes = state::pending_wakes(&rt.eja).unwrap();
-            assert_eq!(wakes.len(), 1);
-            state::settle_guarded_wake(
-                &rt.eja,
-                &wakes[0].id,
-                GuardResolution::Rearm {
-                    next_fire_at_unix: 1,
-                    next_fire_at_display: "00:00:01".into(),
-                    guard: wakes[0].guard.clone().unwrap(),
-                },
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let open = || {
+            let sink = events.clone();
+            HostRuntime::open_with_brain(
+                data.clone(),
+                brain.clone(),
+                Box::new(move |event| sink.lock().unwrap().push(event)),
             )
-            .unwrap();
-            rt.tick_timers().unwrap();
-        }
-        assert_eq!(rt.eja.revision().unwrap(), rev_after_passive);
-        assert_eq!(brain.seen_windows.lock().unwrap().len(), 2);
-        let wakes = state::pending_wakes(&rt.eja).unwrap();
-        assert_eq!(wakes[0].guard.as_ref().unwrap().checks_done, 5);
-
-        // World changes -> writes Source::World (not Source::Clock) and runs proactive turn.
-        fs::write(&target, "v2-ready").unwrap();
-        state::settle_guarded_wake(
-            &rt.eja,
-            &wakes[0].id,
-            GuardResolution::Rearm {
-                next_fire_at_unix: 1,
-                next_fire_at_display: "00:00:01".into(),
-                guard: wakes[0].guard.clone().unwrap(),
-            },
-        )
-        .unwrap();
-        rt.tick_timers().unwrap();
-
-        let recent = rt.eja.recent(10).unwrap();
-        assert!(recent.iter().any(|e| matches!(
-            &e.fact,
-            Fact::Noticed { source: Source::World, text } if text.contains("v2-ready")
-        )));
-        assert!(!recent.iter().any(|e| matches!(
-            &e.fact,
-            Fact::Noticed { source: Source::Clock, text } if text.contains("v2-ready")
-        )));
-        assert!(events
-            .lock()
             .unwrap()
-            .iter()
-            .any(|ev| ev["event"] == "notify"));
-        let proactive_ids = state::proactive_reply_ids(&rt.eja);
-        assert!(!proactive_ids.is_empty());
-        assert!(state::pending_wakes(&rt.eja).unwrap().is_empty());
-    }
-
-    #[test]
-    fn guarded_wake_escalates_on_failure_threshold_and_respects_seatbelt() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
-        let core_db = dir.path().join("ai.eja.kernel").join("subject.db");
-        let brain = Arc::new(ScriptedBrain {
-            replies: Mutex::new(vec![Ok(text_reply("探针异常已收到"))]),
-            seen_windows: Mutex::new(Vec::new()),
-        });
-        let mut rt =
-            HostRuntime::open_with_brain(data_dir, brain.clone(), Box::new(|_| {})).unwrap();
+        };
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(100));
+        let open_subject = || {
+            let clock = clock.clone();
+            Eja::open(dir.path().join("ai.eja.kernel/subject.db"))
+                .unwrap()
+                .with_clock(move || Timestamp(clock.load(Ordering::SeqCst)))
+        };
+        let mut rt = open();
+        rt.eja = open_subject();
         rt.save_config(configured(vec![]));
-
-        let act = rt
-            .eja
-            .act(
-                rt.eja.revision().unwrap(),
-                "wake",
-                json!({
-                    "delay_seconds": 1,
-                    "reason": "attempt kernel read",
-                    "guard_command": format!("cat '{}'", core_db.display()),
-                    "trigger_on": "changed"
-                }),
-            )
-            .unwrap();
-        let outcome = rt.hands.execute(&act, &rt.eja, &rt.sandbox);
-        assert!(matches!(outcome, Outcome::Failed(ref msg) if msg.contains("基线探针失败")));
-        rt.eja.finish(act.id, outcome).unwrap();
-
-        state::schedule_wakes(
-            &rt.eja,
-            &[WakeAlarm {
-                id: "w-fail".into(),
-                fire_at_unix: 1,
-                fire_at_display: "00:00:01".into(),
-                reason: "健康探针".into(),
-                guard: Some(WakeGuard {
-                    probe: state::GuardProbe::Command {
-                        command: "echo down >&2; exit 2".into(),
-                    },
-                    interval_seconds: 1,
-                    trigger_on: GuardTrigger::Changed,
-                    last_digest: Some("prev".into()),
-                    max_checks: None,
-                    checks_done: 0,
-                    consecutive_failures: 0,
-                    failure_threshold: 2,
-                }),
-            }],
-        )
-        .unwrap();
-        rt.tick_timers().unwrap();
-        assert_eq!(brain.seen_windows.lock().unwrap().len(), 0);
-        let wakes = state::pending_wakes(&rt.eja).unwrap();
-        assert_eq!(wakes[0].guard.as_ref().unwrap().consecutive_failures, 1);
-
-        state::settle_guarded_wake(
-            &rt.eja,
-            "w-fail",
-            GuardResolution::Rearm {
-                next_fire_at_unix: 1,
-                next_fire_at_display: "00:00:01".into(),
-                guard: wakes[0].guard.clone().unwrap(),
-            },
-        )
-        .unwrap();
-        rt.tick_timers().unwrap();
-        let windows = brain.seen_windows.lock().unwrap();
-        assert_eq!(windows.len(), 1);
-        assert!(windows[0].iter().any(|m| m["content"]
-            .as_str()
-            .is_some_and(|s| s.contains("探针连续失败 2 次"))));
-    }
-
-    #[test]
-    fn compounding_tool_seals_in_kernel_blocks_tampering_and_self_mutating_check() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
-        let tool_dir = data_dir.join("tools").join("sum_pair");
-        fs::create_dir_all(&tool_dir).unwrap();
-        fs::write(
-            tool_dir.join("manifest.json"),
-            r#"{
-                "name": "sum_pair",
-                "description": "Add two integers a and b from JSON stdin",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "a": {"type": "integer"},
-                        "b": {"type": "integer"}
-                    },
-                    "required": ["a", "b"]
-                }
-            }"#,
-        )
-        .unwrap();
-        fs::write(
-            tool_dir.join("run.sh"),
-            "python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[\"a\"]+d[\"b\"])'\n",
-        )
-        .unwrap();
-        // Self-mutating check.sh must be rejected after post-check digest verification.
-        fs::write(
-            tool_dir.join("check.sh"),
-            "echo '# mutated' >> run.sh; echo ok\n",
-        )
-        .unwrap();
-
-        let brain = Arc::new(MockBrain {
-            judge_calls: AtomicUsize::new(0),
-            mode: "chat",
-        });
-        let mut rt =
-            HostRuntime::open_with_brain(data_dir.clone(), brain, Box::new(|_| {})).unwrap();
-        let mut_call = rt
-            .eja
-            .act(
-                rt.eja.revision().unwrap(),
-                "promote_tool",
-                json!({"name": "sum_pair"}),
-            )
-            .unwrap();
-        let mut_out = rt.hands.execute(&mut_call, &rt.eja, &rt.sandbox);
-        assert!(matches!(mut_out, Outcome::Failed(ref msg) if msg.contains("发生变化")));
-        rt.eja.finish(mut_call.id, mut_out).unwrap();
-
-        // Fix run.sh and check.sh -> promote succeeds and executes directly from verified bytes.
-        fs::write(
-            tool_dir.join("run.sh"),
-            "python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[\"a\"]+d[\"b\"])'\n",
-        )
-        .unwrap();
-        fs::write(
-            tool_dir.join("check.sh"),
-            "out=$(printf '{\"a\":2,\"b\":3}' | /bin/sh ./run.sh); test \"$out\" = \"5\" && echo ok\n",
-        )
-        .unwrap();
-        let promo = rt
-            .eja
-            .act(
-                rt.eja.revision().unwrap(),
-                "promote_tool",
-                json!({"name": "sum_pair"}),
-            )
-            .unwrap();
-        let promo_out = rt.hands.execute(&promo, &rt.eja, &rt.sandbox);
-        assert!(matches!(promo_out, Outcome::Observed(_)));
-        rt.eja.finish(promo.id, promo_out).unwrap();
-        assert!(rt
-            .hands
-            .tools(&rt.eja)
-            .iter()
-            .any(|t| t.capability == "tool.sum_pair"));
-
-        let invoke = rt
-            .eja
-            .act(
-                rt.eja.revision().unwrap(),
-                "tool.sum_pair",
-                json!({"a": 19, "b": 23}),
-            )
-            .unwrap();
-        let invoke_out = rt.hands.execute(&invoke, &rt.eja, &rt.sandbox);
-        assert!(matches!(invoke_out, Outcome::Observed(ref s) if s == "42"));
-        rt.eja.finish(invoke.id, invoke_out).unwrap();
-
-        // Tampering invalidates immediately.
-        fs::write(tool_dir.join("run.sh"), "echo hacked\n").unwrap();
-        assert!(!rt
-            .hands
-            .tools(&rt.eja)
-            .iter()
-            .any(|t| t.capability == "tool.sum_pair"));
-        let tamper = rt
-            .eja
-            .act(
-                rt.eja.revision().unwrap(),
-                "tool.sum_pair",
-                json!({"a": 1, "b": 2}),
-            )
-            .unwrap();
-        let tamper_out = rt.hands.execute(&tamper, &rt.eja, &rt.sandbox);
-        assert!(matches!(tamper_out, Outcome::Failed(ref msg) if msg.contains("校验和不匹配")));
-        rt.eja.finish(tamper.id, tamper_out).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn compounding_tool_blocks_symlink_escape_and_kernel_access() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
-        fs::create_dir_all(&data_dir).unwrap();
-        let outside = dir.path().join("outside_tool");
-        fs::create_dir_all(&outside).unwrap();
-        fs::create_dir_all(data_dir.join("tools")).unwrap();
-        symlink(&outside, data_dir.join("tools").join("evil")).unwrap();
-
-        let brain = Arc::new(MockBrain {
-            judge_calls: AtomicUsize::new(0),
-            mode: "chat",
-        });
-        let mut rt =
-            HostRuntime::open_with_brain(data_dir.clone(), brain, Box::new(|_| {})).unwrap();
-
-        let sym_call = rt
-            .eja
-            .act(
-                rt.eja.revision().unwrap(),
-                "promote_tool",
-                json!({"name": "evil"}),
-            )
-            .unwrap();
-        let sym_out = rt.hands.execute(&sym_call, &rt.eja, &rt.sandbox);
-        assert!(matches!(sym_out, Outcome::Failed(_)));
-        rt.eja.finish(sym_call.id, sym_out).unwrap();
-
-        let probe_dir = data_dir.join("tools").join("peek");
-        fs::create_dir_all(&probe_dir).unwrap();
-        let core_db = dir.path().join("ai.eja.kernel").join("subject.db");
-        fs::write(
-            probe_dir.join("manifest.json"),
-            r#"{"name":"peek","description":"peek","schema":{"type":"object"}}"#,
-        )
-        .unwrap();
-        fs::write(probe_dir.join("run.sh"), "echo ok\n").unwrap();
-        fs::write(
-            probe_dir.join("check.sh"),
-            format!("cat '{}'\n", core_db.display()),
-        )
-        .unwrap();
-        let peek_call = rt
-            .eja
-            .act(
-                rt.eja.revision().unwrap(),
-                "promote_tool",
-                json!({"name": "peek"}),
-            )
-            .unwrap();
-        let peek_out = rt.hands.execute(&peek_call, &rt.eja, &rt.sandbox);
-        assert!(matches!(peek_out, Outcome::Failed(ref msg) if msg.contains("自检脚本未通过")));
-        rt.eja.finish(peek_call.id, peek_out).unwrap();
-    }
-
-    #[test]
-    fn concern_release_checker_rejects_unverified_witnesses_and_accepts_observed_witness() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
-        let brain = Arc::new(MockBrain {
-            judge_calls: AtomicUsize::new(0),
-            mode: "chat",
-        });
-        let rt = HostRuntime::open_with_brain(data_dir, brain, Box::new(|_| {})).unwrap();
-
-        let prior_obs = rt.eja.notice(Source::World, "old fact").unwrap();
-        let (kept, meta) = state::keep_with_check(
-            &rt.eja,
-            None,
-            "确认构建通过",
-            Some(prior_obs),
-            Some("cargo test 全绿".into()),
-            None,
-        )
-        .unwrap();
-        assert!(meta.require_witness);
-        let concern_id = kept.id;
-
-        assert!(state::release_with_witness(&rt.eja, concern_id, None).is_err());
-        assert!(state::release_with_witness(&rt.eja, concern_id, Some(prior_obs)).is_err());
-        let said_id = rt.eja.say("我觉得通过了").unwrap();
-        assert!(state::release_with_witness(&rt.eja, concern_id, Some(said_id)).is_err());
-        let failed_act = rt
-            .eja
-            .act(rt.eja.revision().unwrap(), "shell", json!({"command": "false"}))
-            .unwrap();
-        let failed_rcpt = rt
-            .eja
-            .finish(failed_act.id, Outcome::Failed("exit 1".into()))
-            .unwrap();
-        assert!(state::release_with_witness(&rt.eja, concern_id, Some(failed_rcpt.id)).is_err());
-        let unk_act = rt
-            .eja
-            .act(rt.eja.revision().unwrap(), "shell", json!({"command": "sleep 9"}))
-            .unwrap();
-        let unk_rcpt = rt
-            .eja
-            .finish(unk_act.id, Outcome::Unknown("timeout".into()))
-            .unwrap();
-        assert!(state::release_with_witness(&rt.eja, concern_id, Some(unk_rcpt.id)).is_err());
-        rt.eja
-            .finish(unk_act.id, Outcome::Observed("all tests green".into()))
-            .unwrap();
-        let released = state::release_with_witness(&rt.eja, concern_id, Some(unk_rcpt.id)).unwrap();
-        assert!(matches!(released.fact, Fact::Released { concern } if concern == concern_id));
-    }
-
-    #[test]
-    fn proactive_checker_gate_intercepts_unverified_alert_after_failed_action() {
-        let dir = tempfile::tempdir().unwrap();
-        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let events_sink = events.clone();
-        let brain = Arc::new(ScriptedBrain {
-            replies: Mutex::new(vec![
-                Ok(ModelReply {
-                    message: json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "probe1",
-                            "type": "function",
-                            "function": { "name": "shell", "arguments": "{\"command\":\"exit 1\"}" }
-                        }]
-                    }),
-                    text: String::new(),
-                    calls: vec![ToolCall {
-                        id: "probe1".into(),
-                        name: "shell".into(),
-                        args: json!({"command": "exit 1"}),
-                    }],
-                }),
-                Ok(text_reply("服务已恢复正常")),
-                Ok(text_reply("")),
-            ]),
-            seen_windows: Mutex::new(Vec::new()),
-        });
-        let mut rt = HostRuntime::open_with_brain(
-            dir.path().join("Eja"),
-            brain.clone(),
-            Box::new(move |ev| events_sink.lock().unwrap().push(ev)),
-        )
-        .unwrap();
-        rt.save_config(configured(vec![]));
-        state::schedule_wakes(
-            &rt.eja,
-            &[WakeAlarm {
-                id: "w-check".into(),
-                fire_at_unix: 1,
-                fire_at_display: "00:00:01".into(),
-                reason: "检查服务健康".into(),
-                guard: None,
-            }],
-        )
-        .unwrap();
-        rt.tick_timers().unwrap();
-
-        let windows = brain.seen_windows.lock().unwrap();
-        assert_eq!(windows.len(), 3);
-        assert!(windows[2]
-            .last()
-            .and_then(|m| m["content"].as_str())
-            .is_some_and(|s| s.contains("[checker-gate]")));
-        assert!(!events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|ev| ev["event"] == "notify"));
+        let status = data.join("status.txt");
+        fs::write(&status, "waiting").unwrap();
+        rt.handle_user_message("检查状态");
+        let concern = rt.eja.concerns(rt.eja.revision().unwrap()).unwrap()[0].id;
+        let passive = rt.eja.notice(Source::World, "unrelated").unwrap();
         assert!(!rt.has_pending_trigger());
-    }
+        assert!(state::release_with_witness(&rt.eja, concern, None).is_err());
+        assert!(state::release_with_witness(&rt.eja, concern, Some(passive)).is_err());
 
-    #[test]
-    fn stream_exposes_structured_outcome_status_and_truncation_markers() {
-        let dir = tempfile::tempdir().unwrap();
-        let brain = Arc::new(MockBrain {
-            judge_calls: AtomicUsize::new(0),
-            mode: "chat",
-        });
-        let rt = HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {}))
-            .unwrap();
-        let a1 = rt
-            .eja
-            .act(rt.eja.revision().unwrap(), "shell", json!({"command": "big"}))
-            .unwrap();
-        rt.eja
-            .finish(a1.id, Outcome::Observed("x".repeat(70 * 1024)))
-            .unwrap();
-        let a2 = rt
-            .eja
-            .act(rt.eja.revision().unwrap(), "shell", json!({"command": "hang"}))
-            .unwrap();
-        rt.eja
-            .finish(a2.id, Outcome::Unknown("timeout".into()))
-            .unwrap();
-        let snap = rt.snapshot();
-        let item1 = snap.stream.iter().find(|i| i.id == a1.id).unwrap();
-        assert_eq!(item1.outcome_status.as_deref(), Some("observed"));
-        assert_eq!(item1.truncated, Some(true));
-        let item2 = snap.stream.iter().find(|i| i.id == a2.id).unwrap();
-        assert_eq!(item2.outcome_status.as_deref(), Some("unknown"));
-        assert_eq!(item2.truncated, None);
-    }
-
-    #[test]
-    fn full_gsi_compounding_loop_tool_to_guarded_wake_to_verified_release() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
-        let metric_file = data_dir.join("metric.txt");
-        let tool_dir = data_dir.join("tools").join("watch_metric");
-        fs::create_dir_all(&tool_dir).unwrap();
-        fs::write(&metric_file, "pending").unwrap();
-        fs::write(
-            tool_dir.join("manifest.json"),
-            r#"{
-                "name": "watch_metric",
-                "description": "Read metric status from a JSON path argument",
-                "schema": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            }"#,
-        )
-        .unwrap();
-        fs::write(
-            tool_dir.join("run.sh"),
-            "python3 -c 'import json,sys; p=json.load(sys.stdin)[\"path\"]; print(open(p).read().strip())'\n",
-        )
-        .unwrap();
-        fs::write(
-            tool_dir.join("check.sh"),
-            format!(
-                "out=$(printf '{{\"path\":\"{}\"}}' | /bin/sh ./run.sh); test \"$out\" = \"pending\" && echo ok\n",
-                metric_file.display()
-            ),
-        )
-        .unwrap();
-
-        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let events_sink = events.clone();
-        let brain = Arc::new(ScriptedBrain {
-            replies: Mutex::new(vec![
-                // Turn 1 Step 1: promote verified tool
-                Ok(ModelReply {
-                    message: json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "c1",
-                            "type": "function",
-                            "function": { "name": "promote_tool", "arguments": "{\"name\":\"watch_metric\"}" }
-                        }]
-                    }),
-                    text: String::new(),
-                    calls: vec![ToolCall {
-                        id: "c1".into(),
-                        name: "promote_tool".into(),
-                        args: json!({"name": "watch_metric"}),
-                    }],
-                }),
-                // Turn 1 Step 2: create concern with verify_criteria
-                Ok(ModelReply {
-                    message: json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "c2",
-                            "type": "function",
-                            "function": {
-                                "name": "keep",
-                                "arguments": json!({
-                                    "text": "等待 metric.txt 变为 ready",
-                                    "verify_criteria": "watch_metric 输出 ready"
-                                }).to_string()
-                            }
-                        }]
-                    }),
-                    text: String::new(),
-                    calls: vec![ToolCall {
-                        id: "c2".into(),
-                        name: "keep".into(),
-                        args: json!({
-                            "text": "等待 metric.txt 变为 ready",
-                            "verify_criteria": "watch_metric 输出 ready"
-                        }),
-                    }],
-                }),
-                // Turn 1 Step 3: schedule guarded wake backed by the newly sealed tool
-                Ok(ModelReply {
-                    message: json!({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "c3",
-                            "type": "function",
-                            "function": {
-                                "name": "wake",
-                                "arguments": json!({
-                                    "delay_seconds": 1,
-                                    "interval_seconds": 1,
-                                    "reason": "metric 状态守望",
-                                    "guard_tool": "watch_metric",
-                                    "guard_input": { "path": metric_file.display().to_string() },
-                                    "trigger_on": "changed"
-                                }).to_string()
-                            }
-                        }]
-                    }),
-                    text: String::new(),
-                    calls: vec![ToolCall {
-                        id: "c3".into(),
-                        name: "wake".into(),
-                        args: json!({
-                            "delay_seconds": 1,
-                            "interval_seconds": 1,
-                            "reason": "metric 状态守望",
-                            "guard_tool": "watch_metric",
-                            "guard_input": { "path": metric_file.display().to_string() },
-                            "trigger_on": "changed"
-                        }),
-                    }],
-                }),
-                Ok(text_reply("已封签 watch_metric 并启动零噪音守望")),
-            ]),
-            seen_windows: Mutex::new(Vec::new()),
-        });
-        let mut rt = HostRuntime::open_with_brain(
-            data_dir.clone(),
-            brain.clone(),
-            Box::new(move |ev| events_sink.lock().unwrap().push(ev)),
-        )
-        .unwrap();
-        rt.save_config(configured(vec![]));
-
-        rt.handle_user_message("监控 metric.txt 并在 ready 时通知我");
-        let concerns = rt.eja.concerns(rt.eja.revision().unwrap()).unwrap();
-        assert_eq!(concerns.len(), 1);
-        let concern_id = concerns[0].id;
-        let rev_after_setup = rt.eja.revision().unwrap();
+        clock.store(110, Ordering::SeqCst);
+        rt.tick_timers().unwrap();
+        assert_eq!(rt.eja.revision().unwrap(), passive);
         assert_eq!(brain.seen_windows.lock().unwrap().len(), 4);
+        drop(rt);
 
-        // 3 unchanged ticks -> 0 journal writes, 0 LLM calls.
-        for _ in 0..3 {
-            let wakes = state::pending_wakes(&rt.eja).unwrap();
-            assert_eq!(wakes.len(), 1);
-            state::settle_guarded_wake(
-                &rt.eja,
-                &wakes[0].id,
-                GuardResolution::Rearm {
-                    next_fire_at_unix: 1,
-                    next_fire_at_display: "00:00:01".into(),
-                    guard: wakes[0].guard.clone().unwrap(),
-                },
-            )
-            .unwrap();
-            rt.tick_timers().unwrap();
-        }
-        assert_eq!(rt.eja.revision().unwrap(), rev_after_setup);
-        assert_eq!(brain.seen_windows.lock().unwrap().len(), 4);
-
-        // World changes -> watch_metric detects "ready" -> writes Source::World -> proactive turn!
-        let expected_watch_fact_id = rev_after_setup + 1;
+        fs::write(&status, "ready\n").unwrap();
+        clock.store(120, Ordering::SeqCst);
+        let mut rt = open();
+        rt.eja = open_subject();
+        let hit = passive + 1;
         brain.replies.lock().unwrap().extend([
-            // Premature release without witness must fail.
-            Ok(ModelReply {
-                message: json!({
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "r_bad",
-                        "type": "function",
-                        "function": {
-                            "name": "release",
-                            "arguments": json!({ "concern": concern_id }).to_string()
-                        }
-                    }]
-                }),
-                text: String::new(),
-                calls: vec![ToolCall {
-                    id: "r_bad".into(),
-                    name: "release".into(),
-                    args: json!({ "concern": concern_id }),
-                }],
-            }),
-            // Verified release citing the Source::World watch hit fact succeeds.
-            Ok(ModelReply {
-                message: json!({
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "r_ok",
-                        "type": "function",
-                        "function": {
-                            "name": "release",
-                            "arguments": json!({
-                                "concern": concern_id,
-                                "witness_fact_id": expected_watch_fact_id
-                            }).to_string()
-                        }
-                    }]
-                }),
-                text: String::new(),
-                calls: vec![ToolCall {
-                    id: "r_ok".into(),
-                    name: "release".into(),
-                    args: json!({
-                        "concern": concern_id,
-                        "witness_fact_id": expected_watch_fact_id
-                    }),
-                }],
-            }),
-            Ok(text_reply("metric.txt 已就绪（ready），已凭实证放下挂念。")),
+            Ok(tool_reply(
+                "release",
+                "release",
+                json!({"concern": concern,"witness_fact_id":hit}),
+            )),
+            Ok(text_reply("状态已就绪")),
         ]);
-
-        fs::write(&metric_file, "ready").unwrap();
-        let wakes = state::pending_wakes(&rt.eja).unwrap();
-        state::settle_guarded_wake(
-            &rt.eja,
-            &wakes[0].id,
-            GuardResolution::Rearm {
-                next_fire_at_unix: 1,
-                next_fire_at_display: "00:00:01".into(),
-                guard: wakes[0].guard.clone().unwrap(),
-            },
-        )
-        .unwrap();
         rt.tick_timers().unwrap();
-
-        let watch_entry = rt.eja.read(expected_watch_fact_id).unwrap();
-        assert!(matches!(
-            watch_entry.fact,
-            Fact::Noticed { source: Source::World, ref text } if text.contains("ready")
-        ));
-        assert!(rt.eja.concerns(rt.eja.revision().unwrap()).unwrap().is_empty());
-        assert_eq!(
-            state::concern_check_metas(&rt.eja)
-                .get(&concern_id)
-                .and_then(|m| m.release_witness_fact_id),
-            Some(expected_watch_fact_id)
-        );
-        assert!(events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|ev| ev["event"] == "notify"
-                && ev["body"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("ready"))));
-
-        // Tampering with watch_metric invalidates guard_tool scheduling immediately.
-        fs::write(tool_dir.join("run.sh"), "echo tampered\n").unwrap();
-        let bad_wake = rt
+        assert!(matches!(rt.eja.read(hit).unwrap().fact, Fact::Noticed {
+            source: Source::World, text
+        } if text.contains("ready")));
+        assert!(rt
             .eja
-            .act(
-                rt.eja.revision().unwrap(),
-                "wake",
-                json!({
-                    "delay_seconds": 1,
-                    "reason": "tampered tool watch",
-                    "guard_tool": "watch_metric",
-                    "trigger_on": "changed"
-                }),
-            )
-            .unwrap();
-        let bad_out = rt.hands.execute(&bad_wake, &rt.eja, &rt.sandbox);
-        assert!(matches!(bad_out, Outcome::Failed(ref msg) if msg.contains("校验和不匹配")));
-        rt.eja.finish(bad_wake.id, bad_out).unwrap();
+            .concerns(rt.eja.revision().unwrap())
+            .unwrap()
+            .is_empty());
+        assert!(state::pending_wakes(&rt.eja).unwrap().is_empty());
+        rt.tick_timers().unwrap();
+        assert_eq!(brain.seen_windows.lock().unwrap().len(), 6);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|ev| ev["event"] == "notify")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registered_check_rejects_changes_to_rule_and_unsafe_files() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let data = TrustedDir::open(dir.path()).unwrap();
+        let eja = Eja::open(":memory:").unwrap();
+        assert!(state::register_check(&eja, "unsafe", "../private", "yes").is_err());
+        state::register_check(&eja, "ready", "status.txt", "yes").unwrap();
+        assert!(state::register_check(&eja, "ready", "other.txt", "yes").is_err());
+        let check = state::registered_check(&eja, "ready").unwrap();
+        assert!(!check.matches(&data).unwrap());
+        fs::write(dir.path().join("target"), "yes").unwrap();
+        symlink("target", dir.path().join("status.txt")).unwrap();
+        assert!(check.matches(&data).is_err());
     }
 }

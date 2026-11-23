@@ -225,10 +225,6 @@ impl Tx<'_> {
         entries_after_on(&self.tx, after, through)
     }
 
-    pub fn read(&self, id: Id) -> Result<Entry> {
-        read_on(&self.tx, id)
-    }
-
     pub fn evidence(&self, id: Id) -> Result<Evidence> {
         evidence_at_on(&self.tx, id, self.revision()?)
     }

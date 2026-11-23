@@ -1,10 +1,8 @@
 //! Host-owned scheduling, turn settlement, window anchor, and upgrade state stored
 //! atomically alongside `eja-core` facts via `host_meta`.
-use crate::http::truncate_utf8;
-use crate::sandbox::TrustedDir;
+use crate::sandbox::{validate_single_name, TrustedDir};
 use eja_core::{Eja, Entry, Error, Fact, Id, Outcome, Source, Tx, FACT_BYTES};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -12,69 +10,42 @@ use std::path::Path;
 const META_STATE: &str = "host.state";
 const MAX_PROACTIVE_HISTORY: usize = 256;
 
-fn default_guard_interval() -> i64 {
-    60
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FileCheck {
+    file: String,
+    equals: String,
 }
 
-fn default_failure_threshold() -> u32 {
-    3
+impl FileCheck {
+    pub fn matches(&self, data_dir: &TrustedDir) -> std::io::Result<bool> {
+        match data_dir.read_check_file(&self.file, 4096) {
+            Ok(bytes) => Ok(std::str::from_utf8(&bytes)
+                .map_err(std::io::Error::other)?
+                .trim_end_matches(['\r', '\n'])
+                == self.equals),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
 }
 
-fn default_probe_input() -> Value {
-    serde_json::json!({})
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ConcernCheckMeta {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify_criteria: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_fact_id: Option<Id>,
-    #[serde(default)]
-    pub require_witness: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub release_witness_fact_id: Option<Id>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardTrigger {
-    #[default]
-    Changed,
-    ExitZero,
-    NonEmpty,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum GuardProbe {
-    Command {
-        command: String,
-    },
-    Tool {
-        capability: String,
-        #[serde(default = "default_probe_input")]
-        input: Value,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ConcernCheck {
+    Registered(String),
+    Legacy {
+        #[serde(default)]
+        require_witness: bool,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeGuard {
-    pub probe: GuardProbe,
-    #[serde(default = "default_guard_interval")]
+    #[serde(default)]
+    pub checker: String,
     pub interval_seconds: i64,
     #[serde(default)]
-    pub trigger_on: GuardTrigger,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_checks: Option<u32>,
-    #[serde(default)]
-    pub checks_done: u32,
-    #[serde(default)]
-    pub consecutive_failures: u32,
-    #[serde(default = "default_failure_threshold")]
-    pub failure_threshold: u32,
+    pub remaining: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,7 +73,9 @@ struct HostState {
     #[serde(default)]
     world_triggers: Vec<Id>,
     #[serde(default)]
-    concern_checks: BTreeMap<Id, ConcernCheckMeta>,
+    concern_checks: BTreeMap<Id, ConcernCheck>,
+    #[serde(default)]
+    checks: BTreeMap<String, FileCheck>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -163,7 +136,8 @@ pub fn entries_for_turn(
 ) -> eja_core::Result<Vec<Entry>> {
     let world_triggers = decode_state(eja.get_meta(META_STATE)?)?.world_triggers;
     let mut entries = eja.entries_after(after, through)?;
-    entries.retain(|entry| entry.id <= trigger || is_trigger_entry(entry, &world_triggers).is_none());
+    entries
+        .retain(|entry| entry.id <= trigger || is_trigger_entry(entry, &world_triggers).is_none());
     Ok(entries)
 }
 
@@ -196,6 +170,16 @@ pub fn bootstrap(
             merge_wakes(&mut state.wakes, alarms)?;
         }
 
+        let previous_wakes = state.wakes.len();
+        state.wakes.retain(|alarm| {
+            alarm
+                .guard
+                .as_ref()
+                .is_none_or(|guard| !guard.checker.is_empty())
+        });
+        if previous_wakes != state.wakes.len() {
+            tx.notice(Source::World, "旧守望已停用，请重新绑定本地检查规则。")?;
+        }
         let unfinished = tx.unfinished_actions()?;
         if state.turn_cursor.is_none() {
             let legacy_settled = legacy_window
@@ -341,127 +325,119 @@ pub fn proactive_reply_ids(eja: &Eja) -> HashSet<Id> {
         .unwrap_or_default()
 }
 
-pub fn concern_check_metas(eja: &Eja) -> BTreeMap<Id, ConcernCheckMeta> {
-    decode_state(eja.get_meta(META_STATE).ok().flatten())
-        .ok()
-        .map(|state| state.concern_checks)
-        .unwrap_or_default()
+pub fn register_check(eja: &Eja, name: &str, file: &str, equals: &str) -> eja_core::Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Err(Error::Invalid("本地检查仅支持 macOS".into()));
+    }
+    if name.is_empty()
+        || name.len() > 40
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
+        || file.len() > 255
+        || validate_single_name(file).is_err()
+        || equals.len() > 4096
+        || equals.ends_with(['\r', '\n'])
+    {
+        return Err(Error::Invalid("检查名限 1–40 个小写字母、数字、下划线或连字符；文件限数据目录中的单个文件名；期望文本上限 4096 字节且不能以换行结尾".into()));
+    }
+    let check = FileCheck {
+        file: file.into(),
+        equals: equals.into(),
+    };
+    update_state(eja, |_, state| {
+        if let Some(previous) = state.checks.get(name) {
+            return if previous == &check {
+                Ok(())
+            } else {
+                Err(Error::Invalid("检查名称已绑定，请使用新名称".into()))
+            };
+        }
+        if state.checks.len() >= 64 {
+            return Err(Error::Invalid("已达到 64 条检查规则上限".into()));
+        }
+        state.checks.insert(name.into(), check);
+        Ok(())
+    })
 }
 
-/// Atomically keep/revise a concern together with optional evidence/verification metadata.
+pub fn registered_check(eja: &Eja, name: &str) -> eja_core::Result<FileCheck> {
+    decode_state(eja.get_meta(META_STATE)?)?
+        .checks
+        .remove(name)
+        .ok_or_else(|| Error::Invalid(format!("未知检查规则 {name}")))
+}
+
 pub fn keep_with_check(
     eja: &Eja,
     concern: Option<Id>,
     text: &str,
-    evidence_fact_id: Option<Id>,
-    verify_criteria: Option<String>,
-    require_witness: Option<bool>,
-) -> eja_core::Result<(Entry, ConcernCheckMeta)> {
+    checker: Option<&str>,
+) -> eja_core::Result<Entry> {
+    if text.trim().is_empty() {
+        return Err(Error::Invalid("挂念需要非空文本".into()));
+    }
     update_state(eja, |tx, state| {
-        if let Some(ev_id) = evidence_fact_id {
-            tx.read(ev_id)
-                .map_err(|_| Error::Invalid(format!("evidence_fact_id {ev_id} 不存在")))?;
-        }
-        let entry = tx.keep(concern, text)?;
-        let Fact::Kept { concern: cid, .. } = entry.fact else {
-            unreachable!()
-        };
-        let meta = state.concern_checks.entry(cid).or_default();
-        if let Some(ev_id) = evidence_fact_id {
-            meta.evidence_fact_id = Some(ev_id);
-        }
-        if let Some(criteria) = verify_criteria
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            meta.verify_criteria = Some(criteria);
-            if require_witness.is_none() {
-                meta.require_witness = true;
+        if let Some(checker) = checker {
+            if !state.checks.contains_key(checker) {
+                return Err(Error::Invalid(format!("未知检查规则 {checker}")));
             }
         }
-        if let Some(req) = require_witness {
-            meta.require_witness = req;
+        let bound = concern.and_then(|id| match state.concern_checks.get(&id) {
+            Some(ConcernCheck::Registered(name)) => Some(name.as_str()),
+            _ => None,
+        });
+        let entry = match checker.or(bound) {
+            Some(name) => tx.keep(concern, format!("{text}\n验收规则：{name}"))?,
+            None => tx.keep(concern, text)?,
+        };
+        if let Some(name) = checker {
+            state.concern_checks.insert(
+                concern.unwrap_or(entry.id),
+                ConcernCheck::Registered(name.into()),
+            );
         }
-        Ok((entry, meta.clone()))
+        Ok(entry)
     })
 }
 
-fn validate_witness(tx: &Tx<'_>, concern: Id, witness_id: Id) -> eja_core::Result<()> {
-    if witness_id < concern {
-        return Err(Error::Invalid(format!(
-            "witness_fact_id ({witness_id}) 早于挂念创建记录 ({concern})，不能作为后续验收证据"
-        )));
-    }
-    let ev = tx
-        .evidence(witness_id)
-        .map_err(|_| Error::Invalid(format!("witness_fact_id {witness_id} 不存在")))?;
-    let effective = ev.latest.as_ref().unwrap_or(&ev.entry);
-    match &effective.fact {
-        Fact::Returned {
-            outcome: Outcome::Observed(_),
-            ..
-        } => Ok(()),
-        Fact::Noticed {
-            source: Source::Person | Source::World,
-            ..
-        } => Ok(()),
-        Fact::Acted { .. } => Err(Error::Invalid(format!(
-            "fact {witness_id} 是尚未完成回执的动作，不能作为验收证据"
-        ))),
-        Fact::Returned {
-            outcome: Outcome::Failed(_),
-            ..
-        } => Err(Error::Invalid(format!(
-            "fact {witness_id} 的回执为 failed，不能作为完成验收证据"
-        ))),
-        Fact::Returned {
-            outcome: Outcome::Unknown(_),
-            ..
-        } => Err(Error::Invalid(format!(
-            "fact {witness_id} 的回执为 unknown（未证实），不能作为完成验收证据"
-        ))),
-        Fact::Said { .. } => Err(Error::Invalid(format!(
-            "fact {witness_id} 是主体自身发言（said），自述不能替代客观验收证据"
-        ))),
-        Fact::Noticed {
-            source: Source::Clock,
-            ..
-        }
-        | Fact::Kept { .. }
-        | Fact::Released { .. } => Err(Error::Invalid(format!(
-            "fact {witness_id} 不是客观实测（observed）或外部/人工确认，不能作为验收证据"
-        ))),
-    }
+fn match_notice(checker: &str) -> String {
+    format!("检查规则 {checker} 已命中")
 }
 
-/// Atomically verify witness (when required or supplied) and release an open concern.
 pub fn release_with_witness(
     eja: &Eja,
     concern: Id,
-    witness_fact_id: Option<Id>,
+    witness: Option<Id>,
 ) -> eja_core::Result<Entry> {
     update_state(eja, |tx, state| {
-        let requires = state
-            .concern_checks
-            .get(&concern)
-            .is_some_and(|meta| meta.require_witness);
-        match witness_fact_id {
-            Some(wid) => validate_witness(tx, concern, wid)?,
-            None if requires => {
-                return Err(Error::Invalid(format!(
-                    "挂念 {concern} 绑定了验收约束，release 必须提供指向实测 observed 或用户/世界确认的 witness_fact_id"
-                )));
+        match state.concern_checks.get(&concern) {
+            Some(ConcernCheck::Registered(checker)) => {
+                let basis = tx.evidence(concern)?;
+                let since = basis.latest.unwrap_or(basis.entry).id;
+                let witness = witness.filter(|id| *id > since).ok_or_else(|| {
+                    Error::Invalid(format!("需要检查规则 {checker} 的新命中记录"))
+                })?;
+                let evidence = tx.evidence(witness)?;
+                if !matches!(evidence.entry.fact, Fact::Noticed { source: Source::World, text }
+                    if text == match_notice(checker))
+                {
+                    return Err(Error::Invalid(format!(
+                        "证据须来自检查规则 {checker} 的命中记录"
+                    )));
+                }
             }
-            None => {}
+            Some(ConcernCheck::Legacy {
+                require_witness: true,
+            }) => {
+                return Err(Error::Invalid(
+                    "旧验收条件需要通过 keep 重新绑定检查规则".into(),
+                ));
+            }
+            _ => {}
         }
         let entry = tx.release(concern)?;
-        if let Some(wid) = witness_fact_id {
-            state
-                .concern_checks
-                .entry(concern)
-                .or_default()
-                .release_witness_fact_id = Some(wid);
-        }
+        state.concern_checks.remove(&concern);
         Ok(entry)
     })
 }
@@ -497,28 +473,6 @@ pub fn next_wake_at(eja: &Eja) -> eja_core::Result<Option<i64>> {
     Ok(pending_wakes(eja)?.first().map(|alarm| alarm.fire_at_unix))
 }
 
-/// Atomically record all wakes due at or before `eja.now()` and remove them from the queue.
-#[cfg(test)]
-pub fn record_due_wakes(eja: &Eja) -> eja_core::Result<bool> {
-    eja.transaction(|tx| {
-        let mut state = decode_state(tx.get_meta(META_STATE)?)?;
-        let now = tx.now()?.as_unix();
-        if !state.wakes.iter().any(|alarm| alarm.fire_at_unix <= now) {
-            return Ok(false);
-        }
-        let (due, remaining): (Vec<_>, Vec<_>) = state
-            .wakes
-            .drain(..)
-            .partition(|alarm| alarm.fire_at_unix <= now);
-        for alarm in &due {
-            tx.notice(Source::Clock, wake_notice_text(&alarm.reason))?;
-        }
-        state.wakes = remaining;
-        tx.set_meta(META_STATE, &serde_json::to_string(&state)?)?;
-        Ok(true)
-    })
-}
-
 /// Atomically record due unguarded wakes and return due guarded wakes for out-of-tx probe evaluation.
 pub fn collect_due_wakes(eja: &Eja) -> eja_core::Result<(bool, Vec<WakeAlarm>, i64)> {
     eja.transaction(|tx| {
@@ -548,61 +502,35 @@ pub fn collect_due_wakes(eja: &Eja) -> eja_core::Result<(bool, Vec<WakeAlarm>, i
     })
 }
 
-pub enum GuardResolution {
-    Triggered(String),
-    Rearm {
-        next_fire_at_unix: i64,
-        next_fire_at_display: String,
-        guard: WakeGuard,
-    },
-    Expired,
-}
-
-/// Atomically settle one guarded wake after its probe finishes.
-/// Rearming or expiring writes zero journal facts.
-/// Triggering records a `Source::World` fact and queues its ID as an explicit proactive turn trigger.
 pub fn settle_guarded_wake(
     eja: &Eja,
-    alarm_id: &str,
-    resolution: GuardResolution,
+    alarm: &WakeAlarm,
+    matched: bool,
+    retry_at: Option<(i64, String)>,
 ) -> eja_core::Result<bool> {
-    eja.transaction(|tx| {
-        let mut state = decode_state(tx.get_meta(META_STATE)?)?;
-        let Some(pos) = state.wakes.iter().position(|item| item.id == alarm_id) else {
+    update_state(eja, |tx, state| {
+        let Some(index) = state.wakes.iter().position(|item| item == alarm) else {
             return Ok(false);
         };
-        let fired = match resolution {
-            GuardResolution::Triggered(notice) => {
-                state.wakes.remove(pos);
-                let bounded = truncate_utf8(&notice, FACT_BYTES.saturating_sub(256));
-                let fact_id = tx.notice(Source::World, bounded)?;
-                if !state.world_triggers.contains(&fact_id) {
-                    state.world_triggers.push(fact_id);
-                    state.world_triggers.sort_unstable();
-                }
-                true
-            }
-            GuardResolution::Rearm {
-                next_fire_at_unix,
-                next_fire_at_display,
-                guard,
-            } => {
-                let alarm = &mut state.wakes[pos];
-                alarm.fire_at_unix = next_fire_at_unix;
-                alarm.fire_at_display = next_fire_at_display;
-                alarm.guard = Some(guard);
-                state
-                    .wakes
-                    .sort_by(|a, b| a.fire_at_unix.cmp(&b.fire_at_unix).then(a.id.cmp(&b.id)));
-                false
-            }
-            GuardResolution::Expired => {
-                state.wakes.remove(pos);
-                false
-            }
+        let mut alarm = state.wakes.remove(index);
+        let Some(guard) = alarm.guard.as_mut() else {
+            return Err(Error::Conflict);
         };
-        tx.set_meta(META_STATE, &serde_json::to_string(&state)?)?;
-        Ok(fired)
+        if matched {
+            let id = tx.notice(Source::World, match_notice(&guard.checker))?;
+            state.world_triggers.push(id);
+        } else if let Some((at, display)) = retry_at {
+            guard.remaining -= 1;
+            alarm.fire_at_unix = at;
+            alarm.fire_at_display = display;
+            state.wakes.push(alarm);
+            state.wakes.sort_by(|left, right| {
+                left.fire_at_unix
+                    .cmp(&right.fire_at_unix)
+                    .then(left.id.cmp(&right.id))
+            });
+        }
+        Ok(matched)
     })
 }
 
@@ -618,6 +546,34 @@ pub fn set_kernel_version_for_test(eja: &Eja, version: &str) -> eja_core::Result
 mod tests {
     use super::*;
     use eja_core::Timestamp;
+
+    #[test]
+    fn checkpoint_upgrade_removes_script_watches_and_keeps_existing_obligations() {
+        let dir = tempfile::tempdir().unwrap();
+        let core_dir = TrustedDir::open(dir.path()).unwrap();
+        let eja = Eja::open(":memory:").unwrap();
+        let concern = eja.keep(None, "existing concern").unwrap();
+        let plain = serde_json::json!({
+            "id": "plain", "fire_at_unix": 100, "fire_at_display": "00:01:40", "reason": "reminder"
+        });
+        let mut old = plain.clone();
+        old["id"] = serde_json::json!("script");
+        old["guard"] = serde_json::json!({
+            "probe": {"kind":"command", "command":"true"}, "interval_seconds":10
+        });
+        let state = serde_json::json!({
+            "turn_cursor": concern.id,
+            "wakes": [plain, old],
+            "concern_checks": {(concern.id.to_string()): {"require_witness": true}}
+        });
+        eja.set_meta(META_STATE, &state.to_string()).unwrap();
+        bootstrap(&eja, &core_dir, None, "1", 1).unwrap();
+        let wakes = pending_wakes(&eja).unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].id, "plain");
+        assert_eq!(next_trigger(&eja).unwrap(), None);
+        assert!(release_with_witness(&eja, concern.id, None).is_err());
+    }
 
     #[test]
     fn complete_turn_enforces_order_and_marks_proactive_replies() {
@@ -642,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn record_due_wakes_uses_subject_clock_and_removes_fired_alarms() {
+    fn collect_due_wakes_uses_subject_clock_and_removes_fired_alarms() {
         let eja = Eja::open(":memory:").unwrap().with_clock(|| Timestamp(100));
         schedule_wakes(
             &eja,
@@ -664,7 +620,8 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(record_due_wakes(&eja).unwrap());
+        let (fired, guarded, _) = collect_due_wakes(&eja).unwrap();
+        assert!(fired && guarded.is_empty());
         let remaining = pending_wakes(&eja).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, "w-2");
@@ -675,6 +632,7 @@ mod tests {
                 ref text,
             } if text == "定时唤醒：due now"
         ));
-        assert!(!record_due_wakes(&eja).unwrap());
+        let (fired_again, _, _) = collect_due_wakes(&eja).unwrap();
+        assert!(!fired_again);
     }
 }

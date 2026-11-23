@@ -93,12 +93,11 @@ fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
 }
 
 #[test]
-fn tx_read_and_evidence_reflect_in_tx_settlement() -> Result<()> {
+fn tx_evidence_reflects_in_tx_settlement() -> Result<()> {
     let eja = Eja::open(":memory:")?;
     let act = eja.act(eja.revision()?, "shell", json!({"command": "check"}))?;
     let unk = eja.finish(act.id, Outcome::Unknown("timeout".into()))?;
     eja.transaction(|tx| {
-        assert_eq!(tx.read(unk.id)?.id, unk.id);
         assert!(tx.evidence(unk.id)?.latest.is_none());
         let obs = tx.finish(act.id, Outcome::Observed("green".into()))?;
         let ev = tx.evidence(unk.id)?;
@@ -132,10 +131,7 @@ fn unsettled_unknowns_tracks_only_unresolved_unknown_receipts_at_revision() -> R
             .collect::<Vec<_>>(),
         vec![u2.id]
     );
-    assert_eq!(
-        eja.unsettled_unknowns(rev_before_settle, 10)?.len(),
-        2
-    );
+    assert_eq!(eja.unsettled_unknowns(rev_before_settle, 10)?.len(), 2);
     Ok(())
 }
 
