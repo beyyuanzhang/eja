@@ -17,9 +17,9 @@ eja-host --data-dir "<data_dir>"
 - `subject.db` 保存主体事实日志与宿主元数据。用户消息、普通唤醒与守望命中均按事实 ID 处理。命中时，宿主原子地写入世界观察并排入主动回合。回复与回合进度原子结算。
 - 首次从旧版本升级时，宿主自动将旧 `window.json`（含可选 `settled_through`）、`wakes.json` 与 `kernel_version` 文件迁入 `subject.db` 元数据槽并清理旧文件；旧 `window.json` 仅含 `anchor` 时，宿主根据日志末尾的触发记录或中断的行动恢复进度。
 - 能力授权采用“OS 沙箱边界 + 宿主暴露即授权”契约。宿主使用固定目录句柄读写 `connectors.json` 和 `outputs/`，拒绝跟随符号链接。
-- macOS 的 `promote_tool({name, file, equals})` 注册有固定名称的本地检查。规则保存在宿主元数据，复用同名规则需要参数一致。宿主只读数据目录直属的普通文件，最多读取 4096 字节的 UTF-8 文本，忽略末尾换行后精确比较。
-- `wake({delay_seconds, reason, guard_tool, max_checks})` 可按间隔复查指定规则，默认最多 60 次。文件缺失或尚未匹配时，复查不写主体事实、不调用模型。读取出错时停止守望并报告错误。省略 `guard_tool` 时仍是普通提醒。
-- `keep({text, checker})` 可绑定检查规则。绑定后，`release({concern, witness_fact_id})` 要求引用当前挂念版本之后的同一规则命中记录。旧脚本守望在启动时停用。旧版要求验收的挂念可用 `keep` 绑定新规则。
+- macOS 的 `promote_tool({name, file, equals?, contains?, not_equals?})` 注册有固定名称的本地检查（至少提供 `equals`、`contains`、`not_equals` 之一）。规则保存在宿主元数据，复用同名规则需要参数一致。宿主只读数据目录直属的普通文件，最多读取 4096 字节的 UTF-8 文本，忽略末尾换行后校验所有给定谓词。
+- `wake({delay_seconds, reason, guard_tool, max_checks})` 可按间隔复查指定规则，默认最多 60 次。相同 `reason` 或相同 `guard_tool` 会覆盖旧预约；`delay_seconds: 0` 取消匹配预约。文件缺失或尚未匹配时，复查不写主体事实、不调用模型。读取出错时停止守望并报告错误。省略 `guard_tool` 时仍是普通提醒。
+- `keep({text, checker})` 可绑定检查规则。绑定后，`release({concern, witness_fact_id})` 要求引用当前挂念版本之后的同一规则命中记录，并在该规则不再被其他活跃挂念引用时自动清理其剩余守望。旧脚本守望在启动时停用。旧版要求验收的挂念可用 `keep` 绑定新规则。
 - 模型回合至少需要 256 字节的上下文窗口。设置低于下限时，宿主保留待处理请求，并在设置恢复后继续处理。
 - `connectors.json` 保存 MCP 连接器数组，文件变更在运行期自动热加载。
 - `ui/` 保存用户空间前端。运行 `ui/apply.sh` 发布 `ui/Eja.app` 后，宿主在与 Shell 相同的 macOS 沙箱中启动 `Contents/MacOS/EjaApp`，并通过其标准输入输出连接同一个主体。前端读入状态和事件，向标准输出写指令，环境变量 `EJA_ATTACHED_UI=1` 表示已有宿主。自定义前端可以发消息与重载用户连接器，编辑或测试模型配置由官方设置窗口处理。启动官方 App 时按住 `Option` 键进入默认界面。

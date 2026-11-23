@@ -71,7 +71,7 @@ impl Hands {
         let mut specs = vec![
             builtin_spec(
                 "keep",
-                "新建或修订挂念，可绑定已注册的验收规则。",
+                "新建或修订挂念（旧日志滑出上下文窗口后，仅活跃挂念与未决未知常驻上下文；跨回合约定、长期偏好与待办须记入挂念），可绑定已注册的验收规则。",
                 json!({
                     "type": "object",
                     "properties": {
@@ -121,11 +121,11 @@ impl Hands {
             ),
             builtin_spec(
                 "wake",
-                "预约一次唤醒，或轮询已注册的本地检查规则直到命中。",
+                "预约一次唤醒，或静默轮询已注册的本地检查规则直到命中。相同 reason 或相同 guard_tool 会覆盖旧预约；delay_seconds 为 0 时取消匹配预约。",
                 json!({
                     "type": "object",
                     "properties": {
-                        "delay_seconds": { "type": "integer", "minimum": 1 },
+                        "delay_seconds": { "type": "integer", "minimum": 0, "description": "正整数为延迟/轮询秒数；0 表示取消匹配 reason 或 guard_tool 的预约" },
                         "reason": { "type": "string" },
                         "guard_tool": { "type": "string", "description": "可选：规则名称。未命中则按 delay_seconds 间隔复查。" },
                         "max_checks": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 60 }
@@ -150,15 +150,17 @@ impl Hands {
             ),
             builtin_spec(
                 "promote_tool",
-                "注册可复用的本地文件文本等值检查。名称固定，同一规则可用于守望和验收。",
+                "注册可复用的本地文件文本检查（支持 equals、contains、not_equals，至少提供一项）。名称固定，同一规则可用于静默守望（guard_tool）和挂念验收（checker）。",
                 json!({
                     "type": "object",
                     "properties": {
                         "name": { "type": "string" },
                         "file": { "type": "string", "description": "EJA 数据目录中的单个文件名" },
-                        "equals": { "type": "string", "description": "忽略文件末尾换行后须等于此文本" }
+                        "equals": { "type": "string", "description": "可选：忽略文件末尾换行后须等于此文本" },
+                        "contains": { "type": "string", "description": "可选：文件内容须包含此非空子串" },
+                        "not_equals": { "type": "string", "description": "可选：忽略文件末尾换行后须不等于此文本（例如空串 \"\" 表示非空文件）" }
                     },
-                    "required": ["name", "file", "equals"],
+                    "required": ["name", "file"],
                     "additionalProperties": false
                 }),
                 false,
@@ -190,14 +192,29 @@ impl Hands {
             "wake" => execute_wake(eja, call.id, &call.input),
             "shell" => self.execute_shell(sandbox, call.id, &call.input),
             "promote_tool" => {
-                let (Some(name), Some(file), Some(equals)) = (
-                    call.input["name"].as_str(),
-                    call.input["file"].as_str(),
-                    call.input["equals"].as_str(),
-                ) else {
-                    return Outcome::Failed("需要 name、file 与 equals".into());
+                let (Some(name), Some(file)) =
+                    (call.input["name"].as_str(), call.input["file"].as_str())
+                else {
+                    return Outcome::Failed(
+                        "需要 name、file，以及 equals/contains/not_equals 中至少一项".into(),
+                    );
                 };
-                match state::register_check(eja, name, file, equals) {
+                let parse_opt = |key: &str| match call.input.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.as_str())),
+                    Some(_) => Err(format!("{key} 须为字符串")),
+                };
+                let (equals, contains, not_equals) = match (
+                    parse_opt("equals"),
+                    parse_opt("contains"),
+                    parse_opt("not_equals"),
+                ) {
+                    (Ok(eq), Ok(ct), Ok(ne)) => (eq, ct, ne),
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                        return Outcome::Failed(e);
+                    }
+                };
+                match state::register_check(eja, name, file, equals, contains, not_equals) {
                     Ok(()) => Outcome::Observed(format!("已注册检查规则 {name}")),
                     Err(err) => Outcome::Failed(err.to_string()),
                 }
@@ -237,8 +254,8 @@ fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
         let invalid = |message: &str| eja_core::Error::Invalid(message.into());
         let delay = input["delay_seconds"]
             .as_i64()
-            .filter(|delay| *delay > 0)
-            .ok_or_else(|| invalid("wake 需要正整数 delay_seconds"))?;
+            .filter(|delay| *delay >= 0)
+            .ok_or_else(|| invalid("wake 需要非负整数 delay_seconds（0 表示取消匹配预约）"))?;
         let reason = input["reason"]
             .as_str()
             .map(str::trim)
@@ -256,10 +273,19 @@ fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
                 "wake 仅接受 delay_seconds、reason、guard_tool 与 max_checks",
             ));
         }
-        let guard = if let Some(checker) = input.get("guard_tool") {
-            let checker = checker
-                .as_str()
-                .ok_or_else(|| invalid("guard_tool 需要规则名称"))?;
+        let guard_name = match input.get("guard_tool") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| invalid("guard_tool 需要规则名称"))?,
+            ),
+        };
+        if delay == 0 {
+            let removed = state::cancel_wakes(eja, reason, guard_name)?;
+            return Ok(format!("cancelled {removed} wake(s) ({reason})"));
+        }
+        let guard = if let Some(checker) = guard_name {
             state::registered_check(eja, checker)?;
             let remaining = match input.get("max_checks") {
                 None => 60,
@@ -427,7 +453,7 @@ fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
 
 pub fn format_local_unix(secs: i64) -> String {
     Command::new("/bin/date")
-        .args(["-r", &secs.to_string(), "+%H:%M:%S"])
+        .args(["-r", &secs.to_string(), "+%Y-%m-%d %H:%M:%S"])
         .output()
         .ok()
         .filter(|o| o.status.success())

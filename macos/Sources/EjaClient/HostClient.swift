@@ -143,6 +143,13 @@ public struct StreamItemDTO: Codable, Equatable, Identifiable, Sendable {
     public var text: String
     public var detail: String?
     public var proactive: Bool?
+    public var outcomeStatus: String?
+    public var truncated: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, text, detail, proactive, truncated
+        case outcomeStatus = "outcome_status"
+    }
 }
 
 public struct ConcernDTO: Codable, Equatable, Identifiable, Sendable {
@@ -150,16 +157,29 @@ public struct ConcernDTO: Codable, Equatable, Identifiable, Sendable {
     public var text: String
 }
 
+public struct WakeGuardDTO: Codable, Equatable, Sendable {
+    public var checker: String
+    public var intervalSeconds: Int64
+    public var remaining: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case checker, remaining
+        case intervalSeconds = "interval_seconds"
+    }
+}
+
 public struct WakeAlarmDTO: Codable, Equatable, Identifiable, Sendable {
     public var id: String
     public var fireAtUnix: Int64
     public var fireAtDisplay: String
     public var reason: String
+    public var guardRule: WakeGuardDTO?
 
     enum CodingKeys: String, CodingKey {
         case id, reason
         case fireAtUnix = "fire_at_unix"
         case fireAtDisplay = "fire_at_display"
+        case guardRule = "guard"
     }
 }
 

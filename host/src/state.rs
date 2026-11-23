@@ -13,16 +13,34 @@ const MAX_PROACTIVE_HISTORY: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FileCheck {
     file: String,
-    equals: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    equals: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    not_equals: Option<String>,
 }
 
 impl FileCheck {
     pub fn matches(&self, data_dir: &TrustedDir) -> std::io::Result<bool> {
         match data_dir.read_check_file(&self.file, 4096) {
-            Ok(bytes) => Ok(std::str::from_utf8(&bytes)
-                .map_err(std::io::Error::other)?
-                .trim_end_matches(['\r', '\n'])
-                == self.equals),
+            Ok(bytes) => {
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(std::io::Error::other)?
+                    .trim_end_matches(['\r', '\n']);
+                Ok(self
+                    .equals
+                    .as_deref()
+                    .is_none_or(|expected| text == expected)
+                    && self
+                        .contains
+                        .as_deref()
+                        .is_none_or(|needle| text.contains(needle))
+                    && self
+                        .not_equals
+                        .as_deref()
+                        .is_none_or(|excluded| text != excluded))
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(err),
         }
@@ -325,10 +343,21 @@ pub fn proactive_reply_ids(eja: &Eja) -> HashSet<Id> {
         .unwrap_or_default()
 }
 
-pub fn register_check(eja: &Eja, name: &str, file: &str, equals: &str) -> eja_core::Result<()> {
+pub fn register_check(
+    eja: &Eja,
+    name: &str,
+    file: &str,
+    equals: Option<&str>,
+    contains: Option<&str>,
+    not_equals: Option<&str>,
+) -> eja_core::Result<()> {
     if !cfg!(target_os = "macos") {
         return Err(Error::Invalid("本地检查仅支持 macOS".into()));
     }
+    let has_predicate = equals.is_some() || contains.is_some() || not_equals.is_some();
+    let valid_exact =
+        |val: Option<&str>| val.is_none_or(|s| s.len() <= 4096 && !s.ends_with(['\r', '\n']));
+    let valid_contains = |val: Option<&str>| val.is_none_or(|s| !s.is_empty() && s.len() <= 4096);
     if name.is_empty()
         || name.len() > 40
         || !name.bytes().all(|byte| {
@@ -336,14 +365,18 @@ pub fn register_check(eja: &Eja, name: &str, file: &str, equals: &str) -> eja_co
         })
         || file.len() > 255
         || validate_single_name(file).is_err()
-        || equals.len() > 4096
-        || equals.ends_with(['\r', '\n'])
+        || !has_predicate
+        || !valid_exact(equals)
+        || !valid_contains(contains)
+        || !valid_exact(not_equals)
     {
-        return Err(Error::Invalid("检查名限 1–40 个小写字母、数字、下划线或连字符；文件限数据目录中的单个文件名；期望文本上限 4096 字节且不能以换行结尾".into()));
+        return Err(Error::Invalid("检查名限 1–40 个小写字母、数字、下划线或连字符；文件限数据目录中的单个文件名；至少提供 equals、contains（非空）或 not_equals 之一，文本上限 4096 字节且精确比较项不能以换行结尾".into()));
     }
     let check = FileCheck {
         file: file.into(),
-        equals: equals.into(),
+        equals: equals.map(Into::into),
+        contains: contains.map(Into::into),
+        not_equals: not_equals.map(Into::into),
     };
     update_state(eja, |_, state| {
         if let Some(previous) = state.checks.get(name) {
@@ -388,7 +421,18 @@ pub fn keep_with_check(
             _ => None,
         });
         let entry = match checker.or(bound) {
-            Some(name) => tx.keep(concern, format!("{text}\n验收规则：{name}"))?,
+            Some(name) => {
+                let body: Vec<&str> = text
+                    .lines()
+                    .filter(|line| !line.trim().starts_with("验收规则："))
+                    .collect();
+                let clean = body.join("\n");
+                let clean = clean.trim();
+                if clean.is_empty() {
+                    return Err(Error::Invalid("挂念需要非空文本".into()));
+                }
+                tx.keep(concern, format!("{clean}\n验收规则：{name}"))?
+            }
             None => tx.keep(concern, text)?,
         };
         if let Some(name) = checker {
@@ -437,7 +481,19 @@ pub fn release_with_witness(
             _ => {}
         }
         let entry = tx.release(concern)?;
-        state.concern_checks.remove(&concern);
+        if let Some(ConcernCheck::Registered(checker)) = state.concern_checks.remove(&concern) {
+            let still_bound = state
+                .concern_checks
+                .values()
+                .any(|item| matches!(item, ConcernCheck::Registered(other) if other == &checker));
+            if !still_bound {
+                state.wakes.retain(|wake| {
+                    wake.guard
+                        .as_ref()
+                        .is_none_or(|guard| guard.checker != checker)
+                });
+            }
+        }
         Ok(entry)
     })
 }
@@ -453,9 +509,14 @@ fn merge_wakes(existing: &mut Vec<WakeAlarm>, alarms: &[WakeAlarm]) -> eja_core:
         }
     }
     for alarm in alarms {
-        if !existing.iter().any(|item| item.id == alarm.id) {
-            existing.push(alarm.clone());
-        }
+        let alarm_checker = alarm.guard.as_ref().map(|g| g.checker.as_str());
+        existing.retain(|item| {
+            item.id != alarm.id
+                && item.reason != alarm.reason
+                && (alarm_checker.is_none()
+                    || item.guard.as_ref().map(|g| g.checker.as_str()) != alarm_checker)
+        });
+        existing.push(alarm.clone());
     }
     existing.sort_by(|a, b| a.fire_at_unix.cmp(&b.fire_at_unix).then(a.id.cmp(&b.id)));
     Ok(())
@@ -463,6 +524,22 @@ fn merge_wakes(existing: &mut Vec<WakeAlarm>, alarms: &[WakeAlarm]) -> eja_core:
 
 pub fn schedule_wakes(eja: &Eja, alarms: &[WakeAlarm]) -> eja_core::Result<()> {
     update_state(eja, |_, state| merge_wakes(&mut state.wakes, alarms))
+}
+
+pub fn cancel_wakes(
+    eja: &Eja,
+    reason: &str,
+    guard_checker: Option<&str>,
+) -> eja_core::Result<usize> {
+    update_state(eja, |_, state| {
+        let before = state.wakes.len();
+        state.wakes.retain(|item| {
+            item.reason != reason
+                && (guard_checker.is_none()
+                    || item.guard.as_ref().map(|g| g.checker.as_str()) != guard_checker)
+        });
+        Ok(before - state.wakes.len())
+    })
 }
 
 pub fn pending_wakes(eja: &Eja) -> eja_core::Result<Vec<WakeAlarm>> {

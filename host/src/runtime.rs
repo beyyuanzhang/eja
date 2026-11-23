@@ -453,14 +453,21 @@ impl HostRuntime {
             .as_ref()
             .map(|dir| format!("\n只读协议与模板参考：{}", dir.display()))
             .unwrap_or_default();
+        let local_now = self
+            .eja
+            .now()
+            .ok()
+            .map(|ts| format!("（当前本地时间：{}）", format_local_unix(ts.as_unix())))
+            .unwrap_or_default();
         let system = format!(
             "你是 EJA，一个持续存在的自我同一性主体。\n\
             内核版本：{KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）{resources_line}\n\
             数据目录：{data_dir_str}\n\
             连接器配置：{data_dir_str}/connectors.json（变更会自动热加载）\n\
-            本地时区：{}\n\n\
-            前置消息是主体日志。最后一条用户消息、定时提醒或检查命中触发本回合。不调工具时的文本回复会发送给人，留空则保持沉默。\n\
-            工具回执记录工具返回的内容。区分实测、失败、未知与推断。若要宣告检查通过，请引用对应规则的命中记录。",
+            本地时区：{}{local_now}\n\n\
+            前置消息是主体日志（旧日志滑出上下文窗口后折叠为活跃挂念与未决未知；跨回合约定、长期偏好与待办须通过 keep 保持，滑出窗口的历史细节用 search/read 检索）。\n\
+            最后一条用户消息、定时提醒或检查命中触发本回合。不调工具时的文本回复会发送给人；定时或守望检查未满足触发条件时回复留空以保持沉默，不要播报“仍为空/未就绪”。\n\
+            工具回执记录工具返回的内容。区分实测、失败、未知与推断；未经工具回执证实的外部动作不得声称已执行。若要宣告检查通过，请引用对应规则的命中记录。",
             self.local_tz
         );
 
@@ -483,7 +490,7 @@ impl HostRuntime {
             };
 
             if reply.calls.is_empty() {
-                let text = reply.text.trim();
+                let text = normalize_reply_text(&reply.text);
                 if let Err(err) = state::complete_turn(&self.eja, trigger_id, text) {
                     fatal_error = Some(format!("保存回合结算状态失败: {err}"));
                     break;
@@ -556,7 +563,7 @@ impl HostRuntime {
             "keep" => {
                 let text = call.args["text"].as_str().unwrap_or("").trim();
                 let checker = match call.args.get("checker") {
-                    None => None,
+                    None | Some(Value::Null) => None,
                     Some(value) => match value.as_str() {
                         Some(name) => Some(name),
                         None => {
@@ -766,6 +773,26 @@ fn build_stream(entries: &[Entry], proactive_replies: &HashSet<Id>) -> Vec<Strea
 
 fn is_truncated_receipt(detail: &str) -> bool {
     detail.contains("… [truncated;") || detail.contains("[output truncated at ")
+}
+
+fn normalize_reply_text(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .trim_matches(|ch: char| matches!(ch, '(' | ')' | '（' | '）' | '[' | ']' | '【' | '】'))
+        .trim();
+    if stripped.is_empty()
+        || matches!(
+            stripped,
+            "保持沉默" | "沉默" | "静默" | "无需回复" | "不打扰"
+        )
+        || stripped.eq_ignore_ascii_case("silent")
+        || stripped.eq_ignore_ascii_case("silence")
+        || stripped.eq_ignore_ascii_case("no_reply")
+    {
+        ""
+    } else {
+        trimmed
+    }
 }
 
 fn is_recoverable_llm_error(err: &str) -> bool {
@@ -2099,13 +2126,190 @@ for line in sys.stdin:
         let dir = tempfile::tempdir().unwrap();
         let data = TrustedDir::open(dir.path()).unwrap();
         let eja = Eja::open(":memory:").unwrap();
-        assert!(state::register_check(&eja, "unsafe", "../private", "yes").is_err());
-        state::register_check(&eja, "ready", "status.txt", "yes").unwrap();
-        assert!(state::register_check(&eja, "ready", "other.txt", "yes").is_err());
+        assert!(
+            state::register_check(&eja, "unsafe", "../private", Some("yes"), None, None).is_err()
+        );
+        state::register_check(&eja, "ready", "status.txt", Some("yes"), None, None).unwrap();
+        assert!(
+            state::register_check(&eja, "ready", "other.txt", Some("yes"), None, None).is_err()
+        );
         let check = state::registered_check(&eja, "ready").unwrap();
         assert!(!check.matches(&data).unwrap());
         fs::write(dir.path().join("target"), "yes").unwrap();
         symlink("target", dir.path().join("status.txt")).unwrap();
         assert!(check.matches(&data).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn predicate_checks_wake_dedup_cancel_and_silent_proactive_settlement() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("Eja");
+        let brain = Arc::new(ScriptedBrain {
+            replies: Mutex::new(vec![
+                // Turn 1: register `not_equals: ""` check on inbox.md, keep concern, revise concern,
+                // schedule two wakes with same reason (second replaces first), schedule a test wake and cancel it,
+                // and schedule guarded wake on `inbox_nonempty`.
+                Ok(tool_reply(
+                    "p1",
+                    "promote_tool",
+                    json!({
+                        "name": "inbox_nonempty",
+                        "file": "inbox.md",
+                        "not_equals": "",
+                        "contains": "紧急"
+                    }),
+                )),
+                Ok(tool_reply(
+                    "k1",
+                    "keep",
+                    json!({ "text": "守望 inbox.md 紧急消息", "checker": "inbox_nonempty" }),
+                )),
+                Ok(tool_reply(
+                    "k2",
+                    "keep",
+                    json!({
+                        "concern": 2,
+                        "text": "守望 inbox.md 紧急消息（已激活）\n验收规则：inbox_nonempty"
+                    }),
+                )),
+                Ok(tool_reply(
+                    "w1",
+                    "wake",
+                    json!({ "delay_seconds": 60, "reason": "提醒喝水" }),
+                )),
+                Ok(tool_reply(
+                    "w2",
+                    "wake",
+                    json!({ "delay_seconds": 120, "reason": "提醒喝水" }),
+                )),
+                Ok(tool_reply(
+                    "w_tmp",
+                    "wake",
+                    json!({ "delay_seconds": 86400, "reason": "校准测试" }),
+                )),
+                Ok(tool_reply(
+                    "w_cancel",
+                    "wake",
+                    json!({ "delay_seconds": 0, "reason": "校准测试" }),
+                )),
+                Ok(tool_reply(
+                    "w_guard",
+                    "wake",
+                    json!({
+                        "delay_seconds": 10,
+                        "reason": "守望 inbox",
+                        "guard_tool": "inbox_nonempty",
+                        "max_checks": 5
+                    }),
+                )),
+                Ok(text_reply("已部署静默守望")),
+            ]),
+            seen_windows: Mutex::new(Vec::new()),
+        });
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = events.clone();
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_700_000_000));
+        let mut rt = HostRuntime::open_with_brain(
+            data.clone(),
+            brain.clone(),
+            Box::new(move |event| sink.lock().unwrap().push(event)),
+        )
+        .unwrap();
+        let clock_ref = clock.clone();
+        rt.eja = Eja::open(dir.path().join("ai.eja.kernel/subject.db"))
+            .unwrap()
+            .with_clock(move || Timestamp(clock_ref.load(Ordering::SeqCst)));
+        rt.save_config(configured(vec![]));
+
+        let inbox = data.join("inbox.md");
+        fs::write(&inbox, "\n").unwrap();
+        rt.handle_user_message("开始守望");
+
+        // 1. Concern revision must not duplicate `验收规则：inbox_nonempty`
+        let concerns = rt.eja.concerns(rt.eja.revision().unwrap()).unwrap();
+        assert_eq!(concerns.len(), 1);
+        assert_eq!(
+            concerns[0].text.matches("验收规则：inbox_nonempty").count(),
+            1
+        );
+        let concern_id = concerns[0].id;
+
+        // 2. Wakes deduplicated by reason and cancelled via delay_seconds: 0
+        let wakes = state::pending_wakes(&rt.eja).unwrap();
+        assert_eq!(wakes.len(), 2);
+        let drink_wake = wakes.iter().find(|w| w.reason == "提醒喝水").unwrap();
+        assert_eq!(drink_wake.fire_at_unix, 1_700_000_120);
+        assert!(
+            drink_wake.fire_at_display.contains('-'),
+            "fire_at_display must include YYYY-MM-DD date: {}",
+            drink_wake.fire_at_display
+        );
+
+        // 3. Guarded wake at t+10 with empty inbox and t+20 with non-matching inbox stays 100% silent (0 LLM calls)
+        let calls_before = brain.seen_windows.lock().unwrap().len();
+        clock.store(1_700_000_010, Ordering::SeqCst);
+        rt.tick_timers().unwrap();
+        fs::write(&inbox, "普通通知：无事发生\n").unwrap();
+        clock.store(1_700_000_020, Ordering::SeqCst);
+        rt.tick_timers().unwrap();
+        assert_eq!(brain.seen_windows.lock().unwrap().len(), calls_before);
+
+        // 4. Plain wake fires at t+120, model replies "（保持沉默）" -> settles without Said fact or notify event!
+        brain
+            .replies
+            .lock()
+            .unwrap()
+            .push(Ok(text_reply("（保持沉默）")));
+        clock.store(1_700_000_120, Ordering::SeqCst);
+        // Push guarded wake forward so only the plain wake fires here
+        fs::write(&inbox, "普通通知\n").unwrap();
+        rt.tick_timers().unwrap();
+        assert!(!rt.has_pending_trigger());
+        assert!(
+            !rt.snapshot()
+                .stream
+                .iter()
+                .any(|item| item.text.contains("保持沉默")),
+            "explicit silence marker must not record a Said fact"
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|ev| ev["event"] == "notify")
+                .count(),
+            0
+        );
+
+        // 5. Write matching message to inbox.md; guarded wake fires and model releases concern
+        fs::write(&inbox, "紧急：请立即汇报\n").unwrap();
+        let next_fact_id = rt.eja.revision().unwrap() + 1;
+        brain.replies.lock().unwrap().extend([
+            Ok(tool_reply(
+                "rel",
+                "release",
+                json!({ "concern": concern_id, "witness_fact_id": next_fact_id }),
+            )),
+            Ok(text_reply("收到紧急消息")),
+        ]);
+        clock.store(1_700_000_130, Ordering::SeqCst);
+        rt.tick_timers().unwrap();
+        assert!(rt
+            .eja
+            .concerns(rt.eja.revision().unwrap())
+            .unwrap()
+            .is_empty());
+        assert!(state::pending_wakes(&rt.eja).unwrap().is_empty());
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|ev| ev["event"] == "notify" && ev["body"] == "收到紧急消息")
+                .count(),
+            1
+        );
     }
 }
