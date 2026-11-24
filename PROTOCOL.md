@@ -1,4 +1,4 @@
-# EJA Host Protocol v1
+# EJA Host Protocol v2
 
 `eja-host` 是 EJA 的不可变运行宿主，通过标准输入输出（newline-delimited JSON）与任意前端进程通信。
 
@@ -39,7 +39,7 @@ eja-host --data-dir "<data_dir>"
 
 ## 输出事件（Host -> Frontend，每行一条 JSON）
 
-- 状态快照 `{"event":"state","protocol_version":1,"kernel_version":"1.0.0","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"capability_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
+- 状态快照 `{"event":"state","protocol_version":2,"kernel_version":"1.0.0","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"capability_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
   `config.providers[].api_key` 始终为空字符串，`has_api_key` 表示是否已保存密钥。`stream[]` 可附带 `outcome_status` 与 `truncated`。`wakes[]` 可附带 `guard`，其中 `checker` 为规则名，`remaining` 为剩余检查次数。
 - 回合内活动 `{"event":"activity","status_detail":"执行 Shell"}`。回合开始和结束仍发送状态快照。
 - 流式文本增量 `{"event":"delta","text":"..."}`。用户回合中模型生成文本时实时推送增量，转入工具调用（`activity`）或回合结算（`state`）时收束。

@@ -141,6 +141,22 @@ for line in sys.stdin:
 
     @Test
     @MainActor
+    func rejectsOlderHostProtocol() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = HostClient(hostExecutableURL: URL(fileURLWithPath: "/bin/cat"), dataDir: dir)
+        defer { client.shutdown() }
+
+        client.handleEventLine(
+            Data(#"{"event":"state","protocol_version":1,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
+        )
+
+        #expect(!client.isReady)
+        #expect(client.errorBanner?.contains("协议不匹配") == true)
+    }
+
+    @Test
+    @MainActor
     func streamingDeltaAndActivityEventsConvergeOnState() throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -148,7 +164,7 @@ for line in sys.stdin:
         defer { client.shutdown() }
 
         client.handleEventLine(
-            Data(#"{"event":"state","status":"thinking","status_detail":"思考中…","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
+            Data(#"{"event":"state","protocol_version":2,"status":"thinking","status_detail":"思考中…","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
         )
         #expect(client.status == "thinking")
         #expect(client.statusDetail == "思考中…")
@@ -166,7 +182,7 @@ for line in sys.stdin:
         #expect(client.streamingText == "最终回复")
 
         client.handleEventLine(
-            Data(#"{"event":"state","status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":1,"kind":"eja","text":"最终回复"}]}"#.utf8)
+            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":1,"kind":"eja","text":"最终回复"}]}"#.utf8)
         )
         #expect(client.status == "idle")
         #expect(client.statusDetail == "在线")

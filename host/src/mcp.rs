@@ -6,7 +6,7 @@ use crate::oauth::{is_auth_error, OAuthStore, OAuthToken};
 use crate::sandbox::{kill_process_tree, write_process_input, Sandbox, TrustedDir};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use eja_core::Outcome;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
@@ -38,7 +38,7 @@ impl RequestError {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CapabilityToolSummary {
     pub name: String,
     pub description: String,
@@ -63,15 +63,14 @@ impl CapabilityTool {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CapabilityStatus {
     pub id: String,
     pub name: String,
     pub enabled: bool,
     pub connected: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auth_required: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

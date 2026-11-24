@@ -24,13 +24,7 @@ cargo test --workspace --all-targets
 open macos/build/Eja.app
 ```
 
-或分步开发测试：
-
-```sh
-cargo build -p eja-host
-(cd macos && swift test)
-(cd macos && swift run EjaApp)
-```
+SwiftPM 开发运行、前端测试和 DMG 打包见 [macOS 构建说明](macos/README.md)。
 
 内核目录默认为 `~/Library/Application Support/ai.eja.kernel/`。
 

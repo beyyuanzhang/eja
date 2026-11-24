@@ -58,12 +58,10 @@ cat > "${APP_DIR}/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
-cp "${APP_DIR}/Contents/Info.plist" "${APP_DIR}/Contents/Resources/ui-template/Info.plist"
-cp "${MACOS_DIR}/Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/ui-template/AppIcon.icns"
-cp "${MACOS_DIR}/Package.swift" "${APP_DIR}/Contents/Resources/ui-template/Package.swift"
-cp -R "${MACOS_DIR}/Sources" "${APP_DIR}/Contents/Resources/ui-template/Sources"
-cp -R "${MACOS_DIR}/Tests" "${APP_DIR}/Contents/Resources/ui-template/Tests"
-codesign --force --deep --sign - "${APP_DIR}" >/dev/null 2>&1 || true
+cp -R "${MACOS_DIR}/Package.swift" "${MACOS_DIR}/Sources" "${MACOS_DIR}/Tests" \
+    "${APP_DIR}/Contents/Resources/ui-template/"
+find "${APP_DIR}/Contents/Resources/ui-template" -type f -name .DS_Store -delete
+codesign --force --deep --sign - "${APP_DIR}"
 
 echo "Done: ${APP_DIR}"
 echo "Run with: open \"${APP_DIR}\""

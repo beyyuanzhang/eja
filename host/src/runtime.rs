@@ -29,7 +29,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RETRY_ATTEMPTS: u8 = 3;
 
@@ -58,7 +58,7 @@ pub enum HostCommand {
     ReloadCapabilities,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StreamItem {
     pub id: Id,
     pub kind: String, // "person" | "eja" | "event"
@@ -73,7 +73,7 @@ pub struct StreamItem {
     pub truncated: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ConcernDto {
     pub id: Id,
     pub text: String,

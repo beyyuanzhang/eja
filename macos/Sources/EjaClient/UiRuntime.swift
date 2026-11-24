@@ -53,7 +53,7 @@ public enum UiRuntime {
     private static func copyTemplate(from source: URL, to target: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: target, withIntermediateDirectories: true)
-        for item in ["Package.swift", "Sources", "Tests", "Info.plist", "AppIcon.icns"] {
+        for item in ["Package.swift", "Sources", "Tests"] {
             let src = source.appendingPathComponent(item)
             guard fm.fileExists(atPath: src.path) else { continue }
             let dst = target.appendingPathComponent(item)

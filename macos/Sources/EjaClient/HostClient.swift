@@ -39,11 +39,11 @@ public struct ProviderConfigDTO: Codable, Equatable, Identifiable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
-        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "openai"
+        kind = try c.decode(String.self, forKey: .kind)
         baseUrl = try c.decode(String.self, forKey: .baseUrl)
-        apiKey = try c.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
-        hasApiKey = try c.decodeIfPresent(Bool.self, forKey: .hasApiKey) ?? !apiKey.isEmpty
-        models = try c.decodeIfPresent([String].self, forKey: .models) ?? []
+        apiKey = try c.decode(String.self, forKey: .apiKey)
+        hasApiKey = try c.decodeIfPresent(Bool.self, forKey: .hasApiKey) ?? false
+        models = try c.decode([String].self, forKey: .models)
     }
 }
 
@@ -176,7 +176,6 @@ public struct HostConfigDTO: Codable, Equatable, Sendable {
         self.windowMaxBytes = windowMaxBytes
         self.maxSteps = maxSteps
     }
-
 }
 
 public struct CapabilityToolSummaryDTO: Codable, Equatable, Identifiable, Sendable {
@@ -201,18 +200,6 @@ public struct CapabilityStatusDTO: Codable, Equatable, Identifiable, Sendable {
         case authRequired = "auth_required"
         case oauthCode = "oauth_code"
     }
-
-    public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        name = try c.decode(String.self, forKey: .name)
-        enabled = try c.decode(Bool.self, forKey: .enabled)
-        connected = try c.decode(Bool.self, forKey: .connected)
-        authRequired = try c.decodeIfPresent(Bool.self, forKey: .authRequired) ?? false
-        oauthCode = try c.decodeIfPresent(String.self, forKey: .oauthCode)
-        error = try c.decodeIfPresent(String.self, forKey: .error)
-        tools = try c.decodeIfPresent([CapabilityToolSummaryDTO].self, forKey: .tools) ?? []
-    }
 }
 
 public struct StreamItemDTO: Codable, Equatable, Identifiable, Sendable {
@@ -228,7 +215,7 @@ public struct ProviderTestResult: Equatable, Sendable {
 
 private struct StateEventDTO: Decodable {
     let status: String
-    let statusDetail: String?
+    let statusDetail: String
     let dataDir: String
     let configured: Bool
     let config: HostConfigDTO
@@ -247,6 +234,8 @@ private struct StateEventDTO: Decodable {
 
 @MainActor
 public final class HostClient: ObservableObject {
+    private static let protocolVersion = 2
+
     @Published public private(set) var isReady: Bool = false
     @Published public private(set) var alreadyRunning: Bool = false
     @Published public private(set) var alreadyRunningPid: Int32?
@@ -435,19 +424,24 @@ public final class HostClient: ObservableObject {
               let event = json["event"] as? String else { return }
         switch event {
         case "state":
-            if let state = try? decoder.decode(StateEventDTO.self, from: data) {
-                status = state.status
-                statusDetail = state.statusDetail ?? ""
-                streamingText = ""
-                dataDir = state.dataDir
-                isConfigured = state.configured
-                config = state.config
-                capabilityStatuses = state.capabilityStatuses
-                stream = state.stream
-                isReady = true
-                if let id = state.saveId {
-                    configSaves.removeValue(forKey: id)?(config)
-                }
+            guard json["protocol_version"] as? Int == Self.protocolVersion,
+                  let state = try? decoder.decode(StateEventDTO.self, from: data) else {
+                errorBanner = "eja-host 状态协议不匹配，请使用同一构建的前端和宿主"
+                isReady = false
+                shutdown(wait: false)
+                return
+            }
+            status = state.status
+            statusDetail = state.statusDetail
+            streamingText = ""
+            dataDir = state.dataDir
+            isConfigured = state.configured
+            config = state.config
+            capabilityStatuses = state.capabilityStatuses
+            stream = state.stream
+            isReady = true
+            if let id = state.saveId {
+                configSaves.removeValue(forKey: id)?(config)
             }
         case "activity":
             if let detail = json["status_detail"] as? String {
