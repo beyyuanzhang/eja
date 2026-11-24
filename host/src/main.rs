@@ -8,7 +8,7 @@ mod runtime;
 mod sandbox;
 mod state;
 
-use runtime::{EventSink, HostCommand, HostRuntime};
+use runtime::{EventSink, HostCommand, HostRuntime, OpenError};
 use serde_json::{json, Value};
 use std::env;
 use std::io::{self, BufRead, Write};
@@ -61,7 +61,8 @@ fn main() {
 
     let mut runtime = match HostRuntime::open(parse_data_dir(), emit) {
         Ok(rt) => rt,
-        Err(err) => {
+        Err(OpenError::AlreadyRunning) => std::process::exit(0),
+        Err(OpenError::Failed(err)) => {
             send_owner(&json!({ "event": "error", "message": format!("初始化失败: {err}") }));
             std::process::exit(1);
         }

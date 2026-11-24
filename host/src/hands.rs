@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -602,19 +602,29 @@ fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
 }
 
 pub fn format_local_unix(secs: i64) -> String {
-    Command::new("/bin/date")
-        .args(["-r", &secs.to_string(), "+%Y-%m-%d %H:%M:%S"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| secs.to_string())
+    let time = secs as libc::time_t;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::zeroed();
+    let ptr = unsafe { libc::localtime_r(&time, tm.as_mut_ptr()) };
+    if ptr.is_null() {
+        return secs.to_string();
+    }
+    let tm = unsafe { tm.assume_init() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
 
     fn run_shell(
         sandbox: &Sandbox,
@@ -763,5 +773,16 @@ mod tests {
         );
         assert!(matches!(result.outcome, Outcome::Unknown(ref msg) if msg.contains("命令超时")));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn format_local_unix_produces_iso_like_timestamp() {
+        let formatted = format_local_unix(1_700_000_000);
+        assert_eq!(formatted.len(), 19);
+        assert_eq!(&formatted[4..5], "-");
+        assert_eq!(&formatted[7..8], "-");
+        assert_eq!(&formatted[10..11], " ");
+        assert_eq!(&formatted[13..14], ":");
+        assert_eq!(&formatted[16..17], ":");
     }
 }

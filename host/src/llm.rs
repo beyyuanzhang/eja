@@ -912,12 +912,17 @@ impl OpenAiStreamAcc {
             } else {
                 raw_id
             };
-            let arguments = if raw_args.is_empty() {
+            let arguments = if raw_args.trim().is_empty() {
                 "{}".to_string()
             } else {
                 raw_args
             };
-            let args = serde_json::from_str(&arguments).unwrap_or_else(|_| json!({}));
+            let args = serde_json::from_str(&arguments).map_err(|err| {
+                format!(
+                    "模型返回的工具参数不是有效 JSON（{name}）：{err}（{}）",
+                    truncate_utf8(arguments.trim(), 120)
+                )
+            })?;
             wire_calls.push(json!({
                 "id": id,
                 "type": "function",
@@ -1088,6 +1093,25 @@ impl AnthropicStreamAcc {
                             self.partial_inputs.entry(idx).or_default().push_str(part);
                         }
                     }
+                    Some(kind @ ("thinking_delta" | "signature_delta")) => {
+                        let field = if kind == "thinking_delta" {
+                            "thinking"
+                        } else {
+                            "signature"
+                        };
+                        if let Some(part) = delta
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .filter(|chunk| !chunk.is_empty())
+                        {
+                            let entry = self
+                                .blocks
+                                .entry(idx)
+                                .or_insert_with(|| json!({ "type": "thinking", "thinking": "" }));
+                            let cur = entry.get(field).and_then(Value::as_str).unwrap_or("");
+                            entry[field] = Value::String(format!("{cur}{part}"));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1101,8 +1125,14 @@ impl AnthropicStreamAcc {
         }
         for (idx, raw) in self.partial_inputs {
             if !raw.trim().is_empty() {
+                let parsed: Value = serde_json::from_str(&raw).map_err(|err| {
+                    format!(
+                        "模型返回的工具参数不是有效 JSON：{err}（{}）",
+                        truncate_utf8(raw.trim(), 120)
+                    )
+                })?;
                 if let Some(block) = self.blocks.get_mut(&idx) {
-                    block["input"] = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+                    block["input"] = parsed;
                 }
             }
         }
@@ -1513,5 +1543,51 @@ mod tests {
         assert_eq!(reply.calls[0].id, "toolu_1");
         assert_eq!(reply.calls[0].name, "shell");
         assert_eq!(reply.calls[0].args, json!({ "command": "pwd" }));
+    }
+
+    #[test]
+    fn anthropic_stream_acc_preserves_thinking_and_signature_deltas() {
+        let mut acc = AnthropicStreamAcc::default();
+        let mut deltas = Vec::new();
+        for line in [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先检查"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"状态"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_part1"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"_part2"}}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"shell","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}"#,
+        ] {
+            acc.feed_line(line, |chunk| deltas.push(chunk.to_string()));
+        }
+        assert!(deltas.is_empty());
+        let reply = acc.into_reply().unwrap();
+        assert_eq!(
+            reply.message["content"][0],
+            json!({"type": "thinking", "thinking": "先检查状态", "signature": "sig_part1_part2"})
+        );
+        assert_eq!(reply.calls.len(), 1);
+        assert_eq!(reply.calls[0].args, json!({"command": "pwd"}));
+    }
+
+    #[test]
+    fn stream_accumulators_reject_truncated_tool_call_json() {
+        let mut openai = OpenAiStreamAcc::default();
+        openai.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"shell","arguments":"{\"command\":\"ls"}}]}}]}"#,
+            |_| {},
+        );
+        assert!(openai.into_reply(1).is_err());
+
+        let mut anthropic = AnthropicStreamAcc::default();
+        anthropic.feed_line(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"shell","input":{}}}"#,
+            |_| {},
+        );
+        anthropic.feed_line(
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
+            |_| {},
+        );
+        assert!(anthropic.into_reply().is_err());
     }
 }

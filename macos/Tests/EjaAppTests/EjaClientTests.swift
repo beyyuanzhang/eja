@@ -2,10 +2,10 @@ import Foundation
 import Testing
 @testable import EjaClient
 
-struct OriginTests {
+struct EjaClientTests {
     private func makeTempDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("eja-origin-test-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("eja-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -137,6 +137,26 @@ for line in sys.stdin:
         #expect(confirmed?.capabilities[1].enabled == false)
         #expect(restarted.capabilityStatuses[1].enabled == false)
         #expect(restarted.capabilityStatuses[1].tools.isEmpty)
+    }
+
+    @Test
+    @MainActor
+    func singleInstanceConflictEmitsAlreadyRunningWithoutError() async throws {
+        let hostBin = resolveHostBinary()
+        #expect(FileManager.default.isExecutableFile(atPath: hostBin.path))
+
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let first = HostClient(hostExecutableURL: hostBin, dataDir: dir)
+        defer { first.shutdown() }
+        #expect(await waitUntil { first.isReady })
+
+        let second = HostClient(hostExecutableURL: hostBin, dataDir: dir)
+        defer { second.shutdown() }
+        #expect(await waitUntil { second.alreadyRunning })
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        #expect(second.errorBanner == nil)
     }
 
     @Test

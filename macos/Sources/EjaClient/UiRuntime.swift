@@ -105,7 +105,7 @@ public enum UiRuntime {
         relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
         relaunch.arguments = [
             "-c",
-            "while kill -0 \"$1\" 2>/dev/null; do sleep 0.05; done; exec /usr/bin/open \"$2\" --args --data-dir \"$3\"",
+            "while kill -0 \"$1\" 2>/dev/null; do sleep 0.05; done; exec /usr/bin/open -n \"$2\" --args --data-dir \"$3\"",
             "--",
             "\(pid)",
             appPath,

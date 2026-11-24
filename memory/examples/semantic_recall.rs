@@ -33,7 +33,7 @@ const PROBES: [(&str, &str); 6] = [
 ];
 
 fn load_encoder() -> AppResult<OnnxEncoder> {
-    let dir = std::env::var_os("EJA_MEMORY_MODEL")
+    let dir = std::env::var_os("EJA_ONNX_MODEL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))

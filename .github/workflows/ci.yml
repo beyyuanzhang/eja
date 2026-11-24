@@ -15,4 +15,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-targets
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+      - run: cargo build -p eja-host
+      - run: |
+          cd macos
+          EJA_HOST_BIN="$PWD/../target/debug/eja-host" swift test
+          swift build --product EjaApp
+          swift build --product EjaUI
+      - run: xcrun swiftc -typecheck -parse-as-library -target "$(uname -m)-apple-macosx14.0" capabilities/screen/*.swift

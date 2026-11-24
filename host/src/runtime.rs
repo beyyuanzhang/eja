@@ -33,6 +33,18 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RETRY_ATTEMPTS: u8 = 3;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenError {
+    AlreadyRunning,
+    Failed(String),
+}
+
+impl From<String> for OpenError {
+    fn from(msg: String) -> Self {
+        Self::Failed(msg)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum HostCommand {
@@ -125,7 +137,7 @@ fn needs_handshake(capability: &CapabilityConfig) -> bool {
 }
 
 impl HostRuntime {
-    pub fn open(data_dir: PathBuf, emit: EventSink) -> Result<Self, String> {
+    pub fn open(data_dir: PathBuf, emit: EventSink) -> Result<Self, OpenError> {
         Self::open_with_brain(data_dir, Arc::new(HttpBrain), emit)
     }
 
@@ -133,7 +145,7 @@ impl HostRuntime {
         data_dir: PathBuf,
         brain: Arc<dyn Brain>,
         emit: EventSink,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, OpenError> {
         fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
         let data_path = fs::canonicalize(data_dir).map_err(|err| err.to_string())?;
         let data_dir =
@@ -141,7 +153,7 @@ impl HostRuntime {
         let name = data_dir
             .path()
             .file_name()
-            .ok_or("数据目录不能是文件系统根目录")?;
+            .ok_or_else(|| OpenError::Failed("数据目录不能是文件系统根目录".into()))?;
         let mut core_name = name.to_os_string();
         if name == "Eja" {
             core_name = "ai.eja.kernel".into();
@@ -153,9 +165,9 @@ impl HostRuntime {
             Ok(lock) => lock,
             Err(LockError::AlreadyRunning(ui_pid)) => {
                 (emit)(json!({ "event": "already_running", "ui_pid": ui_pid }));
-                return Err("EJA 已在运行中".into());
+                return Err(OpenError::AlreadyRunning);
             }
-            Err(LockError::Io(msg)) => return Err(msg),
+            Err(LockError::Io(msg)) => return Err(OpenError::Failed(msg)),
         };
         let core_dir =
             TrustedDir::open(core_path).map_err(|err| format!("锁定内核目录失败: {err}"))?;
@@ -744,7 +756,7 @@ impl HostRuntime {
             expire_tool_images(&mut messages, &provider.kind);
 
             if reply.calls.is_empty() {
-                let text = normalize_reply_text(&reply.text);
+                let text = normalize_reply_text(&reply.text, proactive);
                 if let Err(err) = state::complete_turn(&self.eja, trigger_id, text) {
                     fatal_error = Some(format!("保存回合结算状态失败: {err}"));
                     break;
@@ -1042,8 +1054,14 @@ fn is_truncated_receipt(detail: &str) -> bool {
     detail.contains("… [truncated;") || detail.contains("[output truncated at ")
 }
 
-fn normalize_reply_text(raw: &str) -> &str {
+fn normalize_reply_text(raw: &str, proactive: bool) -> &str {
     let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "";
+    }
+    if !proactive {
+        return trimmed;
+    }
     let stripped = trimmed
         .trim_matches(|ch: char| matches!(ch, '(' | ')' | '（' | '）' | '[' | ']' | '【' | '】'))
         .trim();
@@ -1708,7 +1726,7 @@ for line in sys.stdin:
             brain.clone(),
             Arc::new(move |val| sink_events.lock().unwrap().push(val)),
         );
-        assert!(second.is_err());
+        assert!(matches!(second, Err(OpenError::AlreadyRunning)));
         assert!(events
             .lock()
             .unwrap()
@@ -2936,5 +2954,45 @@ for line in sys.stdin:
 
         stop.store(true, Ordering::Relaxed);
         let _ = server.join();
+    }
+
+    #[test]
+    fn normalize_reply_text_only_folds_silence_markers_on_proactive_turns() {
+        assert_eq!(normalize_reply_text("   ", false), "");
+        assert_eq!(normalize_reply_text("沉默", false), "沉默");
+        assert_eq!(normalize_reply_text("silent", false), "silent");
+        assert_eq!(normalize_reply_text("（保持沉默）", true), "");
+        assert_eq!(normalize_reply_text("silent", true), "");
+        assert_eq!(normalize_reply_text("提醒内容", true), "提醒内容");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn register_check_reclaims_unreferenced_slots_at_capacity() {
+        let eja = Eja::open(":memory:").unwrap();
+        for idx in 0..64 {
+            state::register_check(
+                &eja,
+                &format!("old_{idx}"),
+                "status.txt",
+                Some("ok"),
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        state::register_check(&eja, "fresh", "status.txt", Some("ok"), None, None).unwrap();
+        assert!(state::registered_check(&eja, "fresh").is_ok());
+
+        let busy_eja = Eja::open(":memory:").unwrap();
+        for idx in 0..64 {
+            let name = format!("active_{idx}");
+            state::register_check(&busy_eja, &name, "status.txt", Some("ok"), None, None).unwrap();
+            state::keep_with_check(&busy_eja, None, &format!("挂念 {idx}"), Some(&name)).unwrap();
+        }
+        assert!(
+            state::register_check(&busy_eja, "overflow", "status.txt", Some("ok"), None, None)
+                .is_err()
+        );
     }
 }

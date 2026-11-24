@@ -5,7 +5,7 @@ EJA 是一个连续的、有自我同一性的主体。仓库采用清晰分层�
 - `core/`（`eja-core`）：最小闭合主体内核（零 ML/向量扩展依赖，零宿主调度策略），仅负责 SQLite 只追加事实日志、单调物理时间、关切与行动-回执状态机，以及供宿主共享原子事务的 `host_meta` 元数据槽。详见 `core/README.md`。
 - `memory/`（`eja-memory`）：独立的可选全历史检索层，仅消费 `eja-core` 公开只读 API；默认支持无磁盘缓存的关键词召回，启用 `onnx` feature 后可在独立 `memory.db` 中维护可丢弃的 `sqlite-vec` 衍生语义索引。
 - `host/`（`eja-host`）：Rust 驱动循环与统一能力层：`state.rs` 通过 `core` 原子事务统一管理回合游标、定时唤醒、窗口锚点与版本升级；`llm.rs` 基于锚点将日志确定性投影到模型上下文；`hands.rs` 与 `mcp.rs` 统一注册并执行内核原语与热加载能力层（内嵌常驻 `shell`、自由实现的 `exec` 本地插件，以及 `stdio` / `http` MCP 能力）；`http.rs` 统一封装 HTTP 传输与文本截断；`runtime.rs` 驱动判断回合与前端事件桥接。
-- `macos/`（`EjaClient` + `EjaApp`）：纯薄 macOS 原生 SwiftUI 交互壳（对话、模型与统一能力管理）。详见 `macos/README.md`。
+- `macos/`（`EjaLauncher` + `EjaClient` + `EjaUI`）：纯薄 macOS 原生 SwiftUI 交互壳（不可变启动器、宿主通信、对话、模型与统一能力管理）。详见 `macos/README.md`。
 
 默认支持本地关键词查找旧事实，可选语义编码器。
 
@@ -29,8 +29,9 @@ SwiftPM 开发运行、前端测试和 DMG 打包见 [macOS 构建说明](macos/
 内核目录默认为 `~/Library/Application Support/ai.eja.kernel/`。
 
 - `subject.db`：`eja-core` 永久事实日志与宿主原子元数据槽，使用当前 `PRAGMA user_version` 格式
-- `memory.db`：`eja-memory` 在启用语义编码器时按需生成的衍生向量索引缓存（可随时删除重建）
+- `memory.db`：`eja-memory` 在以 `--features onnx` 构建并配置 `EJA_ONNX_MODEL_DIR` 时按需生成的衍生向量索引缓存（可随时删除重建）
 - `config.json`：LLM Provider、密钥与宿主参数（Seatbelt 保护，前端仅见脱敏状态）
+- `oauth.json`：HTTP 能力的 OAuth 2.1 Token 与刷新凭证（Seatbelt 保护，与 `capabilities.json` 分离）
 - `host.lock`：单实例操作系统文件锁（确保同一数据目录仅运行一个主体实例）
 
 用户数据目录默认为 `~/Library/Application Support/Eja/`。

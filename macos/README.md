@@ -32,4 +32,12 @@ swift build --product EjaUI
 swift run EjaApp
 ```
 
+若仅安装了 Command Line Tools（未安装完整 Xcode），执行 Swift Testing 测试时需显式加载宏插件：
+
+```sh
+swift test --disable-xctest --enable-swift-testing \
+  -Xswiftc -load-plugin-library \
+  -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing/libTestingMacros.dylib
+```
+
 宿主和数据目录见 [EJA 项目说明](../README.md)。

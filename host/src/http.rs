@@ -1,4 +1,7 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -73,11 +76,22 @@ fn request_bytes(
     timeout_secs: u64,
     on_line: Option<&mut dyn FnMut(&str)>,
 ) -> Result<HttpResponse, HttpError> {
+    let config = format_curl_config(url, headers)?;
+    let (config_read, config_write) = create_cloexec_pipe()
+        .map_err(|err| HttpError::Launch(format!("创建 curl 配置管道失败: {err}")))?;
+    let config_fd = config_read.as_raw_fd();
+    let config_path = if cfg!(target_os = "linux") {
+        format!("/proc/self/fd/{config_fd}")
+    } else {
+        format!("/dev/fd/{config_fd}")
+    };
+
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
         "-q",
         "-sS",
         "-i",
+        "--suppress-connect-headers",
         "--globoff",
         "--proto",
         "=http,https",
@@ -85,6 +99,8 @@ fn request_bytes(
         method,
         "--max-time",
         &timeout_secs.max(1).to_string(),
+        "-K",
+        &config_path,
     ]);
     if on_line.is_some() {
         cmd.arg("-N");
@@ -92,34 +108,43 @@ fn request_bytes(
     if follow_redirects {
         cmd.arg("-L");
     }
-    for (key, value) in headers {
-        if key.contains(['\r', '\n', ':']) || value.contains(['\r', '\n']) {
-            return Err(HttpError::Launch("无效的 HTTP 请求头".into()));
-        }
-        cmd.arg("-H").arg(format!("{key}: {value}"));
-    }
     if body.is_some() {
         cmd.args(["--data-binary", "@-"]);
     }
-    cmd.arg("--url")
-        .arg(url)
-        .stdin(if body.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if body.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(config_fd, libc::F_SETFD, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let mut child = cmd
         .spawn()
         .map_err(|err| HttpError::Launch(format!("启动 curl 失败: {err}")))?;
-    if let (Some(mut stdin), Some(body)) = (child.stdin.take(), body) {
-        let payload = body.to_vec();
-        thread::spawn(move || {
-            let _ = stdin.write_all(&payload);
-        });
-    }
+    drop(config_read);
+    let config_handle = thread::spawn(move || {
+        let mut file = File::from(config_write);
+        let _ = file.write_all(config.as_bytes());
+    });
+    let stdin_handle = match (child.stdin.take(), body) {
+        (Some(mut stdin), Some(body)) => {
+            let payload = body.to_vec();
+            Some(thread::spawn(move || {
+                let _ = stdin.write_all(&payload);
+            }))
+        }
+        _ => None,
+    };
     let stderr_handle = child.stderr.take().map(|mut err_pipe| {
         thread::spawn(move || {
             let mut buf = Vec::new();
@@ -166,16 +191,57 @@ fn request_bytes(
     let status = child
         .wait()
         .map_err(|err| HttpError::Wait(format!("等待 HTTP 响应失败: {err}")))?;
+    let _ = config_handle.join();
+    if let Some(handle) = stdin_handle {
+        let _ = handle.join();
+    }
+    let stderr = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
     if !status.success() {
-        let stderr = stderr_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
         return Err(HttpError::Transport {
             exit_code: status.code(),
             message: String::from_utf8_lossy(&stderr).trim().to_string(),
         });
     }
     parse_http_response(&raw)
+}
+
+fn format_curl_config(url: &str, headers: &[(String, String)]) -> Result<String, HttpError> {
+    if url.is_empty() || url.contains(['\r', '\n', '\0']) {
+        return Err(HttpError::Launch("无效的请求 URL".into()));
+    }
+    let escape = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut out = format!("url = \"{}\"\n", escape(url));
+    for (key, value) in headers {
+        if key.is_empty()
+            || key.contains(['\r', '\n', ':', '\0'])
+            || value.contains(['\r', '\n', '\0'])
+        {
+            return Err(HttpError::Launch("无效的 HTTP 请求头".into()));
+        }
+        out.push_str(&format!(
+            "header = \"{}: {}\"\n",
+            escape(key),
+            escape(value)
+        ));
+    }
+    Ok(out)
+}
+
+fn create_cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    for fd in [read_fd.as_raw_fd(), write_fd.as_raw_fd()] {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok((read_fd, write_fd))
 }
 
 pub fn parse_http_response(raw: &str) -> Result<HttpResponse, HttpError> {
@@ -235,4 +301,74 @@ pub fn truncate_utf8(input: &str, max_bytes: usize) -> String {
     }
     let end = input.floor_char_boundary(max_bytes - 3);
     format!("{}...", &input[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn curl_config_escapes_quotes_and_rejects_control_characters() {
+        let cfg = format_curl_config(
+            "https://example.com/v1/chat?a=\"1\"\\2",
+            &[
+                ("Authorization".into(), "Bearer sk-\"test\"\\123".into()),
+                ("X-Empty".into(), String::new()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            cfg,
+            "url = \"https://example.com/v1/chat?a=\\\"1\\\"\\\\2\"\n\
+             header = \"Authorization: Bearer sk-\\\"test\\\"\\\\123\"\n\
+             header = \"X-Empty: \"\n"
+        );
+        assert!(format_curl_config("https://example.com\nfoo", &[]).is_err());
+        assert!(format_curl_config("https://example.com", &[("".into(), "v".into())]).is_err());
+        assert!(format_curl_config(
+            "https://example.com",
+            &[("X-Key".into(), "bad\r\nheader".into())]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn post_stream_passes_headers_via_config_pipe_and_streams_body_lines() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let count = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..count]).into_owned();
+            let body = "data: {\"chunk\":1}\n\ndata: [DONE]\n";
+            let reply = format!(
+                "HTTP/1.1 100 Continue\r\n\r\n\
+                 HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            req
+        });
+
+        let mut lines = Vec::new();
+        let resp = post_stream(
+            &format!("http://127.0.0.1:{port}/stream"),
+            &[
+                ("Authorization".into(), "Bearer sec-\"quoted\"\\tok".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            br#"{"ping":true}"#,
+            5,
+            |line| lines.push(line.to_string()),
+        )
+        .unwrap();
+
+        let raw_req = server.join().unwrap();
+        assert!(raw_req.contains("Authorization: Bearer sec-\"quoted\"\\tok\r\n"));
+        assert!(raw_req.ends_with(r#"{"ping":true}"#));
+        assert_eq!(resp.status, 200);
+        assert_eq!(lines, vec!["data: {\"chunk\":1}", "", "data: [DONE]"]);
+    }
 }

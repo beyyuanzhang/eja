@@ -271,6 +271,20 @@ pub fn register_check(
             };
         }
         if state.checks.len() >= 64 {
+            let active: HashSet<String> = state
+                .concern_checks
+                .values()
+                .cloned()
+                .chain(
+                    state
+                        .wakes
+                        .iter()
+                        .filter_map(|wake| wake.guard.as_ref().map(|guard| guard.checker.clone())),
+                )
+                .collect();
+            state.checks.retain(|key, _| active.contains(key));
+        }
+        if state.checks.len() >= 64 {
             return Err(Error::Invalid("已达到 64 条检查规则上限".into()));
         }
         state.checks.insert(name.into(), check);

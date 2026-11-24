@@ -16,7 +16,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const GITHUB_PUBLIC_CLIENT_ID: &str = "178c6fc778ccc68e1d6a";
 const OAUTH_HTTP_TIMEOUT_SECS: u64 = 15;
 const LOOPBACK_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -307,20 +306,14 @@ fn run_oauth_flow(
     }
 
     if let Some(device_endpoint) = &meta.device_authorization_endpoint {
-        let client_id = custom_client_id
-            .or_else(|| {
-                split_origin_and_path(device_endpoint)
-                    .is_some_and(|(origin, _)| origin.eq_ignore_ascii_case("https://github.com"))
-                    .then(|| GITHUB_PUBLIC_CLIENT_ID.to_string())
-            })
-            .ok_or_else(|| {
-                "该连接器要求预注册 OAuth Client ID（可在连接器键值中填入 X-OAuth-Client-Id=...）"
-                    .to_string()
-            })?;
+        let client_id = custom_client_id.ok_or_else(|| {
+            "该能力要求预注册 OAuth Client ID（可在能力键值中填入 X-OAuth-Client-Id=...）"
+                .to_string()
+        })?;
         return run_device_code_flow(id, mcp_url, &meta, device_endpoint, &client_id, cancel, tx);
     }
 
-    Err("该连接器未提供可用的 OAuth 动态注册或设备码授权端点".into())
+    Err("该能力未提供可用的 OAuth 动态注册或设备码授权端点".into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,15 +338,20 @@ fn run_pkce_loopback_flow(
     } else {
         '?'
     };
-    let auth_url = format!(
+    let mut auth_url = format!(
         "{auth_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}",
         url_encode(&client_id),
         url_encode(redirect_uri),
         url_encode(&challenge),
         url_encode(&state),
     );
+    if !meta.scopes.is_empty() {
+        auth_url.push_str("&scope=");
+        auth_url.push_str(&url_encode(&meta.scopes.join(" ")));
+    }
 
-    open_browser(&auth_url);
+    let auth_url = validate_browser_url(&auth_url)?;
+    open_browser(auth_url);
 
     let code = wait_for_loopback_code(listener, &state, cancel)?;
     if cancel.load(Ordering::Relaxed) {
@@ -436,8 +434,9 @@ fn run_device_code_flow(
     if cancel.load(Ordering::Relaxed) {
         return Err("授权已取消".into());
     }
+    let verification_uri = validate_browser_url(&verification_uri)?;
     copy_to_clipboard(&user_code);
-    open_browser(&verification_uri);
+    open_browser(verification_uri);
     let _ = tx.send(OAuthEvent::DeviceCode {
         id: id.to_string(),
         flow: Arc::clone(cancel),
@@ -864,14 +863,39 @@ fn pkce_s256_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
+fn validate_browser_url(url: &str) -> Result<&str, String> {
+    if url.is_empty() || url.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return Err("OAuth 授权地址包含非法字符".into());
+    }
+    let Some((origin, _)) = split_origin_and_path(url) else {
+        return Err("OAuth 授权地址格式无效".into());
+    };
+    let lower = origin.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(url);
+    }
+    if let Some(authority) = lower.strip_prefix("http://") {
+        let host = if let Some(rest) = authority.strip_prefix('[') {
+            rest.split(']').next().unwrap_or("")
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        if matches!(host, "127.0.0.1" | "localhost" | "::1") {
+            return Ok(url);
+        }
+    }
+    Err("OAuth 授权地址必须使用 HTTPS（或本地回环 HTTP）".into())
+}
+
 #[cfg(not(test))]
 fn open_browser(url: &str) {
     let _ = std::process::Command::new("/usr/bin/open")
+        .arg("-u")
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .status();
 }
 
 #[cfg(test)]
@@ -989,7 +1013,8 @@ mod tests {
                             "issuer": base_srv,
                             "authorization_endpoint": format!("{base_srv}/authorize"),
                             "token_endpoint": format!("{base_srv}/token"),
-                            "registration_endpoint": format!("{base_srv}/register")
+                            "registration_endpoint": format!("{base_srv}/register"),
+                            "scopes_supported": ["read:mcp", "write:mcp"]
                         })
                         .to_string(),
                     )
@@ -1047,6 +1072,10 @@ mod tests {
         let redirect_uri = params.get("redirect_uri").unwrap();
         let state = params.get("state").unwrap();
         let challenge = params.get("code_challenge").unwrap();
+        assert_eq!(
+            params.get("scope").map(String::as_str),
+            Some("read:mcp write:mcp")
+        );
 
         let callback_url = format!(
             "{redirect_uri}?code=auth_code_777&state={}",
@@ -1065,5 +1094,20 @@ mod tests {
         assert_eq!(token.access_token, format!("pkce_tok_{challenge}"));
         assert_eq!(token.refresh_token.as_deref(), Some("pkce_ref_1"));
         let _ = server.join();
+    }
+
+    #[test]
+    fn validate_browser_url_allows_https_and_loopback_only() {
+        assert!(validate_browser_url("https://github.com/login/device").is_ok());
+        assert!(validate_browser_url("http://127.0.0.1:8080/authorize?x=1").is_ok());
+        assert!(validate_browser_url("http://localhost:3000/auth").is_ok());
+        assert!(validate_browser_url("http://[::1]:3000/auth").is_ok());
+
+        assert!(validate_browser_url("http://example.com/authorize").is_err());
+        assert!(validate_browser_url("file:///Applications/Calculator.app").is_err());
+        assert!(validate_browser_url("javascript:alert(1)").is_err());
+        assert!(validate_browser_url("-a Calculator").is_err());
+        assert!(validate_browser_url("https://example.com/a b").is_err());
+        assert!(validate_browser_url("https://example.com/a\nb").is_err());
     }
 }

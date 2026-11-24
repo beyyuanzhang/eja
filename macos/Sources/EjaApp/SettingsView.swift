@@ -19,6 +19,7 @@ final class SettingsDraft: ObservableObject {
     @Published var addingModelProvider: String?
     @Published var newModelInput: String = ""
     @Published var rawCommandLines: [String: String] = [:]
+    @Published var rawTransportKVs: [String: String] = [:]
 
     private var saved = HostConfigDTO()
     private var pendingSave: (id: UUID, config: HostConfigDTO)?
@@ -57,9 +58,15 @@ final class SettingsDraft: ObservableObject {
         capabilities = latest
         let ids = Set(latest.map(\.id))
         rawCommandLines = rawCommandLines.filter { ids.contains($0.key) }
-        for cap in latest where rawCommandLines[cap.id] == nil
-            || previous.first(where: { $0.id == cap.id })?.transport != cap.transport {
-            rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
+        rawTransportKVs = rawTransportKVs.filter { ids.contains($0.key) }
+        for cap in latest {
+            let changed = previous.first(where: { $0.id == cap.id })?.transport != cap.transport
+            if rawCommandLines[cap.id] == nil || changed {
+                rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
+            }
+            if rawTransportKVs[cap.id] == nil || changed {
+                rawTransportKVs[cap.id] = Self.formatTransportKV(cap.transport)
+            }
         }
         if let id = expandedCapability, !latest.contains(where: { $0.id == id }) {
             expandedCapability = nil
@@ -201,6 +208,7 @@ final class SettingsDraft: ObservableObject {
         }
         let transport = CapabilityTransportDTO.exec(command: "", args: [])
         rawCommandLines[uniqueId] = ""
+        rawTransportKVs[uniqueId] = ""
         capabilities.append(CapabilityConfigDTO(id: uniqueId, name: "新能力", enabled: true, transport: transport))
         expandedCapability = uniqueId
     }
@@ -208,6 +216,7 @@ final class SettingsDraft: ObservableObject {
     func removeCapability(id: String) {
         capabilities.removeAll { $0.id == id && $0.transport.type != "builtin" }
         rawCommandLines.removeValue(forKey: id)
+        rawTransportKVs.removeValue(forKey: id)
         if expandedCapability == id { expandedCapability = nil }
         flushSave()
     }
@@ -322,6 +331,23 @@ final class SettingsDraft: ObservableObject {
         guard let first = tokens.first else { return ("", []) }
         return (first, Array(tokens.dropFirst()))
     }
+
+    static func formatTransportKV(_ transport: CapabilityTransportDTO) -> String {
+        let map = transport.type == "http" ? (transport.headers ?? [:]) : (transport.env ?? [:])
+        return map.keys.sorted().map { "\($0)=\(map[$0] ?? "")" }.joined(separator: "\n")
+    }
+
+    static func parseTransportKV(_ raw: String) -> [String: String] {
+        var map: [String: String] = [:]
+        for line in raw.split(whereSeparator: \.isNewline) {
+            if let sep = line.firstIndex(of: "=") {
+                let key = String(line[..<sep]).trimmingCharacters(in: .whitespaces)
+                let value = String(line[line.index(after: sep)...]).trimmingCharacters(in: .whitespaces)
+                if !key.isEmpty { map[key] = value }
+            }
+        }
+        return map
+    }
 }
 
 struct ProviderPreset: Identifiable {
@@ -331,27 +357,10 @@ struct ProviderPreset: Identifiable {
     let baseUrl: String
     let models: [String]
 
-    static func detectMagpieBaseUrl() -> String {
-        let gatewayFile = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".config/magpie/gateway.json")
-        if let data = try? Data(contentsOf: gatewayFile),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let addr = json["addr"] as? String,
-           !addr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let clean = addr.trimmingCharacters(in: .whitespacesAndNewlines)
-            if clean.hasPrefix("http://") || clean.hasPrefix("https://") {
-                return clean.hasSuffix("/v1") ? clean : "\(clean)/v1"
-            }
-            return "http://\(clean)/v1"
-        }
-        return "http://127.0.0.1:3425/v1"
-    }
-
     static let all: [ProviderPreset] = [
         .init(id: "anthropic", name: "Anthropic", kind: "anthropic", baseUrl: "https://api.anthropic.com", models: ["claude-sonnet-4-5", "claude-haiku-4-5"]),
         .init(id: "deepseek", name: "DeepSeek", kind: "openai", baseUrl: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"]),
         .init(id: "kimi", name: "Kimi", kind: "openai", baseUrl: "https://api.kimi.com/coding/v1", models: ["k2.5", "k2-thinking"]),
-        .init(id: "magpie", name: "Magpie", kind: "openai", baseUrl: detectMagpieBaseUrl(), models: []),
         .init(id: "ollama", name: "Ollama", kind: "openai", baseUrl: "http://127.0.0.1:11434/v1", models: []),
         .init(id: "openai", name: "OpenAI", kind: "openai", baseUrl: "https://api.openai.com/v1", models: ["gpt-4o", "gpt-4o-mini"]),
         .init(id: "openrouter", name: "OpenRouter", kind: "openai", baseUrl: "https://openrouter.ai/api/v1", models: ["openai/gpt-4o", "anthropic/claude-sonnet-4-5"]),
@@ -1049,6 +1058,7 @@ struct SettingsView: View {
                 }
                 let cap = draft.capabilities[index]
                 draft.rawCommandLines[cap.id] = SettingsDraft.formatCommandLine(cap.transport)
+                draft.rawTransportKVs[cap.id] = SettingsDraft.formatTransportKV(cap.transport)
             }
         } label: {
             Text(label)
@@ -1125,20 +1135,14 @@ struct SettingsView: View {
         Binding(
             get: {
                 guard draft.capabilities.indices.contains(index) else { return "" }
-                let transport = draft.capabilities[index].transport
-                let map = transport.type == "http" ? (transport.headers ?? [:]) : (transport.env ?? [:])
-                return map.keys.sorted().map { "\($0)=\(map[$0] ?? "")" }.joined(separator: "\n")
+                let cap = draft.capabilities[index]
+                return draft.rawTransportKVs[cap.id] ?? SettingsDraft.formatTransportKV(cap.transport)
             },
             set: { raw in
                 guard draft.capabilities.indices.contains(index) else { return }
-                var map: [String: String] = [:]
-                for line in raw.split(separator: "\n") {
-                    if let sep = line.firstIndex(of: "=") {
-                        let key = String(line[..<sep]).trimmingCharacters(in: .whitespaces)
-                        let value = String(line[line.index(after: sep)...]).trimmingCharacters(in: .whitespaces)
-                        if !key.isEmpty { map[key] = value }
-                    }
-                }
+                let id = draft.capabilities[index].id
+                draft.rawTransportKVs[id] = raw
+                let map = SettingsDraft.parseTransportKV(raw)
                 if draft.capabilities[index].transport.type == "http" {
                     draft.capabilities[index].transport.headers = map
                 } else {
