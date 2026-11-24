@@ -434,8 +434,8 @@ struct ProviderPreset: Identifiable {
 
 struct SettingsView: View {
     @ObservedObject var client: HostClient
+    @Binding var isPresented: Bool
     @StateObject private var draft = SettingsDraft()
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         HStack(spacing: 0) {
@@ -443,11 +443,12 @@ struct SettingsView: View {
             Rectangle()
                 .fill(EjaTheme.hairline)
                 .frame(width: 1)
+                .ignoresSafeArea(edges: .vertical)
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 560, height: 420)
-        .background(EjaTheme.canvas)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(EjaTheme.canvas.ignoresSafeArea())
         .tint(EjaTheme.ink)
         .onAppear {
             draft.attach(client: client)
@@ -469,7 +470,7 @@ struct SettingsView: View {
             Spacer(minLength: 0)
             Button {
                 draft.flushSave()
-                dismiss()
+                isPresented = false
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .medium))
@@ -480,8 +481,8 @@ struct SettingsView: View {
             .padding(.bottom, 10)
         }
         .padding(.horizontal, 10)
-        .padding(.top, 14)
-        .frame(width: 112)
+        .padding(.top, 8)
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private func sideItem(_ section: SettingsSection, title: String) -> some View {
@@ -489,17 +490,21 @@ struct SettingsView: View {
         return Button {
             withAnimation(.easeOut(duration: 0.14)) { draft.section = section }
         } label: {
-            Text(title)
-                .font(.system(size: 12.5, weight: active ? .medium : .regular))
-                .foregroundStyle(active ? EjaTheme.ink : EjaTheme.inkSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(active ? EjaTheme.surfaceSubtle : .clear)
-                )
-                .contentShape(Rectangle())
+            ZStack(alignment: .leading) {
+                Text("连接器")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .hidden()
+                Text(title)
+                    .font(.system(size: 12.5, weight: active ? .medium : .regular))
+                    .foregroundStyle(active ? EjaTheme.ink : EjaTheme.inkSecondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(active ? EjaTheme.surfaceSubtle : .clear)
+            )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -525,7 +530,7 @@ struct SettingsView: View {
                 addProviderMenu
             }
             .padding(.horizontal, 16)
-            .padding(.top, 14)
+            .padding(.top, 8)
             .padding(.bottom, 16)
         }
         .scrollIndicators(.never)
@@ -586,13 +591,14 @@ struct SettingsView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .layoutPriority(1)
 
                 if let testResult {
                     Text(testResult.message)
                         .font(.system(size: 10.5))
                         .foregroundStyle(testResult.ok ? EjaTheme.positive : EjaTheme.danger)
                         .lineLimit(1)
-                        .frame(maxWidth: 140, alignment: .trailing)
+                        .truncationMode(.tail)
                 }
 
                 Button {
@@ -703,7 +709,8 @@ struct SettingsView: View {
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(EjaTheme.ink)
                     .textFieldStyle(.plain)
-                    .frame(width: 130)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .frame(minWidth: 64)
                     .onSubmit {
                         draft.addModel(providerId: provider.id, model: draft.newModelInput)
                     }
@@ -839,7 +846,7 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
             }
             .padding(.horizontal, 16)
-            .padding(.top, 14)
+            .padding(.top, 8)
             .padding(.bottom, 16)
         }
         .scrollIndicators(.never)

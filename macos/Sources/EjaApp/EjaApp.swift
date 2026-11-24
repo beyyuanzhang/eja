@@ -46,7 +46,7 @@ struct EjaApp: App {
     var body: some Scene {
         Window("EJA", id: "main") {
             ContentView(client: client, ui: ui)
-                .frame(minWidth: 520, minHeight: 460)
+                .frame(minWidth: 280, minHeight: 220)
                 .onAppear {
                     let hostClient = client
                     appDelegate.onTerminate = { [weak hostClient] in
@@ -74,7 +74,7 @@ struct EjaApp: App {
         .commands {
             CommandGroup(replacing: .appSettings) {
                 Button("设置…") {
-                    ui.showSettingsSheet = true
+                    ui.showSettingsSheet.toggle()
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }

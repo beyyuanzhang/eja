@@ -46,8 +46,7 @@ struct ContentView: View {
                                         .id("eja-busy")
                                 }
                             }
-                            .frame(maxWidth: 640, alignment: .leading)
-                            .frame(maxWidth: .infinity)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 28)
                             .padding(.top, 16)
                             .padding(.bottom, 24)
@@ -110,7 +109,6 @@ struct ContentView: View {
 
                     composer
                 }
-                .frame(maxWidth: 640)
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 24)
                 .padding(.top, 4)
@@ -126,11 +124,13 @@ struct ContentView: View {
             .padding(.top, 10)
             .padding(.trailing, 14)
             .ignoresSafeArea(edges: .top)
+
+            if ui.showSettingsSheet {
+                SettingsView(client: client, isPresented: $ui.showSettingsSheet)
+                    .transition(.opacity)
+            }
         }
         .tint(EjaTheme.ink)
-        .sheet(isPresented: $ui.showSettingsSheet) {
-            SettingsView(client: client)
-        }
         .onAppear {
             composerFocused = true
             ui.captureBaselineIfNeeded(isReady: client.isReady, dataDir: client.dataDir, from: client.stream)
@@ -251,7 +251,7 @@ struct ContentView: View {
         switch item.kind {
         case "person":
             HStack {
-                Spacer(minLength: 64)
+                Spacer(minLength: 48)
                 Text(item.text)
                     .font(.system(size: 13.5))
                     .lineSpacing(3)
@@ -268,15 +268,13 @@ struct ContentView: View {
     }
 
     private func ejaTextRow(_ text: String) -> some View {
-        HStack {
-            markdownText(text)
-                .font(.system(size: 13.5))
-                .lineSpacing(4.5)
-                .foregroundStyle(EjaTheme.ink)
-                .textSelection(.enabled)
-                .padding(.leading, 2)
-            Spacer(minLength: 36)
-        }
+        markdownText(text)
+            .font(.system(size: 13.5))
+            .lineSpacing(4.5)
+            .foregroundStyle(EjaTheme.ink)
+            .textSelection(.enabled)
+            .padding(.leading, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func markdownText(_ source: String) -> Text {
