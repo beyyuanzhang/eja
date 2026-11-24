@@ -119,7 +119,7 @@ public enum UiRuntime {
               let factoryDigest = binaryDigest(at: factoryExec),
               let currentDigest = binaryDigest(at: currentExec),
               factoryDigest != currentDigest else { return false }
-        return replaceAndRelaunch(sourceBinary: factoryExec, currentExec: currentExec, shutdown: shutdown)
+        return replaceAndRelaunch(sourceBinary: factoryExec, currentExec: currentExec, removeSource: false, shutdown: shutdown)
     }
 
     @discardableResult
@@ -144,12 +144,13 @@ public enum UiRuntime {
                 encoding: .utf8
             )
         }
-        return replaceAndRelaunch(sourceBinary: staged, currentExec: currentExec, shutdown: shutdown)
+        return replaceAndRelaunch(sourceBinary: staged, currentExec: currentExec, removeSource: true, shutdown: shutdown)
     }
 
     private static func replaceAndRelaunch(
         sourceBinary: URL,
         currentExec: URL,
+        removeSource: Bool,
         shutdown: () -> Void
     ) -> Bool {
         let fm = FileManager.default
@@ -163,9 +164,8 @@ public enum UiRuntime {
             sign.arguments = ["--force", "--sign", "-", tmpExec.path]
             try? sign.run()
             sign.waitUntilExit()
-            if sourceBinary != currentExec {
+            if removeSource && sourceBinary != currentExec {
                 try? fm.removeItem(at: sourceBinary)
-                try? fm.copyItem(at: tmpExec, to: sourceBinary)
             }
             _ = try fm.replaceItemAt(currentExec, withItemAt: tmpExec)
         } catch {

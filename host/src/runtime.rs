@@ -549,9 +549,19 @@ impl HostRuntime {
             self.poll_oauth_events();
             self.refresh_connectors(false);
             let tools = self.hands.tools();
-            let reply = match self
-                .brain
-                .complete(&provider, &model, &system, &messages, &tools)
+            let emit = &mut self.emit;
+            let reply = match self.brain.complete_streaming(
+                &provider,
+                &model,
+                &system,
+                &messages,
+                &tools,
+                &mut |delta| {
+                    if !proactive && !delta.is_empty() {
+                        (emit)(json!({ "event": "delta", "text": delta }));
+                    }
+                },
+            )
             {
                 Ok(r) => r,
                 Err(err) => {
@@ -1056,13 +1066,18 @@ mod tests {
     #[test]
     fn user_turn_records_stream_and_runs_multiple_turns() {
         let dir = tempfile::tempdir().unwrap();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_sink = events.clone();
         let brain = Arc::new(MockBrain {
             judge_calls: AtomicUsize::new(0),
             mode: "chat",
         });
-        let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
-                .unwrap();
+        let mut rt = HostRuntime::open_with_brain(
+            dir.path().join("Eja"),
+            brain.clone(),
+            Box::new(move |ev| events_sink.lock().unwrap().push(ev)),
+        )
+        .unwrap();
         rt.save_config(configured(vec![]));
         rt.handle_user_message("你好");
 
@@ -1076,6 +1091,11 @@ mod tests {
             .stream
             .iter()
             .any(|item| item.kind == "eja" && item.text == "你好，我在。"));
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|ev| ev["event"] == "delta" && ev["text"] == "你好，我在。"));
         assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 1);
 
         rt.handle_user_message("第 2 轮");

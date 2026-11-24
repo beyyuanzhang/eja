@@ -170,6 +170,7 @@ public struct ProviderTestResult: Equatable, Sendable {
 
 private struct StateEventDTO: Decodable {
     let status: String
+    let statusDetail: String?
     let dataDir: String
     let configured: Bool
     let config: HostConfigDTO
@@ -178,6 +179,7 @@ private struct StateEventDTO: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case status, config, stream, configured
+        case statusDetail = "status_detail"
         case dataDir = "data_dir"
         case connectorStatuses = "connector_statuses"
     }
@@ -189,6 +191,8 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var alreadyRunning: Bool = false
     @Published public private(set) var alreadyRunningPid: Int32?
     @Published public private(set) var status: String = "idle"
+    @Published public private(set) var statusDetail: String = ""
+    @Published public private(set) var streamingText: String = ""
     @Published public private(set) var dataDir: String = ""
     @Published public private(set) var isConfigured: Bool = false
     @Published public private(set) var config: HostConfigDTO = HostConfigDTO()
@@ -332,6 +336,8 @@ public final class HostClient: ObservableObject {
         stdinHandle = nil
         isReady = false
         status = "idle"
+        statusDetail = ""
+        streamingText = ""
         if !alreadyRunning && errorBanner == nil {
             errorBanner = "eja-host 已退出（退出码 \(exitCode)）"
         }
@@ -345,7 +351,7 @@ public final class HostClient: ObservableObject {
         try? handle.write(contentsOf: line)
     }
 
-    private func handleEventLine(_ data: Data) {
+    func handleEventLine(_ data: Data) {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let event = json["event"] as? String else { return }
         switch event {
@@ -353,11 +359,22 @@ public final class HostClient: ObservableObject {
             if let state = try? decoder.decode(StateEventDTO.self, from: data) {
                 isReady = true
                 status = state.status
+                statusDetail = state.statusDetail ?? ""
+                streamingText = ""
                 dataDir = state.dataDir
                 isConfigured = state.configured
                 config = state.config
                 connectorStatuses = state.connectorStatuses
                 stream = state.stream
+            }
+        case "activity":
+            if let detail = json["status_detail"] as? String {
+                statusDetail = detail
+            }
+            streamingText = ""
+        case "delta":
+            if let chunk = json["text"] as? String, !chunk.isEmpty {
+                streamingText.append(chunk)
             }
         case "already_running":
             alreadyRunning = true

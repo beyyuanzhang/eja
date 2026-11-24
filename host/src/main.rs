@@ -106,7 +106,13 @@ fn main() {
             }
             Ok(Some(delay)) => match rx.recv_timeout(delay) {
                 Ok(msg) => msg,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(err) = runtime.tick_timers() {
+                        runtime.emit_error(format!("处理定时任务失败: {err}"));
+                        break;
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
             Ok(None) => match rx.recv() {

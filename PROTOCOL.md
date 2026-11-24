@@ -41,6 +41,7 @@ eja-host --data-dir "<data_dir>"
 - 状态快照 `{"event":"state","protocol_version":1,"kernel_version":"1.0.0","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"connector_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
   `config.providers[].api_key` 始终为空字符串，`has_api_key` 表示是否已保存密钥。`stream[]` 可附带 `outcome_status` 与 `truncated`。`wakes[]` 可附带 `guard`，其中 `checker` 为规则名，`remaining` 为剩余检查次数。
 - 回合内活动 `{"event":"activity","status_detail":"执行 Shell"}`。回合开始和结束仍发送状态快照。
+- 流式文本增量 `{"event":"delta","text":"..."}`。用户回合中模型生成文本时实时推送增量，转入工具调用（`activity`）或回合结算（`state`）时收束。
 - 单实例冲突 `{"event":"already_running","ui_pid":12345}`（同一数据目录已有运行中的 `eja-host` 时立即发出并退出，前端可激活已有实例后退出自身）
 - Provider 测试结果 `{"event":"provider_test","id":"openai","ok":true,"message":"..."}`
 - 系统通知 `{"event":"notify","title":"EJA","body":"..."}`

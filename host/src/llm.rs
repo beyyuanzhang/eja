@@ -1,9 +1,10 @@
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::hands::ToolSpec;
-use crate::http::{post_bytes, truncate_utf8, HttpError};
+use crate::http::{post_stream, truncate_utf8, HttpError};
 use crate::state::entries_for_turn;
 use eja_core::{Eja, Entry, Evidence, Fact, Id, Outcome};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
 
@@ -31,6 +32,22 @@ pub trait Brain: Send + Sync {
         tools: &[ToolSpec],
     ) -> Result<ModelReply, String>;
 
+    fn complete_streaming(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+        system: &str,
+        messages: &[Value],
+        tools: &[ToolSpec],
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelReply, String> {
+        let reply = self.complete(provider, model, system, messages, tools)?;
+        if !reply.text.is_empty() {
+            on_delta(&reply.text);
+        }
+        Ok(reply)
+    }
+
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String>;
 }
 
@@ -45,7 +62,19 @@ impl Brain for HttpBrain {
         messages: &[Value],
         tools: &[ToolSpec],
     ) -> Result<ModelReply, String> {
-        complete_wire(provider, model, system, messages, Some(tools))
+        complete_wire(provider, model, system, messages, Some(tools), None)
+    }
+
+    fn complete_streaming(
+        &self,
+        provider: &ProviderConfig,
+        model: &str,
+        system: &str,
+        messages: &[Value],
+        tools: &[ToolSpec],
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ModelReply, String> {
+        complete_wire(provider, model, system, messages, Some(tools), Some(on_delta))
     }
 
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String> {
@@ -54,6 +83,7 @@ impl Brain for HttpBrain {
             model,
             "Reply with OK.",
             &[user_message("ping")],
+            None,
             None,
         )?
         .text;
@@ -524,10 +554,13 @@ fn complete_wire(
     system: &str,
     messages: &[Value],
     tools: Option<&[ToolSpec]>,
+    on_delta: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ModelReply, String> {
     match provider.kind {
-        ProviderKind::OpenAi => call_openai(provider, model, system, messages, tools),
-        ProviderKind::Anthropic => call_anthropic(provider, model, system, messages, tools),
+        ProviderKind::OpenAi => call_openai(provider, model, system, messages, tools, on_delta),
+        ProviderKind::Anthropic => {
+            call_anthropic(provider, model, system, messages, tools, on_delta)
+        }
     }
 }
 
@@ -537,6 +570,7 @@ fn call_openai(
     system: &str,
     messages: &[Value],
     tools: Option<&[ToolSpec]>,
+    mut on_delta: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ModelReply, String> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/chat/completions") {
@@ -546,6 +580,7 @@ fn call_openai(
     };
     let system_message = json!({ "role": "system", "content": system });
     let messages: Vec<_> = std::iter::once(&system_message).chain(messages).collect();
+    let seed = messages.len();
     let mut body = json!({ "model": model, "messages": messages });
     if let Some(list) = tools {
         body["tools"] = json!(list
@@ -558,56 +593,128 @@ fn call_openai(
     if !api_key.is_empty() {
         headers.push(("Authorization".into(), format!("Bearer {api_key}")));
     }
-    let resp = post_json(&url, &headers, &body)?;
-    let msg = resp.pointer("/choices/0/message").ok_or_else(|| {
-        format!(
-            "LLM 响应缺少 choices[0].message: {}",
-            truncate_utf8(&resp.to_string(), 240)
-        )
-    })?;
-    let text = msg["content"].as_str().unwrap_or("").to_string();
-    let mut message = json!({ "role": "assistant", "content": msg["content"] });
-    if let Some(reasoning) = msg.get("reasoning_content").filter(|v| v.is_string()) {
-        message["reasoning_content"] = reasoning.clone();
+    if on_delta.is_some() {
+        body["stream"] = json!(true);
     }
-    let mut calls = Vec::new();
-    if let Some(arr) = msg.get("tool_calls").and_then(Value::as_array) {
+    let mut notify = |chunk: &str| {
+        if let Some(cb) = on_delta.as_deref_mut() {
+            cb(chunk);
+        }
+    };
+    let mut acc = OpenAiStreamAcc::default();
+    let resp = post_json(&url, &headers, &body, |line| {
+        acc.feed_line(line, &mut notify);
+    })?;
+    if !acc.saw_sse {
+        acc.apply_response(&resp, &mut notify)?;
+    }
+    acc.into_reply(seed)
+}
+
+#[derive(Default)]
+struct OpenAiStreamAcc {
+    saw_sse: bool,
+    text: String,
+    reasoning: String,
+    tool_calls: BTreeMap<usize, (String, String, String)>,
+    stream_error: Option<String>,
+}
+
+impl OpenAiStreamAcc {
+    fn apply_response(&mut self, resp: &Value, on_delta: impl FnMut(&str)) -> Result<(), String> {
+        let msg = resp.pointer("/choices/0/message").ok_or_else(|| {
+            format!(
+                "LLM 响应缺少 choices[0].message: {}",
+                truncate_utf8(&resp.to_string(), 240)
+            )
+        })?;
+        self.apply_delta(msg, on_delta);
+        Ok(())
+    }
+
+    fn feed_line(&mut self, line: &str, on_delta: impl FnMut(&str)) {
+        let Some(chunk) = parse_sse_json(line, &mut self.saw_sse) else {
+            return;
+        };
+        if chunk.get("choices").is_none() {
+            if let Some(msg) = chunk
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .or_else(|| chunk.get("error").and_then(Value::as_str))
+            {
+                self.stream_error = Some(msg.to_string());
+            }
+            return;
+        }
+        if let Some(delta) = chunk
+            .pointer("/choices/0/delta")
+            .or_else(|| chunk.pointer("/choices/0/message"))
+        {
+            self.apply_delta(delta, on_delta);
+        }
+    }
+
+    fn apply_delta(&mut self, delta: &Value, mut on_delta: impl FnMut(&str)) {
+        if let Some(r) = delta["reasoning_content"].as_str() {
+            self.reasoning.push_str(r);
+        }
+        if let Some(c) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+            self.text.push_str(c);
+            on_delta(c);
+        }
+        if let Some(arr) = delta["tool_calls"].as_array() {
+            for (pos, item) in arr.iter().enumerate() {
+                let idx = item["index"].as_u64().map_or(pos, |i| i as usize);
+                let (id, name, arguments) = self.tool_calls.entry(idx).or_default();
+                if let Some(s) = item["id"].as_str().filter(|s| !s.is_empty()) {
+                    *id = s.to_string();
+                }
+                if let Some(s) = item.pointer("/function/name").and_then(Value::as_str) {
+                    name.push_str(s);
+                }
+                match item.pointer("/function/arguments") {
+                    Some(Value::String(s)) => arguments.push_str(s),
+                    Some(v) if v.is_object() => arguments.push_str(&v.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn into_reply(self, seed: usize) -> Result<ModelReply, String> {
+        if let Some(err) = self.stream_error {
+            return Err(err);
+        }
+        let content_val = if self.text.is_empty() && !self.tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(self.text.clone())
+        };
+        let mut message = json!({ "role": "assistant", "content": content_val });
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = Value::String(self.reasoning);
+        }
+        let mut calls = Vec::new();
         let mut wire_calls = Vec::new();
-        for (index, item) in arr.iter().enumerate() {
-            let Some(name) = item.pointer("/function/name").and_then(Value::as_str) else {
+        for (index, (raw_id, name, raw_args)) in self.tool_calls.into_values().enumerate() {
+            if name.is_empty() {
                 continue;
-            };
-            let id = item["id"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("call_{}_{index}", messages.len()));
-            let (args, arguments) = match item.pointer("/function/arguments") {
-                Some(Value::String(s)) => (
-                    serde_json::from_str(s).unwrap_or_else(|_| json!({})),
-                    s.clone(),
-                ),
-                Some(v) if v.is_object() => (v.clone(), v.to_string()),
-                _ => (json!({}), "{}".into()),
-            };
+            }
+            let id = if raw_id.is_empty() { format!("call_{seed}_{index}") } else { raw_id };
+            let arguments = if raw_args.is_empty() { "{}".to_string() } else { raw_args };
+            let args = serde_json::from_str(&arguments).unwrap_or_else(|_| json!({}));
             wire_calls.push(json!({
-                "id": id, "type": "function",
+                "id": id,
+                "type": "function",
                 "function": { "name": name, "arguments": arguments }
             }));
-            calls.push(ToolCall {
-                id,
-                name: name.into(),
-                args,
-            });
+            calls.push(ToolCall { id, name, args });
         }
         if !wire_calls.is_empty() {
             message["tool_calls"] = json!(wire_calls);
         }
+        Ok(ModelReply { message, text: self.text, calls })
     }
-    Ok(ModelReply {
-        message,
-        text,
-        calls,
-    })
 }
 
 fn call_anthropic(
@@ -616,6 +723,7 @@ fn call_anthropic(
     system: &str,
     messages: &[Value],
     tools: Option<&[ToolSpec]>,
+    mut on_delta: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ModelReply, String> {
     let base = provider.base_url.trim().trim_end_matches('/');
     let url = if base.ends_with("/messages") {
@@ -641,19 +749,45 @@ fn call_anthropic(
         ("x-api-key".into(), provider.api_key.trim().into()),
         ("anthropic-version".into(), "2023-06-01".into()),
     ];
-    let resp = post_json(&url, &headers, &body)?;
-    let blocks = resp
-        .get("content")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            format!(
-                "Anthropic 响应缺少 content: {}",
-                truncate_utf8(&resp.to_string(), 240)
-            )
-        })?;
+    if on_delta.is_some() {
+        body["stream"] = json!(true);
+    }
+    let mut notify = |chunk: &str| {
+        if let Some(cb) = on_delta.as_deref_mut() {
+            cb(chunk);
+        }
+    };
+    let mut acc = AnthropicStreamAcc::default();
+    let resp = post_json(&url, &headers, &body, |line| {
+        acc.feed_line(line, &mut notify);
+    })?;
+    if acc.saw_sse {
+        return acc.into_reply();
+    }
+    let reply = parse_anthropic_json(&resp, None)?;
+    if !reply.text.is_empty() {
+        notify(&reply.text);
+    }
+    Ok(reply)
+}
+
+fn parse_anthropic_json(resp: &Value, override_blocks: Option<Vec<Value>>) -> Result<ModelReply, String> {
+    let blocks = match override_blocks {
+        Some(b) => b,
+        None => resp
+            .get("content")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "Anthropic 响应缺少 content: {}",
+                    truncate_utf8(&resp.to_string(), 240)
+                )
+            })?,
+    };
     let mut texts = Vec::new();
     let mut calls = Vec::new();
-    for block in blocks {
+    for block in &blocks {
         match block["type"].as_str() {
             Some("text") => {
                 if let Some(text) = block["text"].as_str() {
@@ -662,11 +796,13 @@ fn call_anthropic(
             }
             Some("tool_use") => {
                 if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
-                    calls.push(ToolCall {
-                        id: id.into(),
-                        name: name.into(),
-                        args: block.get("input").cloned().unwrap_or_else(|| json!({})),
-                    });
+                    if !id.is_empty() && !name.is_empty() {
+                        calls.push(ToolCall {
+                            id: id.into(),
+                            name: name.into(),
+                            args: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                        });
+                    }
                 }
             }
             _ => {}
@@ -679,9 +815,100 @@ fn call_anthropic(
     })
 }
 
-fn post_json(url: &str, headers: &[(String, String)], body: &Value) -> Result<Value, String> {
+#[derive(Default)]
+struct AnthropicStreamAcc {
+    saw_sse: bool,
+    blocks: BTreeMap<usize, Value>,
+    partial_inputs: BTreeMap<usize, String>,
+    stream_error: Option<String>,
+}
+
+impl AnthropicStreamAcc {
+    fn feed_line(&mut self, line: &str, mut on_delta: impl FnMut(&str)) {
+        let Some(ev) = parse_sse_json(line, &mut self.saw_sse) else {
+            return;
+        };
+        match ev.get("type").and_then(Value::as_str) {
+            Some("error") => {
+                let msg = ev
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| ev.get("message").and_then(Value::as_str))
+                    .unwrap_or("Anthropic 流式响应错误");
+                self.stream_error = Some(msg.to_string());
+            }
+            Some("content_block_start") => {
+                let idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let Some(block) = ev.get("content_block") else {
+                    return;
+                };
+                if let Some(t) = block.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    on_delta(t);
+                }
+                self.blocks.insert(idx, block.clone());
+            }
+            Some("content_block_delta") => {
+                let idx = ev.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let Some(delta) = ev.get("delta") else {
+                    return;
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(t) = delta.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                            on_delta(t);
+                            let entry = self
+                                .blocks
+                                .entry(idx)
+                                .or_insert_with(|| json!({ "type": "text", "text": "" }));
+                            let cur = entry.get("text").and_then(Value::as_str).unwrap_or("");
+                            entry["text"] = Value::String(format!("{cur}{t}"));
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(part) = delta.get("partial_json").and_then(Value::as_str) {
+                            self.partial_inputs.entry(idx).or_default().push_str(part);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn into_reply(mut self) -> Result<ModelReply, String> {
+        if let Some(err) = self.stream_error {
+            return Err(err);
+        }
+        for (idx, raw) in self.partial_inputs {
+            if !raw.trim().is_empty() {
+                if let Some(block) = self.blocks.get_mut(&idx) {
+                    block["input"] = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+                }
+            }
+        }
+        parse_anthropic_json(&Value::Null, Some(self.blocks.into_values().collect()))
+    }
+}
+
+fn parse_sse_json(line: &str, saw_sse: &mut bool) -> Option<Value> {
+    let data = line.trim().strip_prefix("data:")?;
+    *saw_sse = true;
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(data).ok()
+}
+
+fn post_json(
+    url: &str,
+    headers: &[(String, String)],
+    body: &Value,
+    on_line: impl FnMut(&str),
+) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
-    let resp = post_bytes(url, headers, &bytes, 300).map_err(|err| match err {
+    let resp = post_stream(url, headers, &bytes, 300, on_line).map_err(|err| match err {
         HttpError::Launch(msg) => msg,
         HttpError::Wait(msg) => format!("等待 LLM 响应失败: {msg}"),
         HttpError::Transport { message, .. } => format!("网络请求失败: {message}"),
@@ -944,5 +1171,58 @@ mod tests {
         assert_eq!(capped["action"], 98);
         assert_eq!(capped["outcome_status"], "unknown");
         Ok(())
+    }
+
+    #[test]
+    fn openai_stream_acc_collects_reasoning_text_and_chunked_tool_calls() {
+        let lines = [
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"先分析"}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"再回答","content":"你好"}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"content":"，世界"}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"sh","arguments":"{\"comm"}}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"ell","arguments":"and\":\"ls\"}"}}]}}]}"#,
+            "data: [DONE]",
+        ];
+        let mut acc = OpenAiStreamAcc::default();
+        let mut deltas = Vec::new();
+        for line in lines {
+            acc.feed_line(line, |d| deltas.push(d.to_string()));
+        }
+        assert!(acc.saw_sse);
+        assert_eq!(deltas, vec!["你好", "，世界"]);
+        let reply = acc.into_reply(3).unwrap();
+        assert_eq!(reply.text, "你好，世界");
+        assert_eq!(reply.message["reasoning_content"], "先分析再回答");
+        assert_eq!(reply.calls.len(), 1);
+        assert_eq!(reply.calls[0].id, "call_1");
+        assert_eq!(reply.calls[0].name, "shell");
+        assert_eq!(reply.calls[0].args, json!({ "command": "ls" }));
+    }
+
+    #[test]
+    fn anthropic_stream_acc_collects_text_and_input_json_deltas() {
+        let lines = [
+            r#"event: content_block_start"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"正在"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"检查"}}"#,
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"shell","input":{}}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"pwd\"}"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ];
+        let mut acc = AnthropicStreamAcc::default();
+        let mut deltas = Vec::new();
+        for line in lines {
+            acc.feed_line(line, |d| deltas.push(d.to_string()));
+        }
+        assert!(acc.saw_sse);
+        assert_eq!(deltas, vec!["正在", "检查"]);
+        let reply = acc.into_reply().unwrap();
+        assert_eq!(reply.text, "正在检查");
+        assert_eq!(reply.calls.len(), 1);
+        assert_eq!(reply.calls[0].id, "toolu_1");
+        assert_eq!(reply.calls[0].name, "shell");
+        assert_eq!(reply.calls[0].args, json!({ "command": "pwd" }));
     }
 }

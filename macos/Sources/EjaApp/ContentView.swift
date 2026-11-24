@@ -40,12 +40,9 @@ struct ContentView: View {
                                 ForEach(visibleItems) { item in
                                     streamRow(item)
                                         .id(item.id)
-                                        .transition(.opacity.combined(with: .offset(y: 4)))
                                 }
                                 if client.status != "idle" {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                        .padding(.leading, 4)
+                                    busyRow
                                         .id("eja-busy")
                                 }
                             }
@@ -54,7 +51,6 @@ struct ContentView: View {
                             .padding(.horizontal, 28)
                             .padding(.top, 16)
                             .padding(.bottom, 24)
-                            .animation(.easeOut(duration: 0.18), value: visibleItems.count)
                         }
                         .contentMargins(.top, 38, for: .scrollContent)
                         .scrollIndicators(.never)
@@ -71,12 +67,17 @@ struct ContentView: View {
                         )
                         .onChange(of: visibleItems.last?.id) { _, lastId in
                             if let lastId {
-                                withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(lastId, anchor: .bottom) }
+                                proxy.scrollTo(lastId, anchor: .bottom)
                             }
                         }
                         .onChange(of: client.status) { _, newStatus in
                             if newStatus != "idle" {
-                                withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo("eja-busy", anchor: .bottom) }
+                                proxy.scrollTo("eja-busy", anchor: .bottom)
+                            }
+                        }
+                        .onChange(of: client.streamingText) { _, text in
+                            if !text.isEmpty {
+                                proxy.scrollTo("eja-busy", anchor: .bottom)
                             }
                         }
                     }
@@ -207,6 +208,29 @@ struct ContentView: View {
         }
     }
 
+    private var streamingPreview: String {
+        client.streamingText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @ViewBuilder
+    private var busyRow: some View {
+        let preview = streamingPreview
+        if !preview.isEmpty {
+            ejaTextRow(preview)
+        } else {
+            HStack(spacing: 7) {
+                ProgressView()
+                    .controlSize(.small)
+                if !client.statusDetail.isEmpty {
+                    Text(client.statusDetail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(EjaTheme.inkMuted)
+                }
+            }
+            .padding(.leading, 4)
+        }
+    }
+
     private var canSend: Bool {
         !ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -239,15 +263,19 @@ struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
         default:
-            HStack {
-                markdownText(item.text)
-                    .font(.system(size: 13.5))
-                    .lineSpacing(4.5)
-                    .foregroundStyle(EjaTheme.ink)
-                    .textSelection(.enabled)
-                    .padding(.leading, 2)
-                Spacer(minLength: 36)
-            }
+            ejaTextRow(item.text)
+        }
+    }
+
+    private func ejaTextRow(_ text: String) -> some View {
+        HStack {
+            markdownText(text)
+                .font(.system(size: 13.5))
+                .lineSpacing(4.5)
+                .foregroundStyle(EjaTheme.ink)
+                .textSelection(.enabled)
+                .padding(.leading, 2)
+            Spacer(minLength: 36)
         }
     }
 

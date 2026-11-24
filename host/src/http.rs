@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -25,7 +25,7 @@ pub fn get_bytes(
     headers: &[(String, String)],
     timeout_secs: u64,
 ) -> Result<HttpResponse, HttpError> {
-    request_bytes("GET", true, url, headers, None, timeout_secs)
+    request_bytes("GET", true, url, headers, None, timeout_secs, None)
 }
 
 pub fn post_bytes(
@@ -34,7 +34,25 @@ pub fn post_bytes(
     body: &[u8],
     timeout_secs: u64,
 ) -> Result<HttpResponse, HttpError> {
-    request_bytes("POST", false, url, headers, Some(body), timeout_secs)
+    request_bytes("POST", false, url, headers, Some(body), timeout_secs, None)
+}
+
+pub fn post_stream(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    timeout_secs: u64,
+    mut on_line: impl FnMut(&str),
+) -> Result<HttpResponse, HttpError> {
+    request_bytes(
+        "POST",
+        false,
+        url,
+        headers,
+        Some(body),
+        timeout_secs,
+        Some(&mut on_line),
+    )
 }
 
 fn request_bytes(
@@ -44,6 +62,7 @@ fn request_bytes(
     headers: &[(String, String)],
     body: Option<&[u8]>,
     timeout_secs: u64,
+    on_line: Option<&mut dyn FnMut(&str)>,
 ) -> Result<HttpResponse, HttpError> {
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
@@ -54,6 +73,9 @@ fn request_bytes(
         "--max-time",
         &timeout_secs.max(1).to_string(),
     ]);
+    if on_line.is_some() {
+        cmd.arg("-N");
+    }
     if follow_redirects {
         cmd.arg("-L");
     }
@@ -81,16 +103,59 @@ fn request_bytes(
             let _ = stdin.write_all(&payload);
         });
     }
-    let output = child
-        .wait_with_output()
+    let stderr_handle = child.stderr.take().map(|mut err_pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err_pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let mut reader = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| HttpError::Launch("无法获取 curl stdout".into()))?,
+    );
+    let (mut raw, mut line_buf, mut in_headers, mut status_code) =
+        (String::new(), Vec::new(), true, 0u16);
+    let mut on_line = on_line;
+    loop {
+        line_buf.clear();
+        if reader
+            .read_until(b'\n', &mut line_buf)
+            .map_err(|err| HttpError::Wait(format!("等待 HTTP 响应失败: {err}")))?
+            == 0
+        {
+            break;
+        }
+        let line = String::from_utf8_lossy(&line_buf);
+        raw.push_str(&line);
+        if in_headers {
+            if let Some(rest) = line.strip_prefix("HTTP/") {
+                status_code = rest
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+            } else if (line == "\r\n" || line == "\n") && !(100..200).contains(&status_code) {
+                in_headers = false;
+            }
+        } else if (200..300).contains(&status_code) {
+            if let Some(cb) = on_line.as_deref_mut() {
+                cb(line.trim_end_matches(['\r', '\n']));
+            }
+        }
+    }
+    let status = child
+        .wait()
         .map_err(|err| HttpError::Wait(format!("等待 HTTP 响应失败: {err}")))?;
-    if !output.status.success() {
+    if !status.success() {
+        let stderr = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
         return Err(HttpError::Transport {
-            exit_code: output.status.code(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            exit_code: status.code(),
+            message: String::from_utf8_lossy(&stderr).trim().to_string(),
         });
     }
-    let raw = String::from_utf8_lossy(&output.stdout);
     parse_http_response(&raw)
 }
 

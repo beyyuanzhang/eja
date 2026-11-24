@@ -119,4 +119,39 @@ for line in sys.stdin:
                 && restarted.connectorStatuses.first?.connected == true
         })
     }
+
+    @Test
+    @MainActor
+    func streamingDeltaAndActivityEventsConvergeOnState() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = HostClient(hostExecutableURL: URL(fileURLWithPath: "/bin/cat"), dataDir: dir)
+        defer { client.shutdown() }
+
+        client.handleEventLine(
+            Data(#"{"event":"state","status":"thinking","status_detail":"思考中…","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"connectors":[]},"connector_statuses":[],"stream":[]}"#.utf8)
+        )
+        #expect(client.status == "thinking")
+        #expect(client.statusDetail == "思考中…")
+        #expect(client.streamingText == "")
+
+        client.handleEventLine(Data(#"{"event":"delta","text":"你好"}"#.utf8))
+        client.handleEventLine(Data(#"{"event":"delta","text":"，世界"}"#.utf8))
+        #expect(client.streamingText == "你好，世界")
+
+        client.handleEventLine(Data(#"{"event":"activity","status_detail":"执行 Shell"}"#.utf8))
+        #expect(client.statusDetail == "执行 Shell")
+        #expect(client.streamingText == "")
+
+        client.handleEventLine(Data(#"{"event":"delta","text":"最终回复"}"#.utf8))
+        #expect(client.streamingText == "最终回复")
+
+        client.handleEventLine(
+            Data(#"{"event":"state","status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"connectors":[]},"connector_statuses":[],"stream":[{"id":1,"kind":"eja","text":"最终回复"}]}"#.utf8)
+        )
+        #expect(client.status == "idle")
+        #expect(client.statusDetail == "在线")
+        #expect(client.streamingText == "")
+        #expect(client.stream.last?.text == "最终回复")
+    }
 }
