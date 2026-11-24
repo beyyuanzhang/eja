@@ -6,11 +6,11 @@ public enum UiRuntime {
     #!/usr/bin/env bash
     set -euo pipefail
     UI_DIR="$(cd "$(dirname "$0")" && pwd)"
-    swift build --package-path "$UI_DIR" --product EjaApp --disable-sandbox
-    BIN="$(swift build --package-path "$UI_DIR" --product EjaApp --disable-sandbox --show-bin-path)/EjaApp"
-    rm -rf "$UI_DIR/Eja.app" "$UI_DIR/Eja.app.tmp"
-    STAGE="$UI_DIR/EjaUI.tmp"
-    TARGET="$UI_DIR/EjaUI"
+    swift build --package-path "$UI_DIR" --product EjaUI --disable-sandbox
+    BIN="$(swift build --package-path "$UI_DIR" --product EjaUI --disable-sandbox --show-bin-path)/libEjaUI.dylib"
+    rm -rf "$UI_DIR/Eja.app" "$UI_DIR/Eja.app.tmp" "$UI_DIR/EjaUI" "$UI_DIR/EjaUI.tmp"
+    STAGE="$UI_DIR/libEjaUI.dylib.tmp"
+    TARGET="$UI_DIR/libEjaUI.dylib"
     rm -f "$STAGE"
     cp "$BIN" "$STAGE"
     chmod 755 "$STAGE"
@@ -19,11 +19,15 @@ public enum UiRuntime {
     """
 
     public static func evolvedExecutable(in dataDir: URL) -> URL {
-        dataDir.appendingPathComponent("ui/EjaUI")
+        dataDir.appendingPathComponent("ui/libEjaUI.dylib")
     }
 
     public static func reloadBaselineFile(in dataDir: URL) -> URL {
         dataDir.appendingPathComponent("ui/.reload-baseline")
+    }
+
+    public static func factoryDigestFile(in dataDir: URL) -> URL {
+        dataDir.appendingPathComponent("ui/.factory-digest")
     }
 
     public static func resolveTemplateDir() -> URL? {
@@ -48,18 +52,21 @@ public enum UiRuntime {
     public static func bootstrapIfNeeded(dataDir: URL, templateDir: URL? = nil) -> Bool {
         let uiDir = dataDir.appendingPathComponent("ui", isDirectory: true)
         let fm = FileManager.default
-        if !fm.fileExists(atPath: uiDir.appendingPathComponent("Package.swift").path) {
+        let pkgURL = uiDir.appendingPathComponent("Package.swift")
+        let pkgText = try? String(contentsOf: pkgURL, encoding: .utf8)
+        let needsTemplateSync = !(pkgText?.contains("name: \"EjaUI\"") ?? false)
+        if needsTemplateSync {
             guard let source = templateDir ?? resolveTemplateDir(),
                   (try? copyTemplate(from: source, to: uiDir)) != nil else { return false }
         }
         let legacyBundle = uiDir.appendingPathComponent("Eja.app", isDirectory: true)
         if fm.fileExists(atPath: legacyBundle.path) {
-            let legacyExec = legacyBundle.appendingPathComponent("Contents/MacOS/EjaApp")
-            let targetExec = evolvedExecutable(in: dataDir)
-            if fm.isExecutableFile(atPath: legacyExec.path) && !fm.fileExists(atPath: targetExec.path) {
-                try? fm.copyItem(at: legacyExec, to: targetExec)
-            }
             try? fm.removeItem(at: legacyBundle)
+        }
+        try? fm.removeItem(at: uiDir.appendingPathComponent("EjaUI"))
+        if let factoryDigest = ProcessInfo.processInfo.environment["EJA_FACTORY_UI_DIGEST"],
+           !factoryDigest.isEmpty {
+            try? factoryDigest.write(to: factoryDigestFile(in: dataDir), atomically: true, encoding: .utf8)
         }
         writeApplyScript(in: uiDir)
         return true
@@ -98,28 +105,31 @@ public enum UiRuntime {
     }
 
     public static func needsHotSwap(in dataDir: URL) -> Bool {
-        guard Bundle.main.bundleURL.pathExtension == "app",
-              let currentExec = Bundle.main.executableURL else { return false }
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return false }
         let staged = evolvedExecutable(in: dataDir)
-        guard FileManager.default.isExecutableFile(atPath: staged.path),
-              let stagedDigest = binaryDigest(at: staged),
-              let currentDigest = binaryDigest(at: currentExec) else { return false }
+        guard FileManager.default.fileExists(atPath: staged.path),
+              let stagedDigest = binaryDigest(at: staged) else { return false }
+        let loadedDigest = ProcessInfo.processInfo.environment["EJA_LOADED_UI_DIGEST"]
+            ?? Bundle.main.executableURL.flatMap {
+                binaryDigest(at: $0.deletingLastPathComponent().appendingPathComponent("libEjaUI.dylib"))
+            }
+        guard let currentDigest = loadedDigest else { return false }
         return stagedDigest != currentDigest
     }
 
     @discardableResult
     public static func restoreFactoryIfNeeded(in dataDir: URL, shutdown: () -> Void) -> Bool {
-        guard Bundle.main.bundleURL.pathExtension == "app",
-              let currentExec = Bundle.main.executableURL else { return false }
         let fm = FileManager.default
-        let factoryExec = currentExec.deletingLastPathComponent().appendingPathComponent("EjaApp.factory")
         let staged = evolvedExecutable(in: dataDir)
+        let hadStaged = fm.fileExists(atPath: staged.path)
         try? fm.removeItem(at: staged)
-        guard fm.isExecutableFile(atPath: factoryExec.path),
-              let factoryDigest = binaryDigest(at: factoryExec),
-              let currentDigest = binaryDigest(at: currentExec),
-              factoryDigest != currentDigest else { return false }
-        return replaceAndRelaunch(sourceBinary: factoryExec, currentExec: currentExec, removeSource: false, shutdown: shutdown)
+        let loadedDigest = ProcessInfo.processInfo.environment["EJA_LOADED_UI_DIGEST"]
+        let factoryDigest = ProcessInfo.processInfo.environment["EJA_FACTORY_UI_DIGEST"]
+        guard Bundle.main.bundleURL.pathExtension == "app",
+              hadStaged || (loadedDigest != nil && factoryDigest != nil && loadedDigest != factoryDigest) else {
+            return false
+        }
+        return relaunchApp(shutdown: shutdown)
     }
 
     @discardableResult
@@ -128,14 +138,13 @@ public enum UiRuntime {
         baselineId: Int64,
         shutdown: () -> Void
     ) -> Bool {
-        guard Bundle.main.bundleURL.pathExtension == "app",
-              let currentExec = Bundle.main.executableURL else { return false }
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return false }
         let staged = evolvedExecutable(in: dataDir)
         let fm = FileManager.default
-        guard fm.isExecutableFile(atPath: staged.path) else { return false }
-        let factoryExec = currentExec.deletingLastPathComponent().appendingPathComponent("EjaApp.factory")
-        if !fm.fileExists(atPath: factoryExec.path) {
-            try? fm.copyItem(at: currentExec, to: factoryExec)
+        guard fm.fileExists(atPath: staged.path) else { return false }
+        if let factoryDigest = ProcessInfo.processInfo.environment["EJA_FACTORY_UI_DIGEST"],
+           !factoryDigest.isEmpty {
+            try? factoryDigest.write(to: factoryDigestFile(in: dataDir), atomically: true, encoding: .utf8)
         }
         if baselineId >= 0 {
             try? "\(baselineId)".write(
@@ -144,35 +153,10 @@ public enum UiRuntime {
                 encoding: .utf8
             )
         }
-        return replaceAndRelaunch(sourceBinary: staged, currentExec: currentExec, removeSource: true, shutdown: shutdown)
+        return relaunchApp(shutdown: shutdown)
     }
 
-    private static func replaceAndRelaunch(
-        sourceBinary: URL,
-        currentExec: URL,
-        removeSource: Bool,
-        shutdown: () -> Void
-    ) -> Bool {
-        let fm = FileManager.default
-        let tmpExec = currentExec.deletingLastPathComponent().appendingPathComponent("EjaApp.next")
-        try? fm.removeItem(at: tmpExec)
-        do {
-            try fm.copyItem(at: sourceBinary, to: tmpExec)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tmpExec.path)
-            let sign = Process()
-            sign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-            sign.arguments = ["--force", "--sign", "-", tmpExec.path]
-            try? sign.run()
-            sign.waitUntilExit()
-            if removeSource && sourceBinary != currentExec {
-                try? fm.removeItem(at: sourceBinary)
-            }
-            _ = try fm.replaceItemAt(currentExec, withItemAt: tmpExec)
-        } catch {
-            try? fm.removeItem(at: tmpExec)
-            return false
-        }
-
+    private static func relaunchApp(shutdown: () -> Void) -> Bool {
         shutdown()
         let pid = ProcessInfo.processInfo.processIdentifier
         let appPath = Bundle.main.bundleURL.path

@@ -11,17 +11,19 @@ VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${REPO_DIR}/Cargo.toml" | hea
 echo "[1/3] Building eja-host (Rust release)..."
 (cd "${REPO_DIR}" && MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release -p eja-host)
 
-echo "[2/3] Building EjaApp (SwiftPM release)..."
+echo "[2/3] Building EjaApp & EjaUI (SwiftPM release)..."
 (cd "${MACOS_DIR}" && swift build -c release -debug-info-format none --product EjaApp --disable-sandbox)
+(cd "${MACOS_DIR}" && swift build -c release -debug-info-format none --product EjaUI --disable-sandbox)
 
 APP_BIN="${MACOS_DIR}/.build/release/EjaApp"
+UI_DYLIB="${MACOS_DIR}/.build/release/libEjaUI.dylib"
 HOST_BIN="${REPO_DIR}/target/release/eja-host"
 
 echo "[3/3] Assembling ${APP_DIR}..."
 rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources/ui-template"
 cp "${APP_BIN}" "${APP_DIR}/Contents/MacOS/EjaApp"
-cp "${APP_BIN}" "${APP_DIR}/Contents/MacOS/EjaApp.factory"
+cp "${UI_DYLIB}" "${APP_DIR}/Contents/MacOS/libEjaUI.dylib"
 cp "${HOST_BIN}" "${APP_DIR}/Contents/MacOS/eja-host"
 cp "${REPO_DIR}/PROTOCOL.md" "${APP_DIR}/Contents/Resources/PROTOCOL.md"
 cp "${MACOS_DIR}/Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"

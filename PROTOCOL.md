@@ -22,7 +22,7 @@ eja-host --data-dir "<data_dir>"
 - `keep({text, checker})` 可绑定检查规则。绑定后，`release({concern, witness_fact_id})` 要求引用当前挂念版本之后的同一规则命中记录，并在该规则不再被其他活跃挂念引用时自动清理其剩余守望。旧脚本守望在启动时停用。旧版要求验收的挂念可用 `keep` 绑定新规则。
 - 模型回合至少需要 256 字节的上下文窗口。设置低于下限时，宿主保留待处理请求，并在设置恢复后继续处理。
 - `capabilities.json` 保存统一能力数组（内嵌默认常驻的 `builtin` `shell` 能力、自由实现的 `exec` 本地插件能力，以及 `stdio` / `http` MCP 能力），文件变更在运行期自动热加载。`exec` 插件通过 `stdin` 接收参数 JSON、向 `stdout` 输出结果文本（退出码 `0` 为 `Observed`，非 `0` 为 `Failed`），零协议框架绑定。HTTP 能力支持标准 MCP OAuth 2.1（RFC 9728 / RFC 8414 元数据发现、RFC 7591 动态客户端注册 + PKCE 本地回环回调，以及 RFC 8628 设备码授权流如 GitHub 官方 MCP）；OAuth Token 保存在内核目录 `oauth.json` 并由宿主自动注入与刷新，`capabilities.json` 无需保存明文 Token。
-- `ui/` 保存用户空间前端源码。运行 `ui/apply.sh` 编译生成单文件可执行程序 `ui/EjaUI`（不在数据目录生成第二个 `.app` 包），运行中的 `Eja.app` 在当前回合空闲（`status == "idle"`）时自动将 `ui/EjaUI` 原地热更新至自身界面二进制并无缝重启（保留 `EjaApp.factory` 出厂备份；启动时按住 `Option` 键自动恢复出厂默认界面）。
+- `ui/` 保存用户空间前端源码。`/Applications/Eja.app` 安装后保持只读不可变（`Contents/MacOS/EjaApp` 为固定签名的不可变启动壳，确保 macOS TCC 权限与 `CDHash` 永久有效）。运行 `ui/apply.sh` 编译生成用户空间动态库 `ui/libEjaUI.dylib`，运行中的 `Eja.app` 在当前回合空闲（`status == "idle"`）时自动无缝重启并由启动壳通过 `dlopen` 加载最新 `ui/libEjaUI.dylib`（加载失败或启动时按住 `Option` 键自动回退至包内出厂 `Contents/MacOS/libEjaUI.dylib`）。
 
 ## 兼容性约定
 

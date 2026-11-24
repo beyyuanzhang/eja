@@ -8,17 +8,22 @@ let package = Package(
     ],
     products: [
         .library(name: "EjaClient", targets: ["EjaClient"]),
-        .executable(name: "EjaApp", targets: ["EjaApp"]),
+        .library(name: "EjaUI", type: .dynamic, targets: ["EjaUI"]),
+        .executable(name: "EjaApp", targets: ["EjaLauncher"]),
     ],
     targets: [
         .target(
             name: "EjaClient",
             path: "Sources/EjaClient"
         ),
-        .executableTarget(
-            name: "EjaApp",
+        .target(
+            name: "EjaUI",
             dependencies: ["EjaClient"],
             path: "Sources/EjaApp"
+        ),
+        .executableTarget(
+            name: "EjaLauncher",
+            path: "Sources/EjaLauncher"
         ),
         .testTarget(
             name: "EjaAppTests",

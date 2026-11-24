@@ -37,7 +37,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@main
+@_cdecl("eja_ui_main")
+public func eja_ui_main() {
+    EjaApp.main()
+}
+
 struct EjaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var client = HostClient()
