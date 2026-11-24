@@ -3,9 +3,10 @@ import CryptoKit
 import Darwin
 import Foundation
 
-private func sha256(at url: URL) -> String? {
-    guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
-    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+private func binaryDigest(at url: URL) -> String? {
+    (try? Data(contentsOf: url, options: .mappedIfSafe)).map {
+        SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 private func resolveDataDir() -> URL {
@@ -28,15 +29,13 @@ private func isSafeModeRequested() -> Bool {
 }
 
 @discardableResult
-private func loadAndRun(dylibURL: URL) -> Bool {
-    guard FileManager.default.fileExists(atPath: dylibURL.path),
-          let handle = dlopen(dylibURL.path, RTLD_NOW | RTLD_GLOBAL),
-          let sym = dlsym(handle, "eja_ui_main") else {
+private func loadAndRun(dylibURL: URL, digest: String) -> Bool {
+    guard let handle = dlopen(dylibURL.path, RTLD_NOW | RTLD_LOCAL) else { return false }
+    guard let sym = dlsym(handle, "eja_ui_main") else {
+        dlclose(handle)
         return false
     }
-    if let digest = sha256(at: dylibURL) {
-        setenv("EJA_LOADED_UI_DIGEST", digest, 1)
-    }
+    setenv("EJA_LOADED_UI_DIGEST", digest, 1)
     typealias EntryPoint = @convention(c) () -> Void
     let entry = unsafeBitCast(sym, to: EntryPoint.self)
     entry()
@@ -46,40 +45,39 @@ private func loadAndRun(dylibURL: URL) -> Bool {
 let fm = FileManager.default
 let execURL = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
     .resolvingSymlinksInPath()
-let execDir = execURL.deletingLastPathComponent()
-let factoryDylib = execDir.appendingPathComponent("libEjaUI.dylib")
-let factoryDigest = sha256(at: factoryDylib) ?? ""
-if !factoryDigest.isEmpty {
-    setenv("EJA_FACTORY_UI_DIGEST", factoryDigest, 1)
-}
-
-let dataDir = resolveDataDir()
+let factoryDylib = execURL.deletingLastPathComponent().appendingPathComponent("libEjaUI.dylib")
+let dataDir = resolveDataDir().standardizedFileURL
+setenv("EJA_DATA_DIR", dataDir.path, 1)
 let uiDir = dataDir.appendingPathComponent("ui", isDirectory: true)
 let evolvedDylib = uiDir.appendingPathComponent("libEjaUI.dylib")
 let stampFile = uiDir.appendingPathComponent(".factory-digest")
-try? fm.removeItem(at: uiDir.appendingPathComponent("EjaUI"))
 
 let safeMode = isSafeModeRequested()
+setenv("EJA_SAFE_MODE", safeMode ? "1" : "0", 1)
 if safeMode {
-    setenv("EJA_SAFE_MODE", "1", 1)
     try? fm.removeItem(at: evolvedDylib)
-} else if !factoryDigest.isEmpty {
+}
+let factoryDigest = binaryDigest(at: factoryDylib)
+if let factoryDigest {
     let recorded = (try? String(contentsOf: stampFile, encoding: .utf8))?
         .trimmingCharacters(in: .whitespacesAndNewlines)
-    if recorded != factoryDigest {
+    if recorded == factoryDigest {
+        if !safeMode, let digest = binaryDigest(at: evolvedDylib) {
+            if loadAndRun(dylibURL: evolvedDylib, digest: digest) { exit(0) }
+            try? fm.removeItem(at: evolvedDylib)
+        }
+    } else {
         try? fm.removeItem(at: evolvedDylib)
-        try? fm.removeItem(at: stampFile)
+        if !fm.fileExists(atPath: evolvedDylib.path) {
+            try? fm.createDirectory(at: uiDir, withIntermediateDirectories: true)
+            try? factoryDigest.write(to: stampFile, atomically: true, encoding: .utf8)
+        }
     }
 }
 
-if !safeMode && fm.fileExists(atPath: evolvedDylib.path) {
-    if loadAndRun(dylibURL: evolvedDylib) {
-        exit(0)
-    }
-    try? fm.removeItem(at: evolvedDylib)
-}
-
-if !loadAndRun(dylibURL: factoryDylib) {
+if let factoryDigest, loadAndRun(dylibURL: factoryDylib, digest: factoryDigest) {
+    exit(0)
+} else {
     fputs("Failed to load EJA UI runtime at \(factoryDylib.path)\n", stderr)
     exit(1)
 }

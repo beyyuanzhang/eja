@@ -20,83 +20,58 @@ final class SettingsDraft: ObservableObject {
     @Published var newModelInput: String = ""
     @Published var rawCommandLines: [String: String] = [:]
 
-    private var savedProviders: [ProviderConfigDTO] = []
-    private var savedJudge = ModelRefDTO()
-    private var savedCapabilities: [CapabilityConfigDTO] = []
+    private var saved = HostConfigDTO()
+    private var pendingSave: (id: UUID, config: HostConfigDTO)?
     private weak var client: HostClient?
     private var saveTask: Task<Void, Never>?
-    private var hasAutoSynced = false
-    private var hasLoadedInitialConfig = false
 
     func attach(client: HostClient) {
         self.client = client
     }
 
     func load(from config: HostConfigDTO) {
-        if !config.providers.isEmpty || !config.capabilities.isEmpty {
-            hasLoadedInitialConfig = true
-        }
         providers = config.providers
         judge = config.judge
-        capabilities = config.capabilities
-        for cap in capabilities where rawCommandLines[cap.id] == nil {
-            rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
-        }
-        savedProviders = providers
-        savedJudge = judge
-        savedCapabilities = capabilities
+        applyCapabilities(config.capabilities)
+        saved = config
 
         if healJudgeModelIfNeeded() {
             scheduleSave()
         }
-        if let first = providers.first,
-           providers.count == 1,
-           first.models.isEmpty || (first.baseUrl.isEmpty && !first.hasApiKey) {
-            expandedProvider = first.id
+    }
+
+    func syncWithHost(_ latest: HostConfigDTO) {
+        guard pendingSave == nil else { return }
+        applyConfirmed(latest, matching: saved)
+    }
+
+    private func applyConfirmed(_ latest: HostConfigDTO, matching baseline: HostConfigDTO) {
+        if providers == baseline.providers { providers = latest.providers }
+        if judge == baseline.judge { judge = latest.judge }
+        if capabilities == baseline.capabilities { applyCapabilities(latest.capabilities) }
+        saved = latest
+    }
+
+    private func applyCapabilities(_ latest: [CapabilityConfigDTO]) {
+        let previous = capabilities
+        capabilities = latest
+        let ids = Set(latest.map(\.id))
+        rawCommandLines = rawCommandLines.filter { ids.contains($0.key) }
+        for cap in latest where rawCommandLines[cap.id] == nil
+            || previous.first(where: { $0.id == cap.id })?.transport != cap.transport {
+            rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
         }
-        if !hasAutoSynced && !providers.isEmpty {
-            hasAutoSynced = true
-            for provider in providers where Self.isLocalEndpoint(provider.baseUrl) {
-                fetchModels(for: provider.id)
-            }
+        if let id = expandedCapability, !latest.contains(where: { $0.id == id }) {
+            expandedCapability = nil
         }
     }
 
-    func syncExternalConfig(_ latest: HostConfigDTO) {
-        if !hasLoadedInitialConfig {
-            if !latest.providers.isEmpty || !latest.capabilities.isEmpty {
-                load(from: latest)
-            }
-            return
-        }
-        if !providersDirty {
-            for idx in providers.indices {
-                if let remote = latest.providers.first(where: { $0.id == providers[idx].id }) {
-                    providers[idx].hasApiKey = remote.hasApiKey
-                }
-            }
-            savedProviders = providers
-        }
-        if !capabilitiesDirty {
-            capabilities = latest.capabilities
-            savedCapabilities = latest.capabilities
-            for cap in latest.capabilities {
-                rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
-            }
-            if let id = expandedCapability, !latest.capabilities.contains(where: { $0.id == id }) {
-                expandedCapability = nil
-            }
-        }
+    private var current: HostConfigDTO {
+        HostConfigDTO(providers: providers, judge: judge, capabilities: capabilities)
     }
 
-    var providersDirty: Bool { providers != savedProviders || judge != savedJudge }
-    var capabilitiesDirty: Bool { capabilities != savedCapabilities }
-    var isDirty: Bool { providersDirty || capabilitiesDirty }
-
-    func markSaved() {
-        savedProviders = providers
-        savedJudge = judge
-        savedCapabilities = capabilities
+    private var lastSubmitted: HostConfigDTO {
+        pendingSave?.config ?? saved
     }
 
     @discardableResult
@@ -194,7 +169,7 @@ final class SettingsDraft: ObservableObject {
         }
         flushSave()
         if !preset.baseUrl.isEmpty {
-            fetchModels(for: uniqueId, selectFirstIfNeeded: true)
+            fetchModels(for: uniqueId)
         }
     }
 
@@ -208,6 +183,13 @@ final class SettingsDraft: ObservableObject {
         }
         if expandedProvider == id { expandedProvider = nil }
         flushSave()
+    }
+
+    func changeEndpoint(_ index: Int, field: WritableKeyPath<ProviderConfigDTO, String>, to value: String) {
+        guard providers.indices.contains(index), providers[index][keyPath: field] != value else { return }
+        providers[index][keyPath: field] = value
+        providers[index].apiKey = ""
+        providers[index].hasApiKey = false
     }
 
     func addCapability() {
@@ -231,7 +213,8 @@ final class SettingsDraft: ObservableObject {
     }
 
     func scheduleSave() {
-        guard isDirty else { return }
+        guard providers != lastSubmitted.providers || judge != lastSubmitted.judge
+            || capabilities != lastSubmitted.capabilities else { return }
         saveTask?.cancel()
         saveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 350_000_000)
@@ -243,130 +226,46 @@ final class SettingsDraft: ObservableObject {
     func flushSave() {
         saveTask?.cancel()
         saveTask = nil
-        guard isDirty, let client else { return }
-        let providers = providersDirty ? providers : nil
-        let judge = providersDirty ? judge : nil
-        let capabilities = capabilitiesDirty ? capabilities : nil
-        guard providers != nil || capabilities != nil else { return }
-        client.saveConfigPatch(providers: providers, judge: judge, capabilities: capabilities)
-        markSaved()
+        guard let client else { return }
+        let draft = current
+        let previous = lastSubmitted
+        let modelsChanged = draft.providers != previous.providers || draft.judge != previous.judge
+        let capabilitiesChanged = draft.capabilities != previous.capabilities
+        guard modelsChanged || capabilitiesChanged else { return }
+        let id = UUID()
+        pendingSave = (id, draft)
+        client.saveConfig(
+            providers: modelsChanged ? draft.providers : nil,
+            judge: modelsChanged ? draft.judge : nil,
+            capabilities: capabilitiesChanged ? draft.capabilities : nil,
+            id: id
+        ) { [weak self] confirmed in
+            guard let self, self.pendingSave?.id == id else { return }
+            self.pendingSave = nil
+            self.applyConfirmed(confirmed, matching: draft)
+        }
     }
 
-    func fetchModels(for providerId: String, selectFirstIfNeeded: Bool = false) {
-        guard let index = providers.firstIndex(where: { $0.id == providerId }) else { return }
-        let provider = providers[index]
-        let rawBase = provider.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawBase.isEmpty else { return }
-
-        let cleanBase = rawBase.hasSuffix("/") ? String(rawBase.dropLast()) : rawBase
-        let urlString = (provider.kind == "anthropic" && !cleanBase.hasSuffix("/v1"))
-            ? "\(cleanBase)/v1/models"
-            : "\(cleanBase)/models"
-        guard let url = URL(string: urlString) else { return }
-
-        let apiKey = resolveApiKey(for: provider)
-        fetchingProviders.insert(providerId)
-
-        Task { @MainActor [weak self] in
+    func fetchModels(for providerId: String) {
+        guard let client, let provider = providers.first(where: { $0.id == providerId }),
+              !provider.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              fetchingProviders.insert(providerId).inserted else { return }
+        client.listModels(for: provider) { [weak self] discovered in
             defer { self?.fetchingProviders.remove(providerId) }
-            var req = URLRequest(url: url)
-            req.httpMethod = "GET"
-            req.timeoutInterval = 8
-            if !apiKey.isEmpty {
-                if provider.kind == "anthropic" {
-                    req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-                    req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-                } else {
-                    req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                }
-            }
-
-            guard let (data, response) = try? await URLSession.shared.data(for: req),
-                  let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode) else { return }
-
-            let discovered = Self.parseModelIds(from: data)
-            guard !discovered.isEmpty,
+            guard let discovered, !discovered.isEmpty,
                   let self,
-                  let idx = self.providers.firstIndex(where: { $0.id == providerId }) else { return }
+                  let idx = self.providers.firstIndex(where: { $0.id == providerId }),
+                  self.providers[idx].kind == provider.kind,
+                  self.providers[idx].baseUrl == provider.baseUrl,
+                  self.providers[idx].apiKey.isEmpty || self.providers[idx].apiKey == provider.apiKey else { return }
 
-            var merged: [String] = []
-            for m in discovered where !merged.contains(m) {
-                merged.append(m)
+            let existing = self.providers[idx].models.filter { model in
+                !discovered.contains(model) && !discovered.contains { $0.lowercased().hasSuffix("/" + model.lowercased()) }
             }
-            for existing in self.providers[idx].models where !merged.contains(existing) {
-                let hasSuffixed = merged.contains { $0.lowercased().hasSuffix("/" + existing.lowercased()) }
-                if !hasSuffixed {
-                    merged.append(existing)
-                }
-            }
-
-            if self.providers[idx].models != merged {
-                self.providers[idx].models = merged
-            }
+            self.providers[idx].models = discovered + existing
             _ = self.healJudgeModelIfNeeded()
-            if selectFirstIfNeeded || self.judge.providerId.isEmpty || (self.judge.providerId == providerId && self.judge.model.isEmpty) {
-                if let first = merged.first {
-                    self.judge = ModelRefDTO(providerId: providerId, model: first)
-                }
-            }
             self.flushSave()
         }
-    }
-
-    private func resolveApiKey(for provider: ProviderConfigDTO) -> String {
-        let direct = provider.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !direct.isEmpty { return direct }
-        guard provider.hasApiKey else { return "" }
-        let configURL: URL
-        if let dataDir = client?.dataDir, !dataDir.isEmpty {
-            let dataURL = URL(fileURLWithPath: dataDir, isDirectory: true)
-            let folderName = dataURL.lastPathComponent
-            let coreName = folderName == "Eja" ? "ai.eja.kernel" : "\(folderName).kernel"
-            configURL = dataURL.deletingLastPathComponent()
-                .appendingPathComponent(coreName, isDirectory: true)
-                .appendingPathComponent("config.json")
-        } else {
-            configURL = URL(fileURLWithPath: NSHomeDirectory())
-                .appendingPathComponent("Library/Application Support/ai.eja.kernel/config.json")
-        }
-        guard let data = try? Data(contentsOf: configURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let list = json["providers"] as? [[String: Any]],
-              let item = list.first(where: { ($0["id"] as? String) == provider.id }),
-              let key = item["api_key"] as? String else {
-            return ""
-        }
-        return key.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func parseModelIds(from data: Data) -> [String] {
-        guard let obj = try? JSONSerialization.jsonObject(with: data) else { return [] }
-        var items: [[String: Any]] = []
-        if let dict = obj as? [String: Any] {
-            if let dataArr = dict["data"] as? [[String: Any]] {
-                items = dataArr
-            } else if let modelsArr = dict["models"] as? [[String: Any]] {
-                items = modelsArr
-            }
-        } else if let arr = obj as? [[String: Any]] {
-            items = arr
-        }
-        var ids: [String] = []
-        for item in items {
-            if let id = (item["id"] as? String) ?? (item["name"] as? String) {
-                let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty && !ids.contains(trimmed) {
-                    ids.append(trimmed)
-                }
-            }
-        }
-        return ids
-    }
-
-    static func isLocalEndpoint(_ baseUrl: String) -> Bool {
-        let lower = baseUrl.lowercased()
-        return lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("0.0.0.0")
     }
 
     static func formatCommandLine(_ transport: CapabilityTransportDTO) -> String {
@@ -463,8 +362,8 @@ struct ProviderPreset: Identifiable {
 
 struct SettingsView: View {
     @ObservedObject var client: HostClient
-    @ObservedObject var draft: SettingsDraft
     @Binding var isPresented: Bool
+    @StateObject private var draft = SettingsDraft()
 
     var body: some View {
         HStack(spacing: 0) {
@@ -481,10 +380,10 @@ struct SettingsView: View {
         .tint(EjaTheme.ink)
         .onAppear {
             draft.attach(client: client)
-            draft.syncExternalConfig(client.config)
+            draft.load(from: client.config)
         }
         .onChange(of: client.config) { _, latest in
-            draft.syncExternalConfig(latest)
+            draft.syncWithHost(latest)
         }
         .onChange(of: draft.providers) { _, _ in draft.scheduleSave() }
         .onChange(of: draft.judge) { _, _ in draft.scheduleSave() }
@@ -594,65 +493,70 @@ struct SettingsView: View {
         let expanded = draft.expandedProvider == provider.id
         let isFetching = draft.fetchingProviders.contains(provider.id)
         let testResult = client.providerTestResults[provider.id]
-        let needsInlineKey = !expanded &&
-            !SettingsDraft.isLocalEndpoint(provider.baseUrl) &&
-            !provider.hasApiKey &&
-            provider.apiKey.trimmingCharacters(in: .whitespaces).isEmpty
+        let activeModel = draft.judge.providerId == provider.id ? draft.judge.model : ""
 
         return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Button {
-                    withAnimation(.easeOut(duration: 0.14)) {
-                        draft.expandedProvider = expanded ? nil : provider.id
-                    }
-                } label: {
-                    HStack(spacing: 5) {
-                        Text(provider.name.isEmpty ? provider.id : provider.name)
-                            .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle(EjaTheme.ink)
-                            .lineLimit(1)
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8.5, weight: .semibold))
-                            .foregroundStyle(EjaTheme.inkMuted)
-                            .rotationEffect(.degrees(expanded ? 90 : 0))
-                        Spacer(minLength: 4)
-                    }
-                    .contentShape(Rectangle())
+            Button {
+                withAnimation(.easeOut(duration: 0.14)) {
+                    draft.expandedProvider = expanded ? nil : provider.id
                 }
-                .buttonStyle(.plain)
-                .layoutPriority(1)
-
-                if let testResult {
-                    Text(testResult.message)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(testResult.ok ? EjaTheme.positive : EjaTheme.danger)
+            } label: {
+                HStack(spacing: 5) {
+                    Text(provider.name.isEmpty ? provider.id : provider.name)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(EjaTheme.ink)
                         .lineLimit(1)
-                        .truncationMode(.tail)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundStyle(EjaTheme.inkMuted)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Spacer(minLength: 4)
+                    if !activeModel.isEmpty {
+                        Text(activeModel)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(EjaTheme.inkSecondary)
+                            .lineLimit(1)
+                    }
                 }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(expanded ? "已展开" : "已收起")
+            .padding(.horizontal, 11)
+            .padding(.vertical, 9)
 
-                Button {
-                    let active = draft.judge.providerId == provider.id ? draft.judge.model : ""
-                    let model = !active.isEmpty ? active : (provider.models.first ?? "gpt-4o")
-                    client.testProvider(provider, model: model)
-                } label: {
-                    Image(systemName: "bolt")
-                        .font(.system(size: 10.5, weight: .medium))
-                }
-                .buttonStyle(EjaIconButtonStyle(size: 22))
-                .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty)
+            if expanded {
+                HStack(spacing: 6) {
+                    Spacer(minLength: 0)
+                    if let testResult {
+                        Text(testResult.message)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(testResult.ok ? EjaTheme.positive : EjaTheme.danger)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
 
-                Button {
-                    draft.fetchModels(for: provider.id)
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .rotationEffect(.degrees(isFetching ? 180 : 0))
-                        .animation(.easeInOut(duration: 0.25), value: isFetching)
-                }
-                .buttonStyle(EjaIconButtonStyle(size: 22))
-                .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty || isFetching)
+                    Button {
+                        let model = !activeModel.isEmpty ? activeModel : (provider.models.first ?? "gpt-4o")
+                        client.testProvider(provider, model: model)
+                    } label: {
+                        Image(systemName: "bolt")
+                            .font(.system(size: 10.5, weight: .medium))
+                    }
+                    .buttonStyle(EjaIconButtonStyle(size: 22))
+                    .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty)
 
-                if expanded {
+                    Button {
+                        draft.fetchModels(for: provider.id)
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .rotationEffect(.degrees(isFetching ? 180 : 0))
+                            .animation(.easeInOut(duration: 0.25), value: isFetching)
+                    }
+                    .buttonStyle(EjaIconButtonStyle(size: 22))
+                    .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty || isFetching)
+
                     Button {
                         draft.removeProvider(id: provider.id)
                     } label: {
@@ -661,30 +565,13 @@ struct SettingsView: View {
                     }
                     .buttonStyle(EjaIconButtonStyle(size: 22, destructive: true))
                 }
-            }
-            .padding(.horizontal, 11)
-            .padding(.top, 9)
-            .padding(.bottom, 7)
-
-            if needsInlineKey {
-                SecureField("", text: providerBinding(index, \.apiKey, ""), prompt: Text("API Key").foregroundStyle(EjaTheme.inkMuted))
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(EjaTheme.ink)
-                    .textFieldStyle(.plain)
-                    .onSubmit {
-                        draft.flushSave()
-                        draft.fetchModels(for: provider.id)
-                    }
-                    .modifier(CardField())
-                    .padding(.horizontal, 11)
-                    .padding(.bottom, 7)
-            }
-
-            providerModelPills(index: index)
                 .padding(.horizontal, 11)
-                .padding(.bottom, 10)
+                .padding(.bottom, 7)
 
-            if expanded {
+                providerModelPills(index: index)
+                    .padding(.horizontal, 11)
+                    .padding(.bottom, 10)
+
                 providerEditor(index: index)
             }
         }
@@ -784,7 +671,10 @@ struct SettingsView: View {
     private func providerEditor(index: Int) -> some View {
         let provider = draft.providers[index]
         let nameBinding = providerBinding(index, \.name, "")
-        let urlBinding = providerBinding(index, \.baseUrl, "")
+        let urlBinding = Binding(
+            get: { draft.providers.indices.contains(index) ? draft.providers[index].baseUrl : "" },
+            set: { draft.changeEndpoint(index, field: \.baseUrl, to: $0) }
+        )
         let keyBinding = providerBinding(index, \.apiKey, "")
 
         return VStack(alignment: .leading, spacing: 6) {
@@ -818,6 +708,10 @@ struct SettingsView: View {
                 .font(.system(size: 11.5, design: .monospaced))
                 .foregroundStyle(EjaTheme.ink)
                 .textFieldStyle(.plain)
+                .onSubmit {
+                    draft.flushSave()
+                    draft.fetchModels(for: provider.id)
+                }
                 .modifier(CardField())
         }
         .padding(.horizontal, 11)
@@ -827,9 +721,8 @@ struct SettingsView: View {
     private func kindSegment(_ label: String, tag: String, index: Int) -> some View {
         let active = draft.providers.indices.contains(index) && draft.providers[index].kind == tag
         return Button {
-            guard draft.providers.indices.contains(index) else { return }
             withAnimation(.easeOut(duration: 0.14)) {
-                draft.providers[index].kind = tag
+                draft.changeEndpoint(index, field: \.kind, to: tag)
             }
         } label: {
             Text(label)
@@ -884,18 +777,23 @@ struct SettingsView: View {
     private func capabilityCard(index: Int) -> some View {
         let cap = draft.capabilities[index]
         let isBuiltin = cap.transport.type == "builtin"
-        let expanded = !isBuiltin && draft.expandedCapability == cap.id
         let status = client.capabilityStatuses.first { $0.id == cap.id }
+        let enabled = status?.enabled ?? false
+        let savingSwitch = cap.enabled != enabled
+        let tools = status?.connected == true ? (status?.tools ?? []) : []
+        let error = enabled && status?.authRequired != true ? status?.error : nil
+        let canExpand = !isBuiltin || !tools.isEmpty || error?.isEmpty == false
+        let expanded = canExpand && draft.expandedCapability == cap.id
         let isHTTP = cap.transport.type == "http"
         let hasURL = !(cap.transport.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let dotColor: Color = {
-            if !cap.enabled && !isBuiltin { return EjaTheme.inkMuted.opacity(0.35) }
+            if !enabled && !isBuiltin { return EjaTheme.inkMuted.opacity(0.35) }
             if isBuiltin || status?.connected == true { return EjaTheme.positive }
             if let err = status?.error, !err.isEmpty { return EjaTheme.warning }
             return EjaTheme.inkMuted
         }()
         let enabledBinding = Binding<Bool>(
-            get: { draft.capabilities.indices.contains(index) ? draft.capabilities[index].enabled : false },
+            get: { enabled },
             set: {
                 if draft.capabilities.indices.contains(index) {
                     draft.capabilities[index].enabled = $0
@@ -907,7 +805,6 @@ struct SettingsView: View {
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Button {
-                    guard !isBuiltin else { return }
                     withAnimation(.easeOut(duration: 0.14)) {
                         draft.expandedCapability = expanded ? nil : cap.id
                     }
@@ -918,15 +815,9 @@ struct SettingsView: View {
                             .frame(width: 6, height: 6)
                         Text(cap.name.isEmpty ? cap.id : cap.name)
                             .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle((cap.enabled || isBuiltin) ? EjaTheme.ink : EjaTheme.inkSecondary)
+                            .foregroundStyle((enabled || isBuiltin) ? EjaTheme.ink : EjaTheme.inkSecondary)
                             .lineLimit(1)
-                        if cap.enabled, status?.authRequired != true, let err = status?.error, !err.isEmpty {
-                            Text(err)
-                                .font(.system(size: 11))
-                                .foregroundStyle(EjaTheme.warning)
-                                .lineLimit(1)
-                        }
-                        if !isBuiltin {
+                        if canExpand {
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 8.5, weight: .semibold))
                                 .foregroundStyle(EjaTheme.inkMuted)
@@ -937,98 +828,117 @@ struct SettingsView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-
-                if let code = status?.oauthCode, !code.isEmpty {
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(code, forType: .string)
-                    } label: {
-                        Text(code)
-                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                            .foregroundStyle(EjaTheme.ink)
-                            .padding(.horizontal, 6.5)
-                            .padding(.vertical, 2.5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                    .fill(EjaTheme.canvas)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                    .stroke(EjaTheme.hairlineStrong, lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                } else if isHTTP && hasURL && status?.authRequired == true {
-                    Button {
-                        draft.flushSave()
-                        client.oauthCapability(id: cap.id)
-                    } label: {
-                        Text("授权")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(EjaTheme.canvas)
-                            .padding(.horizontal, 7.5)
-                            .padding(.vertical, 2.5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                    .fill(EjaTheme.ink)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                if expanded {
-                    Button {
-                        draft.flushSave()
-                        client.reloadCapabilities()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 10.5, weight: .medium))
-                    }
-                    .buttonStyle(EjaIconButtonStyle(size: 22))
-
-                    Button {
-                        draft.removeCapability(id: cap.id)
-                    } label: {
-                        Image(systemName: "trash")
-                            .font(.system(size: 10.5))
-                    }
-                    .buttonStyle(EjaIconButtonStyle(size: 22, destructive: true))
-                }
+                .disabled(!canExpand)
+                .accessibilityValue(canExpand ? (expanded ? "已展开" : "已收起") : "")
 
                 if !isBuiltin {
-                    Toggle("", isOn: enabledBinding)
+                    Toggle("启用能力", isOn: enabledBinding)
                         .labelsHidden()
                         .toggleStyle(.switch)
                         .controlSize(.mini)
+                        .disabled(savingSwitch)
+                        .help(savingSwitch ? "正在保存" : "启用能力")
                 }
             }
             .padding(.horizontal, 11)
             .padding(.vertical, 9)
 
-            if let status, status.connected, !status.tools.isEmpty {
-                FlowLayout(spacing: 5, lineSpacing: 5) {
-                    ForEach(status.tools) { tool in
-                        Text(tool.name)
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(EjaTheme.inkSecondary)
-                            .padding(.horizontal, 6.5)
-                            .padding(.vertical, 2.5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                    .fill(EjaTheme.canvas)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                    .stroke(EjaTheme.hairline, lineWidth: 1)
-                            )
-                    }
-                }
-                .padding(.horizontal, 11)
-                .padding(.bottom, 9)
-            }
-
             if expanded {
-                capabilityEditor(index: index)
+                if !isBuiltin {
+                    HStack(spacing: 6) {
+                        Spacer(minLength: 0)
+                        if let code = status?.oauthCode, !code.isEmpty {
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(code, forType: .string)
+                            } label: {
+                                Text(code)
+                                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(EjaTheme.ink)
+                                    .padding(.horizontal, 6.5)
+                                    .padding(.vertical, 2.5)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                            .fill(EjaTheme.canvas)
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                            .stroke(EjaTheme.hairlineStrong, lineWidth: 1)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        } else if isHTTP && hasURL && status?.authRequired == true {
+                            Button {
+                                draft.flushSave()
+                                client.oauthCapability(id: cap.id)
+                            } label: {
+                                Text("授权")
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundStyle(EjaTheme.canvas)
+                                    .padding(.horizontal, 7.5)
+                                    .padding(.vertical, 2.5)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                            .fill(EjaTheme.ink)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        Button {
+                            draft.flushSave()
+                            client.reloadCapabilities()
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 10.5, weight: .medium))
+                        }
+                        .buttonStyle(EjaIconButtonStyle(size: 22))
+
+                        Button {
+                            draft.removeCapability(id: cap.id)
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.system(size: 10.5))
+                        }
+                        .buttonStyle(EjaIconButtonStyle(size: 22, destructive: true))
+                    }
+                    .padding(.horizontal, 11)
+                    .padding(.bottom, 7)
+                }
+
+                if let error, !error.isEmpty {
+                    Text(error)
+                        .font(.system(size: 11))
+                        .foregroundStyle(EjaTheme.warning)
+                        .padding(.horizontal, 11)
+                        .padding(.bottom, 9)
+                }
+
+                if !tools.isEmpty {
+                    FlowLayout(spacing: 5, lineSpacing: 5) {
+                        ForEach(tools) { tool in
+                            Text(tool.name)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(EjaTheme.inkSecondary)
+                                .padding(.horizontal, 6.5)
+                                .padding(.vertical, 2.5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                        .fill(EjaTheme.canvas)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                        .stroke(EjaTheme.hairline, lineWidth: 1)
+                                )
+                        }
+                    }
+                    .padding(.horizontal, 11)
+                    .padding(.bottom, 9)
+                }
+
+                if !isBuiltin {
+                    capabilityEditor(index: index)
+                }
             }
         }
         .background(

@@ -91,7 +91,7 @@ for line in sys.stdin:
                 ),
             ]
         )
-        client.saveConfig(cfg)
+        client.saveConfig(providers: cfg.providers, judge: cfg.judge, capabilities: cfg.capabilities)
 
         var expectedRedacted = cfg
         for idx in expectedRedacted.providers.indices {
@@ -121,13 +121,22 @@ for line in sys.stdin:
 
         var renamedProviders = restarted.config.providers
         renamedProviders[0].name = "DeepSeek Updated"
-        restarted.saveConfigPatch(providers: renamedProviders, judge: restarted.config.judge)
+        restarted.saveConfig(providers: renamedProviders, judge: restarted.config.judge)
 
         #expect(await waitUntil {
             restarted.config.providers.first?.name == "DeepSeek Updated"
                 && restarted.config.capabilities == expectedRedacted.capabilities
                 && restarted.capabilityStatuses[1].connected == true
         })
+
+        var capabilities = restarted.config.capabilities
+        capabilities[1].enabled = false
+        var confirmed: HostConfigDTO?
+        restarted.saveConfig(capabilities: capabilities) { confirmed = $0 }
+        #expect(await waitUntil { confirmed != nil })
+        #expect(confirmed?.capabilities[1].enabled == false)
+        #expect(restarted.capabilityStatuses[1].enabled == false)
+        #expect(restarted.capabilityStatuses[1].tools.isEmpty)
     }
 
     @Test

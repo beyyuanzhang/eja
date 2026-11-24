@@ -130,4 +130,5 @@ pub struct Call {
 pub struct Eja {
     pub(crate) db: Connection,
     pub(crate) clock: Box<dyn Fn() -> Timestamp + Send>,
+    pub(crate) instance_id: u64,
 }

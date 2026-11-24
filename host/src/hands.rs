@@ -1,13 +1,14 @@
 use crate::config::CapabilityConfig;
 use crate::http::truncate_utf8;
+use crate::llm::{ModelImage, MAX_TOOL_IMAGE_BYTES};
 use crate::mcp::{CapabilityPool, CapabilityStatus};
 use crate::oauth::OAuthToken;
-use crate::sandbox::{kill_process_tree, Sandbox, TrustedDir};
+use crate::sandbox::{kill_process_tree, write_process_input, ProcessOutput, Sandbox, TrustedDir};
 use crate::state::{self, schedule_wakes, WakeAlarm, WakeGuard};
 use eja_core::{Call, Eja, Outcome};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -15,22 +16,48 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_SHELL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SHELL_BYTES: usize = 32 * 1024;
+pub struct ToolExecution {
+    pub outcome: Outcome,
+    pub images: Vec<ModelImage>,
+}
+
+impl From<Outcome> for ToolExecution {
+    fn from(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            images: Vec::new(),
+        }
+    }
+}
+
+pub(crate) enum ProcessInput<'a> {
+    Shell,
+    Exec(&'a [u8]),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
     pub capability: String,
     pub name: String,
     pub description: String,
     pub schema: Value,
-    pub is_kernel: bool,
+    pub target: ToolTarget,
 }
 
-fn builtin_spec(name: &str, description: &str, schema: Value, is_kernel: bool) -> ToolSpec {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolTarget {
+    Kernel,
+    Host,
+    Capability(u64),
+}
+
+fn builtin_spec(name: &str, description: &str, schema: Value, target: ToolTarget) -> ToolSpec {
     ToolSpec {
         capability: name.into(),
         name: name.into(),
         description: description.into(),
         schema,
-        is_kernel,
+        target,
     }
 }
 
@@ -58,21 +85,7 @@ impl Hands {
         capabilities: &[CapabilityConfig],
     ) -> Self {
         let mut pool = CapabilityPool::with_core_dir(sandbox, core_dir);
-        pool.reload(capabilities, false);
-        Self {
-            data_dir,
-            capabilities: pool,
-        }
-    }
-
-    pub fn open_local(
-        data_dir: TrustedDir,
-        core_dir: TrustedDir,
-        sandbox: Sandbox,
-        capabilities: &[CapabilityConfig],
-    ) -> Self {
-        let mut pool = CapabilityPool::with_core_dir(sandbox, core_dir);
-        pool.reload_local(capabilities);
+        pool.register_local(capabilities);
         Self {
             data_dir,
             capabilities: pool,
@@ -81,6 +94,19 @@ impl Hands {
 
     pub fn reload(&mut self, capabilities: &[CapabilityConfig], force: bool) {
         self.capabilities.reload(capabilities, force);
+    }
+
+    pub fn disconnect_dead(&mut self) -> bool {
+        self.capabilities.disconnect_dead()
+    }
+
+    pub fn is_current(&self, spec: &ToolSpec) -> bool {
+        match spec.target {
+            ToolTarget::Capability(generation) => {
+                self.capabilities.is_current(&spec.capability, generation)
+            }
+            _ => true,
+        }
     }
 
     pub fn set_oauth_code(&mut self, id: &str, code: Option<String>) {
@@ -116,7 +142,7 @@ impl Hands {
                     },
                     "required": ["text"]
                 }),
-                true,
+                ToolTarget::Kernel,
             ),
             builtin_spec(
                 "release",
@@ -129,7 +155,7 @@ impl Hands {
                     },
                     "required": ["concern"]
                 }),
-                true,
+                ToolTarget::Kernel,
             ),
             builtin_spec(
                 "read",
@@ -142,7 +168,7 @@ impl Hands {
                     },
                     "required": ["fact"]
                 }),
-                true,
+                ToolTarget::Kernel,
             ),
             builtin_spec(
                 "search",
@@ -152,7 +178,7 @@ impl Hands {
                     "properties": { "cue": { "type": "string" } },
                     "required": ["cue"]
                 }),
-                true,
+                ToolTarget::Kernel,
             ),
             builtin_spec(
                 "wake",
@@ -167,7 +193,7 @@ impl Hands {
                     },
                     "required": ["delay_seconds", "reason"]
                 }),
-                false,
+                ToolTarget::Host,
             ),
             builtin_spec(
                 "promote_tool",
@@ -184,40 +210,41 @@ impl Hands {
                     "required": ["name", "file"],
                     "additionalProperties": false
                 }),
-                false,
+                ToolTarget::Host,
             ),
         ];
 
         let mut used: HashSet<String> = specs.iter().map(|spec| spec.name.clone()).collect();
 
-        for tool in self.capabilities.tools() {
+        for (tool, generation) in self.capabilities.tools() {
             let name = safe_tool_name(&tool.capability, &mut used);
             let description = if tool.description.is_empty() {
                 format!("能力工具 {}", tool.capability)
             } else {
-                tool.description
+                tool.description.clone()
             };
             specs.push(ToolSpec {
-                capability: tool.capability,
+                capability: tool.capability.clone(),
                 name,
                 description,
-                schema: tool.input_schema,
-                is_kernel: false,
+                schema: tool.input_schema.clone(),
+                target: ToolTarget::Capability(generation),
             });
         }
         specs
     }
 
-    pub fn execute(&mut self, call: &Call, eja: &Eja) -> Outcome {
+    pub fn execute(&mut self, call: &Call, eja: &Eja) -> ToolExecution {
         match call.capability.as_str() {
-            "wake" => execute_wake(eja, call.id, &call.input),
+            "wake" => execute_wake(eja, call.id, &call.input).into(),
             "promote_tool" => {
                 let (Some(name), Some(file)) =
                     (call.input["name"].as_str(), call.input["file"].as_str())
                 else {
                     return Outcome::Failed(
                         "需要 name、file，以及 equals/contains/not_equals 中至少一项".into(),
-                    );
+                    )
+                    .into();
                 };
                 let parse_opt = |key: &str| match call.input.get(key) {
                     None | Some(Value::Null) => Ok(None),
@@ -231,13 +258,14 @@ impl Hands {
                 ) {
                     (Ok(eq), Ok(ct), Ok(ne)) => (eq, ct, ne),
                     (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                        return Outcome::Failed(e);
+                        return Outcome::Failed(e).into();
                     }
                 };
                 match state::register_check(eja, name, file, equals, contains, not_equals) {
                     Ok(()) => Outcome::Observed(format!("已注册检查规则 {name}")),
                     Err(err) => Outcome::Failed(err.to_string()),
                 }
+                .into()
             }
             other => self
                 .capabilities
@@ -277,12 +305,13 @@ pub(crate) fn execute_shell(
         "/bin/sh",
         &["-c".into(), command.into()],
         &BTreeMap::new(),
-        None,
+        ProcessInput::Shell,
         &cwd,
         timeout,
         data_dir,
         call_id,
     )
+    .outcome
 }
 
 fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
@@ -373,6 +402,35 @@ fn capture_shell_stream(mut reader: impl Read) -> io::Result<(tempfile::SpooledT
     Ok((spool, len))
 }
 
+enum ProcessStdout {
+    Text((tempfile::SpooledTempFile, u64)),
+    Image(ModelImage),
+    OversizedImage,
+}
+
+fn capture_stdout(mut reader: impl Read, is_exec: bool) -> io::Result<ProcessStdout> {
+    if !is_exec {
+        return capture_shell_stream(reader).map(ProcessStdout::Text);
+    }
+    let mut prefix = Vec::with_capacity(12);
+    reader.by_ref().take(12).read_to_end(&mut prefix)?;
+    let Some(media_type) = ModelImage::media_type(&prefix) else {
+        return capture_shell_stream(prefix.as_slice().chain(reader)).map(ProcessStdout::Text);
+    };
+    reader
+        .by_ref()
+        .take((MAX_TOOL_IMAGE_BYTES + 1 - prefix.len()) as u64)
+        .read_to_end(&mut prefix)?;
+    if prefix.len() > MAX_TOOL_IMAGE_BYTES {
+        io::copy(&mut reader, &mut io::sink())?;
+        return Ok(ProcessStdout::OversizedImage);
+    }
+    Ok(ProcessStdout::Image(ModelImage {
+        media_type,
+        bytes: prefix,
+    }))
+}
+
 fn shell_output(
     (mut stdout, out_len): (tempfile::SpooledTempFile, u64),
     (mut stderr, err_len): (tempfile::SpooledTempFile, u64),
@@ -419,23 +477,27 @@ pub(crate) fn run_process(
     program: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
-    stdin_bytes: Option<&[u8]>,
+    input: ProcessInput<'_>,
     cwd: &Path,
     timeout: Duration,
     data_dir: &TrustedDir,
     call_id: eja_core::Id,
-) -> Outcome {
+) -> ToolExecution {
     let resolved = if program.contains('/') && Path::new(program).is_relative() {
         cwd.join(program).to_string_lossy().into_owned()
     } else {
         program.to_string()
     };
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(timeout)
+        .unwrap_or_else(|| started + DEFAULT_SHELL_TIMEOUT);
     let mut child = match sandbox
         .command(&resolved, args)
         .current_dir(cwd)
         .envs(env)
         .env("EJA_DATA_DIR", data_dir.path())
-        .stdin(if stdin_bytes.is_some() {
+        .stdin(if matches!(input, ProcessInput::Exec(_)) {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -445,47 +507,81 @@ pub(crate) fn run_process(
         .spawn()
     {
         Ok(c) => c,
-        Err(err) => return Outcome::Failed(format!("启动 shell 失败: {err}")),
+        Err(err) => return Outcome::Failed(format!("启动工具进程失败: {err}")).into(),
     };
-    if let Some(bytes) = stdin_bytes {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(bytes);
-        }
-    }
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let out_handle = thread::spawn(move || capture_shell_stream(stdout));
-    let err_handle = thread::spawn(move || capture_shell_stream(stderr));
+    let is_exec = matches!(input, ProcessInput::Exec(_));
+    let out_handle =
+        thread::spawn(move || capture_stdout(ProcessOutput::new(stdout, deadline)?, is_exec));
+    let err_handle =
+        thread::spawn(move || capture_shell_stream(ProcessOutput::new(stderr, deadline)?));
 
-    let started = Instant::now();
+    let input_error = match input {
+        ProcessInput::Exec(bytes) => {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            write_process_input(&mut stdin, bytes, deadline).err()
+        }
+        ProcessInput::Shell => None,
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) if out_handle.is_finished() && err_handle.is_finished() => break Some(st),
-            Ok(_) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(25)),
+            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             _ => {
                 kill_process_tree(&mut child);
                 break None;
             }
         }
     };
+    let succeeded = status.is_some_and(|status| status.success()) && input_error.is_none();
     let bounded = match (out_handle.join(), err_handle.join()) {
-        (Ok(Ok(out)), Ok(Ok(err))) => shell_output(out, err, data_dir, call_id),
+        (Ok(Ok(stdout)), Ok(Ok(stderr))) => {
+            let text = match stdout {
+                ProcessStdout::Text(text) => text,
+                ProcessStdout::Image(image) if succeeded => {
+                    return ToolExecution {
+                        outcome: Outcome::Observed(image.receipt()),
+                        images: vec![image],
+                    };
+                }
+                ProcessStdout::OversizedImage if succeeded => {
+                    return Outcome::Observed(format!(
+                        "工具已完成，图像超过 {MAX_TOOL_IMAGE_BYTES} 字节"
+                    ))
+                    .into();
+                }
+                _ => (tempfile::spooled_tempfile(MAX_SHELL_BYTES), 0),
+            };
+            shell_output(text, stderr, data_dir, call_id)
+        }
         (Ok(Err(err)), _) | (_, Ok(Err(err))) => Err(err),
         _ => Err(io::Error::other("输出读取线程中断")),
     };
     let bounded = match bounded {
         Ok(text) => text,
-        Err(err) => return Outcome::Unknown(format!("读取 Shell 输出失败: {err}")),
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+            return Outcome::Unknown(format!("命令超时 ({}s)", timeout.as_secs())).into()
+        }
+        Err(err) => return Outcome::Unknown(format!("读取进程输出失败: {err}")).into(),
     };
+    if let Some(err) = input_error {
+        if err.kind() == io::ErrorKind::TimedOut || status.is_none() {
+            return Outcome::Unknown(format!("命令超时 ({}s): {bounded}", timeout.as_secs()))
+                .into();
+        }
+        return Outcome::Unknown(format!("工具输入未完整写入: {err}\n{bounded}")).into();
+    }
     match status {
         Some(st) if st.success() => Outcome::Observed(bounded),
         Some(st) => Outcome::Failed(format!("exit {}: {bounded}", st.code().unwrap_or(-1))),
         None => Outcome::Unknown(format!("命令超时 ({}s): {bounded}", timeout.as_secs())),
     }
+    .into()
 }
 
 fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
-    let mut base: String = capability
+    let base: String = capability
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
@@ -496,9 +592,6 @@ fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
         })
         .take(56)
         .collect();
-    if base.is_empty() {
-        base = "cap_tool".to_string();
-    }
     let mut candidate = base.clone();
     let mut idx = 2usize;
     while !used.insert(candidate.clone()) {
@@ -536,12 +629,13 @@ mod tests {
             "/bin/sh",
             &["-c".into(), command.into()],
             &BTreeMap::new(),
-            None,
+            ProcessInput::Shell,
             cwd,
             timeout,
             data_dir,
             call_id,
         )
+        .outcome
     }
 
     #[test]
@@ -645,5 +739,29 @@ mod tests {
         );
         assert!(matches!(outcome, Outcome::Observed(ref text) if !text.contains("saved to")));
         assert!(!core_dir.join("shell-7.log").exists());
+    }
+
+    #[test]
+    fn exec_deadline_includes_input_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = TrustedDir::open(dir.path()).unwrap();
+        let core = dir.path().join("private");
+        fs::create_dir(&core).unwrap();
+        let sandbox = Sandbox::new(&core).unwrap();
+        let input = vec![b' '; 256 * 1024];
+        let started = Instant::now();
+        let result = run_process(
+            &sandbox,
+            "/bin/sleep",
+            &["5".into()],
+            &BTreeMap::new(),
+            ProcessInput::Exec(&input),
+            dir.path(),
+            Duration::from_millis(150),
+            &data,
+            1,
+        );
+        assert!(matches!(result.outcome, Outcome::Unknown(ref msg) if msg.contains("命令超时")));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

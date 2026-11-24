@@ -1,4 +1,4 @@
-use eja_core::{Eja, Fact, Outcome, Source};
+use eja_core::{Eja, Fact, Outcome, Source, Timestamp};
 use eja_memory::{Encoder, Error, InputKind, MemoryIndex};
 use serde_json::json;
 
@@ -168,5 +168,33 @@ fn stale_connection_rejects_search_and_indexing_after_encoder_switch() -> TestRe
     eja.notice(Source::Person, "备用钥匙放在抽屉里")?;
     assert_eq!(fresh.search(&eja, "钥匙")?.len(), 2);
     assert!(matches!(stale.search(&eja, "钥匙"), Err(Error::Conflict)));
+    Ok(())
+}
+
+#[test]
+fn reused_cache_checks_the_full_indexed_journal_prefix() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("memory.db");
+    let encoder = || ToyEncoder { id: "toy", dims: 4 };
+    let journal = |name, middle| -> TestResult<Eja> {
+        let eja = Eja::open(dir.path().join(name))?.with_clock(|| Timestamp(1));
+        eja.notice(Source::Person, "相同开头")?;
+        eja.notice(Source::Person, middle)?;
+        eja.notice(Source::Person, "相同结尾")?;
+        Ok(eja)
+    };
+    let first = journal("first.db", "喜欢喝茶")?;
+    let second = journal("second.db", "钥匙在抽屉")?;
+    assert_eq!(first.revision()?, second.revision()?);
+    let mut memory = MemoryIndex::open(&path, encoder())?;
+    assert!(memory.search(&first, "茶")?[0].similarity > 0.99);
+    assert!(memory
+        .search(&second, "茶")?
+        .iter()
+        .all(|hit| hit.similarity < 0.7));
+    drop(memory);
+    let mut reopened = MemoryIndex::open(&path, encoder())?;
+    assert_eq!(reopened.search(&first, "茶")?[0].evidence.entry.id, 2);
+    assert!(reopened.search(&first, "茶")?[0].similarity > 0.99);
     Ok(())
 }

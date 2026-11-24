@@ -8,49 +8,26 @@ mod runtime;
 mod sandbox;
 mod state;
 
-use config::{ConfigPatch, ProviderConfig};
-use runtime::{EventSink, HostRuntime};
-use serde::Deserialize;
+use runtime::{EventSink, HostCommand, HostRuntime};
 use serde_json::{json, Value};
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
 
-#[derive(Deserialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-enum Command {
-    Send {
-        text: String,
-    },
-    SaveConfig {
-        config: ConfigPatch,
-    },
-    TestProvider {
-        id: String,
-        provider: ProviderConfig,
-        model: String,
-    },
-    OauthCapability {
-        id: String,
-    },
-    ReloadCapabilities,
-}
-
-enum Input {
-    Line(String),
-    Closed,
-}
-
-fn read_commands(reader: impl BufRead, sender: Sender<Input>) {
+fn read_commands(reader: impl BufRead, sender: Sender<Result<HostCommand, String>>) {
     for line in reader.lines() {
         let Ok(line) = line else { break };
-        if !line.trim().is_empty() && sender.send(Input::Line(line)).is_err() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let command = serde_json::from_str(&line).map_err(|err| format!("无效指令: {err}"));
+        if sender.send(command).is_err() {
             return;
         }
     }
-    let _ = sender.send(Input::Closed);
 }
 
 fn default_data_dir() -> PathBuf {
@@ -80,7 +57,7 @@ fn send_owner(value: &Value) {
 }
 
 fn main() {
-    let emit: EventSink = Box::new(|value| send_owner(&value));
+    let emit: EventSink = Arc::new(|value| send_owner(&value));
 
     let mut runtime = match HostRuntime::open(parse_data_dir(), emit) {
         Ok(rt) => rt,
@@ -89,57 +66,9 @@ fn main() {
             std::process::exit(1);
         }
     };
-    runtime.emit_state();
-    runtime.warm_external_capabilities();
-    runtime.process_pending_turn();
-
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || read_commands(io::stdin().lock(), tx));
-
-    loop {
-        let next = match runtime.next_timer_delay() {
-            Ok(Some(delay)) if delay.is_zero() => {
-                if let Err(err) = runtime.tick_timers() {
-                    runtime.emit_error(format!("处理定时任务失败: {err}"));
-                    break;
-                }
-                continue;
-            }
-            Ok(Some(delay)) => match rx.recv_timeout(delay) {
-                Ok(msg) => msg,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(err) = runtime.tick_timers() {
-                        runtime.emit_error(format!("处理定时任务失败: {err}"));
-                        break;
-                    }
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            },
-            Ok(None) => match rx.recv() {
-                Ok(msg) => msg,
-                Err(_) => break,
-            },
-            Err(err) => {
-                runtime.emit_error(format!("读取唤醒计划失败: {err}"));
-                break;
-            }
-        };
-        let line = match next {
-            Input::Closed => break,
-            Input::Line(line) => line,
-        };
-        match serde_json::from_str::<Command>(&line) {
-            Ok(Command::Send { text }) => runtime.handle_user_message(&text),
-            Ok(Command::SaveConfig { config }) => runtime.save_config(config),
-            Ok(Command::TestProvider {
-                id,
-                provider,
-                model,
-            }) => runtime.test_provider(id, provider, model),
-            Ok(Command::OauthCapability { id }) => runtime.oauth_capability(id),
-            Ok(Command::ReloadCapabilities) => runtime.reload_capabilities(),
-            Err(err) => runtime.emit_error(format!("无效指令: {err}")),
-        }
+    if let Err(err) = runtime.run(rx) {
+        runtime.emit_error(err);
     }
 }

@@ -1,14 +1,18 @@
 use std::ffi::{CString, OsStr};
 use std::fs::{self, OpenOptions};
-#[cfg(target_os = "macos")]
-use std::io::Read;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::{fd::AsRawFd, unix::process::CommandExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+use libc::{
+    mkdirat, openat, renameat, unlinkat, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW,
+    O_NONBLOCK, O_RDONLY, O_WRONLY,
+};
 #[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
@@ -18,43 +22,14 @@ use std::fs::File;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{FromRawFd, OwnedFd};
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-#[cfg(target_os = "macos")]
-const O_RDONLY: i32 = 0x0000;
-#[cfg(target_os = "macos")]
-const O_NONBLOCK: i32 = 0x0004;
-#[cfg(target_os = "macos")]
-const O_WRONLY: i32 = 0x0001;
-#[cfg(target_os = "macos")]
-const O_NOFOLLOW: i32 = 0x0100;
-#[cfg(target_os = "macos")]
-const O_CREAT: i32 = 0x0200;
-#[cfg(target_os = "macos")]
-const O_EXCL: i32 = 0x0800;
-#[cfg(target_os = "macos")]
-const O_DIRECTORY: i32 = 0x0010_0000;
-#[cfg(target_os = "macos")]
-const O_CLOEXEC: i32 = 0x0100_0000;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn openat(dirfd: i32, path: *const std::ffi::c_char, oflag: i32, ...) -> i32;
-    fn mkdirat(dirfd: i32, path: *const std::ffi::c_char, mode: u16) -> i32;
-    fn renameat(
-        fromfd: i32,
-        from: *const std::ffi::c_char,
-        tofd: i32,
-        to: *const std::ffi::c_char,
-    ) -> i32;
-    fn unlinkat(dirfd: i32, path: *const std::ffi::c_char, flag: i32) -> i32;
-}
 
 pub fn validate_single_name(name: &str) -> io::Result<CString> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
@@ -352,16 +327,105 @@ pub fn kill_process_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id()) {
         if pid > 0 {
-            extern "C" {
-                fn kill(pid: i32, sig: i32) -> i32;
-            }
             unsafe {
-                let _ = kill(-pid, 9);
+                let _ = libc::kill(-pid, libc::SIGKILL);
             }
         }
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+pub fn write_process_input(
+    stdin: &mut ChildStdin,
+    mut data: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let fd = stdin.as_raw_fd();
+    make_nonblocking(fd)?;
+    while !data.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        match stdin.write(data) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(size) => data = &data[size..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_pipe(fd, libc::POLLOUT, deadline)?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+pub struct ProcessOutput<R> {
+    pipe: R,
+    deadline: Instant,
+}
+
+impl<R: Read + AsRawFd> ProcessOutput<R> {
+    pub fn new(pipe: R, deadline: Instant) -> io::Result<Self> {
+        make_nonblocking(pipe.as_raw_fd())?;
+        Ok(Self { pipe, deadline })
+    }
+}
+
+impl<R: Read + AsRawFd> Read for ProcessOutput<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match self.pipe.read(buffer) {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    wait_for_pipe(self.pipe.as_raw_fd(), libc::POLLIN, self.deadline)?;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+fn make_nonblocking(fd: i32) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn wait_for_pipe(fd: i32, events: i16, deadline: Instant) -> io::Result<()> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let millis = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
+        match unsafe { libc::poll(&mut poll_fd, 1, millis) } {
+            value if value > 0 => return Ok(()),
+            -1 => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

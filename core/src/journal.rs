@@ -6,7 +6,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 const SCHEMA_VERSION: i32 = 4;
 const UNFINISHED_ACTIONS_SQL: &str = "SELECT action.id FROM facts AS action
     WHERE action.kind = 'acted'
@@ -368,14 +370,19 @@ impl Tx<'_> {
 impl Eja {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Connection::open(path.as_ref())?;
-        db.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;",
-        )?;
-        migrate_schema(&db)?;
+        db.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        initialize_schema(&db)?;
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
         Ok(Self {
             db,
             clock: Box::new(Timestamp::now),
+            instance_id: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
         })
+    }
+
+    /// Identifies this open append-only journal within the current process.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     pub fn with_clock(mut self, clock: impl Fn() -> Timestamp + Send + 'static) -> Self {
@@ -520,40 +527,45 @@ impl Eja {
     }
 }
 
-fn migrate_schema(db: &Connection) -> Result<()> {
-    let version: i32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > SCHEMA_VERSION {
-        return Err(Error::Storage(format!(
-            "subject.db schema version {version} is newer than supported version {SCHEMA_VERSION}"
-        )));
+fn initialize_schema(db: &Connection) -> Result<()> {
+    let schema_version =
+        |conn: &Connection| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0));
+    match schema_version(db)? {
+        SCHEMA_VERSION => return Ok(()),
+        0 => {}
+        version => return Err(unsupported_schema(version)),
     }
-    if version == SCHEMA_VERSION {
-        return Ok(());
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    match schema_version(&tx)? {
+        SCHEMA_VERSION => return Ok(()),
+        0 => {}
+        version => return Err(unsupported_schema(version)),
     }
-    let preamble = if version == 0 {
-        "CREATE TABLE IF NOT EXISTS facts (
+    let populated = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema)", [], |row| {
+        row.get::<_, bool>(0)
+    })?;
+    if populated {
+        return Err(unsupported_schema(0));
+    }
+    tx.execute_batch(&format!(
+        "CREATE TABLE facts (
              id INTEGER PRIMARY KEY, at INTEGER NOT NULL,
              kind TEXT NOT NULL, ref_id INTEGER, live INTEGER, body TEXT NOT NULL
-         );"
-    } else {
-        "ALTER TABLE facts ADD COLUMN kind TEXT;
-         ALTER TABLE facts ADD COLUMN ref_id INTEGER;
-         UPDATE facts SET kind = json_extract(body, '$.kind'),
-             ref_id = coalesce(concern, json_extract(body, '$.action')) WHERE kind IS NULL;
-         DROP INDEX IF EXISTS action_receipts;
-         DROP INDEX IF EXISTS turn_entries;"
-    };
-    db.execute_batch(&format!(
-        "BEGIN IMMEDIATE;
-         {preamble}
-         CREATE TABLE IF NOT EXISTS host_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE INDEX IF NOT EXISTS facts_open_concerns ON facts(id) WHERE live = 1;
-         CREATE INDEX IF NOT EXISTS facts_concern_history ON facts(ref_id, id DESC) WHERE live IS NOT NULL;
-         CREATE INDEX IF NOT EXISTS facts_ref ON facts(kind, ref_id, id);
-         PRAGMA user_version = {SCHEMA_VERSION};
-         COMMIT;"
+         );
+         CREATE TABLE host_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE INDEX facts_open_concerns ON facts(id) WHERE live = 1;
+         CREATE INDEX facts_concern_history ON facts(ref_id, id DESC) WHERE live IS NOT NULL;
+         CREATE INDEX facts_ref ON facts(kind, ref_id, id);
+         PRAGMA user_version = {SCHEMA_VERSION};"
     ))?;
+    tx.commit()?;
     Ok(())
+}
+
+fn unsupported_schema(version: i32) -> Error {
+    Error::Storage(format!(
+        "subject.db schema version {version} does not match the current version {SCHEMA_VERSION}"
+    ))
 }
 
 #[cfg(test)]

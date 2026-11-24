@@ -24,8 +24,17 @@ pub fn get_bytes(
     url: &str,
     headers: &[(String, String)],
     timeout_secs: u64,
+    follow_redirects: bool,
 ) -> Result<HttpResponse, HttpError> {
-    request_bytes("GET", true, url, headers, None, timeout_secs, None)
+    request_bytes(
+        "GET",
+        follow_redirects,
+        url,
+        headers,
+        None,
+        timeout_secs,
+        None,
+    )
 }
 
 pub fn post_bytes(
@@ -66,8 +75,12 @@ fn request_bytes(
 ) -> Result<HttpResponse, HttpError> {
     let mut cmd = Command::new("/usr/bin/curl");
     cmd.args([
+        "-q",
         "-sS",
         "-i",
+        "--globoff",
+        "--proto",
+        "=http,https",
         "-X",
         method,
         "--max-time",
@@ -80,12 +93,16 @@ fn request_bytes(
         cmd.arg("-L");
     }
     for (key, value) in headers {
+        if key.contains(['\r', '\n', ':']) || value.contains(['\r', '\n']) {
+            return Err(HttpError::Launch("无效的 HTTP 请求头".into()));
+        }
         cmd.arg("-H").arg(format!("{key}: {value}"));
     }
     if body.is_some() {
         cmd.args(["--data-binary", "@-"]);
     }
-    cmd.arg(url)
+    cmd.arg("--url")
+        .arg(url)
         .stdin(if body.is_some() {
             Stdio::piped()
         } else {

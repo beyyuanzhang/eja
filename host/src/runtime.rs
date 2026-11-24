@@ -2,11 +2,11 @@ use crate::config::{
     write_json_atomic, CapabilityConfig, CapabilityTransport, ConfigPatch, HostConfig,
     ProviderConfig,
 };
-use crate::hands::{activity_label, format_local_unix, Hands, ToolSpec};
+use crate::hands::{activity_label, format_local_unix, Hands, ToolSpec, ToolTarget};
 use crate::http::truncate_utf8;
 use crate::llm::{
-    apply_tool_exchange, project_window_through, tool_messages, Brain, HttpBrain, ToolCall,
-    ToolOutput,
+    apply_tool_exchange, expire_tool_images, list_models, project_window_through, tool_messages,
+    Brain, HttpBrain, ToolCall, ToolOutput,
 };
 use crate::mcp::CapabilityStatus;
 use crate::oauth::{spawn_oauth_flow, OAuthEvent};
@@ -16,7 +16,7 @@ use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, Timestamp};
 use eja_memory::MemoryIndex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,10 +28,35 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-pub type EventSink = Box<dyn FnMut(Value)>;
+pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RETRY_ATTEMPTS: u8 = 3;
+
+#[derive(Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum HostCommand {
+    Send {
+        text: String,
+    },
+    SaveConfig {
+        config: ConfigPatch,
+        id: Option<String>,
+    },
+    TestProvider {
+        id: String,
+        provider: ProviderConfig,
+        model: String,
+    },
+    ListModels {
+        id: String,
+        provider: ProviderConfig,
+    },
+    OauthCapability {
+        id: String,
+    },
+    ReloadCapabilities,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamItem {
@@ -84,6 +109,8 @@ pub struct HostRuntime {
     oauth_tx: Sender<OAuthEvent>,
     oauth_rx: Receiver<OAuthEvent>,
     oauth_cancels: HashMap<String, Arc<AtomicBool>>,
+    inbox: Option<Receiver<Result<HostCommand, String>>>,
+    deferred: VecDeque<Result<HostCommand, String>>,
     anchor: Id,
     retry_at: Option<Instant>,
     retry_attempts: u8,
@@ -93,25 +120,19 @@ pub struct HostRuntime {
     emit: EventSink,
 }
 
+fn needs_handshake(capability: &CapabilityConfig) -> bool {
+    capability.enabled && capability.transport.is_mcp()
+}
+
 impl HostRuntime {
     pub fn open(data_dir: PathBuf, emit: EventSink) -> Result<Self, String> {
-        Self::open_internal(data_dir, Arc::new(HttpBrain), emit, true)
+        Self::open_with_brain(data_dir, Arc::new(HttpBrain), emit)
     }
 
-    #[cfg(test)]
     pub fn open_with_brain(
         data_dir: PathBuf,
         brain: Arc<dyn Brain>,
         emit: EventSink,
-    ) -> Result<Self, String> {
-        Self::open_internal(data_dir, brain, emit, false)
-    }
-
-    fn open_internal(
-        data_dir: PathBuf,
-        brain: Arc<dyn Brain>,
-        mut emit: EventSink,
-        defer_external_capabilities: bool,
     ) -> Result<Self, String> {
         fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
         let data_path = fs::canonicalize(data_dir).map_err(|err| err.to_string())?;
@@ -128,7 +149,7 @@ impl HostRuntime {
             core_name.push(".kernel");
         }
         let core_path = data_dir.path().with_file_name(core_name);
-        let instance_lock = match lock_core_dir(data_dir.path(), &core_path) {
+        let instance_lock = match lock_core_dir(&core_path) {
             Ok(lock) => lock,
             Err(LockError::AlreadyRunning(ui_pid)) => {
                 (emit)(json!({ "event": "already_running", "ui_pid": ui_pid }));
@@ -144,30 +165,31 @@ impl HostRuntime {
         let resources_dir = resolve_resources_dir();
         let anchor = state::bootstrap(
             &eja,
-            &core_dir,
             resources_dir.as_deref(),
             KERNEL_VERSION,
             PROTOCOL_VERSION,
         )?;
         let mut config = HostConfig::load(&core_dir);
-        let capabilities_bytes = HostConfig::read_capabilities(&data_dir).ok().flatten();
+        let capabilities_bytes = HostConfig::read_capabilities(&data_dir).unwrap_or_else(|err| {
+            (emit)(json!({"event":"error", "message":err}));
+            None
+        });
         config.capabilities = HostConfig::parse_capabilities(capabilities_bytes.as_deref())
-            .unwrap_or_else(|_| vec![CapabilityConfig::builtin_shell()]);
-        let hands = if defer_external_capabilities {
-            Hands::open_local(
-                data_dir.clone(),
-                core_dir.clone(),
-                sandbox,
-                &config.capabilities,
-            )
+            .unwrap_or_else(|err| {
+                (emit)(json!({"event":"error", "message":err}));
+                vec![CapabilityConfig::builtin_shell()]
+            });
+        let status = if config.capabilities.iter().any(needs_handshake) {
+            ("connecting".into(), "连接能力…".into())
         } else {
-            Hands::open(
-                data_dir.clone(),
-                core_dir.clone(),
-                sandbox,
-                &config.capabilities,
-            )
+            ("idle".into(), "在线".into())
         };
+        let hands = Hands::open(
+            data_dir.clone(),
+            core_dir.clone(),
+            sandbox,
+            &config.capabilities,
+        );
         let (oauth_tx, oauth_rx) = mpsc::channel();
         Ok(Self {
             data_dir,
@@ -182,27 +204,85 @@ impl HostRuntime {
             oauth_tx,
             oauth_rx,
             oauth_cancels: HashMap::new(),
+            inbox: None,
+            deferred: VecDeque::new(),
             anchor,
             retry_at: None,
             retry_attempts: 0,
             local_tz: detect_local_tz(),
-            status: ("idle".into(), "在线".into()),
+            status,
             brain,
             emit,
         })
     }
 
-    pub fn warm_external_capabilities(&mut self) {
-        let has_external = self.config.capabilities.iter().any(|c| {
-            c.enabled
-                && matches!(
-                    c.transport,
-                    CapabilityTransport::Stdio { .. } | CapabilityTransport::Http { .. }
-                )
-        });
-        if has_external {
+    pub fn connect_external_capabilities(&mut self) {
+        if self.config.capabilities.iter().any(needs_handshake) {
             self.hands.reload(&self.config.capabilities, false);
-            self.emit_state();
+            self.set_status("idle", "在线");
+        }
+    }
+
+    pub fn run(&mut self, inbox: Receiver<Result<HostCommand, String>>) -> Result<(), String> {
+        self.inbox = Some(inbox);
+        self.emit_state(None);
+        self.connect_external_capabilities();
+        self.drain_turn_commands();
+        self.process_pending_turn();
+        loop {
+            let delay = self.next_timer_delay()?;
+            if delay.is_some_and(|delay| delay.is_zero()) {
+                self.tick_timers()?;
+                continue;
+            }
+            let command = if let Some(command) = self.deferred.pop_front() {
+                command
+            } else {
+                let inbox = self.inbox.as_ref().expect("host command inbox");
+                let received = match delay {
+                    Some(delay) => inbox.recv_timeout(delay),
+                    None => inbox
+                        .recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                };
+                match received {
+                    Ok(command) => command,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        self.tick_timers()?;
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+            };
+            match command {
+                Ok(HostCommand::Send { text }) => self.handle_user_message(&text),
+                Ok(HostCommand::SaveConfig { config, id }) => {
+                    self.save_config_request(config, id, true)
+                }
+                Ok(HostCommand::TestProvider {
+                    id,
+                    provider,
+                    model,
+                }) => self.test_provider(id, provider, model),
+                Ok(HostCommand::ListModels { id, provider }) => {
+                    self.list_provider_models(id, provider)
+                }
+                Ok(HostCommand::OauthCapability { id }) => self.oauth_capability(id),
+                Ok(HostCommand::ReloadCapabilities) => self.reload_capabilities(),
+                Err(err) => self.emit_error(err),
+            }
+        }
+    }
+
+    fn drain_turn_commands(&mut self) {
+        while let Some(command) = self.inbox.as_ref().and_then(|inbox| inbox.try_recv().ok()) {
+            match command {
+                Ok(HostCommand::SaveConfig { config, id }) => {
+                    self.save_config_request(config, id, false)
+                }
+                Ok(HostCommand::ReloadCapabilities) => self.reload_capabilities(),
+                command => self.deferred.push_back(command),
+            }
         }
     }
 
@@ -302,20 +382,47 @@ impl HostRuntime {
         }
     }
 
-    pub fn emit_state(&mut self) {
-        let snap = self.snapshot();
-        if let Ok(mut payload) = serde_json::to_value(snap) {
+    fn emit_state(&self, save_id: Option<String>) {
+        if let Ok(mut payload) = serde_json::to_value(self.snapshot()) {
+            if let Some(id) = save_id {
+                payload["save_id"] = Value::String(id);
+            }
             payload["event"] = Value::String("state".into());
             (self.emit)(payload);
         }
     }
 
-    pub fn emit_error(&mut self, message: impl Into<String>) {
+    pub fn emit_error(&self, message: impl Into<String>) {
         (self.emit)(json!({ "event": "error", "message": message.into() }));
     }
 
-    pub fn save_config(&mut self, patch: impl Into<ConfigPatch>) {
-        let patch = patch.into();
+    #[cfg(test)]
+    fn save_config(&mut self, patch: impl Into<ConfigPatch>) {
+        self.save_config_request(patch.into(), None, true);
+    }
+
+    fn save_config_request(&mut self, patch: ConfigPatch, id: Option<String>, resume: bool) {
+        let result = self.apply_config_patch(patch);
+        if let Err(err) = &result {
+            self.emit_error(err);
+        }
+        self.emit_state(id);
+        if resume && result.is_ok() && self.config.is_configured() {
+            self.clear_retry();
+            self.process_pending_turn();
+        }
+    }
+
+    fn apply_config_patch(&mut self, patch: ConfigPatch) -> Result<(), String> {
+        if let Some(capabilities) = patch.capabilities {
+            let capabilities = HostConfig::normalize_capabilities(capabilities)?;
+            if capabilities != self.config.capabilities {
+                write_json_atomic(&self.data_dir, "capabilities.json", &capabilities)
+                    .map_err(|err| format!("保存能力配置失败: {err}"))?;
+            }
+        }
+        self.refresh_capabilities(false);
+
         let has_model_update = patch.providers.is_some()
             || patch.judge.is_some()
             || patch.window_max_bytes.is_some()
@@ -332,33 +439,18 @@ impl HostRuntime {
             updated.max_steps = patch.max_steps.or(updated.max_steps);
             updated.preserve_api_keys(&self.config);
             if updated != self.config {
-                match updated.save_models(&self.core_dir) {
-                    Ok(()) => self.config = updated,
-                    Err(err) => self.emit_error(format!("保存模型配置失败: {err}")),
-                }
+                updated
+                    .save_models(&self.core_dir)
+                    .map_err(|err| format!("保存模型配置失败: {err}"))?;
+                self.config = updated;
             }
         }
-        if let Some(capabilities) = patch.capabilities {
-            let capabilities = HostConfig::normalize_capabilities(capabilities);
-            if capabilities != self.config.capabilities {
-                match write_json_atomic(&self.data_dir, "capabilities.json", &capabilities) {
-                    Ok(()) => self.refresh_capabilities(false),
-                    Err(err) => self.emit_error(format!("保存能力配置失败: {err}")),
-                }
-            }
-        } else {
-            self.refresh_capabilities(false);
-        }
-        self.emit_state();
-        if self.config.is_configured() {
-            self.clear_retry();
-            self.process_pending_turn();
-        }
+        Ok(())
     }
 
     pub fn reload_capabilities(&mut self) {
         self.refresh_capabilities(true);
-        self.emit_state();
+        self.emit_state(None);
     }
 
     pub fn oauth_capability(&mut self, id: String) {
@@ -367,10 +459,10 @@ impl HostRuntime {
             .config
             .capabilities
             .iter()
-            .find(|c| c.id == id)
+            .find(|c| c.enabled && c.id == id)
             .cloned()
         else {
-            self.emit_error(format!("未找到能力: {id}"));
+            self.emit_error(format!("能力缺失或已关闭: {id}"));
             return;
         };
         let CapabilityTransport::Http { url, headers } = cfg.transport else {
@@ -393,13 +485,24 @@ impl HostRuntime {
         let mut changed = false;
         while let Ok(ev) = self.oauth_rx.try_recv() {
             match ev {
-                OAuthEvent::DeviceCode { id, code } => {
-                    if self.oauth_cancels.contains_key(&id) {
+                OAuthEvent::DeviceCode { id, flow, code } => {
+                    if self
+                        .oauth_cancels
+                        .get(&id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &flow))
+                    {
                         self.hands.set_oauth_code(&id, Some(code));
                         changed = true;
                     }
                 }
-                OAuthEvent::Finished { id, result } => {
+                OAuthEvent::Finished { id, flow, result } => {
+                    if !self
+                        .oauth_cancels
+                        .get(&id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &flow))
+                    {
+                        continue;
+                    }
                     self.oauth_cancels.remove(&id);
                     self.hands.set_oauth_code(&id, None);
                     match result {
@@ -420,22 +523,33 @@ impl HostRuntime {
             }
         }
         if changed {
-            self.emit_state();
+            self.emit_state(None);
         }
         changed
     }
 
-    pub fn test_provider(&mut self, id: String, mut provider: ProviderConfig, model: String) {
-        if provider.api_key.is_empty() {
-            if let Some(existing) = self.config.providers.iter().find(|p| p.id == provider.id) {
-                provider.api_key = existing.api_key.clone();
-            }
-        }
-        let (ok, message) = match self.brain.test_connection(&provider, &model) {
-            Ok(message) => (true, message),
-            Err(err) => (false, err),
-        };
-        (self.emit)(json!({ "event": "provider_test", "id": id, "ok": ok, "message": message }));
+    fn test_provider(&self, id: String, mut provider: ProviderConfig, model: String) {
+        provider.reuse_api_key(&self.config.providers);
+        let brain = Arc::clone(&self.brain);
+        let emit = Arc::clone(&self.emit);
+        std::thread::spawn(move || {
+            let (ok, message) = match brain.test_connection(&provider, &model) {
+                Ok(message) => (true, message),
+                Err(err) => (false, err),
+            };
+            emit(json!({ "event": "provider_test", "id": id, "ok": ok, "message": message }));
+        });
+    }
+
+    fn list_provider_models(&self, id: String, mut provider: ProviderConfig) {
+        provider.reuse_api_key(&self.config.providers);
+        let emit = Arc::clone(&self.emit);
+        std::thread::spawn(move || {
+            emit(match list_models(&provider) {
+                Ok(models) => json!({"event":"provider_models", "id":id, "models":models}),
+                Err(err) => json!({"event":"provider_models", "id":id, "error":err}),
+            });
+        });
     }
 
     pub fn handle_user_message(&mut self, raw: &str) {
@@ -452,6 +566,9 @@ impl HostRuntime {
     }
 
     pub fn tick_timers(&mut self) -> Result<(), String> {
+        if !self.oauth_cancels.is_empty() {
+            self.refresh_capabilities(false);
+        }
         self.poll_oauth_events();
         let (mut fired, due_guarded, now) =
             state::collect_due_wakes(&self.eja).map_err(|err| err.to_string())?;
@@ -479,7 +596,7 @@ impl HostRuntime {
             }
         }
         if checked_watches && !fired {
-            self.emit_state();
+            self.emit_state(None);
         }
         if fired {
             self.clear_retry();
@@ -499,11 +616,25 @@ impl HostRuntime {
             Err(err) => return self.emit_error(err),
         };
         if !force && self.capabilities_bytes == bytes {
+            if self.hands.disconnect_dead() {
+                self.emit_state(None);
+            }
             return;
         }
         self.capabilities_bytes = bytes;
         match HostConfig::parse_capabilities(self.capabilities_bytes.as_deref()) {
             Ok(capabilities) if force || self.config.capabilities != capabilities => {
+                self.oauth_cancels.retain(|id, cancel| {
+                    let previous = self.config.capabilities.iter().find(|cap| cap.id == *id);
+                    let current = capabilities.iter().find(|cap| cap.id == *id && cap.enabled);
+                    let keep = previous
+                        .zip(current)
+                        .is_some_and(|(old, new)| old.transport == new.transport);
+                    if !keep {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    keep
+                });
                 self.hands.reload(&capabilities, force);
                 self.config.capabilities = capabilities;
             }
@@ -513,6 +644,7 @@ impl HostRuntime {
     }
 
     fn run_turn(&mut self, proactive: bool, trigger_id: Id) -> bool {
+        self.drain_turn_commands();
         self.set_status("thinking", "思考中…");
         self.refresh_capabilities(false);
         let window_max_bytes = self.config.window_max_bytes();
@@ -584,11 +716,12 @@ impl HostRuntime {
         let mut fatal_error: Option<String> = None;
         let mut recoverable = false;
         for _ in 0..max_steps {
+            self.drain_turn_commands();
             self.set_status("thinking", "思考中…");
-            self.poll_oauth_events();
             self.refresh_capabilities(false);
+            self.poll_oauth_events();
             let tools = self.hands.tools();
-            let emit = &mut self.emit;
+            let emit = &self.emit;
             let reply = match self.brain.complete_streaming(
                 &provider,
                 &model,
@@ -608,6 +741,7 @@ impl HostRuntime {
                     break;
                 }
             };
+            expire_tool_images(&mut messages, &provider.kind);
 
             if reply.calls.is_empty() {
                 let text = normalize_reply_text(&reply.text);
@@ -630,6 +764,8 @@ impl HostRuntime {
                 }
             };
             let step = tool_messages(&provider.kind, reply, window_max_bytes, |call| {
+                self.drain_turn_commands();
+                self.refresh_capabilities(false);
                 self.set_status("thinking", activity_label(&call.name));
                 self.execute_tool_call(call, &tools)
             });
@@ -734,11 +870,19 @@ impl HostRuntime {
                 };
             }
             other => {
-                let Some(spec) = tools.iter().find(|t| !t.is_kernel && t.name == other) else {
+                let Some(spec) = tools
+                    .iter()
+                    .find(|t| t.target != ToolTarget::Kernel && t.name == other)
+                else {
                     return Ok(ToolOutput::Value(
                         json!({ "error": format!("未知工具: {other}") }),
                     ));
                 };
+                if !self.hands.is_current(spec) {
+                    return Ok(ToolOutput::Value(
+                        json!({"error":"能力已关闭或变更，请按当前工具列表重试"}),
+                    ));
+                }
                 let revision = self.eja.revision().map_err(|err| err.to_string())?;
                 let acted = self.eja.act(revision, &spec.capability, call.args.clone());
                 let acted = match acted {
@@ -748,18 +892,23 @@ impl HostRuntime {
                     }
                     Err(err) => return Err(err.to_string()),
                 };
-                let outcome = self.hands.execute(&acted, &self.eja);
+                let execution = self.hands.execute(&acted, &self.eja);
                 let receipt = self
                     .eja
-                    .finish(acted.id, outcome)
+                    .finish(acted.id, execution.outcome)
                     .map_err(|err| err.to_string())?;
-                self.refresh_capabilities(false);
+                if self.hands.disconnect_dead() {
+                    self.emit_state(None);
+                }
                 let Fact::Returned { outcome, .. } = receipt.fact else {
                     unreachable!()
                 };
-                Ok(ToolOutput::Value(
-                    json!({ "id": receipt.id, "action": acted.id, "outcome": outcome }),
-                ))
+                let value = json!({ "id": receipt.id, "action": acted.id, "outcome": outcome });
+                Ok(if execution.images.is_empty() {
+                    ToolOutput::Value(value)
+                } else {
+                    ToolOutput::Images(value, execution.images)
+                })
             }
         };
         match result {
@@ -774,7 +923,7 @@ impl HostRuntime {
             let phase_changed = self.status.0 != status;
             self.status = (status.to_string(), detail.to_string());
             if phase_changed {
-                self.emit_state();
+                self.emit_state(None);
             } else {
                 (self.emit)(json!({ "event": "activity", "status_detail": detail }));
             }
@@ -951,23 +1100,9 @@ enum LockError {
     Io(String),
 }
 
-fn lock_core_dir(data_dir: &Path, core_dir: &Path) -> Result<fs::File, LockError> {
-    let old_dir = data_dir.join("core");
-    let io_error = |err| LockError::Io(format!("准备内核目录失败: {err}"));
-    let old_is_real_dir = fs::symlink_metadata(&old_dir)
-        .map(|meta| meta.file_type().is_dir())
-        .unwrap_or(false);
-    if !core_dir.try_exists().map_err(io_error)? && old_is_real_dir {
-        // Carry the existing instance lock along with the journal and SQLite sidecars.
-        let lock = acquire_instance_lock(&old_dir)?;
-        fs::rename(old_dir, core_dir).map_err(io_error)?;
-        return Ok(lock);
-    }
-    fs::create_dir_all(core_dir).map_err(io_error)?;
-    acquire_instance_lock(core_dir)
-}
-
-fn acquire_instance_lock(core_dir: &Path) -> Result<fs::File, LockError> {
+fn lock_core_dir(core_dir: &Path) -> Result<fs::File, LockError> {
+    fs::create_dir_all(core_dir)
+        .map_err(|err| LockError::Io(format!("准备内核目录失败: {err}")))?;
     let lock_path = core_dir.join("host.lock");
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -1093,7 +1228,7 @@ mod tests {
                 provider_id: "local".into(),
                 model: "demo".into(),
             },
-            capabilities: HostConfig::normalize_capabilities(capabilities),
+            capabilities: HostConfig::normalize_capabilities(capabilities).unwrap(),
             window_max_bytes: None,
             max_steps: None,
         }
@@ -1111,7 +1246,7 @@ mod tests {
         let mut rt = HostRuntime::open_with_brain(
             dir.path().join("Eja"),
             brain.clone(),
-            Box::new(move |ev| events_sink.lock().unwrap().push(ev)),
+            Arc::new(move |ev| events_sink.lock().unwrap().push(ev)),
         )
         .unwrap();
         rt.save_config(configured(vec![]));
@@ -1176,7 +1311,7 @@ for line in sys.stdin:
         let mut rt = HostRuntime::open_with_brain(
             dir.path().join("Eja"),
             brain,
-            Box::new(move |event| sink.lock().unwrap().push(event)),
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
         )
         .unwrap();
         rt.save_config(configured(vec![
@@ -1222,7 +1357,7 @@ for line in sys.stdin:
             input: json!({ "msg": "free" }),
         };
         assert_eq!(
-            rt.hands.execute(&exec_call, &rt.eja),
+            rt.hands.execute(&exec_call, &rt.eja).outcome,
             Outcome::Observed("exec:free".into())
         );
 
@@ -1285,7 +1420,7 @@ for line in sys.stdin:
             windows: Mutex::new(Vec::new()),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         let mut cfg = configured(vec![]);
         cfg.window_max_bytes = Some(900);
@@ -1300,14 +1435,14 @@ for line in sys.stdin:
             assert!(windows[1].starts_with(&windows[0]));
         }
 
-        // Exceed the window budget so anchor advances and persists to window.json.
+        // Exceed the window budget so the persisted anchor advances.
         rt.handle_user_message(&"长消息".repeat(120));
         rt.handle_user_message("推进窗口");
         drop(rt);
 
         // Reopen runtime and verify persisted anchor starts cleanly with the open concern snapshot.
         let mut restarted =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         restarted.handle_user_message("重启后第一轮");
 
@@ -1358,7 +1493,7 @@ for line in sys.stdin:
             seen_error: Mutex::new(None),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
 
@@ -1379,7 +1514,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
 
@@ -1412,7 +1547,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Arc::new(|_| {})).unwrap();
         let mut cfg = configured(vec![]);
         cfg.providers[0].api_key = "sk-top-secret".into();
         rt.save_config(cfg);
@@ -1429,6 +1564,107 @@ for line in sys.stdin:
             fs::read_to_string(HostConfig::config_path(&dir.path().join("ai.eja.kernel"))).unwrap();
         assert!(disk.contains("sk-top-secret"));
         assert!(!disk.contains("has_api_key"));
+
+        let mut edited = rt.snapshot().config;
+        edited.providers[0].base_url = "http://127.0.0.1:10000/v1".into();
+        rt.save_config(edited);
+        assert!(!rt.snapshot().config.providers[0].has_api_key);
+        let disk =
+            fs::read_to_string(HostConfig::config_path(&dir.path().join("ai.eja.kernel"))).unwrap();
+        assert!(!disk.contains("sk-top-secret"));
+    }
+
+    #[test]
+    fn capability_change_during_a_model_step_revokes_the_advertised_tool() {
+        struct SwitchingBrain(Mutex<Option<Sender<Result<HostCommand, String>>>>);
+        impl Brain for SwitchingBrain {
+            fn complete(
+                &self,
+                _: &ProviderConfig,
+                _: &str,
+                _: &str,
+                messages: &[Value],
+                tools: &[ToolSpec],
+            ) -> Result<ModelReply, String> {
+                if let Some(send) = self.0.lock().unwrap().take() {
+                    assert!(tools.iter().any(|tool| tool.name == "cap_toggle"));
+                    let command = serde_json::from_value(json!({
+                        "cmd":"save_config", "id":"switch",
+                        "config":{"capabilities":[{"id":"toggle","name":"Toggle","enabled":false,
+                            "transport":{"type":"exec","command":"/bin/cat"}}]}
+                    }))
+                    .unwrap();
+                    send.send(Ok(command)).unwrap();
+                    return Ok(tool_reply("a1", "cap_toggle", json!({})));
+                }
+                assert!(!tools.iter().any(|tool| tool.name == "cap_toggle"));
+                assert!(messages.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("能力已关闭"));
+                Ok(text_reply("已关闭"))
+            }
+
+            fn test_connection(&self, _: &ProviderConfig, _: &str) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let brain = Arc::new(SwitchingBrain(Mutex::new(Some(tx))));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&events);
+        let mut rt = HostRuntime::open_with_brain(
+            dir.path().join("Eja"),
+            brain,
+            Arc::new(move |event| received.lock().unwrap().push(event)),
+        )
+        .unwrap();
+        let enabled = serde_json::from_value(json!({"id":"toggle","name":"Toggle",
+            "transport":{"type":"exec","command":"/bin/cat"}}))
+        .unwrap();
+        rt.save_config(configured(vec![enabled]));
+        rt.inbox = Some(rx);
+        rt.handle_user_message("检查开关");
+        assert!(!rt
+            .eja
+            .recent(10)
+            .unwrap()
+            .iter()
+            .any(|entry| matches!(entry.fact, Fact::Acted { .. })));
+        assert!(!rt.snapshot().config.capabilities[1].enabled);
+        assert!(events.lock().unwrap().iter().any(|event| {
+            event["event"] == "state"
+                && event["save_id"] == "switch"
+                && event["config"]["capabilities"][1]["enabled"] == false
+        }));
+    }
+
+    #[test]
+    fn queued_oauth_events_cannot_settle_a_replacement_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = HostRuntime::open(dir.path().join("Eja"), Arc::new(|_| {})).unwrap();
+        let old = Arc::new(AtomicBool::new(true));
+        let current = Arc::new(AtomicBool::new(false));
+        rt.oauth_cancels.insert("http".into(), Arc::clone(&current));
+        rt.oauth_tx
+            .send(OAuthEvent::DeviceCode {
+                id: "http".into(),
+                flow: Arc::clone(&old),
+                code: "OLD".into(),
+            })
+            .unwrap();
+        rt.oauth_tx
+            .send(OAuthEvent::Finished {
+                id: "http".into(),
+                flow: old,
+                result: Ok(crate::oauth::OAuthToken::default()),
+            })
+            .unwrap();
+        assert!(!rt.poll_oauth_events());
+        assert!(Arc::ptr_eq(&rt.oauth_cancels["http"], &current));
+        assert!(!dir.path().join("ai.eja.kernel/oauth.json").exists());
     }
 
     #[test]
@@ -1439,14 +1675,14 @@ for line in sys.stdin:
             mode: "chat",
         });
         let rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         assert!(rt.snapshot().stream.is_empty());
         state::set_kernel_version_for_test(&rt.eja, "0.9.0").unwrap();
         drop(rt);
 
         let upgraded =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Arc::new(|_| {})).unwrap();
         assert!(upgraded
             .snapshot()
             .stream
@@ -1462,7 +1698,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let rt1 =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
 
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1470,7 +1706,7 @@ for line in sys.stdin:
         let second = HostRuntime::open_with_brain(
             dir.path().join("Eja"),
             brain.clone(),
-            Box::new(move |val| sink_events.lock().unwrap().push(val)),
+            Arc::new(move |val| sink_events.lock().unwrap().push(val)),
         );
         assert!(second.is_err());
         assert!(events
@@ -1481,37 +1717,32 @@ for line in sys.stdin:
 
         drop(rt1);
         assert!(
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {}),).is_ok()
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Arc::new(|_| {}),).is_ok()
         );
     }
 
     #[test]
-    fn moves_legacy_core_and_reconciles_unfinished_actions() {
+    fn restart_reconciles_unfinished_actions_once() {
         let dir = tempfile::tempdir().unwrap();
-        let old_dir = dir.path().join("Eja/core");
-        fs::create_dir_all(&old_dir).unwrap();
-        let eja = Eja::open(old_dir.join("subject.db")).unwrap();
-        let rev = eja.revision().unwrap();
-        let dangling = eja
-            .act(rev, "shell", json!({ "command": "sleep 999" }))
-            .unwrap();
-        drop(eja);
-
+        let data_dir = dir.path().join("Eja");
         let brain = Arc::new(MockBrain {
             judge_calls: AtomicUsize::new(0),
             mode: "chat",
         });
-        let legacy_lock = acquire_instance_lock(&old_dir).ok().unwrap();
-        assert!(matches!(
-            lock_core_dir(&dir.path().join("Eja"), &dir.path().join("ai.eja.kernel")),
-            Err(LockError::AlreadyRunning(_))
-        ));
-        assert!(old_dir.exists());
-        legacy_lock.unlock().unwrap();
+        let rt = HostRuntime::open_with_brain(data_dir.clone(), brain.clone(), Arc::new(|_| {}))
+            .unwrap();
+        let dangling = rt
+            .eja
+            .act(
+                rt.eja.revision().unwrap(),
+                "shell",
+                json!({ "command": "sleep 999" }),
+            )
+            .unwrap();
+        drop(rt);
 
-        let rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
-                .unwrap();
+        let rt = HostRuntime::open_with_brain(data_dir.clone(), brain.clone(), Arc::new(|_| {}))
+            .unwrap();
         let snap = rt.snapshot();
         assert!(snap.stream.iter().any(|item| {
             item.id == dangling.id
@@ -1520,13 +1751,10 @@ for line in sys.stdin:
                     .as_deref()
                     .is_some_and(|d| d.contains("未知:") && d.contains("中断"))
         }));
-        assert!(!old_dir.exists());
-        assert!(dir.path().join("ai.eja.kernel/subject.db").is_file());
         let rev_after_first = rt.eja.revision().unwrap();
         drop(rt);
 
-        let reopened =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
+        let reopened = HostRuntime::open_with_brain(data_dir, brain, Arc::new(|_| {})).unwrap();
         assert_eq!(reopened.eja.revision().unwrap(), rev_after_first);
     }
 
@@ -1565,7 +1793,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         rt.save_config(HostConfig {
             providers: Vec::new(),
@@ -1595,7 +1823,7 @@ for line in sys.stdin:
         let mut restarted = HostRuntime::open_with_brain(
             dir.path().join("Eja"),
             brain.clone(),
-            Box::new(move |event| sink.lock().unwrap().push(event)),
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
         )
         .unwrap();
         assert!(restarted.has_pending_trigger());
@@ -1610,7 +1838,7 @@ for line in sys.stdin:
         drop(restarted);
 
         let mut settled =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         assert!(!settled.has_pending_trigger());
         settled.process_pending_turn();
@@ -1630,7 +1858,7 @@ for line in sys.stdin:
             seen_windows: Mutex::new(Vec::new()),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
         rt.handle_user_message("保持沉默测试");
@@ -1654,7 +1882,7 @@ for line in sys.stdin:
         drop(rt);
 
         let mut restarted =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         assert!(restarted.has_pending_trigger());
         restarted.process_pending_turn();
@@ -1692,7 +1920,7 @@ for line in sys.stdin:
         let mut rt = HostRuntime::open_with_brain(
             dir.path().join("Eja"),
             brain.clone(),
-            Box::new(move |event| sink.lock().unwrap().push(event)),
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
         )
         .unwrap();
         let mut cfg = configured(vec![]);
@@ -1738,7 +1966,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Box::new(|_| {})).unwrap();
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain, Arc::new(|_| {})).unwrap();
         let mut cfg = configured(vec![]);
         cfg.providers[0].api_key = "sk-keep-me".into();
         cfg.max_steps = Some(7);
@@ -1767,7 +1995,7 @@ for line in sys.stdin:
         });
 
         let expected_capabilities =
-            HostConfig::normalize_capabilities(external_capabilities.clone());
+            HostConfig::normalize_capabilities(external_capabilities.clone()).unwrap();
         assert_eq!(rt.snapshot().config.capabilities, expected_capabilities);
         assert_eq!(rt.snapshot().config.providers[0].name, "Renamed Local");
         assert_eq!(rt.config.max_steps, Some(7));
@@ -1833,7 +2061,7 @@ for line in sys.stdin:
             step: AtomicUsize::new(0),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         let mut cfg = configured(vec![]);
         cfg.window_max_bytes = Some(4096);
@@ -1927,7 +2155,7 @@ for line in sys.stdin:
             let mut rt = HostRuntime::open_with_brain(
                 dir.path().join("Eja"),
                 brain.clone(),
-                Box::new(|_| {}),
+                Arc::new(|_| {}),
             )
             .unwrap();
             let mut cfg = configured(vec![]);
@@ -1971,7 +2199,7 @@ for line in sys.stdin:
             step: AtomicUsize::new(0),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
         let fact_id = rt.eja.notice(Source::World, &big).unwrap();
@@ -1997,7 +2225,7 @@ for line in sys.stdin:
             let mut small_rt = HostRuntime::open_with_brain(
                 small_dir.path().join("Eja"),
                 small_brain.clone(),
-                Box::new(|_| {}),
+                Arc::new(|_| {}),
             )
             .unwrap();
             let mut cfg = configured(vec![]);
@@ -2034,7 +2262,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn silent_turn_with_wake_survives_unwritable_window_file_and_restart() {
+    fn silent_turn_persists_the_wake_across_restart() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("Eja");
         let brain = Arc::new(ScriptedBrain {
@@ -2049,14 +2277,13 @@ for line in sys.stdin:
             seen_windows: Mutex::new(Vec::new()),
         });
         let mut rt =
-            HostRuntime::open_with_brain(data.clone(), brain.clone(), Box::new(|_| {})).unwrap();
+            HostRuntime::open_with_brain(data.clone(), brain.clone(), Arc::new(|_| {})).unwrap();
         rt.save_config(configured(vec![]));
-        fs::create_dir(dir.path().join("ai.eja.kernel/window.json")).unwrap();
         rt.handle_user_message("请预约一次，随后保持沉默");
         assert!(!rt.has_pending_trigger());
         assert_eq!(state::pending_wakes(&rt.eja).unwrap().len(), 1);
         drop(rt);
-        let mut rt = HostRuntime::open_with_brain(data, brain.clone(), Box::new(|_| {})).unwrap();
+        let mut rt = HostRuntime::open_with_brain(data, brain.clone(), Arc::new(|_| {})).unwrap();
         rt.process_pending_turn();
         assert_eq!(state::pending_wakes(&rt.eja).unwrap().len(), 1);
         assert_eq!(brain.seen_windows.lock().unwrap().len(), 2);
@@ -2070,7 +2297,7 @@ for line in sys.stdin:
             seen_windows: Mutex::new(Vec::new()),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         let mut cfg = configured(vec![]);
         cfg.window_max_bytes = Some(1);
@@ -2095,7 +2322,7 @@ for line in sys.stdin:
             seen_windows: Mutex::new(Vec::new()),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         let mut cfg = configured(vec![]);
         cfg.window_max_bytes = Some(2048);
@@ -2125,25 +2352,21 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn legacy_anchor_at_pending_trigger_restores_user_request() {
+    fn saved_anchor_at_pending_trigger_restores_user_request() {
         let dir = tempfile::tempdir().unwrap();
         let core = dir.path().join("ai.eja.kernel");
         fs::create_dir(&core).unwrap();
         let eja = Eja::open(core.join("subject.db")).unwrap();
         eja.notice(Source::Person, "original request").unwrap();
         eja.keep(None, "later concern").unwrap();
+        state::save_anchor(&eja, 1).unwrap();
         drop(eja);
-        fs::write(
-            core.join("window.json"),
-            r#"{"anchor":1,"settled_through":0}"#,
-        )
-        .unwrap();
         let brain = Arc::new(ScriptedBrain {
             replies: Mutex::new(vec![Ok(text_reply(""))]),
             seen_windows: Mutex::new(Vec::new()),
         });
         let mut rt =
-            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
         rt.save_config(configured(vec![]));
         assert!(brain.seen_windows.lock().unwrap()[0]
@@ -2155,7 +2378,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn legacy_window_json_without_settled_through_recovers_trailing_clock_wake() {
+    fn restart_resumes_pending_clock_wake_after_a_settled_turn() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("Eja");
         let core_dir = dir.path().join("ai.eja.kernel");
@@ -2163,12 +2386,10 @@ for line in sys.stdin:
         fs::create_dir_all(&core_dir).unwrap();
         {
             let eja = Eja::open(core_dir.join("subject.db")).unwrap();
-            eja.notice(Source::Person, "旧消息").unwrap();
-            eja.say("旧回复").unwrap();
-            eja.notice(Source::Clock, "定时唤醒：升级前漏掉的提醒")
-                .unwrap();
+            let trigger = eja.notice(Source::Person, "消息").unwrap();
+            state::complete_turn(&eja, trigger, "回复").unwrap();
+            eja.notice(Source::Clock, "定时唤醒：重启前的提醒").unwrap();
         }
-        fs::write(core_dir.join("window.json"), r#"{"anchor":0}"#).unwrap();
         let core_root = TrustedDir::open(&core_dir).unwrap();
         configured(vec![]).save_models(&core_root).unwrap();
 
@@ -2177,7 +2398,7 @@ for line in sys.stdin:
             mode: "chat",
         });
         let mut rt =
-            HostRuntime::open_with_brain(data_dir, brain.clone(), Box::new(|_| {})).unwrap();
+            HostRuntime::open_with_brain(data_dir, brain.clone(), Arc::new(|_| {})).unwrap();
         assert!(rt.has_pending_trigger());
         rt.process_pending_turn();
         assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 1);
@@ -2220,7 +2441,7 @@ for line in sys.stdin:
             HostRuntime::open_with_brain(
                 data.clone(),
                 brain.clone(),
-                Box::new(move |event| sink.lock().unwrap().push(event)),
+                Arc::new(move |event| sink.lock().unwrap().push(event)),
             )
             .unwrap()
         };
@@ -2379,7 +2600,7 @@ for line in sys.stdin:
         let mut rt = HostRuntime::open_with_brain(
             data.clone(),
             brain.clone(),
-            Box::new(move |event| sink.lock().unwrap().push(event)),
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
         )
         .unwrap();
         let clock_ref = clock.clone();
@@ -2649,7 +2870,7 @@ for line in sys.stdin:
             seen_windows: Mutex::new(Vec::new()),
         });
         let mut rt =
-            HostRuntime::open_with_brain(data_dir.clone(), brain.clone(), Box::new(|_| {}))
+            HostRuntime::open_with_brain(data_dir.clone(), brain.clone(), Arc::new(|_| {}))
                 .unwrap();
 
         let mut headers = std::collections::BTreeMap::new();
@@ -2715,65 +2936,5 @@ for line in sys.stdin:
 
         stop.store(true, Ordering::Relaxed);
         let _ = server.join();
-    }
-
-    #[test]
-    fn fast_open_populates_models_and_local_capabilities_before_external_mcp_warmup() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
-        fs::create_dir_all(&data_dir).unwrap();
-        let mcp_script = data_dir.join("slow_mcp.py");
-        fs::write(
-            &mcp_script,
-            r#"import json, sys
-for line in sys.stdin:
-    msg = json.loads(line)
-    mid = msg.get("id")
-    method = msg.get("method")
-    if method == "initialize":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"demo","version":"1"}}}), flush=True)
-    elif method == "tools/list":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}), flush=True)
-"#,
-        )
-        .unwrap();
-
-        let cfg = configured(vec![CapabilityConfig {
-            id: "ext".into(),
-            name: "External MCP".into(),
-            enabled: true,
-            transport: CapabilityTransport::Stdio {
-                command: "/usr/bin/python3".into(),
-                args: vec![mcp_script.to_string_lossy().into()],
-                env: Default::default(),
-            },
-        }]);
-
-        let mut setup =
-            HostRuntime::open_with_brain(data_dir.clone(), Arc::new(HttpBrain), Box::new(|_| {}))
-                .unwrap();
-        setup.save_config(cfg);
-        drop(setup);
-
-        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let sink = events.clone();
-        let mut rt =
-            HostRuntime::open(data_dir, Box::new(move |ev| sink.lock().unwrap().push(ev))).unwrap();
-        rt.emit_state();
-        let initial = events.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(initial["config"]["providers"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            initial["config"]["capabilities"].as_array().unwrap().len(),
-            2
-        );
-        assert_eq!(initial["capability_statuses"][0]["id"], "shell");
-        assert_eq!(initial["capability_statuses"][0]["connected"], true);
-        assert_eq!(initial["capability_statuses"][1]["id"], "ext");
-        assert_eq!(initial["capability_statuses"][1]["connected"], false);
-
-        rt.warm_external_capabilities();
-        let warmed = events.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(warmed["capability_statuses"][1]["id"], "ext");
-        assert_eq!(warmed["capability_statuses"][1]["connected"], true);
     }
 }

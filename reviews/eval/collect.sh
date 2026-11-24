@@ -86,6 +86,16 @@ fi
 proactive_sql="EXISTS (SELECT 1 FROM host_meta, json_each(json_extract(host_meta.value, '$.proactive_replies'))
   WHERE host_meta.key = 'host.state' AND json_each.value = facts.id)"
 
+active_concerns_before() {
+  local boundary="$1"
+  echo "SELECT f.ref_id, json_extract(f.body, '$.text') AS text
+          FROM facts f
+         WHERE f.id < $boundary AND f.live = 1
+           AND NOT EXISTS (SELECT 1 FROM facts later
+                            WHERE later.ref_id = f.ref_id AND later.live IS NOT NULL
+                              AND later.id > f.id AND later.id < $boundary)"
+}
+
 q "SELECT printf('### #%d · %s · %s', id, datetime(at, 'unixepoch', 'localtime'),
           CASE kind
             WHEN 'noticed' THEN 'noticed/' || json_extract(body, '$.source')
@@ -124,11 +134,9 @@ q "SELECT printf('### #%d · %s · %s', id, datetime(at, 'unixepoch', 'localtime
   echo
   echo "## 当前开放挂念"
   echo
-  q "SELECT '- #' || f.ref_id || '：' || coalesce((SELECT json_extract(k.body, '$.text') FROM facts k
-       WHERE k.kind = 'kept' AND k.ref_id = f.ref_id ORDER BY k.id DESC LIMIT 1), '')
-     FROM facts f
-     WHERE f.live = 1 AND f.id = (SELECT max(g.id) FROM facts g WHERE g.live IS NOT NULL AND g.ref_id = f.ref_id)
-     ORDER BY f.ref_id;"
+  q "SELECT '- #' || ref_id || '：' || text
+       FROM ($(active_concerns_before '9223372036854775807'))
+      ORDER BY ref_id;"
   echo
   echo "## 待执行唤醒"
   echo
@@ -148,9 +156,9 @@ checkpoint_anchor="$(grep -o 'window_anchor=[0-9]*' "$out_dir/checkpoint.txt" 2>
 {
   echo "# 探针"
   echo
-  echo "检查点 window_anchor：${checkpoint_anchor:-未记录}。search/read 不写入日志，无法直接观察。"
+  echo "检查点 window_anchor：${checkpoint_anchor:-未记录}。动作列记录探针至首条直接回复之间的行动，缺少直接回复时止于下一条用户消息。"
   echo
-  echo "| 编号 | 类型 | 植入 | 检查点时移出窗口 | 挂念含关键词 | 探针 | 本回合记录的行动 | 回复 |"
+  echo "| 编号 | 类型 | 植入 | 检查点时移出窗口 | 活跃挂念含关键词 | 探针 | 区间内记录的行动 | 直接回复 |"
   echo "|---|---|---|---|---|---|---|---|"
   while IFS='|' read -r code kind plant probe keyword; do
     probe_id="$(person_id "$probe")"
@@ -170,14 +178,20 @@ checkpoint_anchor="$(grep -o 'window_anchor=[0-9]*' "$out_dir/checkpoint.txt" 2>
                       AND json_extract(body, '$.source') = 'person' AND id > $probe_id;")"
     concern_hit="-"
     if [[ "$keyword" != "-" ]]; then
-      hits="$(q "SELECT count(*) FROM facts WHERE kind = 'kept' AND id < $probe_id
-                 AND instr(json_extract(body, '$.text'), '$keyword') > 0;")"
+      hits="$(q "SELECT count(*) FROM ($(active_concerns_before "$probe_id"))
+                  WHERE instr(text, '$keyword') > 0;")"
       if [[ "$hits" -gt 0 ]]; then concern_hit="是"; else concern_hit="否"; fi
     fi
-    actions="$(q "SELECT coalesce(group_concat(json_extract(body, '$.capability'), ','), '-') FROM facts
-                  WHERE kind = 'acted' AND id > $probe_id AND id < $next_person;")"
+    reply_id="$(q "SELECT coalesce(min(id), 0) FROM facts
+                    WHERE kind = 'said' AND id > $probe_id AND id < $next_person
+                      AND NOT ($proactive_sql);")"
+    end_id="$next_person"
+    if [[ "$reply_id" -gt 0 ]]; then end_id="$reply_id"; fi
+    actions="$(q "SELECT coalesce(group_concat(capability, ','), '-') FROM (
+                   SELECT json_extract(body, '$.capability') AS capability FROM facts
+                    WHERE kind = 'acted' AND id > $probe_id AND id < $end_id ORDER BY id);")"
     reply="$(q "SELECT replace(replace(substr(json_extract(body, '$.text'), 1, 160), char(10), ' '), '|', '/') FROM facts
-                WHERE kind = 'said' AND id > $probe_id AND id < $next_person ORDER BY id LIMIT 1;")"
+                WHERE id = $reply_id;")"
     echo "| $code | $kind | $plant_id | $evicted | $concern_hit | #$probe_id | $actions | ${reply:-（沉默）} |"
   done <<< "$PROBES"
 } > "$out_dir/probes.md"

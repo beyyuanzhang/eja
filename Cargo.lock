@@ -298,10 +298,13 @@ dependencies = [
 name = "eja-host"
 version = "1.0.0"
 dependencies = [
+ "base64 0.23.1",
  "eja-core",
  "eja-memory",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

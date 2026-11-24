@@ -176,6 +176,7 @@ public struct HostConfigDTO: Codable, Equatable, Sendable {
         self.windowMaxBytes = windowMaxBytes
         self.maxSteps = maxSteps
     }
+
 }
 
 public struct CapabilityToolSummaryDTO: Codable, Equatable, Identifiable, Sendable {
@@ -233,12 +234,14 @@ private struct StateEventDTO: Decodable {
     let config: HostConfigDTO
     let capabilityStatuses: [CapabilityStatusDTO]
     let stream: [StreamItemDTO]
+    let saveId: String?
 
     enum CodingKeys: String, CodingKey {
         case status, config, stream, configured
         case statusDetail = "status_detail"
         case dataDir = "data_dir"
         case capabilityStatuses = "capability_statuses"
+        case saveId = "save_id"
     }
 }
 
@@ -261,6 +264,8 @@ public final class HostClient: ObservableObject {
     private var process: Process?
     private var stdinHandle: FileHandle?
     private let decoder = JSONDecoder()
+    private var configSaves: [String: (HostConfigDTO) -> Void] = [:]
+    private var modelLists: [String: ([String]?) -> Void] = [:]
 
     public init(hostExecutableURL: URL? = nil, dataDir: URL? = nil) {
         if Bundle.main.bundleURL.pathExtension == "app" {
@@ -285,38 +290,42 @@ public final class HostClient: ObservableObject {
         sendCommand(["cmd": "send", "text": trimmed])
     }
 
-    public func saveConfig(_ updated: HostConfigDTO) {
-        errorBanner = nil
-        guard let data = try? JSONEncoder().encode(updated),
-              let obj = try? JSONSerialization.jsonObject(with: data) else { return }
-        sendCommand(["cmd": "save_config", "config": obj])
-    }
-
-    public func saveConfigPatch(
+    public func saveConfig(
         providers: [ProviderConfigDTO]? = nil,
         judge: ModelRefDTO? = nil,
-        capabilities: [CapabilityConfigDTO]? = nil
+        capabilities: [CapabilityConfigDTO]? = nil,
+        id: UUID = UUID(),
+        completion: ((HostConfigDTO) -> Void)? = nil
     ) {
-        var patch: [String: Any] = [:]
-        let encoder = JSONEncoder()
-        if let providers,
-           let data = try? encoder.encode(providers),
-           let obj = try? JSONSerialization.jsonObject(with: data) {
-            patch["providers"] = obj
+        struct Patch: Encodable {
+            var providers: [ProviderConfigDTO]?
+            var judge: ModelRefDTO?
+            var capabilities: [CapabilityConfigDTO]?
         }
-        if let judge,
-           let data = try? encoder.encode(judge),
-           let obj = try? JSONSerialization.jsonObject(with: data) {
-            patch["judge"] = obj
+        let patch = Patch(providers: providers, judge: judge, capabilities: capabilities)
+        guard let data = try? JSONEncoder().encode(patch),
+              let fields = try? JSONSerialization.jsonObject(with: data) else {
+            completion?(config)
+            return
         }
-        if let capabilities,
-           let data = try? encoder.encode(capabilities),
-           let obj = try? JSONSerialization.jsonObject(with: data) {
-            patch["capabilities"] = obj
-        }
-        guard !patch.isEmpty else { return }
         errorBanner = nil
-        sendCommand(["cmd": "save_config", "config": patch])
+        let id = id.uuidString
+        if sendCommand(["cmd": "save_config", "config": fields, "id": id]) {
+            configSaves[id] = completion
+        } else {
+            completion?(config)
+        }
+    }
+
+    public func listModels(for provider: ProviderConfigDTO, completion: @escaping ([String]?) -> Void) {
+        let id = UUID().uuidString
+        guard let data = try? JSONEncoder().encode(provider),
+              let fields = try? JSONSerialization.jsonObject(with: data),
+              sendCommand(["cmd": "list_models", "id": id, "provider": fields]) else {
+            completion(nil)
+            return
+        }
+        modelLists[id] = completion
     }
 
     public func testProvider(_ provider: ProviderConfigDTO, model: String) {
@@ -374,14 +383,14 @@ public final class HostClient: ObservableObject {
                     let lineData = buffer.subdata(in: buffer.startIndex..<range.lowerBound)
                     buffer.removeSubrange(buffer.startIndex...range.lowerBound)
                     if lineData.isEmpty { continue }
-                    Task { @MainActor [weak self] in
+                    DispatchQueue.main.async { [weak self] in
                         self?.handleEventLine(lineData)
                     }
                 }
             }
             process?.waitUntilExit()
             let exitCode = process?.terminationStatus ?? 0
-            Task { @MainActor [weak self] in
+            DispatchQueue.main.async { [weak self] in
                 self?.handleHostExited(process, status: exitCode)
             }
         }
@@ -395,17 +404,30 @@ public final class HostClient: ObservableObject {
         status = "idle"
         statusDetail = ""
         streamingText = ""
+        let saves = configSaves
+        let lists = modelLists
+        configSaves.removeAll()
+        modelLists.removeAll()
+        for saved in saves.values { saved(config) }
+        for listed in lists.values { listed(nil) }
         if !alreadyRunning && errorBanner == nil {
             errorBanner = "eja-host 已退出（退出码 \(exitCode)）"
         }
     }
 
-    private func sendCommand(_ payload: [String: Any]) {
+    @discardableResult
+    private func sendCommand(_ payload: [String: Any]) -> Bool {
         guard let handle = stdinHandle,
-              let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+              let data = try? JSONSerialization.data(withJSONObject: payload) else { return false }
         var line = data
         line.append(0x0A)
-        try? handle.write(contentsOf: line)
+        do {
+            try handle.write(contentsOf: line)
+            return true
+        } catch {
+            errorBanner = "无法向 eja-host 写入指令"
+            return false
+        }
     }
 
     func handleEventLine(_ data: Data) {
@@ -414,7 +436,6 @@ public final class HostClient: ObservableObject {
         switch event {
         case "state":
             if let state = try? decoder.decode(StateEventDTO.self, from: data) {
-                isReady = true
                 status = state.status
                 statusDetail = state.statusDetail ?? ""
                 streamingText = ""
@@ -423,6 +444,10 @@ public final class HostClient: ObservableObject {
                 config = state.config
                 capabilityStatuses = state.capabilityStatuses
                 stream = state.stream
+                isReady = true
+                if let id = state.saveId {
+                    configSaves.removeValue(forKey: id)?(config)
+                }
             }
         case "activity":
             if let detail = json["status_detail"] as? String {
@@ -445,6 +470,11 @@ public final class HostClient: ObservableObject {
                let ok = json["ok"] as? Bool,
                let msg = json["message"] as? String {
                 providerTestResults[id] = ProviderTestResult(ok: ok, message: msg)
+            }
+        case "provider_models":
+            if let id = json["id"] as? String, let listed = modelLists.removeValue(forKey: id) {
+                if let error = json["error"] as? String { errorBanner = error }
+                listed(json["models"] as? [String])
             }
         case "notify":
             if Bundle.main.bundleURL.pathExtension == "app",

@@ -7,7 +7,6 @@ final class ContentUIState: ObservableObject {
     @Published var showSettingsSheet: Bool = false
     @Published var baselineId: Int64 = -1
     @Published var sendHovered: Bool = false
-    let settingsDraft = SettingsDraft()
 
     func captureBaselineIfNeeded(isReady: Bool, dataDir: String, from stream: [StreamItemDTO]) {
         guard isReady, baselineId < 0 else { return }
@@ -34,56 +33,54 @@ struct ContentView: View {
             EjaTheme.canvas.ignoresSafeArea()
 
             VStack(spacing: 0) {
-                ZStack(alignment: .top) {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 18) {
-                                ForEach(visibleItems) { item in
-                                    streamRow(item)
-                                        .id(item.id)
-                                }
-                                if client.status != "idle" {
-                                    busyRow
-                                        .id("eja-busy")
-                                }
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 18) {
+                            ForEach(visibleItems) { item in
+                                streamRow(item)
+                                    .id(item.id)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 28)
-                            .padding(.top, 16)
-                            .padding(.bottom, 24)
-                        }
-                        .contentMargins(.top, 38, for: .scrollContent)
-                        .scrollIndicators(.never)
-                        .mask(
-                            LinearGradient(
-                                stops: [
-                                    .init(color: .clear, location: 0.0),
-                                    .init(color: .black, location: 0.09),
-                                    .init(color: .black, location: 1.0),
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .onChange(of: visibleItems.last?.id) { _, lastId in
-                            if let lastId {
-                                proxy.scrollTo(lastId, anchor: .bottom)
+                            if client.status != "idle" {
+                                busyRow
                             }
+                            Color.clear
+                                .frame(height: 42)
+                                .accessibilityHidden(true)
+                                .id("eja-conversation-bottom")
                         }
-                        .onChange(of: client.status) { _, newStatus in
-                            if newStatus != "idle" {
-                                proxy.scrollTo("eja-busy", anchor: .bottom)
-                            }
-                        }
-                        .onChange(of: client.streamingText) { _, text in
-                            if !text.isEmpty {
-                                proxy.scrollTo("eja-busy", anchor: .bottom)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 28)
+                    }
+                    .contentMargins(.top, 72, for: .scrollContent)
+                    .scrollIndicators(.never)
+                    .clipped()
+                    .mask {
+                        GeometryReader { geometry in
+                            let fadeHeight = min(60, geometry.size.height / 2)
+                            VStack(spacing: 0) {
+                                LinearGradient(stops: Self.edgeFadeStops, startPoint: .bottom, endPoint: .top)
+                                    .frame(height: fadeHeight)
+                                Color.black
+                                LinearGradient(stops: Self.edgeFadeStops, startPoint: .top, endPoint: .bottom)
+                                    .frame(height: fadeHeight)
                             }
                         }
                     }
-
-                    topFade
+                    .onChange(of: visibleItems.last?.id) {
+                        proxy.scrollTo("eja-conversation-bottom", anchor: .bottom)
+                    }
+                    .onChange(of: client.status) { _, status in
+                        if status != "idle" {
+                            proxy.scrollTo("eja-conversation-bottom", anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: client.streamingText) { _, text in
+                        if !text.isEmpty {
+                            proxy.scrollTo("eja-conversation-bottom", anchor: .bottom)
+                        }
+                    }
                 }
+                .ignoresSafeArea(.container, edges: .top)
 
                 VStack(spacing: 8) {
                     if let err = client.errorBanner {
@@ -126,52 +123,23 @@ struct ContentView: View {
             .padding(.trailing, 14)
             .ignoresSafeArea(edges: .top)
 
-            if ui.showSettingsSheet {
-                SettingsView(client: client, draft: ui.settingsDraft, isPresented: $ui.showSettingsSheet)
+            if ui.showSettingsSheet && client.isReady {
+                SettingsView(client: client, isPresented: $ui.showSettingsSheet)
                     .transition(.opacity)
             }
         }
         .tint(EjaTheme.ink)
         .onAppear {
             composerFocused = true
-            ui.settingsDraft.attach(client: client)
-            ui.settingsDraft.syncExternalConfig(client.config)
             ui.captureBaselineIfNeeded(isReady: client.isReady, dataDir: client.dataDir, from: client.stream)
         }
         .onChange(of: client.isReady) { _, ready in
-            ui.settingsDraft.attach(client: client)
-            ui.settingsDraft.syncExternalConfig(client.config)
             ui.captureBaselineIfNeeded(isReady: ready, dataDir: client.dataDir, from: client.stream)
-        }
-        .onChange(of: client.config) { _, newConfig in
-            ui.settingsDraft.attach(client: client)
-            ui.settingsDraft.syncExternalConfig(newConfig)
-        }
-        .onChange(of: ui.showSettingsSheet) { _, shown in
-            if !shown {
-                composerFocused = true
-            }
         }
     }
 
     private func showSettings() {
         ui.showSettingsSheet = true
-    }
-
-    private var topFade: some View {
-        LinearGradient(
-            stops: [
-                .init(color: EjaTheme.canvas, location: 0.0),
-                .init(color: EjaTheme.canvas.opacity(0.92), location: 0.48),
-                .init(color: EjaTheme.canvas.opacity(0.0), location: 1.0),
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-        .frame(height: 52)
-        .frame(maxWidth: .infinity, alignment: .top)
-        .ignoresSafeArea(edges: .top)
-        .allowsHitTesting(false)
     }
 
     private var composer: some View {
@@ -246,12 +214,12 @@ struct ContentView: View {
     }
 
     private var canSend: Bool {
-        !ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        client.isReady && !ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func sendDraft() {
         let text = ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard client.isReady, !text.isEmpty else { return }
         if !client.isConfigured {
             ui.showSettingsSheet = true
             return
@@ -299,6 +267,12 @@ struct ContentView: View {
             return Text(attributed)
         }
         return Text(source)
+    }
+
+    private static let edgeFadeStops: [Gradient.Stop] = (0...16).map { step in
+        let position = Double(step) / 16
+        let opacity = 1 - position * position * (3 - 2 * position)
+        return .init(color: .black.opacity(opacity), location: CGFloat(position))
     }
 }
 

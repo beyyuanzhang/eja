@@ -5,9 +5,10 @@ mod onnx;
 #[cfg(feature = "onnx")]
 pub use onnx::OnnxEncoder;
 
-use eja_core::{Eja, Evidence, Fact, Id, Outcome, FACT_BYTES};
+use eja_core::{Eja, Entry, Evidence, Fact, Id, Outcome, FACT_BYTES};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, path::Path, sync::OnceLock};
 
 const BATCH: usize = 256;
@@ -28,7 +29,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Conflict => f.write_str("memory index signature changed"),
+            Self::Conflict => f.write_str("memory index changed during search"),
             Self::Invalid(msg) | Self::Backend(msg) => f.write_str(msg),
         }
     }
@@ -89,6 +90,26 @@ struct SemanticIndex {
     encoder: Box<dyn Encoder>,
     dimensions: usize,
     signature: String,
+    verified: Option<(u64, Checkpoint)>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Checkpoint {
+    through: Id,
+    fingerprint: [u8; 32],
+}
+
+impl Checkpoint {
+    fn advance(mut self, entries: &[Entry], through: Id) -> Result<Self> {
+        let mut digest = Sha256::new();
+        for entry in entries {
+            digest.update(self.fingerprint);
+            digest.update(serde_json::to_vec(entry)?);
+            self.fingerprint = digest.finalize_reset().into();
+        }
+        self.through = through;
+        Ok(self)
+    }
 }
 
 impl MemoryIndex {
@@ -252,29 +273,33 @@ impl SemanticIndex {
         }
         let signature = format!("{dimensions}/{}", encoder.identity());
         let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS memory_meta(
-                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                 signature TEXT NOT NULL,
-                 through_id INTEGER NOT NULL
-             )",
+        let has_checkpoint: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('memory_meta') WHERE name='fingerprint')",
+            [],
+            |row| row.get(0),
         )?;
-        let stored: Option<String> = tx
-            .query_row("SELECT signature FROM memory_meta", [], |row| row.get(0))
-            .optional()?;
-        if stored
-            .as_deref()
-            .is_some_and(|existing| existing != signature)
-        {
+        let stored: Option<String> = if has_checkpoint {
+            tx.query_row("SELECT signature FROM memory_meta", [], |row| row.get(0))
+                .optional()?
+        } else {
+            None
+        };
+        if stored.as_deref() != Some(signature.as_str()) {
             tx.execute_batch(
                 "DROP TABLE IF EXISTS memory_vectors;
                  DROP TABLE IF EXISTS memory_refs;
                  DROP TABLE IF EXISTS memory_keys;
-                 DELETE FROM memory_meta;",
+                 DROP TABLE IF EXISTS memory_meta;",
             )?;
         }
         tx.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS memory_keys(
+            "CREATE TABLE IF NOT EXISTS memory_meta(
+                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                 signature TEXT NOT NULL,
+                 through_id INTEGER NOT NULL,
+                 fingerprint BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS memory_keys(
                  id INTEGER PRIMARY KEY,
                  passage TEXT NOT NULL UNIQUE
              );
@@ -287,7 +312,7 @@ impl SemanticIndex {
                  USING vec0(embedding float[{dimensions}] distance_metric=cosine, first_event integer);"
         ))?;
         tx.execute(
-            "INSERT OR IGNORE INTO memory_meta VALUES(1, ?1, 0)",
+            "INSERT OR IGNORE INTO memory_meta VALUES(1, ?1, 0, zeroblob(32))",
             [&signature],
         )?;
         tx.commit()?;
@@ -296,6 +321,7 @@ impl SemanticIndex {
             encoder,
             dimensions,
             signature,
+            verified: None,
         })
     }
 
@@ -315,40 +341,62 @@ impl SemanticIndex {
         Ok(vectors)
     }
 
-    fn require_signature(&self, conn: &Connection) -> Result<()> {
-        let current: Option<String> = conn
-            .query_row(
-                "SELECT signature FROM memory_meta WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if current.as_deref() != Some(self.signature.as_str()) {
-            return Err(Error::Conflict);
-        }
-        Ok(())
+    fn checkpoint(&self, conn: &Connection) -> Result<Checkpoint> {
+        conn.query_row(
+            "SELECT through_id, fingerprint FROM memory_meta WHERE singleton=1 AND signature=?1",
+            [&self.signature],
+            |row| {
+                Ok(Checkpoint {
+                    through: row.get(0)?,
+                    fingerprint: row.get(1)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(Error::Conflict)
     }
 
-    fn catch_up(&mut self, eja: &Eja, through: Id) -> Result<()> {
+    fn verify_prefix(&mut self, eja: &Eja, through: Id) -> Result<Checkpoint> {
+        let instance = eja.instance_id();
+        let mut proof = self
+            .verified
+            .filter(|(id, checkpoint)| *id == instance && checkpoint.through <= through)
+            .map(|(_, checkpoint)| checkpoint)
+            .unwrap_or_default();
+        while proof.through < through {
+            let end = proof.through.saturating_add(BATCH as Id).min(through);
+            proof = proof.advance(&eja.entries_after(proof.through, end)?, end)?;
+        }
+        self.verified = Some((instance, proof));
+        Ok(proof)
+    }
+
+    fn catch_up(&mut self, eja: &Eja, through: Id) -> Result<Checkpoint> {
         loop {
-            let (stored_signature, cursor): (String, Id) = self
-                .db
-                .query_row(
-                    "SELECT signature, through_id FROM memory_meta WHERE singleton=1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?
-                .ok_or(Error::Conflict)?;
-            if stored_signature != self.signature {
-                return Err(Error::Conflict);
+            let cached = self.checkpoint(&self.db)?;
+            let cursor = cached.through;
+            if (cursor > through && cursor > eja.revision()?)
+                || self.verify_prefix(eja, cursor)? != cached
+            {
+                let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+                if self.checkpoint(&tx)? == cached {
+                    tx.execute_batch(
+                        "DELETE FROM memory_vectors;
+                         DELETE FROM memory_refs;
+                         DELETE FROM memory_keys;
+                         UPDATE memory_meta SET through_id=0, fingerprint=zeroblob(32);",
+                    )?;
+                    tx.commit()?;
+                }
+                continue;
             }
             if cursor >= through {
-                return Ok(());
+                return Ok(cached);
             }
-            let batch_end = (cursor + BATCH as Id).min(through);
+            let batch_end = cursor.saturating_add(BATCH as Id).min(through);
             let entries = eja.entries_after(cursor, batch_end)?;
             let last = entries.last().map_or(batch_end, |entry| entry.id);
+            let updated = cached.advance(&entries, last)?;
             let mut sources: BTreeMap<String, Vec<Id>> = BTreeMap::new();
             for entry in entries {
                 if let Some(text) = fact_text(&entry.fact) {
@@ -373,12 +421,7 @@ impl SemanticIndex {
             let vectors = self.encode(InputKind::Passage, &unknown_refs)?;
 
             let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-            self.require_signature(&tx)?;
-            if tx.execute(
-                "UPDATE memory_meta SET through_id=?1 WHERE singleton=1 AND signature=?2 AND through_id=?3",
-                params![last, &self.signature, cursor],
-            )? == 0
-            {
+            if self.checkpoint(&tx)? != cached {
                 continue;
             }
             {
@@ -406,18 +449,25 @@ impl SemanticIndex {
                     }
                 }
             }
+            tx.execute(
+                "UPDATE memory_meta SET through_id=?1, fingerprint=?2 WHERE singleton=1",
+                params![updated.through, updated.fingerprint],
+            )?;
             tx.commit()?;
+            self.verified = Some((eja.instance_id(), updated));
         }
     }
 
     fn search(&mut self, eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
-        self.catch_up(eja, head)?;
+        let verified = self.catch_up(eja, head)?;
         let chunks = passages(cue);
         let queries = self.encode(InputKind::Query, &chunks)?;
         let limit = (TOP * 32).min(256);
         let mut scores: BTreeMap<Id, f64> = BTreeMap::new();
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
-        self.require_signature(&tx)?;
+        if self.checkpoint(&tx)? != verified {
+            return Err(Error::Conflict);
+        }
         {
             let mut stmt = tx.prepare_cached(
                 "SELECT rowid,distance FROM memory_vectors

@@ -8,39 +8,6 @@ use std::sync::{
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[test]
-fn migrates_v3_subject_db_to_v4_preserving_concerns_and_actions() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("subject.db");
-    let db = rusqlite::Connection::open(&path)?;
-    db.execute_batch(
-        "CREATE TABLE facts (
-             id INTEGER PRIMARY KEY,
-             at INTEGER NOT NULL,
-             body TEXT NOT NULL,
-             concern INTEGER,
-             live INTEGER
-         );
-         INSERT INTO facts(id, at, body, concern, live) VALUES
-             (1, 100, '{\"kind\":\"kept\",\"concern\":1,\"text\":\"watch\"}', 1, 1),
-             (2, 101, '{\"kind\":\"acted\",\"capability\":\"shell\",\"input\":null}', NULL, NULL),
-             (3, 102, '{\"kind\":\"returned\",\"action\":2,\"outcome\":{\"status\":\"observed\",\"detail\":\"ok\"}}', NULL, NULL),
-             (4, 103, '{\"kind\":\"acted\",\"capability\":\"shell\",\"input\":null}', NULL, NULL),
-             (5, 104, '{\"kind\":\"said\",\"text\":\"hi\",\"in_response_to\":\"person\"}', NULL, NULL);
-         PRAGMA user_version = 3;",
-    )?;
-    drop(db);
-
-    let reopened = Eja::open(&path)?;
-    assert_eq!(reopened.concerns(reopened.revision()?)?.len(), 1);
-    assert_eq!(reopened.unfinished_actions()?, vec![4]);
-    assert_eq!(reopened.evidence(2)?.latest.unwrap().id, 3);
-    assert!(matches!(reopened.read(5)?.fact, Fact::Said { ref text } if text == "hi"));
-    reopened.set_meta("host.anchor", "5")?;
-    assert_eq!(reopened.get_meta("host.anchor")?.as_deref(), Some("5"));
-    Ok(())
-}
-
-#[test]
 fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
@@ -332,7 +299,7 @@ fn physical_time_is_rfc3339_monotonic_and_visible_across_reopen() -> Result<()> 
 }
 
 #[test]
-fn subject_db_sets_schema_version_and_rejects_future_versions() -> Result<()> {
+fn subject_db_rejects_other_schema_versions_without_changing_the_file() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
     let eja = Eja::open(&path)?;
@@ -342,10 +309,16 @@ fn subject_db_sets_schema_version_and_rejects_future_versions() -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     assert_eq!(version, 4);
 
-    conn.execute_batch("PRAGMA user_version = 99;")?;
     drop(conn);
 
-    assert!(Eja::open(&path).is_err());
+    for version in [0, 3, 99] {
+        let conn = rusqlite::Connection::open(&path)?;
+        conn.pragma_update(None, "user_version", version)?;
+        drop(conn);
+        let before = std::fs::read(&path)?;
+        assert!(matches!(Eja::open(&path), Err(Error::Storage(_))));
+        assert_eq!(std::fs::read(&path)?, before);
+    }
     Ok(())
 }
 

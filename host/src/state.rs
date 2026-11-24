@@ -1,10 +1,9 @@
-//! Host-owned scheduling, turn settlement, window anchor, and upgrade state stored
+//! Host-owned scheduling, turn settlement, and window state stored
 //! atomically alongside `eja-core` facts via `host_meta`.
 use crate::sandbox::{validate_single_name, TrustedDir};
 use eja_core::{Eja, Entry, Error, Fact, Id, Outcome, Source, Tx, FACT_BYTES};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
 use std::path::Path;
 
 const META_STATE: &str = "host.state";
@@ -48,21 +47,10 @@ impl FileCheck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-enum ConcernCheck {
-    Registered(String),
-    Legacy {
-        #[serde(default)]
-        require_witness: bool,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WakeGuard {
-    #[serde(default)]
     pub checker: String,
     pub interval_seconds: i64,
-    #[serde(default)]
     pub remaining: u32,
 }
 
@@ -77,31 +65,16 @@ pub struct WakeAlarm {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct HostState {
-    #[serde(default)]
-    turn_cursor: Option<Id>,
-    #[serde(default)]
-    window_anchor: Option<Id>,
-    #[serde(default)]
+    turn_cursor: Id,
+    window_anchor: Id,
     wakes: Vec<WakeAlarm>,
-    #[serde(default)]
     kernel_version: Option<String>,
-    #[serde(default)]
     proactive_replies: Vec<Id>,
-    #[serde(default)]
     world_triggers: Vec<Id>,
-    #[serde(default)]
-    concern_checks: BTreeMap<Id, ConcernCheck>,
-    #[serde(default)]
+    concern_checks: BTreeMap<Id, String>,
     checks: BTreeMap<String, FileCheck>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct LegacyWindowFile {
-    #[serde(default)]
-    anchor: Id,
-    #[serde(default)]
-    settled_through: Option<Id>,
 }
 
 fn decode_state(raw: Option<String>) -> eja_core::Result<HostState> {
@@ -161,61 +134,17 @@ pub fn entries_for_turn(
 
 pub fn bootstrap(
     eja: &Eja,
-    core_dir: &TrustedDir,
     resources_dir: Option<&Path>,
     kernel_version: &str,
     protocol_version: u32,
 ) -> Result<Id, String> {
-    let legacy_wakes_path = core_dir.path().join("wakes.json");
-    let legacy_wakes: Option<Vec<WakeAlarm>> = match fs::read(&legacy_wakes_path) {
-        Ok(bytes) => Some(serde_json::from_slice(&bytes).map_err(|err| err.to_string())?),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err.to_string()),
-    };
-    let legacy_window: Option<LegacyWindowFile> = core_dir
-        .read_file("window.json")
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<LegacyWindowFile>(&bytes).ok());
-    let legacy_version: Option<String> = core_dir
-        .read_file("kernel_version")
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let anchor = update_state(eja, |tx, state| {
-        if let Some(alarms) = &legacy_wakes {
-            merge_wakes(&mut state.wakes, alarms)?;
+    eja.transaction(|tx| {
+        let stored = tx.get_meta(META_STATE)?;
+        if stored.is_none() && tx.revision()? > 0 {
+            return Err(Error::Invalid("非空主体日志缺少宿主状态".into()));
         }
-
-        let previous_wakes = state.wakes.len();
-        state.wakes.retain(|alarm| {
-            alarm
-                .guard
-                .as_ref()
-                .is_none_or(|guard| !guard.checker.is_empty())
-        });
-        if previous_wakes != state.wakes.len() {
-            tx.notice(Source::World, "旧守望已停用，请重新绑定本地检查规则。")?;
-        }
-        let unfinished = tx.unfinished_actions()?;
-        if state.turn_cursor.is_none() {
-            let legacy_settled = legacy_window
-                .as_ref()
-                .and_then(|w| w.settled_through)
-                .map(|id| id.max(0));
-            state.turn_cursor = Some(compute_initial_cursor(
-                tx,
-                legacy_settled,
-                unfinished.first().copied(),
-                &state.world_triggers,
-            )?);
-        }
-
-        let anchor = *state
-            .window_anchor
-            .get_or_insert_with(|| legacy_window.as_ref().map_or(0, |w| w.anchor.max(0)));
-        for action in unfinished {
+        let mut state = decode_state(stored)?;
+        for action in tx.unfinished_actions()? {
             tx.finish(
                 action,
                 Outcome::Unknown("上次执行因宿主中断而未完成".into()),
@@ -225,16 +154,10 @@ pub fn bootstrap(
         if let Some(old) = state
             .kernel_version
             .as_deref()
-            .or(legacy_version.as_deref())
             .filter(|old| *old != kernel_version)
         {
             let suffix = resources_dir
-                .map(|dir| {
-                    format!(
-                        "协议文档与默认界面参考位于 {}，可按需对照调整本地前端或连接器。",
-                        dir.display()
-                    )
-                })
+                .map(|dir| format!("默认界面与协议文档位于 {}。", dir.display()))
                 .unwrap_or_default();
             tx.notice(
                 Source::World,
@@ -244,54 +167,15 @@ pub fn bootstrap(
             )?;
         }
         state.kernel_version = Some(kernel_version.to_string());
-        Ok(anchor.max(0))
+        tx.set_meta(META_STATE, &serde_json::to_string(&state)?)?;
+        Ok(state.window_anchor)
     })
-    .map_err(|err| err.to_string())?;
-
-    for (migrated, name) in [
-        (legacy_wakes.is_some(), "wakes.json"),
-        (legacy_window.is_some(), "window.json"),
-        (legacy_version.is_some(), "kernel_version"),
-    ] {
-        if migrated {
-            let _ = fs::remove_file(core_dir.path().join(name));
-        }
-    }
-    Ok(anchor)
-}
-
-fn compute_initial_cursor(
-    tx: &Tx<'_>,
-    legacy: Option<Id>,
-    first_unfinished: Option<Id>,
-    world_triggers: &[Id],
-) -> eja_core::Result<Id> {
-    let head = tx.revision()?;
-    let all = tx.entries_after(0, head)?;
-    let through = if let Some(id) = legacy.filter(|id| (0..=head).contains(id)) {
-        id
-    } else if let Some(action) = first_unfinished {
-        all.iter()
-            .rev()
-            .find(|entry| entry.id < action && is_trigger_entry(entry, world_triggers).is_some())
-            .map_or(head, |entry| entry.id - 1)
-    } else {
-        all.iter()
-            .rev()
-            .find(|entry| !matches!(entry.fact, Fact::Noticed { .. }))
-            .map_or(0, |entry| entry.id)
-    };
-    let after_said = all
-        .iter()
-        .rev()
-        .find(|entry| entry.id > through && matches!(entry.fact, Fact::Said { .. }))
-        .map(|entry| entry.id);
-    Ok(after_said.unwrap_or(through))
+    .map_err(|err| err.to_string())
 }
 
 pub fn save_anchor(eja: &Eja, anchor: Id) -> Result<(), String> {
     update_state(eja, |_, state| {
-        state.window_anchor = Some(anchor.max(0));
+        state.window_anchor = anchor.max(0);
         Ok(())
     })
     .map_err(|err| err.to_string())
@@ -299,7 +183,7 @@ pub fn save_anchor(eja: &Eja, anchor: Id) -> Result<(), String> {
 
 pub fn next_trigger(eja: &Eja) -> eja_core::Result<Option<(Id, Source)>> {
     let state = decode_state(eja.get_meta(META_STATE)?)?;
-    let cursor = state.turn_cursor.unwrap_or(0);
+    let cursor = state.turn_cursor;
     let head = eja.revision()?;
     Ok(find_trigger(
         &eja.entries_after(cursor, head)?,
@@ -310,7 +194,7 @@ pub fn next_trigger(eja: &Eja) -> eja_core::Result<Option<(Id, Source)>> {
 /// Atomically record an optional reply and advance the host turn cursor for `trigger`.
 pub fn complete_turn(eja: &Eja, trigger: Id, reply: &str) -> eja_core::Result<()> {
     update_state(eja, |tx, state| {
-        let cursor = state.turn_cursor.unwrap_or(0);
+        let cursor = state.turn_cursor;
         let head = tx.revision()?;
         let Some((expected, source)) =
             find_trigger(&tx.entries_after(cursor, head)?, &state.world_triggers)
@@ -330,7 +214,7 @@ pub fn complete_turn(eja: &Eja, trigger: Id, reply: &str) -> eja_core::Result<()
                 }
             }
         }
-        state.turn_cursor = Some(trigger);
+        state.turn_cursor = trigger;
         state.world_triggers.retain(|&id| id > trigger);
         Ok(())
     })
@@ -416,10 +300,9 @@ pub fn keep_with_check(
                 return Err(Error::Invalid(format!("未知检查规则 {checker}")));
             }
         }
-        let bound = concern.and_then(|id| match state.concern_checks.get(&id) {
-            Some(ConcernCheck::Registered(name)) => Some(name.as_str()),
-            _ => None,
-        });
+        let bound = concern
+            .and_then(|id| state.concern_checks.get(&id))
+            .map(String::as_str);
         let entry = match checker.or(bound) {
             Some(name) => {
                 let body: Vec<&str> = text
@@ -436,10 +319,9 @@ pub fn keep_with_check(
             None => tx.keep(concern, text)?,
         };
         if let Some(name) = checker {
-            state.concern_checks.insert(
-                concern.unwrap_or(entry.id),
-                ConcernCheck::Registered(name.into()),
-            );
+            state
+                .concern_checks
+                .insert(concern.unwrap_or(entry.id), name.into());
         }
         Ok(entry)
     })
@@ -455,37 +337,24 @@ pub fn release_with_witness(
     witness: Option<Id>,
 ) -> eja_core::Result<Entry> {
     update_state(eja, |tx, state| {
-        match state.concern_checks.get(&concern) {
-            Some(ConcernCheck::Registered(checker)) => {
-                let basis = tx.evidence(concern)?;
-                let since = basis.latest.unwrap_or(basis.entry).id;
-                let witness = witness.filter(|id| *id > since).ok_or_else(|| {
-                    Error::Invalid(format!("需要检查规则 {checker} 的新命中记录"))
-                })?;
-                let evidence = tx.evidence(witness)?;
-                if !matches!(evidence.entry.fact, Fact::Noticed { source: Source::World, text }
+        if let Some(checker) = state.concern_checks.get(&concern) {
+            let basis = tx.evidence(concern)?;
+            let since = basis.latest.unwrap_or(basis.entry).id;
+            let witness = witness
+                .filter(|id| *id > since)
+                .ok_or_else(|| Error::Invalid(format!("需要检查规则 {checker} 的新命中记录")))?;
+            let evidence = tx.evidence(witness)?;
+            if !matches!(evidence.entry.fact, Fact::Noticed { source: Source::World, text }
                     if text == match_notice(checker))
-                {
-                    return Err(Error::Invalid(format!(
-                        "证据须来自检查规则 {checker} 的命中记录"
-                    )));
-                }
+            {
+                return Err(Error::Invalid(format!(
+                    "证据须来自检查规则 {checker} 的命中记录"
+                )));
             }
-            Some(ConcernCheck::Legacy {
-                require_witness: true,
-            }) => {
-                return Err(Error::Invalid(
-                    "旧验收条件需要通过 keep 重新绑定检查规则".into(),
-                ));
-            }
-            _ => {}
         }
         let entry = tx.release(concern)?;
-        if let Some(ConcernCheck::Registered(checker)) = state.concern_checks.remove(&concern) {
-            let still_bound = state
-                .concern_checks
-                .values()
-                .any(|item| matches!(item, ConcernCheck::Registered(other) if other == &checker));
+        if let Some(checker) = state.concern_checks.remove(&concern) {
+            let still_bound = state.concern_checks.values().any(|item| item == &checker);
             if !still_bound {
                 state.wakes.retain(|wake| {
                     wake.guard
@@ -623,34 +492,6 @@ pub fn set_kernel_version_for_test(eja: &Eja, version: &str) -> eja_core::Result
 mod tests {
     use super::*;
     use eja_core::Timestamp;
-
-    #[test]
-    fn checkpoint_upgrade_removes_script_watches_and_keeps_existing_obligations() {
-        let dir = tempfile::tempdir().unwrap();
-        let core_dir = TrustedDir::open(dir.path()).unwrap();
-        let eja = Eja::open(":memory:").unwrap();
-        let concern = eja.keep(None, "existing concern").unwrap();
-        let plain = serde_json::json!({
-            "id": "plain", "fire_at_unix": 100, "fire_at_display": "00:01:40", "reason": "reminder"
-        });
-        let mut old = plain.clone();
-        old["id"] = serde_json::json!("script");
-        old["guard"] = serde_json::json!({
-            "probe": {"kind":"command", "command":"true"}, "interval_seconds":10
-        });
-        let state = serde_json::json!({
-            "turn_cursor": concern.id,
-            "wakes": [plain, old],
-            "concern_checks": {(concern.id.to_string()): {"require_witness": true}}
-        });
-        eja.set_meta(META_STATE, &state.to_string()).unwrap();
-        bootstrap(&eja, &core_dir, None, "1", 1).unwrap();
-        let wakes = pending_wakes(&eja).unwrap();
-        assert_eq!(wakes.len(), 1);
-        assert_eq!(wakes[0].id, "plain");
-        assert_eq!(next_trigger(&eja).unwrap(), None);
-        assert!(release_with_witness(&eja, concern.id, None).is_err());
-    }
 
     #[test]
     fn complete_turn_enforces_order_and_marks_proactive_replies() {

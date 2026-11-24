@@ -1,12 +1,16 @@
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::hands::ToolSpec;
-use crate::http::{post_stream, truncate_utf8, HttpError};
+use crate::http::{get_bytes, post_stream, truncate_utf8, HttpError};
 use crate::state::entries_for_turn;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use eja_core::{Eja, Entry, Evidence, Fact, Id, Outcome};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Write};
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
+pub const MAX_TOOL_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+const TOOL_IMAGE_CONTEXT: &str = "图像来自工具调用 ";
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -104,6 +108,50 @@ impl Brain for HttpBrain {
 pub enum ToolOutput {
     Value(Value),
     Read(Evidence, usize),
+    Images(Value, Vec<ModelImage>),
+}
+
+pub struct ModelImage {
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+impl ModelImage {
+    pub fn receipt(&self) -> String {
+        format!(
+            "工具返回图像（{}，{} 字节）",
+            self.media_type,
+            self.bytes.len()
+        )
+    }
+
+    pub fn media_type(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            Some("image/jpeg")
+        } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some("image/png")
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            Some("image/gif")
+        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+            Some("image/webp")
+        } else {
+            None
+        }
+    }
+
+    fn into_content_part(self, provider: &ProviderKind) -> Value {
+        let data = STANDARD.encode(self.bytes);
+        match provider {
+            ProviderKind::OpenAi => json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{};base64,{data}", self.media_type) }
+            }),
+            ProviderKind::Anthropic => json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": self.media_type, "data": data }
+            }),
+        }
+    }
 }
 
 pub fn tool_messages(
@@ -113,7 +161,10 @@ pub fn tool_messages(
     mut execute: impl FnMut(&ToolCall) -> Result<ToolOutput, String>,
 ) -> Result<Option<Vec<Value>>, String> {
     let count = reply.calls.len();
-    let blocks: Vec<_> = reply
+    if count == 0 {
+        return Ok(None);
+    }
+    let mut slots: Vec<_> = reply
         .calls
         .iter()
         .map(|call| match provider {
@@ -123,23 +174,16 @@ pub fn tool_messages(
             }
         })
         .collect();
-    let mut tail = match provider {
-        ProviderKind::OpenAi => blocks,
-        ProviderKind::Anthropic => vec![json!({"role":"user", "content":blocks})],
-    };
-    let framing = messages_bytes(&tail);
     let reserve = (window_bytes / 4).min(64 * 1024);
-    let per_call =
-        window_bytes.saturating_sub(reserve + msg_bytes(&reply.message) + framing) / count;
-    let keep_exchange = per_call >= 128;
-    let slots = match provider {
-        ProviderKind::OpenAi => tail.as_mut_slice(),
-        ProviderKind::Anthropic => tail[0]["content"]
-            .as_array_mut()
-            .expect("tool result blocks")
-            .as_mut_slice(),
+    let budget = window_bytes.saturating_sub(reserve + msg_bytes(&reply.message));
+    let framing = match provider {
+        ProviderKind::OpenAi => messages_bytes(&slots),
+        ProviderKind::Anthropic => msg_bytes(&json!({"role":"user", "content":slots})),
     };
-    for (call, slot) in reply.calls.into_iter().zip(slots) {
+    let per_call = budget.saturating_sub(framing) / count;
+    let keep_exchange = per_call >= 128;
+    let mut attachments = Vec::new();
+    for (index, (call, slot)) in reply.calls.into_iter().zip(&mut slots).enumerate() {
         let output = execute(&call)?;
         if !keep_exchange {
             continue;
@@ -149,14 +193,118 @@ pub fn tool_messages(
                 format_read_result(provider, &evidence, offset, per_call)
             }
             ToolOutput::Value(v) => cap_tool_result(provider, v, per_call),
+            ToolOutput::Images(value, images) => {
+                let metadata = json!({"images_omitted": images.len()});
+                let text_budget = per_call.saturating_sub(json_bytes(&metadata) + 2);
+                let mut bounded = cap_tool_result(provider, value, text_budget);
+                bounded["images_omitted"] = metadata["images_omitted"].clone();
+                attachments.push((index, call.id, images, bounded.clone()));
+                bounded
+            }
         };
         slot["content"] = Value::String(value.to_string());
     }
-    if keep_exchange {
-        tail.insert(0, reply.message);
-        Ok(Some(tail))
-    } else {
-        Ok(None)
+    if !keep_exchange {
+        return Ok(None);
+    }
+    let text_bytes = match provider {
+        ProviderKind::OpenAi => messages_bytes(&slots),
+        ProviderKind::Anthropic => msg_bytes(&json!({"role":"user", "content":slots})),
+    };
+    let mut available = budget.saturating_sub(text_bytes);
+    let mut following_images = Vec::new();
+    for (index, id, images, mut receipt) in attachments {
+        let slot = &mut slots[index];
+        let text = &slot["content"];
+        let openai = *provider == ProviderKind::OpenAi;
+        let mut parts = vec![if openai {
+            json!({ "type": "text", "text": format!("{TOOL_IMAGE_CONTEXT}{id} 的回执。") })
+        } else {
+            json!({ "type": "text", "text": text })
+        }];
+        let framing = if openai {
+            msg_bytes(&json!({"role":"user", "content":parts}))
+        } else {
+            json_bytes(&json!(parts)) - json_bytes(text)
+        };
+        let mut remaining = available.saturating_sub(framing);
+        let total = images.len();
+        for image in images {
+            if image.bytes.len().div_ceil(3) * 4 >= remaining {
+                continue;
+            }
+            let part = image.into_content_part(provider);
+            let size = json_bytes(&part) + 1;
+            if size <= remaining {
+                remaining -= size;
+                parts.push(part);
+            }
+        }
+        if parts.len() == 1 {
+            continue;
+        }
+        available = remaining;
+        let omitted = total + 1 - parts.len();
+        if let Some(receipt) = receipt.as_object_mut() {
+            if omitted == 0 {
+                receipt.remove("images_omitted");
+            } else {
+                receipt.insert("images_omitted".into(), json!(omitted));
+            }
+        }
+        let text = receipt.to_string();
+        if openai {
+            slot["content"] = Value::String(text);
+            following_images.push(json!({"role":"user", "content":parts}));
+        } else {
+            parts[0]["text"] = Value::String(text);
+            slot["content"] = Value::Array(parts);
+        }
+    }
+    let mut tail = vec![reply.message];
+    match provider {
+        ProviderKind::OpenAi => {
+            tail.extend(slots);
+            tail.extend(following_images);
+        }
+        ProviderKind::Anthropic => tail.push(json!({"role":"user", "content":slots})),
+    }
+    Ok(Some(tail))
+}
+
+pub fn expire_tool_images(messages: &mut Vec<Value>, provider: &ProviderKind) {
+    match provider {
+        ProviderKind::OpenAi => messages.retain(|message| {
+            message["role"] != "user"
+                || !message["content"].as_array().is_some_and(|parts| {
+                    parts
+                        .first()
+                        .and_then(|part| part["text"].as_str())
+                        .is_some_and(|text| text.starts_with(TOOL_IMAGE_CONTEXT))
+                        && parts.iter().any(|part| part["type"] == "image_url")
+                })
+        }),
+        ProviderKind::Anthropic => {
+            for message in messages {
+                if message["role"] != "user" {
+                    continue;
+                }
+                if let Some(blocks) = message["content"].as_array_mut() {
+                    for result in blocks
+                        .iter_mut()
+                        .filter(|block| block["type"] == "tool_result")
+                    {
+                        let text = result["content"]
+                            .as_array()
+                            .filter(|parts| parts.iter().any(|part| part["type"] == "image"))
+                            .and_then(|parts| parts.first()?.get("text")?.as_str());
+                        if let Some(text) = text {
+                            result["content"] = Value::String(text.into());
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -418,12 +566,31 @@ fn format_read_result(
 
 pub fn msg_bytes(msg: &Value) -> usize {
     if msg.get("tool_calls").is_some() {
-        return msg.to_string().len() + 1;
+        return json_bytes(msg) + 1;
     }
     msg["content"]
         .as_str()
         .map(|text| text.len() + 1)
-        .unwrap_or_else(|| msg.to_string().len() + 1)
+        .unwrap_or_else(|| json_bytes(msg) + 1)
+}
+
+fn json_bytes(value: &Value) -> usize {
+    struct ByteCounter(usize);
+
+    impl Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value).expect("counting JSON bytes cannot fail");
+    counter.0
 }
 
 fn bound_entry_message(entry: &Entry, message: Value, budget: usize) -> Value {
@@ -555,6 +722,48 @@ fn user_message(content: impl Into<String>) -> Value {
     json!({ "role": "user", "content": content.into() })
 }
 
+fn provider_headers(provider: &ProviderConfig) -> Vec<(String, String)> {
+    let mut headers = vec![("Content-Type".into(), "application/json".into())];
+    let key = provider.api_key.trim();
+    match provider.kind {
+        ProviderKind::OpenAi if !key.is_empty() => {
+            headers.push(("Authorization".into(), format!("Bearer {key}")));
+        }
+        ProviderKind::Anthropic => {
+            headers.push(("anthropic-version".into(), "2023-06-01".into()));
+            if !key.is_empty() {
+                headers.push(("x-api-key".into(), key.into()));
+            }
+        }
+        ProviderKind::OpenAi => {}
+    }
+    headers
+}
+
+pub fn list_models(provider: &ProviderConfig) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", provider.api_root()?);
+    let response = get_bytes(&url, &provider_headers(provider), 8, false)
+        .map_err(|err| format!("读取模型列表失败：{}", http_error_message(err)))?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!("读取模型列表失败：HTTP {}", response.status));
+    }
+    let payload: Value = serde_json::from_str(&response.body)
+        .map_err(|err| format!("模型列表不是有效 JSON：{err}"))?;
+    let items = payload
+        .as_array()
+        .or_else(|| payload["data"].as_array())
+        .or_else(|| payload["models"].as_array())
+        .ok_or("模型服务未返回列表")?;
+    let mut seen = HashSet::new();
+    Ok(items
+        .iter()
+        .filter_map(|item| item["id"].as_str().or_else(|| item["name"].as_str()))
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && seen.insert(*id))
+        .map(str::to_string)
+        .collect())
+}
+
 fn complete_wire(
     provider: &ProviderConfig,
     model: &str,
@@ -579,12 +788,7 @@ fn call_openai(
     tools: Option<&[ToolSpec]>,
     mut on_delta: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ModelReply, String> {
-    let base = provider.base_url.trim().trim_end_matches('/');
-    let url = if base.ends_with("/chat/completions") {
-        base.to_string()
-    } else {
-        format!("{base}/chat/completions")
-    };
+    let url = format!("{}/chat/completions", provider.api_root()?);
     let system_message = json!({ "role": "system", "content": system });
     let messages: Vec<_> = std::iter::once(&system_message).chain(messages).collect();
     let seed = messages.len();
@@ -595,11 +799,7 @@ fn call_openai(
             .map(|s| json!({"type": "function", "function": {"name": s.name, "description": s.description, "parameters": s.schema}}))
             .collect::<Vec<_>>());
     }
-    let mut headers = vec![("Content-Type".into(), "application/json".into())];
-    let api_key = provider.api_key.trim();
-    if !api_key.is_empty() {
-        headers.push(("Authorization".into(), format!("Bearer {api_key}")));
-    }
+    let headers = provider_headers(provider);
     if on_delta.is_some() {
         body["stream"] = json!(true);
     }
@@ -744,14 +944,7 @@ fn call_anthropic(
     tools: Option<&[ToolSpec]>,
     mut on_delta: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ModelReply, String> {
-    let base = provider.base_url.trim().trim_end_matches('/');
-    let url = if base.ends_with("/messages") {
-        base.to_string()
-    } else if base.ends_with("/v1") {
-        format!("{base}/messages")
-    } else {
-        format!("{base}/v1/messages")
-    };
+    let url = format!("{}/messages", provider.api_root()?);
     let mut body = json!({
         "model": model, "max_tokens": 16384, "system": system, "messages": messages
     });
@@ -763,11 +956,7 @@ fn call_anthropic(
             )
             .collect::<Vec<_>>());
     }
-    let headers = vec![
-        ("Content-Type".into(), "application/json".into()),
-        ("x-api-key".into(), provider.api_key.trim().into()),
-        ("anthropic-version".into(), "2023-06-01".into()),
-    ];
+    let headers = provider_headers(provider);
     if on_delta.is_some() {
         body["stream"] = json!(true);
     }
@@ -938,12 +1127,7 @@ fn post_json(
     on_line: impl FnMut(&str),
 ) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
-    let resp = post_stream(url, headers, &bytes, 300, on_line).map_err(|err| match err {
-        HttpError::Launch(msg) => msg,
-        HttpError::Wait(msg) => format!("等待 LLM 响应失败: {msg}"),
-        HttpError::Transport { message, .. } => format!("网络请求失败: {message}"),
-        HttpError::InvalidResponse(msg) => format!("无效 LLM 响应: {msg}"),
-    })?;
+    let resp = post_stream(url, headers, &bytes, 300, on_line).map_err(http_error_message)?;
     let parsed: Value =
         serde_json::from_str(&resp.body).unwrap_or_else(|_| json!({ "raw": resp.body }));
     if !(200..300).contains(&resp.status) {
@@ -959,6 +1143,15 @@ fn post_json(
         ));
     }
     Ok(parsed)
+}
+
+fn http_error_message(err: HttpError) -> String {
+    match err {
+        HttpError::Launch(msg) => msg,
+        HttpError::Wait(msg) => format!("等待 LLM 响应失败: {msg}"),
+        HttpError::Transport { message, .. } => format!("网络请求失败: {message}"),
+        HttpError::InvalidResponse(msg) => format!("无效 LLM 响应: {msg}"),
+    }
 }
 
 #[cfg(test)]
@@ -1039,6 +1232,72 @@ mod tests {
             assert_eq!(result(2)["status"], "kept");
             assert_eq!(result(2)["fact_id"], 2);
             assert_eq!(result(2)["concern"], 2);
+        }
+    }
+
+    #[test]
+    fn tool_image_uses_the_models_image_input_and_respects_the_window() {
+        for provider in [ProviderKind::OpenAi, ProviderKind::Anthropic] {
+            let reply = ModelReply {
+                message: json!({"role": "assistant", "content": ""}),
+                text: String::new(),
+                calls: vec![
+                    ToolCall {
+                        id: "image-call".into(),
+                        name: "image-tool".into(),
+                        args: json!({}),
+                    },
+                    ToolCall {
+                        id: "text-call".into(),
+                        name: "text-tool".into(),
+                        args: json!({}),
+                    },
+                ],
+            };
+            let run = |budget, bytes| {
+                tool_messages(&provider, reply.clone(), budget, |call| {
+                    if call.name == "image-tool" {
+                        Ok(ToolOutput::Images(
+                            json!({"id":2,"action":1,"outcome":{"status":"observed","detail":"已发送输入"}}),
+                            vec![ModelImage { media_type: "image/jpeg", bytes: vec![42; bytes] }],
+                        ))
+                    } else {
+                        Ok(ToolOutput::Value(json!({"status":"ok"})))
+                    }
+                })
+                .unwrap()
+                .unwrap()
+            };
+            let mut exchange = run(4096, 1500);
+            match provider {
+                ProviderKind::OpenAi => {
+                    assert_eq!(exchange[1]["tool_call_id"], "image-call");
+                    assert_eq!(exchange[3]["role"], "user");
+                    assert!(exchange[3]["content"][1]["image_url"]["url"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:image/jpeg;base64,Kioq"));
+                }
+                ProviderKind::Anthropic => {
+                    assert_eq!(exchange[1]["content"][0]["tool_use_id"], "image-call");
+                    assert!(exchange[1]["content"][0]["content"][1]["source"]["data"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("Kioq"));
+                }
+            }
+            assert!(messages_bytes(&exchange) <= 4096);
+            expire_tool_images(&mut exchange, &provider);
+            assert!(!exchange
+                .iter()
+                .any(|message| message.to_string().contains("Kioq")));
+            let bounded = run(1024, 1024);
+            let raw = serde_json::to_string(&bounded).unwrap();
+            assert!(raw.contains("images_omitted"));
+            assert!(raw.contains("observed"));
+            assert!(raw.contains("已发送输入"));
+            assert!(!raw.contains("Kioq"));
+            assert!(messages_bytes(&bounded) <= 1024);
         }
     }
 
