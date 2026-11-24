@@ -9,6 +9,18 @@ EJA 是一个连续的、有自我同一性的主体。仓库采用清晰分层�
 
 默认支持本地关键词查找旧事实，可选语义编码器。
 
+## 下载
+
+从 [GitHub Releases](https://github.com/beyyuanzhang/eja/releases/latest) 下载最新的 `Eja-<version>.dmg`（macOS 14+，Apple Silicon）和 `SHA256SUMS.txt`，将 `Eja.app` 拖入 `/Applications` 即可。
+
+首次打开若被 macOS 拦截，执行：
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Eja.app
+```
+
+发布由 GitHub Actions 全自动完成：更新 `Cargo.toml` 的 `version` 并推送到 `main` 后，CI 会在所有检查通过时自动打 `v<version>` Tag 并发布新的 `.dmg` 与校验文件。
+
 ## 构建与验证
 
 ```sh

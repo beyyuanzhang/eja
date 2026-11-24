@@ -3,10 +3,18 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      should_release: ${{ steps.release.outputs.should_release }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -17,6 +25,39 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-targets
+      - name: Determine release plan
+        id: release
+        run: |
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          : "${VERSION:?Failed to read version from Cargo.toml}"
+          TAG="v${VERSION}"
+          SHOULD_RELEASE=false
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            SHOULD_RELEASE=true
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+              if [ "${GITHUB_REF_NAME}" != "${TAG}" ]; then
+                echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VERSION}"
+                exit 1
+              fi
+              SHOULD_RELEASE=true
+            fi
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            set +e
+            git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null
+            rc=$?
+            set -e
+            if [ "${rc}" -eq 2 ]; then
+              SHOULD_RELEASE=true
+            elif [ "${rc}" -ne 0 ]; then
+              exit "${rc}"
+            fi
+          fi
+          {
+            echo "version=${VERSION}"
+            echo "tag=${TAG}"
+            echo "should_release=${SHOULD_RELEASE}"
+          } >> "${GITHUB_OUTPUT}"
 
   macos:
     runs-on: macos-latest
@@ -32,3 +73,46 @@ jobs:
           swift build --product EjaApp
           swift build --product EjaUI
       - run: xcrun swiftc -typecheck -parse-as-library -target "$(uname -m)-apple-macosx14.0" capabilities/screen/*.swift
+
+  release:
+    needs: [check, macos]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.check.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and verify DMG
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          ./macos/scripts/build-dmg.sh
+          codesign --verify --deep --strict macos/build/Eja.app
+          hdiutil verify "macos/build/Eja-${VERSION}.dmg"
+          (cd macos/build && shasum -a 256 "Eja-${VERSION}.dmg" > SHA256SUMS.txt)
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          DMG="macos/build/Eja-${VERSION}.dmg"
+          SUMS="macos/build/SHA256SUMS.txt"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${DMG}" "${SUMS}" --clobber
+          else
+            set -- "${TAG}" "${DMG}" "${SUMS}" \
+              --target "${GITHUB_SHA}" \
+              --title "EJA ${TAG}" \
+              --generate-notes \
+              --notes $'macOS 14+ (Apple Silicon) 安装包。\n\n首次打开若被 macOS 拦截，请拖入 `/Applications` 后执行：\n```sh\nxattr -dr com.apple.quarantine /Applications/Eja.app\n```'
+            if [[ "${VERSION}" == *-* ]]; then
+              set -- "$@" --prerelease
+            fi
+            gh release create "$@"
+          fi

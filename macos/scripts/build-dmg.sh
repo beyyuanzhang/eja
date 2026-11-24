@@ -19,12 +19,20 @@ trap 'rm -rf "${STAGE_DIR}"' EXIT
 cp -R "${APP_DIR}" "${STAGE_DIR}/Eja.app"
 ln -s /Applications "${STAGE_DIR}/Applications"
 
-rm -f "${DMG_PATH}"
-hdiutil create \
-    -volname "EJA" \
-    -srcfolder "${STAGE_DIR}" \
-    -ov \
-    -format UDZO \
-    "${DMG_PATH}"
+for attempt in 1 2 3; do
+    rm -f "${DMG_PATH}"
+    if hdiutil create \
+        -volname "EJA" \
+        -srcfolder "${STAGE_DIR}" \
+        -ov \
+        -format UDZO \
+        "${DMG_PATH}"; then
+        break
+    fi
+    if [ "${attempt}" -eq 3 ]; then
+        exit 1
+    fi
+    sleep 2
+done
 
 echo "Done: ${DMG_PATH}"
