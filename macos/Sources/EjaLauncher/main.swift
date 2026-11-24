@@ -68,9 +68,7 @@ if safeMode {
         .trimmingCharacters(in: .whitespacesAndNewlines)
     if recorded != factoryDigest {
         try? fm.removeItem(at: evolvedDylib)
-        if fm.fileExists(atPath: uiDir.path) {
-            try? factoryDigest.write(to: stampFile, atomically: true, encoding: .utf8)
-        }
+        try? fm.removeItem(at: stampFile)
     }
 }
 

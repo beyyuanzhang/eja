@@ -65,6 +65,20 @@ impl Hands {
         }
     }
 
+    pub fn open_local(
+        data_dir: TrustedDir,
+        core_dir: TrustedDir,
+        sandbox: Sandbox,
+        capabilities: &[CapabilityConfig],
+    ) -> Self {
+        let mut pool = CapabilityPool::with_core_dir(sandbox, core_dir);
+        pool.reload_local(capabilities);
+        Self {
+            data_dir,
+            capabilities: pool,
+        }
+    }
+
     pub fn reload(&mut self, capabilities: &[CapabilityConfig], force: bool) {
         self.capabilities.reload(capabilities, force);
     }

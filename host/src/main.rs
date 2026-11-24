@@ -90,6 +90,7 @@ fn main() {
         }
     };
     runtime.emit_state();
+    runtime.warm_external_capabilities();
     runtime.process_pending_turn();
 
     let (tx, rx) = mpsc::channel();

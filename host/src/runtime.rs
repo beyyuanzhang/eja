@@ -95,13 +95,23 @@ pub struct HostRuntime {
 
 impl HostRuntime {
     pub fn open(data_dir: PathBuf, emit: EventSink) -> Result<Self, String> {
-        Self::open_with_brain(data_dir, Arc::new(HttpBrain), emit)
+        Self::open_internal(data_dir, Arc::new(HttpBrain), emit, true)
     }
 
+    #[cfg(test)]
     pub fn open_with_brain(
         data_dir: PathBuf,
         brain: Arc<dyn Brain>,
+        emit: EventSink,
+    ) -> Result<Self, String> {
+        Self::open_internal(data_dir, brain, emit, false)
+    }
+
+    fn open_internal(
+        data_dir: PathBuf,
+        brain: Arc<dyn Brain>,
         mut emit: EventSink,
+        defer_external_capabilities: bool,
     ) -> Result<Self, String> {
         fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
         let data_path = fs::canonicalize(data_dir).map_err(|err| err.to_string())?;
@@ -143,12 +153,21 @@ impl HostRuntime {
         let capabilities_bytes = HostConfig::read_capabilities(&data_dir).ok().flatten();
         config.capabilities = HostConfig::parse_capabilities(capabilities_bytes.as_deref())
             .unwrap_or_else(|_| vec![CapabilityConfig::builtin_shell()]);
-        let hands = Hands::open(
-            data_dir.clone(),
-            core_dir.clone(),
-            sandbox,
-            &config.capabilities,
-        );
+        let hands = if defer_external_capabilities {
+            Hands::open_local(
+                data_dir.clone(),
+                core_dir.clone(),
+                sandbox,
+                &config.capabilities,
+            )
+        } else {
+            Hands::open(
+                data_dir.clone(),
+                core_dir.clone(),
+                sandbox,
+                &config.capabilities,
+            )
+        };
         let (oauth_tx, oauth_rx) = mpsc::channel();
         Ok(Self {
             data_dir,
@@ -171,6 +190,20 @@ impl HostRuntime {
             brain,
             emit,
         })
+    }
+
+    pub fn warm_external_capabilities(&mut self) {
+        let has_external = self.config.capabilities.iter().any(|c| {
+            c.enabled
+                && matches!(
+                    c.transport,
+                    CapabilityTransport::Stdio { .. } | CapabilityTransport::Http { .. }
+                )
+        });
+        if has_external {
+            self.hands.reload(&self.config.capabilities, false);
+            self.emit_state();
+        }
     }
 
     fn next_wake_delay(&self) -> Result<Option<Duration>, String> {
@@ -2682,5 +2715,65 @@ for line in sys.stdin:
 
         stop.store(true, Ordering::Relaxed);
         let _ = server.join();
+    }
+
+    #[test]
+    fn fast_open_populates_models_and_local_capabilities_before_external_mcp_warmup() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("Eja");
+        fs::create_dir_all(&data_dir).unwrap();
+        let mcp_script = data_dir.join("slow_mcp.py");
+        fs::write(
+            &mcp_script,
+            r#"import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"demo","version":"1"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let cfg = configured(vec![CapabilityConfig {
+            id: "ext".into(),
+            name: "External MCP".into(),
+            enabled: true,
+            transport: CapabilityTransport::Stdio {
+                command: "/usr/bin/python3".into(),
+                args: vec![mcp_script.to_string_lossy().into()],
+                env: Default::default(),
+            },
+        }]);
+
+        let mut setup =
+            HostRuntime::open_with_brain(data_dir.clone(), Arc::new(HttpBrain), Box::new(|_| {}))
+                .unwrap();
+        setup.save_config(cfg);
+        drop(setup);
+
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = events.clone();
+        let mut rt =
+            HostRuntime::open(data_dir, Box::new(move |ev| sink.lock().unwrap().push(ev))).unwrap();
+        rt.emit_state();
+        let initial = events.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(initial["config"]["providers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            initial["config"]["capabilities"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(initial["capability_statuses"][0]["id"], "shell");
+        assert_eq!(initial["capability_statuses"][0]["connected"], true);
+        assert_eq!(initial["capability_statuses"][1]["id"], "ext");
+        assert_eq!(initial["capability_statuses"][1]["connected"], false);
+
+        rt.warm_external_capabilities();
+        let warmed = events.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(warmed["capability_statuses"][1]["id"], "ext");
+        assert_eq!(warmed["capability_statuses"][1]["connected"], true);
     }
 }

@@ -7,6 +7,7 @@ final class ContentUIState: ObservableObject {
     @Published var showSettingsSheet: Bool = false
     @Published var baselineId: Int64 = -1
     @Published var sendHovered: Bool = false
+    let settingsDraft = SettingsDraft()
 
     func captureBaselineIfNeeded(isReady: Bool, dataDir: String, from stream: [StreamItemDTO]) {
         guard isReady, baselineId < 0 else { return }
@@ -126,17 +127,30 @@ struct ContentView: View {
             .ignoresSafeArea(edges: .top)
 
             if ui.showSettingsSheet {
-                SettingsView(client: client, isPresented: $ui.showSettingsSheet)
+                SettingsView(client: client, draft: ui.settingsDraft, isPresented: $ui.showSettingsSheet)
                     .transition(.opacity)
             }
         }
         .tint(EjaTheme.ink)
         .onAppear {
             composerFocused = true
+            ui.settingsDraft.attach(client: client)
+            ui.settingsDraft.syncExternalConfig(client.config)
             ui.captureBaselineIfNeeded(isReady: client.isReady, dataDir: client.dataDir, from: client.stream)
         }
         .onChange(of: client.isReady) { _, ready in
+            ui.settingsDraft.attach(client: client)
+            ui.settingsDraft.syncExternalConfig(client.config)
             ui.captureBaselineIfNeeded(isReady: ready, dataDir: client.dataDir, from: client.stream)
+        }
+        .onChange(of: client.config) { _, newConfig in
+            ui.settingsDraft.attach(client: client)
+            ui.settingsDraft.syncExternalConfig(newConfig)
+        }
+        .onChange(of: ui.showSettingsSheet) { _, shown in
+            if !shown {
+                composerFocused = true
+            }
         }
     }
 

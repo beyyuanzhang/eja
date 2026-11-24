@@ -525,6 +525,45 @@ impl CapabilityPool {
         self.oauth.save(id, token)
     }
 
+    pub fn reload_local(&mut self, configs: &[CapabilityConfig]) {
+        self.connections.clear();
+        self.statuses.clear();
+        self.tools.clear();
+
+        for cfg in configs {
+            if !cfg.enabled {
+                self.statuses.push(self.status_for(cfg, false, None, &[]));
+                continue;
+            }
+            match cfg.transport {
+                CapabilityTransport::Builtin | CapabilityTransport::Exec { .. } => {
+                    match connect_and_list(&self.sandbox, &mut self.oauth, cfg) {
+                        Ok((connection, entry_tools)) => {
+                            self.tools.extend(entry_tools.iter().cloned());
+                            self.statuses
+                                .push(self.status_for(cfg, true, None, &entry_tools));
+                            self.connections.insert(
+                                cfg.id.clone(),
+                                ConnectedEntry {
+                                    transport: cfg.transport.clone(),
+                                    connection,
+                                    tools: entry_tools,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            self.statuses
+                                .push(self.status_for(cfg, false, Some(err), &[]));
+                        }
+                    }
+                }
+                CapabilityTransport::Stdio { .. } | CapabilityTransport::Http { .. } => {
+                    self.statuses.push(self.status_for(cfg, false, None, &[]));
+                }
+            }
+        }
+    }
+
     fn status_for(
         &self,
         cfg: &CapabilityConfig,

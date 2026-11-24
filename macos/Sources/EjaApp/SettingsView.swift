@@ -26,12 +26,16 @@ final class SettingsDraft: ObservableObject {
     private weak var client: HostClient?
     private var saveTask: Task<Void, Never>?
     private var hasAutoSynced = false
+    private var hasLoadedInitialConfig = false
 
     func attach(client: HostClient) {
         self.client = client
     }
 
     func load(from config: HostConfigDTO) {
+        if !config.providers.isEmpty || !config.capabilities.isEmpty {
+            hasLoadedInitialConfig = true
+        }
         providers = config.providers
         judge = config.judge
         capabilities = config.capabilities
@@ -50,7 +54,7 @@ final class SettingsDraft: ObservableObject {
            first.models.isEmpty || (first.baseUrl.isEmpty && !first.hasApiKey) {
             expandedProvider = first.id
         }
-        if !hasAutoSynced {
+        if !hasAutoSynced && !providers.isEmpty {
             hasAutoSynced = true
             for provider in providers where Self.isLocalEndpoint(provider.baseUrl) {
                 fetchModels(for: provider.id)
@@ -58,15 +62,30 @@ final class SettingsDraft: ObservableObject {
         }
     }
 
-    func syncExternalCapabilities(_ latest: [CapabilityConfigDTO]) {
-        guard capabilities == savedCapabilities else { return }
-        capabilities = latest
-        savedCapabilities = latest
-        for cap in latest {
-            rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
+    func syncExternalConfig(_ latest: HostConfigDTO) {
+        if !hasLoadedInitialConfig {
+            if !latest.providers.isEmpty || !latest.capabilities.isEmpty {
+                load(from: latest)
+            }
+            return
         }
-        if let id = expandedCapability, !latest.contains(where: { $0.id == id }) {
-            expandedCapability = nil
+        if !providersDirty {
+            for idx in providers.indices {
+                if let remote = latest.providers.first(where: { $0.id == providers[idx].id }) {
+                    providers[idx].hasApiKey = remote.hasApiKey
+                }
+            }
+            savedProviders = providers
+        }
+        if !capabilitiesDirty {
+            capabilities = latest.capabilities
+            savedCapabilities = latest.capabilities
+            for cap in latest.capabilities {
+                rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
+            }
+            if let id = expandedCapability, !latest.capabilities.contains(where: { $0.id == id }) {
+                expandedCapability = nil
+            }
         }
     }
 
@@ -299,8 +318,18 @@ final class SettingsDraft: ObservableObject {
         let direct = provider.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !direct.isEmpty { return direct }
         guard provider.hasApiKey else { return "" }
-        let configURL = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/Application Support/ai.eja.kernel/config.json")
+        let configURL: URL
+        if let dataDir = client?.dataDir, !dataDir.isEmpty {
+            let dataURL = URL(fileURLWithPath: dataDir, isDirectory: true)
+            let folderName = dataURL.lastPathComponent
+            let coreName = folderName == "Eja" ? "ai.eja.kernel" : "\(folderName).kernel"
+            configURL = dataURL.deletingLastPathComponent()
+                .appendingPathComponent(coreName, isDirectory: true)
+                .appendingPathComponent("config.json")
+        } else {
+            configURL = URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support/ai.eja.kernel/config.json")
+        }
         guard let data = try? Data(contentsOf: configURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let list = json["providers"] as? [[String: Any]],
@@ -434,8 +463,8 @@ struct ProviderPreset: Identifiable {
 
 struct SettingsView: View {
     @ObservedObject var client: HostClient
+    @ObservedObject var draft: SettingsDraft
     @Binding var isPresented: Bool
-    @StateObject private var draft = SettingsDraft()
 
     var body: some View {
         HStack(spacing: 0) {
@@ -452,10 +481,10 @@ struct SettingsView: View {
         .tint(EjaTheme.ink)
         .onAppear {
             draft.attach(client: client)
-            draft.load(from: client.config)
+            draft.syncExternalConfig(client.config)
         }
-        .onChange(of: client.config.capabilities) { _, latest in
-            draft.syncExternalCapabilities(latest)
+        .onChange(of: client.config) { _, latest in
+            draft.syncExternalConfig(latest)
         }
         .onChange(of: draft.providers) { _, _ in draft.scheduleSave() }
         .onChange(of: draft.judge) { _, _ in draft.scheduleSave() }

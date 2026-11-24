@@ -54,7 +54,12 @@ public enum UiRuntime {
         let fm = FileManager.default
         let pkgURL = uiDir.appendingPathComponent("Package.swift")
         let pkgText = try? String(contentsOf: pkgURL, encoding: .utf8)
-        let needsTemplateSync = !(pkgText?.contains("name: \"EjaUI\"") ?? false)
+        let stampURL = factoryDigestFile(in: dataDir)
+        let recordedDigest = (try? String(contentsOf: stampURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let factoryDigest = ProcessInfo.processInfo.environment["EJA_FACTORY_UI_DIGEST"] ?? ""
+        let factoryChanged = !factoryDigest.isEmpty && recordedDigest != factoryDigest
+        let needsTemplateSync = !(pkgText?.contains("name: \"EjaUI\"") ?? false) || factoryChanged
         if needsTemplateSync {
             guard let source = templateDir ?? resolveTemplateDir(),
                   (try? copyTemplate(from: source, to: uiDir)) != nil else { return false }
@@ -64,9 +69,8 @@ public enum UiRuntime {
             try? fm.removeItem(at: legacyBundle)
         }
         try? fm.removeItem(at: uiDir.appendingPathComponent("EjaUI"))
-        if let factoryDigest = ProcessInfo.processInfo.environment["EJA_FACTORY_UI_DIGEST"],
-           !factoryDigest.isEmpty {
-            try? factoryDigest.write(to: factoryDigestFile(in: dataDir), atomically: true, encoding: .utf8)
+        if !factoryDigest.isEmpty {
+            try? factoryDigest.write(to: stampURL, atomically: true, encoding: .utf8)
         }
         writeApplyScript(in: uiDir)
         return true

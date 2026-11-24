@@ -2,11 +2,15 @@ import AppKit
 import EjaClient
 import SwiftUI
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var onTerminate: (() -> Void)?
+    var reopenMainWindow: (() -> Void)?
+    weak var mainWindow: NSWindow?
     var safeMode = ProcessInfo.processInfo.environment["EJA_SAFE_MODE"] == "1"
         || NSEvent.modifierFlags.contains(.option)
     private var uiWatch: DispatchSourceFileSystemObject?
+    private var windowObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if NSEvent.modifierFlags.contains(.option) {
@@ -14,6 +18,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        windowObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let window = note.object as? NSWindow else { return }
+            Task { @MainActor in
+                self?.bindMainWindowIfNeeded(window)
+            }
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.captureExistingMainWindow()
+        }
+    }
+
+    func captureExistingMainWindow() {
+        if let win = NSApp.windows.first(where: { $0.canBecomeMain }) {
+            bindMainWindowIfNeeded(win)
+        }
+    }
+
+    func bindMainWindowIfNeeded(_ window: NSWindow) {
+        guard window.canBecomeMain else { return }
+        mainWindow = window
+        window.isReleasedWhenClosed = false
+        if let closeBtn = window.standardWindowButton(.closeButton) {
+            closeBtn.target = self
+            closeBtn.action = #selector(hideMainWindow(_:))
+        }
+    }
+
+    @objc func hideMainWindow(_ sender: Any?) {
+        captureExistingMainWindow()
+        if let win = mainWindow ?? NSApp.keyWindow {
+            win.orderOut(nil)
+        }
+    }
+
+    func showMainWindow() {
+        captureExistingMainWindow()
+        if let win = mainWindow {
+            if win.isMiniaturized {
+                win.deminiaturize(nil)
+            }
+            win.makeKeyAndOrderFront(nil)
+        } else {
+            reopenMainWindow?()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            showMainWindow()
+        }
+        return true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        let hasVisible = NSApp.windows.contains { $0.isVisible && $0.canBecomeMain }
+        if !hasVisible {
+            showMainWindow()
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     func watchUI(at directory: URL, onChange: @escaping @MainActor () -> Void) {
@@ -32,6 +103,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let windowObserver {
+            NotificationCenter.default.removeObserver(windowObserver)
+        }
         uiWatch?.cancel()
         onTerminate?()
     }
@@ -44,6 +118,7 @@ public func eja_ui_main() {
 
 struct EjaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.openWindow) private var openWindow
     @StateObject private var client = HostClient()
     @StateObject private var ui = ContentUIState()
 
@@ -58,6 +133,16 @@ struct EjaApp: App {
                             hostClient?.shutdown(wait: false)
                         }
                     }
+                    appDelegate.reopenMainWindow = { [openWindow] in
+                        openWindow(id: "main")
+                        for window in NSApp.windows where window.canBecomeMain {
+                            if window.isMiniaturized {
+                                window.deminiaturize(nil)
+                            }
+                            window.makeKeyAndOrderFront(nil)
+                        }
+                    }
+                    appDelegate.captureExistingMainWindow()
                     bootstrapUI(dataDirPath: client.dataDir)
                     handleAlreadyRunning()
                 }
@@ -78,9 +163,20 @@ struct EjaApp: App {
         .commands {
             CommandGroup(replacing: .appSettings) {
                 Button("设置…") {
+                    appDelegate.showMainWindow()
                     ui.showSettingsSheet.toggle()
                 }
                 .keyboardShortcut(",", modifiers: .command)
+            }
+            CommandGroup(replacing: .saveItem) {
+                Button("关闭窗口") {
+                    if ui.showSettingsSheet {
+                        ui.showSettingsSheet = false
+                    } else {
+                        appDelegate.hideMainWindow(nil)
+                    }
+                }
+                .keyboardShortcut("w", modifiers: .command)
             }
         }
     }
