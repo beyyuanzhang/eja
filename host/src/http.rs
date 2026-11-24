@@ -150,7 +150,9 @@ fn request_bytes(
         .wait()
         .map_err(|err| HttpError::Wait(format!("等待 HTTP 响应失败: {err}")))?;
     if !status.success() {
-        let stderr = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
         return Err(HttpError::Transport {
             exit_code: status.code(),
             message: String::from_utf8_lossy(&stderr).trim().to_string(),
@@ -180,8 +182,7 @@ pub fn parse_http_response(raw: &str) -> Result<HttpResponse, HttpError> {
         last_headers = head;
         status_code = Some(code);
         rest = tail;
-        if !(100..200).contains(&code)
-            && !((300..400).contains(&code) && rest.starts_with("HTTP/"))
+        if !(100..200).contains(&code) && !((300..400).contains(&code) && rest.starts_with("HTTP/"))
         {
             break;
         }

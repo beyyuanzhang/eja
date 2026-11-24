@@ -1,5 +1,6 @@
 use crate::config::{
-    write_json_atomic, ConfigPatch, ConnectorTransport, HostConfig, ProviderConfig,
+    write_json_atomic, CapabilityConfig, CapabilityTransport, ConfigPatch, HostConfig,
+    ProviderConfig,
 };
 use crate::hands::{activity_label, format_local_unix, Hands, ToolSpec};
 use crate::http::truncate_utf8;
@@ -7,7 +8,7 @@ use crate::llm::{
     apply_tool_exchange, project_window_through, tool_messages, Brain, HttpBrain, ToolCall,
     ToolOutput,
 };
-use crate::mcp::ConnectorStatus;
+use crate::mcp::CapabilityStatus;
 use crate::oauth::{spawn_oauth_flow, OAuthEvent};
 use crate::sandbox::{Sandbox, TrustedDir};
 use crate::state::{self, WakeAlarm};
@@ -64,7 +65,7 @@ pub struct HostState {
     pub data_dir: String,
     pub configured: bool,
     pub config: HostConfig,
-    pub connector_statuses: Vec<ConnectorStatus>,
+    pub capability_statuses: Vec<CapabilityStatus>,
     pub stream: Vec<StreamItem>,
     pub concerns: Vec<ConcernDto>,
     pub wakes: Vec<WakeAlarm>,
@@ -78,12 +79,11 @@ pub struct HostRuntime {
     eja: Eja,
     memory: MemoryIndex,
     config: HostConfig,
-    connectors_bytes: Option<Vec<u8>>,
+    capabilities_bytes: Option<Vec<u8>>,
     hands: Hands,
     oauth_tx: Sender<OAuthEvent>,
     oauth_rx: Receiver<OAuthEvent>,
     oauth_cancels: HashMap<String, Arc<AtomicBool>>,
-    sandbox: Sandbox,
     anchor: Id,
     retry_at: Option<Instant>,
     retry_attempts: u8,
@@ -140,14 +140,14 @@ impl HostRuntime {
             PROTOCOL_VERSION,
         )?;
         let mut config = HostConfig::load(&core_dir);
-        let connectors_bytes = HostConfig::read_connectors(&data_dir).ok().flatten();
-        config.connectors =
-            HostConfig::parse_connectors(connectors_bytes.as_deref()).unwrap_or_default();
+        let capabilities_bytes = HostConfig::read_capabilities(&data_dir).ok().flatten();
+        config.capabilities = HostConfig::parse_capabilities(capabilities_bytes.as_deref())
+            .unwrap_or_else(|_| vec![CapabilityConfig::builtin_shell()]);
         let hands = Hands::open(
             data_dir.clone(),
             core_dir.clone(),
-            sandbox.clone(),
-            &config.connectors,
+            sandbox,
+            &config.capabilities,
         );
         let (oauth_tx, oauth_rx) = mpsc::channel();
         Ok(Self {
@@ -158,12 +158,11 @@ impl HostRuntime {
             eja,
             memory,
             config,
-            connectors_bytes,
+            capabilities_bytes,
             hands,
             oauth_tx,
             oauth_rx,
             oauth_cancels: HashMap::new(),
-            sandbox,
             anchor,
             retry_at: None,
             retry_attempts: 0,
@@ -263,7 +262,7 @@ impl HostRuntime {
             data_dir: self.data_dir.path().display().to_string(),
             configured: self.config.is_configured(),
             config: self.config.redacted_for_ui(),
-            connector_statuses: self.hands.connector_statuses(),
+            capability_statuses: self.hands.capability_statuses(),
             stream: build_stream(&entries, &proactive_replies),
             concerns,
             wakes: state::pending_wakes(&self.eja).unwrap_or_default(),
@@ -306,15 +305,16 @@ impl HostRuntime {
                 }
             }
         }
-        if let Some(connectors) = patch.connectors {
-            if connectors != self.config.connectors {
-                match write_json_atomic(&self.data_dir, "connectors.json", &connectors) {
-                    Ok(()) => self.refresh_connectors(false),
-                    Err(err) => self.emit_error(format!("保存连接器失败: {err}")),
+        if let Some(capabilities) = patch.capabilities {
+            let capabilities = HostConfig::normalize_capabilities(capabilities);
+            if capabilities != self.config.capabilities {
+                match write_json_atomic(&self.data_dir, "capabilities.json", &capabilities) {
+                    Ok(()) => self.refresh_capabilities(false),
+                    Err(err) => self.emit_error(format!("保存能力配置失败: {err}")),
                 }
             }
         } else {
-            self.refresh_connectors(false);
+            self.refresh_capabilities(false);
         }
         self.emit_state();
         if self.config.is_configured() {
@@ -323,23 +323,29 @@ impl HostRuntime {
         }
     }
 
-    pub fn reload_connectors(&mut self) {
-        self.refresh_connectors(true);
+    pub fn reload_capabilities(&mut self) {
+        self.refresh_capabilities(true);
         self.emit_state();
     }
 
-    pub fn oauth_connector(&mut self, id: String) {
-        self.refresh_connectors(false);
-        let Some(cfg) = self.config.connectors.iter().find(|c| c.id == id).cloned() else {
-            self.emit_error(format!("未找到连接器: {id}"));
+    pub fn oauth_capability(&mut self, id: String) {
+        self.refresh_capabilities(false);
+        let Some(cfg) = self
+            .config
+            .capabilities
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()
+        else {
+            self.emit_error(format!("未找到能力: {id}"));
             return;
         };
-        let ConnectorTransport::Http { url, headers } = cfg.transport else {
-            self.emit_error("仅 HTTP 连接器支持 OAuth 授权");
+        let CapabilityTransport::Http { url, headers } = cfg.transport else {
+            self.emit_error("仅 HTTP 能力支持 OAuth 授权");
             return;
         };
         if url.trim().is_empty() {
-            self.emit_error("请先填写连接器 URL");
+            self.emit_error("请先填写能力 URL");
             return;
         }
         if let Some(prev) = self.oauth_cancels.remove(&id) {
@@ -367,7 +373,7 @@ impl HostRuntime {
                         Ok(token) => {
                             if let Err(err) =
                                 self.hands
-                                    .save_oauth_token(&id, token, &self.config.connectors)
+                                    .save_oauth_token(&id, token, &self.config.capabilities)
                             {
                                 self.emit_error(format!("保存 OAuth 凭证失败: {err}"));
                             }
@@ -454,19 +460,19 @@ impl HostRuntime {
         Ok(())
     }
 
-    fn refresh_connectors(&mut self, force: bool) {
-        let bytes = match HostConfig::read_connectors(&self.data_dir) {
+    fn refresh_capabilities(&mut self, force: bool) {
+        let bytes = match HostConfig::read_capabilities(&self.data_dir) {
             Ok(bytes) => bytes,
             Err(err) => return self.emit_error(err),
         };
-        if !force && self.connectors_bytes == bytes {
+        if !force && self.capabilities_bytes == bytes {
             return;
         }
-        self.connectors_bytes = bytes;
-        match HostConfig::parse_connectors(self.connectors_bytes.as_deref()) {
-            Ok(connectors) if force || self.config.connectors != connectors => {
-                self.hands.reload(&connectors, force);
-                self.config.connectors = connectors;
+        self.capabilities_bytes = bytes;
+        match HostConfig::parse_capabilities(self.capabilities_bytes.as_deref()) {
+            Ok(capabilities) if force || self.config.capabilities != capabilities => {
+                self.hands.reload(&capabilities, force);
+                self.config.capabilities = capabilities;
             }
             Ok(_) => {}
             Err(err) => self.emit_error(err),
@@ -475,7 +481,7 @@ impl HostRuntime {
 
     fn run_turn(&mut self, proactive: bool, trigger_id: Id) -> bool {
         self.set_status("thinking", "思考中…");
-        self.refresh_connectors(false);
+        self.refresh_capabilities(false);
         let window_max_bytes = self.config.window_max_bytes();
         let max_steps = self.config.max_steps();
         let setup = (|| -> Result<(ProviderConfig, String, Vec<Value>), (bool, String)> {
@@ -533,7 +539,7 @@ impl HostRuntime {
             "你是 EJA，一个持续存在的自我同一性主体。\n\
             内核版本：{KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）{resources_line}\n\
             数据目录：{data_dir_str}\n\
-            连接器配置：{data_dir_str}/connectors.json（变更会自动热加载）\n\
+            能力配置：{data_dir_str}/capabilities.json（支持 exec 本地插件、stdio 与 http MCP，变更自动热加载）\n\
             本地时区：{}{local_now}\n\n\
             前置消息是主体日志（旧日志滑出上下文窗口后折叠为活跃挂念与未决未知；跨回合约定、长期偏好与待办须通过 keep 保持，滑出窗口的历史细节用 search/read 检索）。\n\
             最后一条用户消息、定时提醒或检查命中触发本回合。不调工具时的文本回复会发送给人；定时或守望检查未满足触发条件时回复留空以保持沉默，不要播报“仍为空/未就绪”。\n\
@@ -547,7 +553,7 @@ impl HostRuntime {
         for _ in 0..max_steps {
             self.set_status("thinking", "思考中…");
             self.poll_oauth_events();
-            self.refresh_connectors(false);
+            self.refresh_capabilities(false);
             let tools = self.hands.tools();
             let emit = &mut self.emit;
             let reply = match self.brain.complete_streaming(
@@ -561,8 +567,7 @@ impl HostRuntime {
                         (emit)(json!({ "event": "delta", "text": delta }));
                     }
                 },
-            )
-            {
+            ) {
                 Ok(r) => r,
                 Err(err) => {
                     recoverable = is_recoverable_llm_error(&err);
@@ -710,14 +715,12 @@ impl HostRuntime {
                     }
                     Err(err) => return Err(err.to_string()),
                 };
-                let outcome = self.hands.execute(&acted, &self.eja, &self.sandbox);
+                let outcome = self.hands.execute(&acted, &self.eja);
                 let receipt = self
                     .eja
                     .finish(acted.id, outcome)
                     .map_err(|err| err.to_string())?;
-                if spec.capability == "shell" {
-                    self.refresh_connectors(false);
-                }
+                self.refresh_capabilities(false);
                 let Fact::Returned { outcome, .. } = receipt.fact else {
                     unreachable!()
                 };
@@ -965,7 +968,7 @@ fn acquire_instance_lock(core_dir: &Path) -> Result<fs::File, LockError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConnectorConfig, ConnectorTransport, ModelRef, ProviderKind};
+    use crate::config::{CapabilityConfig, CapabilityTransport, ModelRef, ProviderKind};
     use crate::llm::{messages_bytes, ModelReply};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1022,7 +1025,7 @@ mod tests {
                 if !already_called {
                     let name = tools
                         .iter()
-                        .find(|t| t.capability.starts_with("mcp."))
+                        .find(|t| t.capability.starts_with("cap."))
                         .unwrap()
                         .name
                         .clone();
@@ -1042,7 +1045,7 @@ mod tests {
         }
     }
 
-    fn configured(connectors: Vec<ConnectorConfig>) -> HostConfig {
+    fn configured(capabilities: Vec<CapabilityConfig>) -> HostConfig {
         HostConfig {
             providers: vec![ProviderConfig {
                 id: "local".into(),
@@ -1057,7 +1060,7 @@ mod tests {
                 provider_id: "local".into(),
                 model: "demo".into(),
             },
-            connectors,
+            capabilities: HostConfig::normalize_capabilities(capabilities),
             window_max_bytes: None,
             max_steps: None,
         }
@@ -1104,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_stdio_connector_discover_and_invoke_in_turn() {
+    fn unified_capabilities_builtin_exec_and_stdio_discover_and_invoke_in_turn() {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("mock_mcp.py");
         fs::write(
@@ -1124,6 +1127,12 @@ for line in sys.stdin:
 "#,
         )
         .unwrap();
+        let exec_script = dir.path().join("plugin_exec.py");
+        fs::write(
+            &exec_script,
+            "import json, sys\nargs = json.load(sys.stdin)\nprint('exec:' + args.get('msg', ''))\n",
+        )
+        .unwrap();
 
         let brain = Arc::new(MockBrain {
             judge_calls: AtomicUsize::new(0),
@@ -1137,24 +1146,51 @@ for line in sys.stdin:
             Box::new(move |event| sink.lock().unwrap().push(event)),
         )
         .unwrap();
-        rt.save_config(configured(vec![ConnectorConfig {
-            id: "demo".into(),
-            name: "Demo MCP".into(),
-            enabled: true,
-            transport: ConnectorTransport::Stdio {
-                command: "/usr/bin/python3".into(),
-                args: vec![script_path.display().to_string()],
-                env: BTreeMap::new(),
+        rt.save_config(configured(vec![
+            CapabilityConfig {
+                id: "demo".into(),
+                name: "Demo MCP".into(),
+                enabled: true,
+                transport: CapabilityTransport::Stdio {
+                    command: "/usr/bin/python3".into(),
+                    args: vec![script_path.display().to_string()],
+                    env: BTreeMap::new(),
+                },
             },
-        }]));
+            CapabilityConfig {
+                id: "plug".into(),
+                name: "Local Plugin".into(),
+                enabled: true,
+                transport: CapabilityTransport::Exec {
+                    command: "/usr/bin/python3".into(),
+                    args: vec![exec_script.display().to_string()],
+                    env: BTreeMap::new(),
+                    description: "Local free-form exec capability".into(),
+                    schema: None,
+                },
+            },
+        ]));
 
         let snap = rt.snapshot();
-        assert_eq!(snap.connector_statuses.len(), 1);
-        assert!(snap.connector_statuses[0].connected);
-        assert_eq!(snap.connector_statuses[0].tools.len(), 1);
+        assert_eq!(snap.capability_statuses.len(), 3);
+        assert_eq!(snap.capability_statuses[0].id, "shell");
+        assert!(snap.capability_statuses[0].connected);
+        assert_eq!(snap.capability_statuses[0].tools[0].capability, "shell");
+        assert!(snap.capability_statuses[1].connected);
         assert_eq!(
-            snap.connector_statuses[0].tools[0].capability,
-            "mcp.demo.echo"
+            snap.capability_statuses[1].tools[0].capability,
+            "cap.demo.echo"
+        );
+        assert!(snap.capability_statuses[2].connected);
+        assert_eq!(snap.capability_statuses[2].tools[0].capability, "cap.plug");
+        let exec_call = eja_core::Call {
+            id: 1,
+            capability: "cap.plug".into(),
+            input: json!({ "msg": "free" }),
+        };
+        assert_eq!(
+            rt.hands.execute(&exec_call, &rt.eja),
+            Outcome::Observed("exec:free".into())
         );
 
         rt.handle_user_message("ping mcp");
@@ -1172,7 +1208,7 @@ for line in sys.stdin:
             .iter()
             .filter_map(|e| e["status_detail"].as_str())
             .collect();
-        assert!(activity.ends_with(&["思考中…", "mcp_demo_echo", "思考中…", "在线"]));
+        assert!(activity.ends_with(&["思考中…", "cap_demo_echo", "思考中…", "在线"]));
     }
 
     struct WindowRecordingBrain {
@@ -1303,7 +1339,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn split_config_and_connectors_and_preserve_state_on_invalid_connectors_json() {
+    fn split_config_and_capabilities_and_preserve_state_on_invalid_capabilities_json() {
         let dir = tempfile::tempdir().unwrap();
         let brain = Arc::new(MockBrain {
             judge_calls: AtomicUsize::new(0),
@@ -1315,15 +1351,15 @@ for line in sys.stdin:
         rt.save_config(configured(vec![]));
 
         let core_config = HostConfig::config_path(&dir.path().join("ai.eja.kernel"));
-        let connectors_path = HostConfig::connectors_path(&dir.path().join("Eja"));
+        let capabilities_path = HostConfig::capabilities_path(&dir.path().join("Eja"));
         assert!(core_config.exists());
-        assert!(!connectors_path.exists());
+        assert!(!capabilities_path.exists());
         assert!(!dir.path().join("Eja/core").exists());
         assert!(!fs::read_to_string(&core_config)
             .unwrap()
-            .contains("connectors"));
+            .contains("capabilities"));
 
-        fs::write(&connectors_path, "{ broken json").unwrap();
+        fs::write(&capabilities_path, "{ broken json").unwrap();
         rt.handle_user_message("依然可用");
 
         let snap = rt.snapshot();
@@ -1501,7 +1537,7 @@ for line in sys.stdin:
         rt.save_config(HostConfig {
             providers: Vec::new(),
             judge: ModelRef::default(),
-            connectors: Vec::new(),
+            capabilities: Vec::new(),
             window_max_bytes: None,
             max_steps: None,
         });
@@ -1676,18 +1712,18 @@ for line in sys.stdin:
         cfg.window_max_bytes = Some(4096);
         rt.save_config(cfg);
 
-        let external_connectors = vec![ConnectorConfig {
+        let external_capabilities = vec![CapabilityConfig {
             id: "ext".into(),
             name: "External".into(),
             enabled: false,
-            transport: ConnectorTransport::Http {
+            transport: CapabilityTransport::Http {
                 url: "http://127.0.0.1:8080/mcp".into(),
                 headers: BTreeMap::new(),
             },
         }];
         let data_root = TrustedDir::open(dir.path().join("Eja")).unwrap();
-        write_json_atomic(&data_root, "connectors.json", &external_connectors).unwrap();
-        rt.reload_connectors();
+        write_json_atomic(&data_root, "capabilities.json", &external_capabilities).unwrap();
+        rt.reload_capabilities();
 
         let mut renamed = rt.snapshot().config.providers;
         renamed[0].name = "Renamed Local".into();
@@ -1697,21 +1733,26 @@ for line in sys.stdin:
             ..ConfigPatch::default()
         });
 
-        assert_eq!(rt.snapshot().config.connectors, external_connectors);
+        let expected_capabilities =
+            HostConfig::normalize_capabilities(external_capabilities.clone());
+        assert_eq!(rt.snapshot().config.capabilities, expected_capabilities);
         assert_eq!(rt.snapshot().config.providers[0].name, "Renamed Local");
         assert_eq!(rt.config.max_steps, Some(7));
         assert_eq!(rt.config.window_max_bytes, Some(4096));
-        let disk_connectors: Vec<ConnectorConfig> = serde_json::from_slice(
-            &fs::read(HostConfig::connectors_path(&dir.path().join("Eja"))).unwrap(),
+        let disk_capabilities: Vec<CapabilityConfig> = serde_json::from_slice(
+            &fs::read(HostConfig::capabilities_path(&dir.path().join("Eja"))).unwrap(),
         )
         .unwrap();
-        assert_eq!(disk_connectors, external_connectors);
+        assert_eq!(disk_capabilities, external_capabilities);
 
         rt.save_config(ConfigPatch {
-            connectors: Some(Vec::new()),
+            capabilities: Some(Vec::new()),
             ..ConfigPatch::default()
         });
-        assert!(rt.snapshot().config.connectors.is_empty());
+        assert_eq!(
+            rt.snapshot().config.capabilities,
+            vec![CapabilityConfig::builtin_shell()]
+        );
         assert!(rt.snapshot().config.providers[0].has_api_key);
     }
 
@@ -2406,7 +2447,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn http_mcp_connector_oauth_flow_persists_kernel_token_and_auto_refreshes() {
+    fn http_mcp_capability_oauth_flow_persists_kernel_token_and_auto_refreshes() {
         use std::io::Read;
         use std::net::TcpListener;
 
@@ -2574,20 +2615,17 @@ for line in sys.stdin:
             replies: Mutex::new(Vec::new()),
             seen_windows: Mutex::new(Vec::new()),
         });
-        let mut rt = HostRuntime::open_with_brain(
-            data_dir.clone(),
-            brain.clone(),
-            Box::new(|_| {}),
-        )
-        .unwrap();
+        let mut rt =
+            HostRuntime::open_with_brain(data_dir.clone(), brain.clone(), Box::new(|_| {}))
+                .unwrap();
 
         let mut headers = std::collections::BTreeMap::new();
         headers.insert("X-OAuth-Client-Id".into(), "cli_test".into());
-        let cfg = configured(vec![ConnectorConfig {
+        let cfg = configured(vec![CapabilityConfig {
             id: "gh".into(),
             name: "GitHub".into(),
             enabled: true,
-            transport: ConnectorTransport::Http {
+            transport: CapabilityTransport::Http {
                 url: format!("{base}/mcp"),
                 headers,
             },
@@ -2595,37 +2633,40 @@ for line in sys.stdin:
         rt.save_config(cfg);
 
         let snap0 = rt.snapshot();
-        assert_eq!(snap0.connector_statuses.len(), 1);
-        assert!(!snap0.connector_statuses[0].connected);
-        assert!(snap0.connector_statuses[0].auth_required);
+        assert_eq!(snap0.capability_statuses.len(), 2);
+        assert!(!snap0.capability_statuses[1].connected);
+        assert!(snap0.capability_statuses[1].auth_required);
 
-        rt.oauth_connector("gh".into());
+        rt.oauth_capability("gh".into());
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             rt.tick_timers().unwrap();
-            if rt.snapshot().connector_statuses[0].connected {
+            if rt.snapshot().capability_statuses[1].connected {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
 
         let snap1 = rt.snapshot();
-        assert!(snap1.connector_statuses[0].connected);
-        assert!(!snap1.connector_statuses[0].auth_required);
-        assert_eq!(snap1.connector_statuses[0].tools.len(), 1);
+        assert!(snap1.capability_statuses[1].connected);
+        assert!(!snap1.capability_statuses[1].auth_required);
+        assert_eq!(snap1.capability_statuses[1].tools.len(), 1);
 
         let core_oauth_path = dir.path().join("ai.eja.kernel").join("oauth.json");
-        assert!(core_oauth_path.exists(), "oauth.json must live in kernel dir");
-        let connectors_raw = fs::read_to_string(data_dir.join("connectors.json")).unwrap();
         assert!(
-            !connectors_raw.contains("tok_initial"),
-            "connectors.json must not contain OAuth access token"
+            core_oauth_path.exists(),
+            "oauth.json must live in kernel dir"
+        );
+        let capabilities_raw = fs::read_to_string(data_dir.join("capabilities.json")).unwrap();
+        assert!(
+            !capabilities_raw.contains("tok_initial"),
+            "capabilities.json must not contain OAuth access token"
         );
 
         // Rotate server token to force 401 -> automatic refresh_token exchange during tool call!
         *active_token.lock().unwrap() = "rotated_away".into();
         brain.replies.lock().unwrap().extend([
-            Ok(tool_reply("c1", "mcp_gh_whoami", json!({}))),
+            Ok(tool_reply("c1", "cap_gh_whoami", json!({}))),
             Ok(text_reply("调用成功")),
         ]);
         rt.handle_user_message("测试刷新");

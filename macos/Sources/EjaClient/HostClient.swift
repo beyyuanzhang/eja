@@ -62,30 +62,87 @@ public struct ModelRefDTO: Codable, Equatable, Sendable {
     }
 }
 
-public struct ConnectorTransportDTO: Codable, Equatable, Sendable {
-    public var type: String // "stdio" | "http"
-    public var command: String?
-    public var args: [String]?
-    public var env: [String: String]?
-    public var url: String?
-    public var headers: [String: String]?
+public indirect enum JSONValue: Codable, Equatable, Sendable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case null
 
-    public static func stdio(command: String, args: [String] = [], env: [String: String] = [:]) -> Self {
-        Self(type: "stdio", command: command, args: args, env: env, url: nil, headers: nil)
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null }
+        else if let b = try? c.decode(Bool.self) { self = .bool(b) }
+        else if let n = try? c.decode(Double.self) { self = .number(n) }
+        else if let s = try? c.decode(String.self) { self = .string(s) }
+        else if let a = try? c.decode([JSONValue].self) { self = .array(a) }
+        else if let o = try? c.decode([String: JSONValue].self) { self = .object(o) }
+        else { self = .null }
     }
 
-    public static func http(url: String, headers: [String: String] = [:]) -> Self {
-        Self(type: "http", command: nil, args: nil, env: nil, url: url, headers: headers)
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .string(let s): try c.encode(s)
+        case .number(let n): try c.encode(n)
+        case .bool(let b): try c.encode(b)
+        case .object(let o): try c.encode(o)
+        case .array(let a): try c.encode(a)
+        case .null: try c.encodeNil()
+        }
     }
 }
 
-public struct ConnectorConfigDTO: Codable, Equatable, Identifiable, Sendable {
+public struct CapabilityTransportDTO: Codable, Equatable, Sendable {
+    public var type: String // "builtin" | "exec" | "stdio" | "http"
+    public var command: String?
+    public var args: [String]?
+    public var env: [String: String]?
+    public var description: String?
+    public var schema: JSONValue?
+    public var url: String?
+    public var headers: [String: String]?
+
+    public static func builtin() -> Self {
+        Self(type: "builtin")
+    }
+
+    public static func exec(
+        command: String,
+        args: [String] = [],
+        env: [String: String] = [:],
+        description: String = "",
+        schema: JSONValue? = nil
+    ) -> Self {
+        Self(
+            type: "exec",
+            command: command,
+            args: args,
+            env: env,
+            description: description,
+            schema: schema,
+            url: nil,
+            headers: nil
+        )
+    }
+
+    public static func stdio(command: String, args: [String] = [], env: [String: String] = [:]) -> Self {
+        Self(type: "stdio", command: command, args: args, env: env, description: nil, schema: nil, url: nil, headers: nil)
+    }
+
+    public static func http(url: String, headers: [String: String] = [:]) -> Self {
+        Self(type: "http", command: nil, args: nil, env: nil, description: nil, schema: nil, url: url, headers: headers)
+    }
+}
+
+public struct CapabilityConfigDTO: Codable, Equatable, Identifiable, Sendable {
     public var id: String
     public var name: String
     public var enabled: Bool
-    public var transport: ConnectorTransportDTO
+    public var transport: CapabilityTransportDTO
 
-    public init(id: String, name: String, enabled: Bool = true, transport: ConnectorTransportDTO) {
+    public init(id: String, name: String, enabled: Bool = true, transport: CapabilityTransportDTO) {
         self.id = id
         self.name = name
         self.enabled = enabled
@@ -96,12 +153,12 @@ public struct ConnectorConfigDTO: Codable, Equatable, Identifiable, Sendable {
 public struct HostConfigDTO: Codable, Equatable, Sendable {
     public var providers: [ProviderConfigDTO]
     public var judge: ModelRefDTO
-    public var connectors: [ConnectorConfigDTO]
+    public var capabilities: [CapabilityConfigDTO]
     public var windowMaxBytes: Int?
     public var maxSteps: Int?
 
     enum CodingKeys: String, CodingKey {
-        case providers, judge, connectors
+        case providers, judge, capabilities
         case windowMaxBytes = "window_max_bytes"
         case maxSteps = "max_steps"
     }
@@ -109,26 +166,26 @@ public struct HostConfigDTO: Codable, Equatable, Sendable {
     public init(
         providers: [ProviderConfigDTO] = [],
         judge: ModelRefDTO = ModelRefDTO(),
-        connectors: [ConnectorConfigDTO] = [],
+        capabilities: [CapabilityConfigDTO] = [],
         windowMaxBytes: Int? = nil,
         maxSteps: Int? = nil
     ) {
         self.providers = providers
         self.judge = judge
-        self.connectors = connectors
+        self.capabilities = capabilities
         self.windowMaxBytes = windowMaxBytes
         self.maxSteps = maxSteps
     }
 }
 
-public struct McpToolSummaryDTO: Codable, Equatable, Identifiable, Sendable {
+public struct CapabilityToolSummaryDTO: Codable, Equatable, Identifiable, Sendable {
     public var id: String { capability }
     public var name: String
     public var description: String
     public var capability: String
 }
 
-public struct ConnectorStatusDTO: Codable, Equatable, Identifiable, Sendable {
+public struct CapabilityStatusDTO: Codable, Equatable, Identifiable, Sendable {
     public var id: String
     public var name: String
     public var enabled: Bool
@@ -136,7 +193,7 @@ public struct ConnectorStatusDTO: Codable, Equatable, Identifiable, Sendable {
     public var authRequired: Bool
     public var oauthCode: String?
     public var error: String?
-    public var tools: [McpToolSummaryDTO]
+    public var tools: [CapabilityToolSummaryDTO]
 
     enum CodingKeys: String, CodingKey {
         case id, name, enabled, connected, error, tools
@@ -153,7 +210,7 @@ public struct ConnectorStatusDTO: Codable, Equatable, Identifiable, Sendable {
         authRequired = try c.decodeIfPresent(Bool.self, forKey: .authRequired) ?? false
         oauthCode = try c.decodeIfPresent(String.self, forKey: .oauthCode)
         error = try c.decodeIfPresent(String.self, forKey: .error)
-        tools = try c.decodeIfPresent([McpToolSummaryDTO].self, forKey: .tools) ?? []
+        tools = try c.decodeIfPresent([CapabilityToolSummaryDTO].self, forKey: .tools) ?? []
     }
 }
 
@@ -174,14 +231,14 @@ private struct StateEventDTO: Decodable {
     let dataDir: String
     let configured: Bool
     let config: HostConfigDTO
-    let connectorStatuses: [ConnectorStatusDTO]
+    let capabilityStatuses: [CapabilityStatusDTO]
     let stream: [StreamItemDTO]
 
     enum CodingKeys: String, CodingKey {
         case status, config, stream, configured
         case statusDetail = "status_detail"
         case dataDir = "data_dir"
-        case connectorStatuses = "connector_statuses"
+        case capabilityStatuses = "capability_statuses"
     }
 }
 
@@ -196,7 +253,7 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var dataDir: String = ""
     @Published public private(set) var isConfigured: Bool = false
     @Published public private(set) var config: HostConfigDTO = HostConfigDTO()
-    @Published public private(set) var connectorStatuses: [ConnectorStatusDTO] = []
+    @Published public private(set) var capabilityStatuses: [CapabilityStatusDTO] = []
     @Published public private(set) var stream: [StreamItemDTO] = []
     @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
@@ -238,7 +295,7 @@ public final class HostClient: ObservableObject {
     public func saveConfigPatch(
         providers: [ProviderConfigDTO]? = nil,
         judge: ModelRefDTO? = nil,
-        connectors: [ConnectorConfigDTO]? = nil
+        capabilities: [CapabilityConfigDTO]? = nil
     ) {
         var patch: [String: Any] = [:]
         let encoder = JSONEncoder()
@@ -252,10 +309,10 @@ public final class HostClient: ObservableObject {
            let obj = try? JSONSerialization.jsonObject(with: data) {
             patch["judge"] = obj
         }
-        if let connectors,
-           let data = try? encoder.encode(connectors),
+        if let capabilities,
+           let data = try? encoder.encode(capabilities),
            let obj = try? JSONSerialization.jsonObject(with: data) {
-            patch["connectors"] = obj
+            patch["capabilities"] = obj
         }
         guard !patch.isEmpty else { return }
         errorBanner = nil
@@ -269,14 +326,14 @@ public final class HostClient: ObservableObject {
         sendCommand(["cmd": "test_provider", "id": provider.id, "provider": obj, "model": model])
     }
 
-    public func reloadConnectors() {
+    public func reloadCapabilities() {
         errorBanner = nil
-        sendCommand(["cmd": "reload_connectors"])
+        sendCommand(["cmd": "reload_capabilities"])
     }
 
-    public func oauthConnector(id: String) {
+    public func oauthCapability(id: String) {
         errorBanner = nil
-        sendCommand(["cmd": "oauth_connector", "id": id])
+        sendCommand(["cmd": "oauth_capability", "id": id])
     }
 
     private func startHost(executableURL: URL?, dataDir: URL?) {
@@ -364,7 +421,7 @@ public final class HostClient: ObservableObject {
                 dataDir = state.dataDir
                 isConfigured = state.configured
                 config = state.config
-                connectorStatuses = state.connectorStatuses
+                capabilityStatuses = state.capabilityStatuses
                 stream = state.stream
             }
         case "activity":

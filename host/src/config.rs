@@ -1,5 +1,6 @@
 use crate::sandbox::TrustedDir;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -51,7 +52,19 @@ impl ModelRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ConnectorTransport {
+pub enum CapabilityTransport {
+    Builtin,
+    Exec {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<Value>,
+    },
     Stdio {
         command: String,
         #[serde(default)]
@@ -67,12 +80,23 @@ pub enum ConnectorTransport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConnectorConfig {
+pub struct CapabilityConfig {
     pub id: String,
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    pub transport: ConnectorTransport,
+    pub transport: CapabilityTransport,
+}
+
+impl CapabilityConfig {
+    pub fn builtin_shell() -> Self {
+        Self {
+            id: "shell".into(),
+            name: "Shell".into(),
+            enabled: true,
+            transport: CapabilityTransport::Builtin,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -86,7 +110,7 @@ pub struct HostConfig {
     #[serde(default)]
     pub judge: ModelRef,
     #[serde(default)]
-    pub connectors: Vec<ConnectorConfig>,
+    pub capabilities: Vec<CapabilityConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_max_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,7 +124,7 @@ pub struct ConfigPatch {
     #[serde(default)]
     pub judge: Option<ModelRef>,
     #[serde(default)]
-    pub connectors: Option<Vec<ConnectorConfig>>,
+    pub capabilities: Option<Vec<CapabilityConfig>>,
     #[serde(default)]
     pub window_max_bytes: Option<usize>,
     #[serde(default)]
@@ -112,7 +136,7 @@ impl From<HostConfig> for ConfigPatch {
         Self {
             providers: Some(config.providers),
             judge: Some(config.judge),
-            connectors: Some(config.connectors),
+            capabilities: Some(config.capabilities),
             window_max_bytes: config.window_max_bytes,
             max_steps: config.max_steps,
         }
@@ -135,7 +159,7 @@ impl Default for HostConfig {
                 provider_id: "openai".into(),
                 model: "gpt-4o".into(),
             },
-            connectors: Vec::new(),
+            capabilities: vec![CapabilityConfig::builtin_shell()],
             window_max_bytes: None,
             max_steps: None,
         }
@@ -149,8 +173,8 @@ impl HostConfig {
     }
 
     #[cfg(test)]
-    pub fn connectors_path(data_dir: &Path) -> PathBuf {
-        data_dir.join("connectors.json")
+    pub fn capabilities_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("capabilities.json")
     }
 
     pub fn load(core_dir: &TrustedDir) -> Self {
@@ -161,23 +185,42 @@ impl HostConfig {
             .unwrap_or_default()
     }
 
-    pub fn read_connectors(data_dir: &TrustedDir) -> Result<Option<Vec<u8>>, String> {
-        match data_dir.read_file("connectors.json") {
+    pub fn normalize_capabilities(caps: Vec<CapabilityConfig>) -> Vec<CapabilityConfig> {
+        let mut shell = CapabilityConfig::builtin_shell();
+        let mut others = Vec::with_capacity(caps.len());
+        for cap in caps {
+            if cap.id == "shell" || matches!(cap.transport, CapabilityTransport::Builtin) {
+                if !cap.name.trim().is_empty() {
+                    shell.name = cap.name;
+                }
+            } else {
+                others.push(cap);
+            }
+        }
+        let mut out = Vec::with_capacity(1 + others.len());
+        out.push(shell);
+        out.extend(others);
+        out
+    }
+
+    pub fn read_capabilities(data_dir: &TrustedDir) -> Result<Option<Vec<u8>>, String> {
+        match data_dir.read_file("capabilities.json") {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(format!("读取连接器配置失败: {err}")),
+            Err(err) => Err(format!("读取能力配置失败: {err}")),
         }
     }
 
-    pub fn parse_connectors(bytes: Option<&[u8]>) -> Result<Vec<ConnectorConfig>, String> {
-        serde_json::from_slice(bytes.unwrap_or(b"[]"))
-            .map_err(|err| format!("解析 connectors.json 失败: {err}"))
+    pub fn parse_capabilities(bytes: Option<&[u8]>) -> Result<Vec<CapabilityConfig>, String> {
+        let parsed: Vec<CapabilityConfig> = serde_json::from_slice(bytes.unwrap_or(b"[]"))
+            .map_err(|err| format!("解析 capabilities.json 失败: {err}"))?;
+        Ok(Self::normalize_capabilities(parsed))
     }
 
     pub fn save_models(&self, core_dir: &TrustedDir) -> Result<(), String> {
         let mut core_value = serde_json::to_value(self).map_err(|err| err.to_string())?;
         if let Some(map) = core_value.as_object_mut() {
-            map.remove("connectors");
+            map.remove("capabilities");
         }
         write_json_atomic(core_dir, "config.json", &core_value)
     }

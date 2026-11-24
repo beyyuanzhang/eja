@@ -74,7 +74,14 @@ impl Brain for HttpBrain {
         tools: &[ToolSpec],
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ModelReply, String> {
-        complete_wire(provider, model, system, messages, Some(tools), Some(on_delta))
+        complete_wire(
+            provider,
+            model,
+            system,
+            messages,
+            Some(tools),
+            Some(on_delta),
+        )
     }
 
     fn test_connection(&self, provider: &ProviderConfig, model: &str) -> Result<String, String> {
@@ -700,8 +707,16 @@ impl OpenAiStreamAcc {
             if name.is_empty() {
                 continue;
             }
-            let id = if raw_id.is_empty() { format!("call_{seed}_{index}") } else { raw_id };
-            let arguments = if raw_args.is_empty() { "{}".to_string() } else { raw_args };
+            let id = if raw_id.is_empty() {
+                format!("call_{seed}_{index}")
+            } else {
+                raw_id
+            };
+            let arguments = if raw_args.is_empty() {
+                "{}".to_string()
+            } else {
+                raw_args
+            };
             let args = serde_json::from_str(&arguments).unwrap_or_else(|_| json!({}));
             wire_calls.push(json!({
                 "id": id,
@@ -713,7 +728,11 @@ impl OpenAiStreamAcc {
         if !wire_calls.is_empty() {
             message["tool_calls"] = json!(wire_calls);
         }
-        Ok(ModelReply { message, text: self.text, calls })
+        Ok(ModelReply {
+            message,
+            text: self.text,
+            calls,
+        })
     }
 }
 
@@ -771,7 +790,10 @@ fn call_anthropic(
     Ok(reply)
 }
 
-fn parse_anthropic_json(resp: &Value, override_blocks: Option<Vec<Value>>) -> Result<ModelReply, String> {
+fn parse_anthropic_json(
+    resp: &Value,
+    override_blocks: Option<Vec<Value>>,
+) -> Result<ModelReply, String> {
     let blocks = match override_blocks {
         Some(b) => b,
         None => resp
@@ -842,7 +864,11 @@ impl AnthropicStreamAcc {
                 let Some(block) = ev.get("content_block") else {
                     return;
                 };
-                if let Some(t) = block.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                if let Some(t) = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
                     on_delta(t);
                 }
                 self.blocks.insert(idx, block.clone());
@@ -854,7 +880,11 @@ impl AnthropicStreamAcc {
                 };
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
-                        if let Some(t) = delta.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        if let Some(t) = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
                             on_delta(t);
                             let entry = self
                                 .blocks

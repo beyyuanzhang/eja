@@ -4,7 +4,7 @@ import SwiftUI
 
 enum SettingsSection: Hashable {
     case models
-    case connectors
+    case capabilities
 }
 
 @MainActor
@@ -12,9 +12,9 @@ final class SettingsDraft: ObservableObject {
     @Published var section: SettingsSection = .models
     @Published var providers: [ProviderConfigDTO] = []
     @Published var judge = ModelRefDTO()
-    @Published var connectors: [ConnectorConfigDTO] = []
+    @Published var capabilities: [CapabilityConfigDTO] = []
     @Published var expandedProvider: String?
-    @Published var expandedConnector: String?
+    @Published var expandedCapability: String?
     @Published var fetchingProviders: Set<String> = []
     @Published var addingModelProvider: String?
     @Published var newModelInput: String = ""
@@ -22,7 +22,7 @@ final class SettingsDraft: ObservableObject {
 
     private var savedProviders: [ProviderConfigDTO] = []
     private var savedJudge = ModelRefDTO()
-    private var savedConnectors: [ConnectorConfigDTO] = []
+    private var savedCapabilities: [CapabilityConfigDTO] = []
     private weak var client: HostClient?
     private var saveTask: Task<Void, Never>?
     private var hasAutoSynced = false
@@ -34,13 +34,13 @@ final class SettingsDraft: ObservableObject {
     func load(from config: HostConfigDTO) {
         providers = config.providers
         judge = config.judge
-        connectors = config.connectors
-        for conn in connectors where rawCommandLines[conn.id] == nil {
-            rawCommandLines[conn.id] = Self.formatCommandLine(conn.transport)
+        capabilities = config.capabilities
+        for cap in capabilities where rawCommandLines[cap.id] == nil {
+            rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
         }
         savedProviders = providers
         savedJudge = judge
-        savedConnectors = connectors
+        savedCapabilities = capabilities
 
         if healJudgeModelIfNeeded() {
             scheduleSave()
@@ -58,26 +58,26 @@ final class SettingsDraft: ObservableObject {
         }
     }
 
-    func syncExternalConnectors(_ latest: [ConnectorConfigDTO]) {
-        guard connectors == savedConnectors else { return }
-        connectors = latest
-        savedConnectors = latest
-        for conn in latest {
-            rawCommandLines[conn.id] = Self.formatCommandLine(conn.transport)
+    func syncExternalCapabilities(_ latest: [CapabilityConfigDTO]) {
+        guard capabilities == savedCapabilities else { return }
+        capabilities = latest
+        savedCapabilities = latest
+        for cap in latest {
+            rawCommandLines[cap.id] = Self.formatCommandLine(cap.transport)
         }
-        if let id = expandedConnector, !latest.contains(where: { $0.id == id }) {
-            expandedConnector = nil
+        if let id = expandedCapability, !latest.contains(where: { $0.id == id }) {
+            expandedCapability = nil
         }
     }
 
     var providersDirty: Bool { providers != savedProviders || judge != savedJudge }
-    var connectorsDirty: Bool { connectors != savedConnectors }
-    var isDirty: Bool { providersDirty || connectorsDirty }
+    var capabilitiesDirty: Bool { capabilities != savedCapabilities }
+    var isDirty: Bool { providersDirty || capabilitiesDirty }
 
     func markSaved() {
         savedProviders = providers
         savedJudge = judge
-        savedConnectors = connectors
+        savedCapabilities = capabilities
     }
 
     @discardableResult
@@ -191,23 +191,23 @@ final class SettingsDraft: ObservableObject {
         flushSave()
     }
 
-    func addConnector() {
-        var uniqueId = "mcp-\(connectors.count + 1)"
-        var n = connectors.count + 2
-        while connectors.contains(where: { $0.id == uniqueId }) {
-            uniqueId = "mcp-\(n)"
+    func addCapability() {
+        var uniqueId = "cap-\(capabilities.count + 1)"
+        var n = capabilities.count + 2
+        while capabilities.contains(where: { $0.id == uniqueId }) {
+            uniqueId = "cap-\(n)"
             n += 1
         }
-        let transport = ConnectorTransportDTO.stdio(command: "npx", args: [])
+        let transport = CapabilityTransportDTO.exec(command: "", args: [])
         rawCommandLines[uniqueId] = ""
-        connectors.append(ConnectorConfigDTO(id: uniqueId, name: "MCP", enabled: true, transport: transport))
-        expandedConnector = uniqueId
+        capabilities.append(CapabilityConfigDTO(id: uniqueId, name: "新能力", enabled: true, transport: transport))
+        expandedCapability = uniqueId
     }
 
-    func removeConnector(id: String) {
-        connectors.removeAll { $0.id == id }
+    func removeCapability(id: String) {
+        capabilities.removeAll { $0.id == id && $0.transport.type != "builtin" }
         rawCommandLines.removeValue(forKey: id)
-        if expandedConnector == id { expandedConnector = nil }
+        if expandedCapability == id { expandedCapability = nil }
         flushSave()
     }
 
@@ -227,9 +227,9 @@ final class SettingsDraft: ObservableObject {
         guard isDirty, let client else { return }
         let providers = providersDirty ? providers : nil
         let judge = providersDirty ? judge : nil
-        let connectors = connectorsDirty ? connectors : nil
-        guard providers != nil || connectors != nil else { return }
-        client.saveConfigPatch(providers: providers, judge: judge, connectors: connectors)
+        let capabilities = capabilitiesDirty ? capabilities : nil
+        guard providers != nil || capabilities != nil else { return }
+        client.saveConfigPatch(providers: providers, judge: judge, capabilities: capabilities)
         markSaved()
     }
 
@@ -340,7 +340,7 @@ final class SettingsDraft: ObservableObject {
         return lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("0.0.0.0")
     }
 
-    static func formatCommandLine(_ transport: ConnectorTransportDTO) -> String {
+    static func formatCommandLine(_ transport: CapabilityTransportDTO) -> String {
         let cmd = (transport.command ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let args = transport.args ?? []
         guard !cmd.isEmpty else { return args.joined(separator: " ") }
@@ -454,19 +454,19 @@ struct SettingsView: View {
             draft.attach(client: client)
             draft.load(from: client.config)
         }
-        .onChange(of: client.config.connectors) { _, latest in
-            draft.syncExternalConnectors(latest)
+        .onChange(of: client.config.capabilities) { _, latest in
+            draft.syncExternalCapabilities(latest)
         }
         .onChange(of: draft.providers) { _, _ in draft.scheduleSave() }
         .onChange(of: draft.judge) { _, _ in draft.scheduleSave() }
-        .onChange(of: draft.connectors) { _, _ in draft.scheduleSave() }
+        .onChange(of: draft.capabilities) { _, _ in draft.scheduleSave() }
         .onDisappear { draft.flushSave() }
     }
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 2) {
             sideItem(.models, title: "模型")
-            sideItem(.connectors, title: "连接器")
+            sideItem(.capabilities, title: "能力")
             Spacer(minLength: 0)
             Button {
                 draft.flushSave()
@@ -491,7 +491,7 @@ struct SettingsView: View {
             withAnimation(.easeOut(duration: 0.14)) { draft.section = section }
         } label: {
             ZStack(alignment: .leading) {
-                Text("连接器")
+                Text("模型")
                     .font(.system(size: 12.5, weight: .medium))
                     .hidden()
                 Text(title)
@@ -514,8 +514,8 @@ struct SettingsView: View {
         switch draft.section {
         case .models:
             modelsPane
-        case .connectors:
-            connectorsPane
+        case .capabilities:
+            capabilitiesPane
         }
     }
 
@@ -819,16 +819,16 @@ struct SettingsView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - 连接器
+    // MARK: - 能力
 
-    private var connectorsPane: some View {
+    private var capabilitiesPane: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(Array(draft.connectors.enumerated()), id: \.element.id) { idx, _ in
-                    connectorCard(index: idx)
+                ForEach(Array(draft.capabilities.enumerated()), id: \.element.id) { idx, _ in
+                    capabilityCard(index: idx)
                 }
                 Button {
-                    draft.addConnector()
+                    draft.addCapability()
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .medium))
@@ -852,23 +852,24 @@ struct SettingsView: View {
         .scrollIndicators(.never)
     }
 
-    private func connectorCard(index: Int) -> some View {
-        let conn = draft.connectors[index]
-        let expanded = draft.expandedConnector == conn.id
-        let status = client.connectorStatuses.first { $0.id == conn.id }
-        let isHTTP = conn.transport.type == "http"
-        let hasURL = !(conn.transport.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    private func capabilityCard(index: Int) -> some View {
+        let cap = draft.capabilities[index]
+        let isBuiltin = cap.transport.type == "builtin"
+        let expanded = !isBuiltin && draft.expandedCapability == cap.id
+        let status = client.capabilityStatuses.first { $0.id == cap.id }
+        let isHTTP = cap.transport.type == "http"
+        let hasURL = !(cap.transport.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let dotColor: Color = {
-            if !conn.enabled { return EjaTheme.inkMuted.opacity(0.35) }
-            if status?.connected == true { return EjaTheme.positive }
+            if !cap.enabled && !isBuiltin { return EjaTheme.inkMuted.opacity(0.35) }
+            if isBuiltin || status?.connected == true { return EjaTheme.positive }
             if let err = status?.error, !err.isEmpty { return EjaTheme.warning }
             return EjaTheme.inkMuted
         }()
         let enabledBinding = Binding<Bool>(
-            get: { draft.connectors.indices.contains(index) ? draft.connectors[index].enabled : false },
+            get: { draft.capabilities.indices.contains(index) ? draft.capabilities[index].enabled : false },
             set: {
-                if draft.connectors.indices.contains(index) {
-                    draft.connectors[index].enabled = $0
+                if draft.capabilities.indices.contains(index) {
+                    draft.capabilities[index].enabled = $0
                     draft.flushSave()
                 }
             }
@@ -877,28 +878,31 @@ struct SettingsView: View {
         return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Button {
+                    guard !isBuiltin else { return }
                     withAnimation(.easeOut(duration: 0.14)) {
-                        draft.expandedConnector = expanded ? nil : conn.id
+                        draft.expandedCapability = expanded ? nil : cap.id
                     }
                 } label: {
                     HStack(spacing: 7) {
                         Circle()
                             .fill(dotColor)
                             .frame(width: 6, height: 6)
-                        Text(conn.name.isEmpty ? conn.id : conn.name)
+                        Text(cap.name.isEmpty ? cap.id : cap.name)
                             .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle(conn.enabled ? EjaTheme.ink : EjaTheme.inkSecondary)
+                            .foregroundStyle((cap.enabled || isBuiltin) ? EjaTheme.ink : EjaTheme.inkSecondary)
                             .lineLimit(1)
-                        if conn.enabled, status?.authRequired != true, let err = status?.error, !err.isEmpty {
+                        if cap.enabled, status?.authRequired != true, let err = status?.error, !err.isEmpty {
                             Text(err)
                                 .font(.system(size: 11))
                                 .foregroundStyle(EjaTheme.warning)
                                 .lineLimit(1)
                         }
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8.5, weight: .semibold))
-                            .foregroundStyle(EjaTheme.inkMuted)
-                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                        if !isBuiltin {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 8.5, weight: .semibold))
+                                .foregroundStyle(EjaTheme.inkMuted)
+                                .rotationEffect(.degrees(expanded ? 90 : 0))
+                        }
                         Spacer(minLength: 4)
                     }
                     .contentShape(Rectangle())
@@ -928,7 +932,7 @@ struct SettingsView: View {
                 } else if isHTTP && hasURL && status?.authRequired == true {
                     Button {
                         draft.flushSave()
-                        client.oauthConnector(id: conn.id)
+                        client.oauthCapability(id: cap.id)
                     } label: {
                         Text("授权")
                             .font(.system(size: 10.5, weight: .medium))
@@ -946,7 +950,7 @@ struct SettingsView: View {
                 if expanded {
                     Button {
                         draft.flushSave()
-                        client.reloadConnectors()
+                        client.reloadCapabilities()
                     } label: {
                         Image(systemName: "arrow.clockwise")
                             .font(.system(size: 10.5, weight: .medium))
@@ -954,7 +958,7 @@ struct SettingsView: View {
                     .buttonStyle(EjaIconButtonStyle(size: 22))
 
                     Button {
-                        draft.removeConnector(id: conn.id)
+                        draft.removeCapability(id: cap.id)
                     } label: {
                         Image(systemName: "trash")
                             .font(.system(size: 10.5))
@@ -962,10 +966,12 @@ struct SettingsView: View {
                     .buttonStyle(EjaIconButtonStyle(size: 22, destructive: true))
                 }
 
-                Toggle("", isOn: enabledBinding)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
+                if !isBuiltin {
+                    Toggle("", isOn: enabledBinding)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                }
             }
             .padding(.horizontal, 11)
             .padding(.vertical, 9)
@@ -993,7 +999,7 @@ struct SettingsView: View {
             }
 
             if expanded {
-                connectorEditor(index: index)
+                capabilityEditor(index: index)
             }
         }
         .background(
@@ -1006,16 +1012,18 @@ struct SettingsView: View {
         )
     }
 
-    private func connectorEditor(index: Int) -> some View {
-        let conn = draft.connectors[index]
+    private func capabilityEditor(index: Int) -> some View {
+        let cap = draft.capabilities[index]
         let nameBinding = Binding<String>(
-            get: { draft.connectors.indices.contains(index) ? draft.connectors[index].name : "" },
-            set: { if draft.connectors.indices.contains(index) { draft.connectors[index].name = $0 } }
+            get: { draft.capabilities.indices.contains(index) ? draft.capabilities[index].name : "" },
+            set: { if draft.capabilities.indices.contains(index) { draft.capabilities[index].name = $0 } }
         )
         let urlBinding = transportBinding(index, \.url, "")
+        let descBinding = transportBinding(index, \.description, "")
         let cmdLineBinding = commandLineBinding(index)
         let kvBinding = transportKVBinding(index)
-        let isHTTP = conn.transport.type == "http"
+        let isHTTP = cap.transport.type == "http"
+        let isExec = cap.transport.type == "exec"
 
         return VStack(alignment: .leading, spacing: 6) {
             divider
@@ -1027,6 +1035,7 @@ struct SettingsView: View {
                     .modifier(CardField())
 
                 HStack(spacing: 2) {
+                    transportSegment("Exec", tag: "exec", index: index)
                     transportSegment("Stdio", tag: "stdio", index: index)
                     transportSegment("HTTP", tag: "http", index: index)
                 }
@@ -1052,6 +1061,14 @@ struct SettingsView: View {
                     .modifier(CardField())
             }
 
+            if isExec {
+                TextField("", text: descBinding, prompt: Text("描述").foregroundStyle(EjaTheme.inkMuted))
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(EjaTheme.ink)
+                    .textFieldStyle(.plain)
+                    .modifier(CardField())
+            }
+
             TextField("", text: kvBinding, prompt: Text("KEY=VALUE").foregroundStyle(EjaTheme.inkMuted), axis: .vertical)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(EjaTheme.ink)
@@ -1064,19 +1081,35 @@ struct SettingsView: View {
     }
 
     private func transportSegment(_ label: String, tag: String, index: Int) -> some View {
-        let active = draft.connectors.indices.contains(index) && draft.connectors[index].transport.type == tag
+        let active = draft.capabilities.indices.contains(index) && draft.capabilities[index].transport.type == tag
         return Button {
-            guard draft.connectors.indices.contains(index),
-                  draft.connectors[index].transport.type != tag else { return }
+            guard draft.capabilities.indices.contains(index),
+                  draft.capabilities[index].transport.type != tag else { return }
             withAnimation(.easeOut(duration: 0.14)) {
-                draft.connectors[index].transport = tag == "http"
-                    ? ConnectorTransportDTO.http(url: draft.connectors[index].transport.url ?? "")
-                    : ConnectorTransportDTO.stdio(
-                        command: draft.connectors[index].transport.command ?? "",
-                        args: draft.connectors[index].transport.args ?? []
+                let prev = draft.capabilities[index].transport
+                switch tag {
+                case "http":
+                    draft.capabilities[index].transport = CapabilityTransportDTO.http(
+                        url: prev.url ?? "",
+                        headers: prev.headers ?? [:]
                     )
-                let conn = draft.connectors[index]
-                draft.rawCommandLines[conn.id] = SettingsDraft.formatCommandLine(conn.transport)
+                case "stdio":
+                    draft.capabilities[index].transport = CapabilityTransportDTO.stdio(
+                        command: prev.command ?? "",
+                        args: prev.args ?? [],
+                        env: prev.env ?? [:]
+                    )
+                default:
+                    draft.capabilities[index].transport = CapabilityTransportDTO.exec(
+                        command: prev.command ?? "",
+                        args: prev.args ?? [],
+                        env: prev.env ?? [:],
+                        description: prev.description ?? "",
+                        schema: prev.schema
+                    )
+                }
+                let cap = draft.capabilities[index]
+                draft.rawCommandLines[cap.id] = SettingsDraft.formatCommandLine(cap.transport)
             }
         } label: {
             Text(label)
@@ -1116,17 +1149,17 @@ struct SettingsView: View {
 
     private func transportBinding<T>(
         _ index: Int,
-        _ keyPath: WritableKeyPath<ConnectorTransportDTO, T?>,
+        _ keyPath: WritableKeyPath<CapabilityTransportDTO, T?>,
         _ fallback: T
     ) -> Binding<T> {
         Binding(
             get: {
-                guard draft.connectors.indices.contains(index) else { return fallback }
-                return draft.connectors[index].transport[keyPath: keyPath] ?? fallback
+                guard draft.capabilities.indices.contains(index) else { return fallback }
+                return draft.capabilities[index].transport[keyPath: keyPath] ?? fallback
             },
             set: {
-                guard draft.connectors.indices.contains(index) else { return }
-                draft.connectors[index].transport[keyPath: keyPath] = $0
+                guard draft.capabilities.indices.contains(index) else { return }
+                draft.capabilities[index].transport[keyPath: keyPath] = $0
             }
         )
     }
@@ -1134,17 +1167,17 @@ struct SettingsView: View {
     private func commandLineBinding(_ index: Int) -> Binding<String> {
         Binding(
             get: {
-                guard draft.connectors.indices.contains(index) else { return "" }
-                let conn = draft.connectors[index]
-                return draft.rawCommandLines[conn.id] ?? SettingsDraft.formatCommandLine(conn.transport)
+                guard draft.capabilities.indices.contains(index) else { return "" }
+                let cap = draft.capabilities[index]
+                return draft.rawCommandLines[cap.id] ?? SettingsDraft.formatCommandLine(cap.transport)
             },
             set: { raw in
-                guard draft.connectors.indices.contains(index) else { return }
-                let id = draft.connectors[index].id
+                guard draft.capabilities.indices.contains(index) else { return }
+                let id = draft.capabilities[index].id
                 draft.rawCommandLines[id] = raw
                 let parsed = SettingsDraft.parseCommandLine(raw)
-                draft.connectors[index].transport.command = parsed.command
-                draft.connectors[index].transport.args = parsed.args
+                draft.capabilities[index].transport.command = parsed.command
+                draft.capabilities[index].transport.args = parsed.args
             }
         )
     }
@@ -1152,13 +1185,13 @@ struct SettingsView: View {
     private func transportKVBinding(_ index: Int) -> Binding<String> {
         Binding(
             get: {
-                guard draft.connectors.indices.contains(index) else { return "" }
-                let transport = draft.connectors[index].transport
+                guard draft.capabilities.indices.contains(index) else { return "" }
+                let transport = draft.capabilities[index].transport
                 let map = transport.type == "http" ? (transport.headers ?? [:]) : (transport.env ?? [:])
                 return map.keys.sorted().map { "\($0)=\(map[$0] ?? "")" }.joined(separator: "\n")
             },
             set: { raw in
-                guard draft.connectors.indices.contains(index) else { return }
+                guard draft.capabilities.indices.contains(index) else { return }
                 var map: [String: String] = [:]
                 for line in raw.split(separator: "\n") {
                     if let sep = line.firstIndex(of: "=") {
@@ -1167,10 +1200,10 @@ struct SettingsView: View {
                         if !key.isEmpty { map[key] = value }
                     }
                 }
-                if draft.connectors[index].transport.type == "http" {
-                    draft.connectors[index].transport.headers = map
+                if draft.capabilities[index].transport.type == "http" {
+                    draft.capabilities[index].transport.headers = map
                 } else {
-                    draft.connectors[index].transport.env = map
+                    draft.capabilities[index].transport.env = map
                 }
             }
         )

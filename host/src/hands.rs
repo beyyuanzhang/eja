@@ -1,13 +1,13 @@
-use crate::config::ConnectorConfig;
+use crate::config::CapabilityConfig;
 use crate::http::truncate_utf8;
-use crate::mcp::{ConnectorPool, ConnectorStatus};
+use crate::mcp::{CapabilityPool, CapabilityStatus};
 use crate::oauth::OAuthToken;
 use crate::sandbox::{kill_process_tree, Sandbox, TrustedDir};
 use crate::state::{self, schedule_wakes, WakeAlarm, WakeGuard};
 use eja_core::{Call, Eja, Outcome};
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::io::{self, Read, Seek};
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -47,7 +47,7 @@ pub fn activity_label(tool_name: &str) -> &str {
 
 pub struct Hands {
     data_dir: TrustedDir,
-    connectors: ConnectorPool,
+    capabilities: CapabilityPool,
 }
 
 impl Hands {
@@ -55,37 +55,37 @@ impl Hands {
         data_dir: TrustedDir,
         core_dir: TrustedDir,
         sandbox: Sandbox,
-        connectors: &[ConnectorConfig],
+        capabilities: &[CapabilityConfig],
     ) -> Self {
-        let mut pool = ConnectorPool::with_core_dir(sandbox, core_dir);
-        pool.reload(connectors, false);
+        let mut pool = CapabilityPool::with_core_dir(sandbox, core_dir);
+        pool.reload(capabilities, false);
         Self {
             data_dir,
-            connectors: pool,
+            capabilities: pool,
         }
     }
 
-    pub fn reload(&mut self, connectors: &[ConnectorConfig], force: bool) {
-        self.connectors.reload(connectors, force);
+    pub fn reload(&mut self, capabilities: &[CapabilityConfig], force: bool) {
+        self.capabilities.reload(capabilities, force);
     }
 
     pub fn set_oauth_code(&mut self, id: &str, code: Option<String>) {
-        self.connectors.set_oauth_code(id, code);
+        self.capabilities.set_oauth_code(id, code);
     }
 
     pub fn save_oauth_token(
         &mut self,
         id: &str,
         token: OAuthToken,
-        connectors: &[ConnectorConfig],
+        capabilities: &[CapabilityConfig],
     ) -> Result<(), String> {
-        self.connectors.save_oauth_token(id, token)?;
-        self.connectors.reload(connectors, false);
+        self.capabilities.save_oauth_token(id, token)?;
+        self.capabilities.reload(capabilities, false);
         Ok(())
     }
 
-    pub fn connector_statuses(&self) -> Vec<ConnectorStatus> {
-        self.connectors.statuses()
+    pub fn capability_statuses(&self) -> Vec<CapabilityStatus> {
+        self.capabilities.statuses()
     }
 
     pub fn tools(&self) -> Vec<ToolSpec> {
@@ -156,20 +156,6 @@ impl Hands {
                 false,
             ),
             builtin_spec(
-                "shell",
-                "执行本机 shell 命令。",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "command": { "type": "string" },
-                        "cwd": { "type": "string" },
-                        "timeout_seconds": { "type": "integer", "minimum": 1 }
-                    },
-                    "required": ["command"]
-                }),
-                false,
-            ),
-            builtin_spec(
                 "promote_tool",
                 "注册可复用的本地文件文本检查（支持 equals、contains、not_equals，至少提供一项）。名称固定，同一规则可用于静默守望（guard_tool）和挂念验收（checker）。",
                 json!({
@@ -190,10 +176,10 @@ impl Hands {
 
         let mut used: HashSet<String> = specs.iter().map(|spec| spec.name.clone()).collect();
 
-        for tool in self.connectors.tools() {
+        for tool in self.capabilities.tools() {
             let name = safe_tool_name(&tool.capability, &mut used);
             let description = if tool.description.is_empty() {
-                format!("MCP 工具 {}", tool.capability)
+                format!("能力工具 {}", tool.capability)
             } else {
                 tool.description
             };
@@ -208,10 +194,9 @@ impl Hands {
         specs
     }
 
-    pub fn execute(&mut self, call: &Call, eja: &Eja, sandbox: &Sandbox) -> Outcome {
+    pub fn execute(&mut self, call: &Call, eja: &Eja) -> Outcome {
         match call.capability.as_str() {
             "wake" => execute_wake(eja, call.id, &call.input),
-            "shell" => self.execute_shell(sandbox, call.id, &call.input),
             "promote_tool" => {
                 let (Some(name), Some(file)) =
                     (call.input["name"].as_str(), call.input["file"].as_str())
@@ -240,34 +225,50 @@ impl Hands {
                     Err(err) => Outcome::Failed(err.to_string()),
                 }
             }
-            other if other.starts_with("mcp.") => self.connectors.call(other, &call.input),
-            other => Outcome::Failed(format!("未知能力: {other}")),
+            other => self
+                .capabilities
+                .call(other, call.id, &call.input, &self.data_dir),
         }
     }
+}
 
-    fn execute_shell(&self, sandbox: &Sandbox, call_id: eja_core::Id, input: &Value) -> Outcome {
-        let command = input
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if command.is_empty() {
-            return Outcome::Failed("shell 需要非空 command".into());
-        }
-        let cwd = input
-            .get("cwd")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.data_dir.path().to_path_buf());
-        let timeout = input
-            .get("timeout_seconds")
-            .and_then(Value::as_u64)
-            .filter(|&secs| secs >= 1)
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_SHELL_TIMEOUT);
-        run_shell(sandbox, command, &cwd, timeout, &self.data_dir, call_id)
+pub(crate) fn execute_shell(
+    sandbox: &Sandbox,
+    data_dir: &TrustedDir,
+    call_id: eja_core::Id,
+    input: &Value,
+) -> Outcome {
+    let command = input
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if command.is_empty() {
+        return Outcome::Failed("shell 需要非空 command".into());
     }
+    let cwd = input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.path().to_path_buf());
+    let timeout = input
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .filter(|&secs| secs >= 1)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT);
+    run_process(
+        sandbox,
+        "/bin/sh",
+        &["-c".into(), command.into()],
+        &BTreeMap::new(),
+        None,
+        &cwd,
+        timeout,
+        data_dir,
+        call_id,
+    )
 }
 
 fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
@@ -398,17 +399,33 @@ fn shell_output(
     }
 }
 
-fn run_shell(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_process(
     sandbox: &Sandbox,
-    command: &str,
+    program: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    stdin_bytes: Option<&[u8]>,
     cwd: &Path,
     timeout: Duration,
     data_dir: &TrustedDir,
     call_id: eja_core::Id,
 ) -> Outcome {
+    let resolved = if program.contains('/') && Path::new(program).is_relative() {
+        cwd.join(program).to_string_lossy().into_owned()
+    } else {
+        program.to_string()
+    };
     let mut child = match sandbox
-        .command("/bin/sh", ["-c", command])
+        .command(&resolved, args)
         .current_dir(cwd)
+        .envs(env)
+        .env("EJA_DATA_DIR", data_dir.path())
+        .stdin(if stdin_bytes.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -416,6 +433,11 @@ fn run_shell(
         Ok(c) => c,
         Err(err) => return Outcome::Failed(format!("启动 shell 失败: {err}")),
     };
+    if let Some(bytes) = stdin_bytes {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(bytes);
+        }
+    }
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let out_handle = thread::spawn(move || capture_shell_stream(stdout));
@@ -461,7 +483,7 @@ fn safe_tool_name(capability: &str, used: &mut HashSet<String>) -> String {
         .take(56)
         .collect();
     if base.is_empty() {
-        base = "mcp_tool".to_string();
+        base = "cap_tool".to_string();
     }
     let mut candidate = base.clone();
     let mut idx = 2usize;
@@ -486,6 +508,27 @@ pub fn format_local_unix(secs: i64) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn run_shell(
+        sandbox: &Sandbox,
+        command: &str,
+        cwd: &Path,
+        timeout: Duration,
+        data_dir: &TrustedDir,
+        call_id: eja_core::Id,
+    ) -> Outcome {
+        run_process(
+            sandbox,
+            "/bin/sh",
+            &["-c".into(), command.into()],
+            &BTreeMap::new(),
+            None,
+            cwd,
+            timeout,
+            data_dir,
+            call_id,
+        )
+    }
 
     #[test]
     fn shell_closes_stdin_and_reaps_pipeline_grandchildren_on_timeout() {

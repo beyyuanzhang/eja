@@ -1,4 +1,5 @@
-use crate::config::{ConnectorConfig, ConnectorTransport};
+use crate::config::{CapabilityConfig, CapabilityTransport};
+use crate::hands::{execute_shell, run_process};
 use crate::http::{post_bytes, truncate_utf8, HttpError, HttpResponse};
 use crate::oauth::{is_auth_error, OAuthStore, OAuthToken};
 use crate::sandbox::TrustedDir;
@@ -36,24 +37,24 @@ impl RequestError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpToolSummary {
+pub struct CapabilityToolSummary {
     pub name: String,
     pub description: String,
     pub capability: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct McpTool {
-    pub connector_id: String,
+pub struct CapabilityTool {
+    pub capability_id: String,
     pub name: String,
     pub description: String,
     pub input_schema: Value,
     pub capability: String,
 }
 
-impl McpTool {
-    fn summary(&self) -> McpToolSummary {
-        McpToolSummary {
+impl CapabilityTool {
+    fn summary(&self) -> CapabilityToolSummary {
+        CapabilityToolSummary {
             name: self.name.clone(),
             description: self.description.clone(),
             capability: self.capability.clone(),
@@ -62,7 +63,7 @@ impl McpTool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectorStatus {
+pub struct CapabilityStatus {
     pub id: String,
     pub name: String,
     pub enabled: bool,
@@ -73,7 +74,7 @@ pub struct ConnectorStatus {
     pub oauth_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    pub tools: Vec<McpToolSummary>,
+    pub tools: Vec<CapabilityToolSummary>,
 }
 
 fn init_params() -> Value {
@@ -434,6 +435,12 @@ fn parse_http_jsonrpc(body: &str, id: u64) -> Result<Value, String> {
 }
 
 enum ActiveConnection {
+    Builtin,
+    Exec {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
     Stdio(StdioConnection),
     Http(HttpConnection),
 }
@@ -448,33 +455,36 @@ impl ActiveConnection {
         match self {
             Self::Stdio(conn) => conn.request(method, params, timeout),
             Self::Http(conn) => conn.request(method, params, timeout),
+            Self::Builtin | Self::Exec { .. } => Err(RequestError::Failed(
+                "非 MCP 能力不支持 JSON-RPC 请求".into(),
+            )),
         }
     }
 
     fn is_alive(&mut self) -> bool {
         match self {
             Self::Stdio(conn) => !conn.broken && matches!(conn.child.try_wait(), Ok(None)),
-            Self::Http(_) => true,
+            Self::Builtin | Self::Exec { .. } | Self::Http(_) => true,
         }
     }
 }
 
 struct ConnectedEntry {
-    transport: ConnectorTransport,
+    transport: CapabilityTransport,
     connection: ActiveConnection,
-    tools: Vec<McpTool>,
+    tools: Vec<CapabilityTool>,
 }
 
-pub struct ConnectorPool {
+pub struct CapabilityPool {
     sandbox: Sandbox,
     oauth: OAuthStore,
     oauth_codes: HashMap<String, String>,
     connections: HashMap<String, ConnectedEntry>,
-    statuses: Vec<ConnectorStatus>,
-    tools: Vec<McpTool>,
+    statuses: Vec<CapabilityStatus>,
+    tools: Vec<CapabilityTool>,
 }
 
-impl ConnectorPool {
+impl CapabilityPool {
     #[cfg(test)]
     pub fn new(sandbox: Sandbox) -> Self {
         Self::open(sandbox, None)
@@ -517,14 +527,14 @@ impl ConnectorPool {
 
     fn status_for(
         &self,
-        cfg: &ConnectorConfig,
+        cfg: &CapabilityConfig,
         connected: bool,
         error: Option<String>,
-        tools: &[McpTool],
-    ) -> ConnectorStatus {
-        let auth_required = matches!(cfg.transport, ConnectorTransport::Http { .. })
+        tools: &[CapabilityTool],
+    ) -> CapabilityStatus {
+        let auth_required = matches!(cfg.transport, CapabilityTransport::Http { .. })
             && error.as_deref().is_some_and(is_auth_error);
-        ConnectorStatus {
+        CapabilityStatus {
             id: cfg.id.clone(),
             name: cfg.name.clone(),
             enabled: cfg.enabled,
@@ -532,11 +542,11 @@ impl ConnectorPool {
             auth_required,
             oauth_code: self.oauth_codes.get(&cfg.id).cloned(),
             error,
-            tools: tools.iter().map(McpTool::summary).collect(),
+            tools: tools.iter().map(CapabilityTool::summary).collect(),
         }
     }
 
-    pub fn reload(&mut self, configs: &[ConnectorConfig], force: bool) {
+    pub fn reload(&mut self, configs: &[CapabilityConfig], force: bool) {
         let mut reusable = HashMap::new();
         if force {
             self.connections.clear();
@@ -556,8 +566,7 @@ impl ConnectorPool {
 
         for cfg in configs {
             if !cfg.enabled {
-                self.statuses
-                    .push(self.status_for(cfg, false, None, &[]));
+                self.statuses.push(self.status_for(cfg, false, None, &[]));
                 continue;
             }
 
@@ -591,39 +600,70 @@ impl ConnectorPool {
         }
     }
 
-    pub fn statuses(&self) -> Vec<ConnectorStatus> {
+    pub fn statuses(&self) -> Vec<CapabilityStatus> {
         self.statuses.clone()
     }
 
-    pub fn tools(&self) -> Vec<McpTool> {
+    pub fn tools(&self) -> Vec<CapabilityTool> {
         self.tools.clone()
     }
 
-    pub fn call(&mut self, capability: &str, input: &Value) -> Outcome {
+    pub fn call(
+        &mut self,
+        capability: &str,
+        call_id: eja_core::Id,
+        input: &Value,
+        data_dir: &TrustedDir,
+    ) -> Outcome {
         let Some(tool) = self
             .tools
             .iter()
             .find(|item| item.capability == capability)
             .cloned()
         else {
-            return Outcome::Failed(format!("未找到 MCP 工具: {capability}"));
+            return Outcome::Failed(format!("未知能力: {capability}"));
         };
-        let Some(entry) = self.connections.get_mut(&tool.connector_id) else {
-            return Outcome::Failed(format!("MCP 连接器未连接: {}", tool.connector_id));
+        let Some(entry) = self.connections.get_mut(&tool.capability_id) else {
+            return Outcome::Failed(format!("能力未连接: {}", tool.capability_id));
         };
         let args = if input.is_object() {
             input.clone()
         } else {
             json!({})
         };
+        match &entry.connection {
+            ActiveConnection::Builtin => {
+                return execute_shell(&self.sandbox, data_dir, call_id, input);
+            }
+            ActiveConnection::Exec {
+                command,
+                args: cmd_args,
+                env,
+            } => {
+                let stdin_bytes = serde_json::to_vec(&args).unwrap_or_else(|_| b"{}".to_vec());
+                return run_process(
+                    &self.sandbox,
+                    command,
+                    cmd_args,
+                    env,
+                    Some(&stdin_bytes),
+                    data_dir.path(),
+                    TOOL_TIMEOUT,
+                    data_dir,
+                    call_id,
+                );
+            }
+            ActiveConnection::Stdio(_) | ActiveConnection::Http(_) => {}
+        }
         let call_params = json!({ "name": tool.name, "arguments": args });
-        let mut response = entry
-            .connection
-            .request("tools/call", call_params.clone(), TOOL_TIMEOUT);
+        let mut response =
+            entry
+                .connection
+                .request("tools/call", call_params.clone(), TOOL_TIMEOUT);
         if let Err(RequestError::Failed(ref err)) = response {
             if is_auth_error(err) {
                 if let ActiveConnection::Http(ref mut http_conn) = entry.connection {
-                    if let Some(new_token) = self.oauth.refresh(&tool.connector_id, &http_conn.url)
+                    if let Some(new_token) = self.oauth.refresh(&tool.capability_id, &http_conn.url)
                     {
                         http_conn.set_bearer_token(&new_token);
                         response = http_conn.request("tools/call", call_params, TOOL_TIMEOUT);
@@ -674,13 +714,68 @@ impl ConnectorPool {
 fn connect_and_list(
     sandbox: &Sandbox,
     oauth: &mut OAuthStore,
-    cfg: &ConnectorConfig,
-) -> Result<(ActiveConnection, Vec<McpTool>), String> {
+    cfg: &CapabilityConfig,
+) -> Result<(ActiveConnection, Vec<CapabilityTool>), String> {
     let mut conn = match &cfg.transport {
-        ConnectorTransport::Stdio { command, args, env } => {
+        CapabilityTransport::Builtin => {
+            let tool = CapabilityTool {
+                capability_id: cfg.id.clone(),
+                name: "shell".into(),
+                description: "执行本机 shell 命令。".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "cwd": { "type": "string" },
+                        "timeout_seconds": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["command"]
+                }),
+                capability: "shell".into(),
+            };
+            return Ok((ActiveConnection::Builtin, vec![tool]));
+        }
+        CapabilityTransport::Exec {
+            command,
+            args,
+            env,
+            description,
+            schema,
+        } => {
+            let trimmed = command.trim();
+            if trimmed.is_empty() {
+                return Err("未配置执行命令".into());
+            }
+            let safe_id = sanitize_id(&cfg.id);
+            let desc = if description.trim().is_empty() {
+                cfg.name.clone()
+            } else {
+                description.clone()
+            };
+            let input_schema = schema
+                .clone()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+            let tool = CapabilityTool {
+                capability_id: cfg.id.clone(),
+                name: safe_id.clone(),
+                description: desc,
+                input_schema,
+                capability: format!("cap.{safe_id}"),
+            };
+            return Ok((
+                ActiveConnection::Exec {
+                    command: trimmed.to_string(),
+                    args: args.clone(),
+                    env: env.clone(),
+                },
+                vec![tool],
+            ));
+        }
+        CapabilityTransport::Stdio { command, args, env } => {
             StdioConnection::connect(sandbox, command, args, env).map(ActiveConnection::Stdio)?
         }
-        ConnectorTransport::Http { url, headers } => {
+        CapabilityTransport::Http { url, headers } => {
             let mut effective = headers.clone();
             let manual_auth = has_authorization_header(&effective);
             if !manual_auth {
@@ -720,9 +815,9 @@ fn connect_and_list(
                 .filter(|v| v.is_object())
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-            let capability = format!("mcp.{safe_id}.{name}");
-            Some(McpTool {
-                connector_id: cfg.id.clone(),
+            let capability = format!("cap.{safe_id}.{name}");
+            Some(CapabilityTool {
+                capability_id: cfg.id.clone(),
                 name,
                 description,
                 input_schema,
@@ -770,7 +865,7 @@ fn sanitize_id(raw: &str) -> String {
         })
         .collect();
     if cleaned.is_empty() {
-        "mcp".to_string()
+        "cap".to_string()
     } else {
         cleaned
     }
@@ -851,13 +946,14 @@ for line in sys.stdin:
         )
         .unwrap();
 
-        let mut pool = ConnectorPool::new(Sandbox::new(&core_dir).unwrap());
+        let data_dir = TrustedDir::open(dir.path()).unwrap();
+        let mut pool = CapabilityPool::new(Sandbox::new(&core_dir).unwrap());
         pool.reload(
-            &[ConnectorConfig {
+            &[CapabilityConfig {
                 id: "flaky".into(),
                 name: "Flaky".into(),
                 enabled: true,
-                transport: ConnectorTransport::Stdio {
+                transport: CapabilityTransport::Stdio {
                     command: "/usr/bin/python3".into(),
                     args: vec![script.display().to_string()],
                     env: BTreeMap::new(),
@@ -868,20 +964,20 @@ for line in sys.stdin:
 
         for mode in ["null", "bad_flag", "bad_block"] {
             assert!(matches!(
-                pool.call("mcp.flaky.op", &json!({"mode":mode})),
+                pool.call("cap.flaky.op", 1, &json!({"mode":mode}), &data_dir),
                 Outcome::Unknown(_)
             ));
         }
         assert!(matches!(
-            pool.call("mcp.flaky.op", &json!({"mode":"empty"})),
+            pool.call("cap.flaky.op", 1, &json!({"mode":"empty"}), &data_dir),
             Outcome::Observed(_)
         ));
         assert_eq!(
-            pool.call("mcp.flaky.op", &json!({ "mode": "err" })),
+            pool.call("cap.flaky.op", 1, &json!({ "mode": "err" }), &data_dir),
             Outcome::Failed("rejected".into())
         );
         assert!(matches!(
-            pool.call("mcp.flaky.op", &json!({ "mode": "drop" })),
+            pool.call("cap.flaky.op", 1, &json!({ "mode": "drop" }), &data_dir),
             Outcome::Unknown(ref msg) if msg.contains("MCP 响应超时或进程退出")
         ));
     }
@@ -889,6 +985,7 @@ for line in sys.stdin:
     #[test]
     fn incremental_reload_reuses_unchanged_connections_and_force_restarts_them() {
         let dir = tempfile::tempdir().unwrap();
+        let data_dir = TrustedDir::open(dir.path()).unwrap();
         let core_dir = dir.path().join("core");
         std::fs::create_dir_all(&core_dir).unwrap();
         let script = dir.path().join("pid_mcp.py");
@@ -911,22 +1008,22 @@ for line in sys.stdin:
         )
         .unwrap();
 
-        let make_cfg = |id: &str, name: &str, enabled: bool| ConnectorConfig {
+        let make_cfg = |id: &str, name: &str, enabled: bool| CapabilityConfig {
             id: id.into(),
             name: name.into(),
             enabled,
-            transport: ConnectorTransport::Stdio {
+            transport: CapabilityTransport::Stdio {
                 command: "/usr/bin/python3".into(),
                 args: vec![script.display().to_string()],
                 env: BTreeMap::new(),
             },
         };
 
-        let mut pool = ConnectorPool::new(Sandbox::new(&core_dir).unwrap());
+        let mut pool = CapabilityPool::new(Sandbox::new(&core_dir).unwrap());
         let first = make_cfg("a", "A", true);
         let second = make_cfg("b", "B", true);
         pool.reload(std::slice::from_ref(&first), false);
-        let Outcome::Observed(pid_before) = pool.call("mcp.a.pid", &json!({})) else {
+        let Outcome::Observed(pid_before) = pool.call("cap.a.pid", 1, &json!({}), &data_dir) else {
             panic!("expected observed pid");
         };
 
@@ -934,34 +1031,37 @@ for line in sys.stdin:
         renamed_first.name = "A Renamed".into();
         pool.reload(&[renamed_first.clone(), second.clone()], false);
         assert_eq!(
-            pool.call("mcp.a.pid", &json!({})),
+            pool.call("cap.a.pid", 1, &json!({}), &data_dir),
             Outcome::Observed(pid_before.clone())
         );
         assert!(matches!(
-            pool.call("mcp.b.pid", &json!({})),
+            pool.call("cap.b.pid", 1, &json!({}), &data_dir),
             Outcome::Observed(_)
         ));
 
         pool.reload(std::slice::from_ref(&renamed_first), true);
-        let Outcome::Observed(pid_after_force) = pool.call("mcp.a.pid", &json!({})) else {
+        let Outcome::Observed(pid_after_force) = pool.call("cap.a.pid", 1, &json!({}), &data_dir)
+        else {
             panic!("expected observed pid after force reload");
         };
         assert_ne!(pid_after_force, pid_before);
 
         assert!(matches!(
-            pool.call("mcp.a.pid", &json!({ "exit": true })),
+            pool.call("cap.a.pid", 1, &json!({ "exit": true }), &data_dir),
             Outcome::Unknown(_)
         ));
         pool.reload(std::slice::from_ref(&renamed_first), false);
-        let Outcome::Observed(pid_after_crash) = pool.call("mcp.a.pid", &json!({})) else {
+        let Outcome::Observed(pid_after_crash) = pool.call("cap.a.pid", 1, &json!({}), &data_dir)
+        else {
             panic!("expected observed pid after dead process reload");
         };
         assert_ne!(pid_after_crash, pid_after_force);
     }
 
     #[test]
-    fn renaming_connector_id_closes_old_process_before_starting_new_one() {
+    fn renaming_capability_id_closes_old_process_before_starting_new_one() {
         let dir = tempfile::tempdir().unwrap();
+        let data_dir = TrustedDir::open(dir.path()).unwrap();
         let core_dir = dir.path().join("core");
         std::fs::create_dir_all(&core_dir).unwrap();
         let lock_file = dir.path().join("exclusive.lock");
@@ -985,11 +1085,11 @@ for line in sys.stdin:
         )
         .unwrap();
 
-        let make_cfg = |id: &str| ConnectorConfig {
+        let make_cfg = |id: &str| CapabilityConfig {
             id: id.into(),
             name: id.into(),
             enabled: true,
-            transport: ConnectorTransport::Stdio {
+            transport: CapabilityTransport::Stdio {
                 command: "/usr/bin/python3".into(),
                 args: vec![
                     script.display().to_string(),
@@ -999,10 +1099,10 @@ for line in sys.stdin:
             },
         };
 
-        let mut pool = ConnectorPool::new(Sandbox::new(&core_dir).unwrap());
+        let mut pool = CapabilityPool::new(Sandbox::new(&core_dir).unwrap());
         pool.reload(&[make_cfg("old_id")], false);
         assert_eq!(
-            pool.call("mcp.old_id.ping", &json!({})),
+            pool.call("cap.old_id.ping", 1, &json!({}), &data_dir),
             Outcome::Observed("ok".into())
         );
 
@@ -1015,7 +1115,7 @@ for line in sys.stdin:
             statuses[0].error
         );
         assert_eq!(
-            pool.call("mcp.new_id.ping", &json!({})),
+            pool.call("cap.new_id.ping", 1, &json!({}), &data_dir),
             Outcome::Observed("ok".into())
         );
     }

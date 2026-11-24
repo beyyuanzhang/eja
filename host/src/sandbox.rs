@@ -477,8 +477,8 @@ mod tests {
         fs::write(&db, "secret-journal").unwrap();
         let core_config = core_dir.join("config.json");
         fs::write(&core_config, "{\"api_key\":\"secret-key\"}").unwrap();
-        let connectors = data_dir.join("connectors.json");
-        fs::write(&connectors, "[]").unwrap();
+        let capabilities = data_dir.join("capabilities.json");
+        fs::write(&capabilities, "[]").unwrap();
         let fake_exe = dir.path().join("eja-host");
         fs::write(&fake_exe, "host-binary").unwrap();
 
@@ -495,26 +495,26 @@ mod tests {
         );
         assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), "ok");
 
-        let edit_connectors = sandbox
+        let edit_capabilities = sandbox
             .command(
                 "/bin/sh",
                 [
                     "-c",
                     &format!(
                         "printf '[{{\"id\":\"demo\"}}]' > '{0}.tmp' && mv '{0}.tmp' '{0}' && cat '{0}'",
-                        connectors.display()
+                        capabilities.display()
                     ),
                 ],
             )
             .output()
             .unwrap();
         assert!(
-            edit_connectors.status.success(),
-            "editing connectors.json should succeed: {}",
-            String::from_utf8_lossy(&edit_connectors.stderr)
+            edit_capabilities.status.success(),
+            "editing capabilities.json should succeed: {}",
+            String::from_utf8_lossy(&edit_capabilities.stderr)
         );
         assert_eq!(
-            String::from_utf8_lossy(&edit_connectors.stdout).trim(),
+            String::from_utf8_lossy(&edit_capabilities.stdout).trim(),
             "[{\"id\":\"demo\"}]"
         );
 
@@ -731,12 +731,12 @@ mod tests {
         fs::write(&secret, r#"{"secret":true}"#).unwrap();
         let root = TrustedDir::open(&data_dir).unwrap();
 
-        symlink(&secret, data_dir.join("connectors.json")).unwrap();
-        assert!(root.read_file("connectors.json").is_err());
+        symlink(&secret, data_dir.join("capabilities.json")).unwrap();
+        assert!(root.read_file("capabilities.json").is_err());
 
-        root.write_file_atomic("connectors.json", b"[]").unwrap();
+        root.write_file_atomic("capabilities.json", b"[]").unwrap();
         assert_eq!(fs::read_to_string(&secret).unwrap(), r#"{"secret":true}"#);
-        assert_eq!(root.read_file("connectors.json").unwrap(), b"[]");
+        assert_eq!(root.read_file("capabilities.json").unwrap(), b"[]");
 
         symlink(&core_dir, data_dir.join("outputs")).unwrap();
         assert!(root
@@ -762,9 +762,9 @@ mod tests {
         symlink(&core_dir, &data_dir).unwrap();
         assert!(TrustedDir::open(&data_dir).is_err());
         assert!(root.read_file("config.json").is_err());
-        root.write_file_atomic("connectors.json", b"[1]").unwrap();
-        assert!(!core_dir.join("connectors.json").exists());
-        assert_eq!(fs::read(moved.join("connectors.json")).unwrap(), b"[1]");
+        root.write_file_atomic("capabilities.json", b"[1]").unwrap();
+        assert!(!core_dir.join("capabilities.json").exists());
+        assert_eq!(fs::read(moved.join("capabilities.json")).unwrap(), b"[1]");
         root.write_new_file_in_subdir("outputs", "shell-4.log", b"pinned".as_slice())
             .unwrap();
         assert!(!core_dir.join("outputs").exists());

@@ -32,10 +32,10 @@ enum Command {
         provider: ProviderConfig,
         model: String,
     },
-    OauthConnector {
+    OauthCapability {
         id: String,
     },
-    ReloadConnectors,
+    ReloadCapabilities,
 }
 
 enum Input {
@@ -136,8 +136,8 @@ fn main() {
                 provider,
                 model,
             }) => runtime.test_provider(id, provider, model),
-            Ok(Command::OauthConnector { id }) => runtime.oauth_connector(id),
-            Ok(Command::ReloadConnectors) => runtime.reload_connectors(),
+            Ok(Command::OauthCapability { id }) => runtime.oauth_capability(id),
+            Ok(Command::ReloadCapabilities) => runtime.reload_capabilities(),
             Err(err) => runtime.emit_error(format!("无效指令: {err}")),
         }
     }

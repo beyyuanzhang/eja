@@ -146,14 +146,11 @@ pub fn discover_oauth_metadata(
             .then(|| format!("{origin}/.well-known/oauth-protected-resource{trimmed_path}")),
         Some(format!("{origin}/.well-known/oauth-protected-resource")),
     ];
-    let mut resource_meta = resource_candidates
-        .into_iter()
-        .flatten()
-        .find_map(|url| {
-            fetch_json_object(&url, &json_headers).filter(|val| {
-                val.get("authorization_servers").is_some() || val.get("resource").is_some()
-            })
-        });
+    let mut resource_meta = resource_candidates.into_iter().flatten().find_map(|url| {
+        fetch_json_object(&url, &json_headers).filter(|val| {
+            val.get("authorization_servers").is_some() || val.get("resource").is_some()
+        })
+    });
 
     if resource_meta.is_none() {
         let mut probe_headers = vec![
@@ -192,13 +189,16 @@ pub fn discover_oauth_metadata(
     let iss_path_trimmed = iss_path.trim_end_matches('/');
     let has_iss_path = !iss_path_trimmed.is_empty();
     let auth_candidates = [
-        has_iss_path
-            .then(|| format!("{iss_origin}/.well-known/oauth-authorization-server{iss_path_trimmed}")),
+        has_iss_path.then(|| {
+            format!("{iss_origin}/.well-known/oauth-authorization-server{iss_path_trimmed}")
+        }),
         has_iss_path
             .then(|| format!("{iss_origin}/.well-known/openid-configuration{iss_path_trimmed}")),
         has_iss_path
             .then(|| format!("{iss_origin}{iss_path_trimmed}/.well-known/openid-configuration")),
-        Some(format!("{iss_origin}/.well-known/oauth-authorization-server")),
+        Some(format!(
+            "{iss_origin}/.well-known/oauth-authorization-server"
+        )),
         Some(format!("{iss_origin}/.well-known/openid-configuration")),
         (iss_origin != origin).then(|| format!("{origin}/.well-known/oauth-authorization-server")),
     ];
@@ -307,20 +307,13 @@ fn run_oauth_flow(
                 "该连接器要求预注册 OAuth Client ID（可在连接器键值中填入 X-OAuth-Client-Id=...）"
                     .to_string()
             })?;
-        return run_device_code_flow(
-            id,
-            mcp_url,
-            &meta,
-            device_endpoint,
-            &client_id,
-            cancel,
-            tx,
-        );
+        return run_device_code_flow(id, mcp_url, &meta, device_endpoint, &client_id, cancel, tx);
     }
 
     Err("该连接器未提供可用的 OAuth 动态注册或设备码授权端点".into())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pkce_loopback_flow(
     mcp_url: &str,
     meta: &OAuthMetadata,
@@ -395,8 +388,8 @@ fn run_device_code_flow(
     if !meta.scopes.is_empty() {
         form.push(("scope", meta.scopes.join(" ")));
     }
-    let resp = post_form(device_endpoint, &form)
-        .map_err(|err| format!("请求 OAuth 设备码失败: {err}"))?;
+    let resp =
+        post_form(device_endpoint, &form).map_err(|err| format!("请求 OAuth 设备码失败: {err}"))?;
     if !(200..300).contains(&resp.status) {
         return Err(format!(
             "请求 OAuth 设备码失败 (HTTP {}): {}",
@@ -547,7 +540,8 @@ fn wait_for_loopback_code(
                     .and_then(|line| line.split_whitespace().nth(1))
                     .unwrap_or("/");
                 if path.starts_with("/favicon.ico") {
-                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
                     continue;
                 }
                 let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
@@ -643,8 +637,12 @@ fn parse_token_response(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<OAuthToken, String> {
-    let val = serde_json::from_str::<Value>(raw_body.trim())
-        .map_err(|_| format!("无法解析 OAuth Token 响应: {}", truncate_utf8(raw_body, 200)))?;
+    let val = serde_json::from_str::<Value>(raw_body.trim()).map_err(|_| {
+        format!(
+            "无法解析 OAuth Token 响应: {}",
+            truncate_utf8(raw_body, 200)
+        )
+    })?;
     let access_token = str_field(&val, "access_token")
         .ok_or_else(|| {
             let err = str_field(&val, "error_description")
@@ -850,13 +848,20 @@ pub fn pkce_s256_challenge(verifier: &str) -> String {
 }
 
 pub fn base64url_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = u32::from(chunk[0]);
-        let b1 = if chunk.len() > 1 { u32::from(chunk[1]) } else { 0 };
-        let b2 = if chunk.len() > 2 { u32::from(chunk[2]) } else { 0 };
+        let b1 = if chunk.len() > 1 {
+            u32::from(chunk[1])
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            u32::from(chunk[2])
+        } else {
+            0
+        };
         let triple = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
@@ -896,7 +901,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -958,7 +963,7 @@ fn open_browser(url: &str) {
 
 #[cfg(test)]
 fn open_browser(url: &str) {
-    * TEST_BROWSER_URL.lock().unwrap() = Some(url.to_string());
+    *TEST_BROWSER_URL.lock().unwrap() = Some(url.to_string());
 }
 
 #[cfg(test)]
@@ -1115,12 +1120,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         *TEST_BROWSER_URL.lock().unwrap() = None;
-        let _cancel = spawn_oauth_flow(
-            "notion".into(),
-            format!("{base}/mcp"),
-            BTreeMap::new(),
-            tx,
-        );
+        let _cancel = spawn_oauth_flow("notion".into(), format!("{base}/mcp"), BTreeMap::new(), tx);
 
         let auth_url = loop {
             if let Some(url) = TEST_BROWSER_URL.lock().unwrap().take() {
@@ -1142,8 +1142,7 @@ mod tests {
         let cb_resp = get_bytes(&callback_url, &[], 5).unwrap();
         assert_eq!(cb_resp.status, 200);
 
-        let OAuthEvent::Finished { id, result } =
-            rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        let OAuthEvent::Finished { id, result } = rx.recv_timeout(Duration::from_secs(5)).unwrap()
         else {
             panic!("expected Finished event");
         };

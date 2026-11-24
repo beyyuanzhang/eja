@@ -39,7 +39,7 @@ struct OriginTests {
 
     @Test
     @MainActor
-    func providerConfigAndLiveMcpConnectorRoundtrip() async throws {
+    func providerConfigAndUnifiedCapabilitiesRoundtrip() async throws {
         let hostBin = resolveHostBinary()
         #expect(FileManager.default.isExecutableFile(atPath: hostBin.path))
 
@@ -67,6 +67,8 @@ for line in sys.stdin:
 
         #expect(await waitUntil { client.isReady })
         #expect(client.status == "idle")
+        #expect(client.capabilityStatuses.first?.id == "shell")
+        #expect(client.capabilityStatuses.first?.connected == true)
 
         let cfg = HostConfigDTO(
             providers: [
@@ -74,8 +76,14 @@ for line in sys.stdin:
                 ProviderConfigDTO(id: "anthropic", name: "Anthropic", kind: "anthropic", baseUrl: "https://api.anthropic.com", apiKey: "sk-ant-demo", models: ["claude-sonnet-4-5"]),
             ],
             judge: ModelRefDTO(providerId: "anthropic", model: "claude-sonnet-4-5"),
-            connectors: [
-                ConnectorConfigDTO(
+            capabilities: [
+                CapabilityConfigDTO(
+                    id: "shell",
+                    name: "Shell",
+                    enabled: true,
+                    transport: .builtin()
+                ),
+                CapabilityConfigDTO(
                     id: "echo",
                     name: "Echo MCP",
                     enabled: true,
@@ -94,8 +102,9 @@ for line in sys.stdin:
         #expect(await waitUntil {
             client.isConfigured
                 && client.config == expectedRedacted
-                && client.connectorStatuses.first?.connected == true
-                && client.connectorStatuses.first?.tools.first?.capability == "mcp.echo.echo"
+                && client.capabilityStatuses.count == 2
+                && client.capabilityStatuses[1].connected == true
+                && client.capabilityStatuses[1].tools.first?.capability == "cap.echo.echo"
         })
 
         client.shutdown()
@@ -106,7 +115,8 @@ for line in sys.stdin:
         #expect(await waitUntil {
             restarted.isReady
                 && restarted.config == expectedRedacted
-                && restarted.connectorStatuses.first?.connected == true
+                && restarted.capabilityStatuses.count == 2
+                && restarted.capabilityStatuses[1].connected == true
         })
 
         var renamedProviders = restarted.config.providers
@@ -115,8 +125,8 @@ for line in sys.stdin:
 
         #expect(await waitUntil {
             restarted.config.providers.first?.name == "DeepSeek Updated"
-                && restarted.config.connectors == expectedRedacted.connectors
-                && restarted.connectorStatuses.first?.connected == true
+                && restarted.config.capabilities == expectedRedacted.capabilities
+                && restarted.capabilityStatuses[1].connected == true
         })
     }
 
@@ -129,7 +139,7 @@ for line in sys.stdin:
         defer { client.shutdown() }
 
         client.handleEventLine(
-            Data(#"{"event":"state","status":"thinking","status_detail":"思考中…","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"connectors":[]},"connector_statuses":[],"stream":[]}"#.utf8)
+            Data(#"{"event":"state","status":"thinking","status_detail":"思考中…","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
         )
         #expect(client.status == "thinking")
         #expect(client.statusDetail == "思考中…")
@@ -147,7 +157,7 @@ for line in sys.stdin:
         #expect(client.streamingText == "最终回复")
 
         client.handleEventLine(
-            Data(#"{"event":"state","status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"connectors":[]},"connector_statuses":[],"stream":[{"id":1,"kind":"eja","text":"最终回复"}]}"#.utf8)
+            Data(#"{"event":"state","status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":1,"kind":"eja","text":"最终回复"}]}"#.utf8)
         )
         #expect(client.status == "idle")
         #expect(client.statusDetail == "在线")
