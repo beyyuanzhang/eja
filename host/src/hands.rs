@@ -66,7 +66,6 @@ pub fn activity_label(tool_name: &str) -> &str {
         "shell" => "执行 Shell",
         "search" | "read" => "查阅记忆",
         "keep" | "release" => "更新挂念",
-        "reflect" => "更新反思线索",
         "wake" => "预约唤醒",
         "promote_tool" => "校验并注册工具",
         other => other,
@@ -178,22 +177,6 @@ impl Hands {
                     "type": "object",
                     "properties": { "cue": { "type": "string" } },
                     "required": ["cue"]
-                }),
-                ToolTarget::Kernel,
-            ),
-            builtin_spec(
-                "reflect",
-                "记录、升级或退役一条按作用域隔离的检索线索（when -> next_cue）。当用户纠正规则、指出某类事项应查特定档案或步骤，或你在本回合通过 search/read 找到滑出窗口的关键原始证据时调用，使后续同类回合自动带上原始证据；若旧线索已作废或误触发，设 retire=true 退役。when 和 next_cue 必须原样出自本回合可见消息或检索证据。",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "when": { "type": "string", "description": "2字以上的可复用触发场景词（原样摘自本回合可见内容；不要填档案标签或单次特例名）" },
-                        "next_cue": { "type": "string", "description": "下次检索历史原始证据用的关键词或档案标签（原样摘自本回合可见内容）；退役时省略" },
-                        "finding": { "type": "string", "description": "本轮反思的一句话事实总结或退役原因" },
-                        "retire": { "type": "boolean", "description": "为 true 时退役 rule 或 when 对应的活跃线索" },
-                        "rule": { "type": "integer", "description": "可选：要升级或退役的已有反思规则 ID" }
-                    },
-                    "required": ["finding"]
                 }),
                 ToolTarget::Kernel,
             ),

@@ -14,7 +14,6 @@ pub type Id = i64;
 pub type Result<T> = std::result::Result<T, Error>;
 /// Bound one serialized fact before it enters a model-facing history.
 pub const FACT_BYTES: usize = 64 * 1024;
-pub const REFLECTION_FACTS: usize = 8;
 
 #[derive(Debug)]
 pub enum Error {
@@ -74,13 +73,31 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fact {
-    Noticed { source: Source, text: String },
-    Said { text: String },
-    Kept { concern: Id, text: String },
-    Released { concern: Id },
-    Acted { capability: String, input: Value },
-    Returned { action: Id, outcome: Outcome },
-    Reflected(Reflection),
+    Noticed {
+        source: Source,
+        text: String,
+    },
+    Said {
+        text: String,
+    },
+    Kept {
+        concern: Id,
+        text: String,
+    },
+    Released {
+        concern: Id,
+    },
+    Acted {
+        capability: String,
+        input: Value,
+    },
+    Returned {
+        action: Id,
+        outcome: Outcome,
+    },
+    #[doc(hidden)]
+    #[serde(rename = "reflected")]
+    LegacyReflection(Value),
 }
 
 impl Fact {
@@ -92,28 +109,9 @@ impl Fact {
             Self::Released { .. } => "released",
             Self::Acted { .. } => "acted",
             Self::Returned { .. } => "returned",
-            Self::Reflected(_) => "reflected",
+            Self::LegacyReflection(_) => "reflected",
         }
     }
-}
-
-/// The host's record of what was shown and what the model proposed after a correction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Reflection {
-    pub parent: Option<Id>,
-    pub through: Id,
-    pub feedback: Id,
-    pub shown: Vec<Id>,
-    pub finding: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<String>,
-    pub next_cue: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub retire: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 /// One immutable record in the subject's journal.

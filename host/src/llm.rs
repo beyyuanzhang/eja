@@ -109,7 +109,8 @@ impl Brain for HttpBrain {
 
 pub enum ToolOutput {
     Value(Value),
-    Read(Box<Evidence>, usize),
+    Packed(Value),
+    Read(Evidence, usize),
     Images(Value, Vec<ModelImage>),
 }
 
@@ -160,7 +161,7 @@ pub fn tool_messages(
     provider: &ProviderKind,
     reply: ModelReply,
     window_bytes: usize,
-    mut execute: impl FnMut(&ToolCall) -> Result<ToolOutput, String>,
+    mut execute: impl FnMut(&ToolCall, usize) -> Result<ToolOutput, String>,
 ) -> Result<Option<Vec<Value>>, String> {
     let count = reply.calls.len();
     if count == 0 {
@@ -186,7 +187,7 @@ pub fn tool_messages(
     let keep_exchange = per_call >= 128;
     let mut attachments = Vec::new();
     for (index, (call, slot)) in reply.calls.into_iter().zip(&mut slots).enumerate() {
-        let output = execute(&call)?;
+        let output = execute(&call, if keep_exchange { per_call } else { 0 })?;
         if !keep_exchange {
             continue;
         }
@@ -195,6 +196,7 @@ pub fn tool_messages(
                 format_read_result(provider, &evidence, offset, per_call)
             }
             ToolOutput::Value(v) => cap_tool_result(provider, v, per_call),
+            ToolOutput::Packed(v) => v,
             ToolOutput::Images(value, images) => {
                 let metadata = json!({"images_omitted": images.len()});
                 let text_budget = per_call.saturating_sub(json_bytes(&metadata) + 2);
@@ -443,11 +445,7 @@ pub fn messages_bytes(messages: &[Value]) -> usize {
     messages.iter().map(msg_bytes).sum()
 }
 
-pub(crate) fn fit_utf8_prefix(
-    text: &str,
-    max_prefix: usize,
-    mut fits: impl FnMut(&str) -> bool,
-) -> &str {
+fn fit_utf8_prefix(text: &str, max_prefix: usize, mut fits: impl FnMut(&str) -> bool) -> &str {
     let mut hi = text.floor_char_boundary(max_prefix.min(text.len()));
     if fits(&text[..hi]) {
         return &text[..hi];
@@ -477,7 +475,7 @@ fn result_fits(serialized: &str, provider: &ProviderKind, budget: usize) -> bool
             || serde_json::to_string(serialized).unwrap().len() - 2 <= budget)
 }
 
-fn cap_tool_result(provider: &ProviderKind, value: Value, max_bytes: usize) -> Value {
+pub(crate) fn cap_tool_result(provider: &ProviderKind, value: Value, max_bytes: usize) -> Value {
     let serialized = value.to_string();
     if result_fits(&serialized, provider, max_bytes) {
         return value;
@@ -646,20 +644,7 @@ fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Resul
             _ => None,
         })
         .collect();
-    let observations: Vec<Value> = eja
-        .observations_at(anchor)?
-        .into_iter()
-        .filter_map(|entry| match entry.fact {
-            Fact::Reflected(reflection) => Some(json!({
-                "id": entry.id,
-                "when": reflection.when?,
-                "cue": reflection.next_cue?,
-            })),
-            _ => None,
-        })
-        .take(16)
-        .collect();
-    let encode = |items: &[Value], omitted: usize, unk: &[Value], obs: &[Value]| {
+    let encode = |items: &[Value], omitted: usize, unk: &[Value]| {
         let mut obj = json!({ "anchor": anchor, "concerns": items });
         if omitted > 0 {
             obj["omitted_concerns"] = json!(omitted);
@@ -667,40 +652,29 @@ fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Resul
         if !unk.is_empty() {
             obj["unsettled_unknowns"] = json!(unk);
         }
-        if !obs.is_empty() {
-            obj["observations"] = json!(obs);
-        }
         obj.to_string()
     };
-    if content_budget == 0 || encode(&[], 0, &[], &[]).len() > content_budget {
+    if content_budget == 0 || encode(&[], 0, &[]).len() > content_budget {
         return Ok(None);
     }
-    let pack_with_extras = |items: &[Value], omitted: usize| {
+    let pack_with_unknowns = |items: &[Value], omitted: usize| {
         let mut kept: Vec<Value> = Vec::new();
         for item in unknowns.iter().rev() {
             kept.insert(0, item.clone());
-            if encode(items, omitted, &kept, &[]).len() > content_budget {
+            if encode(items, omitted, &kept).len() > content_budget {
                 kept.remove(0);
                 break;
             }
         }
-        let mut kept_obs: Vec<Value> = Vec::new();
-        for item in &observations {
-            kept_obs.push(item.clone());
-            if encode(items, omitted, &kept, &kept_obs).len() > content_budget {
-                kept_obs.pop();
-                break;
-            }
-        }
-        encode(items, omitted, &kept, &kept_obs)
+        encode(items, omitted, &kept)
     };
     let concerns = eja.concerns(anchor)?;
     let full_items: Vec<Value> = concerns
         .iter()
         .map(serde_json::to_value)
         .collect::<serde_json::Result<_>>()?;
-    if encode(&full_items, 0, &[], &[]).len() <= content_budget {
-        return Ok(Some(user_message(pack_with_extras(&full_items, 0))));
+    if encode(&full_items, 0, &[]).len() <= content_budget {
+        return Ok(Some(user_message(pack_with_unknowns(&full_items, 0))));
     }
 
     let max_each = (content_budget / concerns.len().max(1)).clamp(48, 2048);
@@ -715,28 +689,28 @@ fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Resul
         };
         if concern.text.len() <= max_each {
             packed.push(serde_json::to_value(concern)?);
-            if encode(&packed, rest, &[], &[]).len() <= content_budget {
+            if encode(&packed, rest, &[]).len() <= content_budget {
                 continue;
             }
             packed.pop();
         }
         packed.push(trunc(""));
-        let fits_empty = encode(&packed, rest, &[], &[]).len() <= content_budget;
+        let fits_empty = encode(&packed, rest, &[]).len() <= content_budget;
         packed.pop();
         if !fits_empty {
             break;
         }
         let prefix = fit_utf8_prefix(&concern.text, max_each, |slice| {
             packed.push(trunc(slice));
-            let ok = encode(&packed, rest, &[], &[]).len() <= content_budget;
+            let ok = encode(&packed, rest, &[]).len() <= content_budget;
             packed.pop();
             ok
         });
         packed.push(trunc(prefix));
     }
-    let mut rendered = pack_with_extras(&packed, concerns.len() - packed.len());
+    let mut rendered = pack_with_unknowns(&packed, concerns.len() - packed.len());
     if rendered.len() > content_budget {
-        rendered = encode(&packed, 0, &[], &[]);
+        rendered = encode(&packed, 0, &[]);
     }
     Ok(Some(user_message(rendered)))
 }
@@ -1336,7 +1310,7 @@ mod tests {
                 text: String::new(),
                 calls,
             };
-            let Some(messages) = tool_messages(&provider, reply, WINDOW_MAX_BYTES, |call| {
+            let Some(messages) = tool_messages(&provider, reply, WINDOW_MAX_BYTES, |call, _| {
                 Ok(ToolOutput::Value(call.args.clone()))
             })
             .unwrap() else {
@@ -1385,7 +1359,7 @@ mod tests {
                 ],
             };
             let run = |budget, bytes| {
-                tool_messages(&provider, reply.clone(), budget, |call| {
+                tool_messages(&provider, reply.clone(), budget, |call, _| {
                     if call.name == "image-tool" {
                         Ok(ToolOutput::Images(
                             json!({"id":2,"action":1,"outcome":{"status":"observed","detail":"已发送输入"}}),

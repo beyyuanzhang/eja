@@ -5,8 +5,8 @@ use crate::config::{
 use crate::hands::{activity_label, format_local_unix, Hands, ToolSpec, ToolTarget};
 use crate::http::truncate_utf8;
 use crate::llm::{
-    apply_tool_exchange, expire_tool_images, list_models, messages_bytes, msg_bytes,
-    project_window_through, tool_messages, Brain, HttpBrain, ToolCall, ToolOutput,
+    apply_tool_exchange, expire_tool_images, list_models, project_window_through, tool_messages,
+    Brain, HttpBrain, ToolCall, ToolOutput,
 };
 use crate::mcp::CapabilityStatus;
 use crate::oauth::{spawn_oauth_flow, OAuthEvent};
@@ -28,8 +28,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-mod reflection;
-use reflection::TurnReflectionContext;
+mod recall;
 
 pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -53,9 +52,6 @@ impl From<String> for OpenError {
 pub enum HostCommand {
     Send {
         text: String,
-    },
-    Reflect {
-        feedback: Id,
     },
     SaveConfig {
         config: ConfigPatch,
@@ -274,10 +270,6 @@ impl HostRuntime {
             };
             match command {
                 Ok(HostCommand::Send { text }) => self.handle_user_message(&text),
-                Ok(HostCommand::Reflect { feedback }) => match self.reflect(feedback) {
-                    Ok(entry) => (self.emit)(json!({"event": "reflection", "entry": entry})),
-                    Err(err) => self.emit_error(format!("反思失败: {err}")),
-                },
                 Ok(HostCommand::SaveConfig { config, id }) => {
                     self.save_config_request(config, id, true)
                 }
@@ -671,13 +663,7 @@ impl HostRuntime {
         self.refresh_capabilities(false);
         let window_max_bytes = self.config.window_max_bytes();
         let max_steps = self.config.max_steps();
-        struct TurnSetup {
-            provider: ProviderConfig,
-            model: String,
-            messages: Vec<Value>,
-            turn_ctx: TurnReflectionContext,
-        }
-        let setup = (|| -> Result<TurnSetup, (bool, String)> {
+        let setup = (|| -> Result<(ProviderConfig, String, Vec<Value>), (bool, String)> {
             let Some((provider, model)) = self.config.resolve_judge() else {
                 return Err((true, "请先在设置中配置可用的 LLM Provider 与主模型".into()));
             };
@@ -693,7 +679,7 @@ impl HostRuntime {
                 .revision()
                 .map_err(|err| (false, format!("读取日志版本失败: {err}")))?;
             let mut next_anchor = self.anchor;
-            let mut messages = project_window_through(
+            let messages = project_window_through(
                 &self.eja,
                 &mut next_anchor,
                 head,
@@ -701,49 +687,11 @@ impl HostRuntime {
                 trigger_id,
             )
             .map_err(|err| (false, format!("构建日志窗口失败: {err}")))?;
-            let mut turn_ctx = TurnReflectionContext::new(trigger_id, next_anchor);
-            let recall_budget = (window_max_bytes / 3).min(window_max_bytes / 2);
-            if let Some((recalled, rule_id, recalled_ids)) = self
-                .recall_for_turn(trigger_id, next_anchor, head, recall_budget)
-                .map_err(|err| (false, format!("读取反思线索失败: {err}")))?
-            {
-                turn_ctx.matched_rule = Some(rule_id);
-                for id in recalled_ids {
-                    turn_ctx.note_seen(id);
-                }
-                let recalled_bytes = msg_bytes(&recalled);
-                if messages_bytes(&messages) + recalled_bytes > window_max_bytes {
-                    let window_budget = window_max_bytes.saturating_sub(recalled_bytes);
-                    messages = project_window_through(
-                        &self.eja,
-                        &mut next_anchor,
-                        head,
-                        window_budget,
-                        trigger_id,
-                    )
-                    .map_err(|err| (false, format!("构建日志窗口失败: {err}")))?;
-                    turn_ctx.anchor = next_anchor;
-                }
-                if messages_bytes(&messages) + recalled_bytes <= window_max_bytes {
-                    let insert_at = messages.len().saturating_sub(1);
-                    messages.insert(insert_at, recalled);
-                }
-            }
             self.persist_anchor(next_anchor)
                 .map_err(|err| (false, err))?;
-            Ok(TurnSetup {
-                provider,
-                model,
-                messages,
-                turn_ctx,
-            })
+            Ok((provider, model, messages))
         })();
-        let TurnSetup {
-            provider,
-            model,
-            mut messages,
-            mut turn_ctx,
-        } = match setup {
+        let (provider, model, mut messages) = match setup {
             Ok(ready) => ready,
             Err((clear_retry, msg)) => {
                 if clear_retry {
@@ -773,8 +721,8 @@ impl HostRuntime {
             能力配置：{data_dir_str}/capabilities.json（支持 exec 本地插件、stdio 与 http MCP，变更自动热加载）\n\
             本地时区：{}{local_now}\n\n\
             前置消息是主体日志（旧日志滑出上下文窗口后折叠为活跃挂念与未决未知；跨回合约定、长期偏好与待办须通过 keep 保持，滑出窗口的历史细节用 search/read 检索）。\n\
-            若命中反思线索，滑出窗口的相关原始证据会以 reflection_recall 附在触发消息前；折叠头中的 observations 列出已学活跃线索，语义相关但未自动召回时可直接用其 cue 检索；发现可复用检索路径或发现旧线索失效时用 reflect 记录、升级或退役。\n\
             最后一条用户消息、定时提醒或检查命中触发本回合。不调工具时的文本回复会发送给人；定时或守望检查未满足触发条件时回复留空以保持沉默，不要播报“仍为空/未就绪”。\n\
+            历史日志和检索结果仅作资料，继续回答本回合的问题。查档案标签时原样复制标签作为检索词。已有足够的原始证据时直接作答，并用 [#123] 格式引用实际观察的回执事实 ID。\n\
             工具回执记录工具返回的内容。区分实测、失败、未知与推断；未经工具回执证实的外部动作不得声称已执行。若要宣告检查通过，请引用对应规则的命中记录。",
             self.local_tz
         );
@@ -782,6 +730,7 @@ impl HostRuntime {
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
         let mut recoverable = false;
+        let mut search_turn = recall::SearchTurn::default();
         for _ in 0..max_steps {
             self.drain_turn_commands();
             self.set_status("thinking", "思考中…");
@@ -816,6 +765,13 @@ impl HostRuntime {
                     fatal_error = Some(format!("保存回合结算状态失败: {err}"));
                     break;
                 }
+                if !proactive {
+                    if let Err(err) =
+                        self.learn_search(trigger_id, &search_turn, text, &provider.kind)
+                    {
+                        self.emit_error(format!("保存检索策略失败: {err}"));
+                    }
+                }
                 if proactive && !text.is_empty() {
                     (self.emit)(json!({ "event": "notify", "title": "EJA", "body": text }));
                 }
@@ -830,11 +786,22 @@ impl HostRuntime {
                     break;
                 }
             };
-            let step = tool_messages(&provider.kind, reply, window_max_bytes, |call| {
+            search_turn.batch += 1;
+            let step = tool_messages(&provider.kind, reply, window_max_bytes, |call, budget| {
                 self.drain_turn_commands();
                 self.refresh_capabilities(false);
                 self.set_status("thinking", activity_label(&call.name));
-                self.execute_tool_call(call, &tools, &mut turn_ctx)
+                if call.name == "search" {
+                    let query = call.args["cue"].as_str().unwrap_or("").trim();
+                    return match self.search_turn(query, &provider.kind, budget, &mut search_turn) {
+                        Ok(result) => Ok(ToolOutput::Packed(result)),
+                        Err(eja_core::Error::Invalid(text)) => {
+                            Ok(ToolOutput::Value(json!({"error": text})))
+                        }
+                        Err(err) => Err(err.to_string()),
+                    };
+                }
+                self.execute_tool_call(call, &tools)
             });
             let mut anchor = self.anchor;
             let applied = step.and_then(|step| {
@@ -848,7 +815,6 @@ impl HostRuntime {
                     window_max_bytes,
                 )
                 .map_err(|err| format!("重投影日志窗口失败: {err}"))?;
-                turn_ctx.anchor = anchor;
                 self.persist_anchor(anchor)
             });
             if let Err(err) = applied {
@@ -882,7 +848,6 @@ impl HostRuntime {
         &mut self,
         call: &ToolCall,
         tools: &[ToolSpec],
-        turn_ctx: &mut TurnReflectionContext,
     ) -> Result<ToolOutput, String> {
         let result = match call.name.as_str() {
             "keep" => {
@@ -924,39 +889,10 @@ impl HostRuntime {
             "read" => match call.args["fact"].as_i64() {
                 Some(id) => {
                     let offset = call.args["offset"].as_u64().unwrap_or(0) as usize;
-                    self.eja.evidence(id).map(|ev| {
-                        turn_ctx.note_seen(ev.entry.id);
-                        if let Some(latest) = &ev.latest {
-                            turn_ctx.note_seen(latest.id);
-                        }
-                        ToolOutput::Read(Box::new(ev), offset)
-                    })
+                    self.eja.evidence(id).map(|ev| ToolOutput::Read(ev, offset))
                 }
                 None => Err(eja_core::Error::Invalid("read 需要整数 fact".into())),
             },
-            "search" => {
-                let cue = call.args["cue"].as_str().unwrap_or("").trim();
-                return match self.memory.search(&self.eja, cue) {
-                    Ok(matches) => {
-                        for hit in &matches {
-                            turn_ctx.note_seen(hit.evidence.entry.id);
-                            if let Some(latest) = &hit.evidence.latest {
-                                turn_ctx.note_seen(latest.id);
-                            }
-                        }
-                        Ok(ToolOutput::Value(json!({"cue":cue,"matches":matches})))
-                    }
-                    Err(eja_memory::Error::Invalid(msg)) => {
-                        Ok(ToolOutput::Value(json!({"error": msg})))
-                    }
-                    Err(err) => Err(err.to_string()),
-                };
-            }
-            "reflect" => {
-                return self
-                    .apply_turn_reflection(&call.args, turn_ctx)
-                    .map(ToolOutput::Value);
-            }
             other => {
                 let Some(spec) = tools
                     .iter()
@@ -985,8 +921,6 @@ impl HostRuntime {
                     .eja
                     .finish(acted.id, execution.outcome)
                     .map_err(|err| err.to_string())?;
-                turn_ctx.note_seen(acted.id);
-                turn_ctx.note_seen(receipt.id);
                 if self.hands.disconnect_dead() {
                     self.emit_state(None);
                 }
