@@ -1,4 +1,4 @@
-use eja_core::{Eja, Error, Fact, Outcome, Source, Timestamp, FACT_BYTES};
+use eja_core::{Eja, Error, Fact, Outcome, Reflection, Source, Timestamp, FACT_BYTES};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
@@ -307,7 +307,7 @@ fn subject_db_rejects_other_schema_versions_without_changing_the_file() -> Resul
 
     let conn = rusqlite::Connection::open(&path)?;
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 
     drop(conn);
 
@@ -319,6 +319,222 @@ fn subject_db_rejects_other_schema_versions_without_changing_the_file() -> Resul
         assert!(matches!(Eja::open(&path), Err(Error::Storage(_))));
         assert_eq!(std::fs::read(&path)?, before);
     }
+    Ok(())
+}
+
+#[test]
+fn reflections_keep_lineage_across_restart_and_reject_invalid_commits() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("subject.db");
+    let eja = Eja::open(&path)?;
+    let evidence = eja.notice(Source::Person, "进度状态约定")?;
+    let feedback = eja.notice(Source::Person, "这条状态写错了")?;
+    let first = Reflection {
+        parent: None,
+        through: feedback,
+        feedback,
+        shown: vec![],
+        finding: "下次查进度状态".into(),
+        when: None,
+        next_cue: Some("进度状态".into()),
+        retire: false,
+    };
+    let r1 = eja.record_reflection(first.clone())?;
+    assert!(matches!(eja.record_reflection(first), Err(Error::Conflict)));
+    assert_eq!(eja.observation_at(feedback)?, None);
+    drop(eja);
+
+    let eja = Eja::open(&path)?;
+    let feedback2 = eja.notice(Source::Person, "找交接的专用判据")?;
+    let world = eja.notice(Source::World, "不属于用户纠正")?;
+    let second = Reflection {
+        parent: Some(r1.id),
+        through: feedback2,
+        feedback: feedback2,
+        shown: vec![evidence, r1.id],
+        finding: "已看到进度约定".into(),
+        when: None,
+        next_cue: Some("交接凭证".into()),
+        retire: false,
+    };
+    let mut invalid = second.clone();
+    invalid.shown.push(world);
+    assert!(matches!(
+        eja.record_reflection(invalid),
+        Err(Error::Invalid(_))
+    ));
+    let mut invalid = second.clone();
+    invalid.feedback = world;
+    invalid.through = world;
+    assert!(matches!(
+        eja.record_reflection(invalid),
+        Err(Error::Invalid(_))
+    ));
+    let mut stale = second.clone();
+    stale.parent = None;
+    assert!(matches!(eja.record_reflection(stale), Err(Error::Conflict)));
+    let r2 = eja.record_reflection(second.clone())?;
+    assert_eq!(eja.reflection_for(feedback2)?, Some(r2.clone()));
+    assert_eq!(r2.fact, Fact::Reflected(second));
+
+    let feedback3 = eja.notice(Source::Person, "这次线索可以继续使用")?;
+    let same = eja.record_reflection(Reflection {
+        parent: Some(r2.id),
+        through: feedback3,
+        feedback: feedback3,
+        shown: vec![],
+        finding: "继续用当前线索".into(),
+        when: None,
+        next_cue: Some("交接凭证".into()),
+        retire: false,
+    })?;
+    assert!(matches!(
+        same.fact,
+        Fact::Reflected(Reflection { next_cue: None, .. })
+    ));
+    assert_eq!(eja.observation_at(eja.revision()?)?, Some(r2));
+    Ok(())
+}
+
+#[test]
+fn reflections_keep_distinct_scopes_without_overwriting_and_enforce_scope_cas() -> Result<()> {
+    let eja = Eja::open(":memory:")?;
+    let f_a1 = eja.notice(Source::Person, "场地预约先查目录")?;
+    let r_a1 = eja.record_reflection(Reflection {
+        parent: None,
+        through: f_a1,
+        feedback: f_a1,
+        shown: vec![],
+        finding: "记录场地目录".into(),
+        when: Some("场地预约".into()),
+        next_cue: Some("IDX-A".into()),
+        retire: false,
+    })?;
+    let f_b1 = eja.notice(Source::Person, "物料验收先查目录")?;
+    let r_b1 = eja.record_reflection(Reflection {
+        parent: None,
+        through: f_b1,
+        feedback: f_b1,
+        shown: vec![],
+        finding: "记录物料目录".into(),
+        when: Some("物料验收".into()),
+        next_cue: Some("IDX-B".into()),
+        retire: false,
+    })?;
+    let active = eja.observations_at(eja.revision()?)?;
+    assert_eq!(active, vec![r_b1.clone(), r_a1.clone()]);
+
+    let f_a2 = eja.notice(Source::Person, "场地预约改查确认函")?;
+    assert!(matches!(
+        eja.record_reflection(Reflection {
+            parent: None,
+            through: f_a2,
+            feedback: f_a2,
+            shown: vec![],
+            finding: "缺父版本".into(),
+            when: Some("场地预约".into()),
+            next_cue: Some("ARC-A".into()),
+            retire: false,
+        }),
+        Err(Error::Conflict)
+    ));
+    let r_a2 = eja.record_reflection(Reflection {
+        parent: Some(r_a1.id),
+        through: f_a2,
+        feedback: f_a2,
+        shown: vec![],
+        finding: "升级场地线索".into(),
+        when: Some("场地预约".into()),
+        next_cue: Some("ARC-A".into()),
+        retire: false,
+    })?;
+    let active = eja.observations_at(eja.revision()?)?;
+    assert_eq!(active, vec![r_a2.clone(), r_b1.clone()]);
+
+    let f_a3 = eja.notice(Source::Person, "场地预约衍生子主题")?;
+    let r_sub = eja.record_reflection(Reflection {
+        parent: Some(r_a2.id),
+        through: f_a3,
+        feedback: f_a3,
+        shown: vec![],
+        finding: "衍生交接线索".into(),
+        when: Some("值班交接".into()),
+        next_cue: Some("ARC-C".into()),
+        retire: false,
+    })?;
+    assert_eq!(
+        eja.observations_at(eja.revision()?)?,
+        vec![r_sub.clone(), r_a2.clone(), r_b1.clone()]
+    );
+
+    let f_retire = eja.notice(Source::Person, "场地预约旧规则作废")?;
+    let r_retire = eja.record_reflection(Reflection {
+        parent: Some(r_a2.id),
+        through: f_retire,
+        feedback: f_retire,
+        shown: vec![],
+        finding: "退役场地预约线索".into(),
+        when: None,
+        next_cue: None,
+        retire: true,
+    })?;
+    assert_eq!(
+        eja.observations_at(eja.revision()?)?,
+        vec![r_sub.clone(), r_b1.clone()]
+    );
+    assert_eq!(
+        eja.observations_at(r_a2.id)?,
+        vec![r_a2.clone(), r_b1.clone()]
+    );
+    assert_eq!(
+        eja.observations_at(r_retire.id)?,
+        vec![r_sub.clone(), r_b1.clone()]
+    );
+
+    let f_recreate = eja.notice(Source::Person, "场地预约启用新档案")?;
+    let r_new = eja.record_reflection(Reflection {
+        parent: None,
+        through: f_recreate,
+        feedback: f_recreate,
+        shown: vec![],
+        finding: "新建场地预约线索".into(),
+        when: Some("场地预约".into()),
+        next_cue: Some("ARC-NEW".into()),
+        retire: false,
+    })?;
+    assert_eq!(
+        eja.observations_at(eja.revision()?)?,
+        vec![r_new, r_sub, r_b1]
+    );
+    Ok(())
+}
+
+#[test]
+fn opening_v4_preserves_existing_facts_and_allows_reflection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("subject.db");
+    let eja = Eja::open(&path)?;
+    let id = eja.notice(Source::Person, "先前的纠正")?;
+    let before = eja.read(id)?;
+    drop(eja);
+    let conn = rusqlite::Connection::open(&path)?;
+    conn.pragma_update(None, "user_version", 4)?;
+    drop(conn);
+    let eja = Eja::open(&path)?;
+    assert_eq!(eja.read(id)?, before);
+    assert_eq!(eja.observation_at(id)?, None);
+    assert!(eja
+        .record_reflection(Reflection {
+            parent: None,
+            through: id,
+            feedback: id,
+            shown: vec![],
+            finding: "下次查历史".into(),
+            when: None,
+            next_cue: Some("约定".into()),
+            retire: false,
+        })
+        .is_ok());
     Ok(())
 }
 

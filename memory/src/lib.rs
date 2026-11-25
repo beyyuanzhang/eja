@@ -149,6 +149,45 @@ impl MemoryIndex {
         }
         keyword_search_at(eja, cue, head)
     }
+
+    /// Cosine similarity between `query` and each candidate text when semantic indexing is active.
+    pub fn score_texts(&mut self, query: &str, candidates: &[&str]) -> Result<Option<Vec<f64>>> {
+        let Some(semantic) = &mut self.semantic else {
+            return Ok(None);
+        };
+        if query.trim().is_empty() || candidates.is_empty() {
+            return Ok(Some(vec![0.0; candidates.len()]));
+        }
+        let query_vec = semantic.encode(InputKind::Query, &[query])?;
+        let cand_vecs = semantic.encode(InputKind::Passage, candidates)?;
+        let scores = cand_vecs
+            .iter()
+            .map(|cand| cosine_similarity(&query_vec[0], cand))
+            .collect();
+        Ok(Some(scores))
+    }
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f64;
+    let mut norm_left = 0.0f64;
+    let mut norm_right = 0.0f64;
+    for (&a, &b) in left.iter().zip(right.iter()) {
+        let af = f64::from(a);
+        let bf = f64::from(b);
+        dot += af * bf;
+        norm_left += af * af;
+        norm_right += bf * bf;
+    }
+    let denom = norm_left.sqrt() * norm_right.sqrt();
+    if denom > 0.0 && denom.is_finite() {
+        dot / denom
+    } else {
+        0.0
+    }
 }
 
 fn register_vectors() -> Result<()> {
@@ -177,7 +216,7 @@ fn fact_text(fact: &Fact) -> Option<String> {
             outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
             ..
         } => Some(text.clone()),
-        Fact::Released { .. } => None,
+        Fact::Released { .. } | Fact::Reflected(_) => None,
     }
 }
 

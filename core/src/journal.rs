@@ -1,15 +1,16 @@
 use crate::{
-    Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Source, Timestamp,
-    FACT_BYTES,
+    Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Reflection, Result, Source,
+    Timestamp, FACT_BYTES, REFLECTION_FACTS,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const UNFINISHED_ACTIONS_SQL: &str = "SELECT action.id FROM facts AS action
     WHERE action.kind = 'acted'
       AND NOT EXISTS (
@@ -110,7 +111,9 @@ fn evidence_at_on(conn: &Connection, id: Id, revision: Id) -> Result<Evidence> {
             .optional()?
             .map(|later| read_on(conn, later))
             .transpose()?,
-        Fact::Noticed { .. } | Fact::Said { .. } | Fact::Released { .. } => None,
+        Fact::Noticed { .. } | Fact::Said { .. } | Fact::Released { .. } | Fact::Reflected(_) => {
+            None
+        }
     };
     Ok(Evidence {
         latest: latest.filter(|later| later.id > id),
@@ -130,6 +133,48 @@ fn get_meta_on(conn: &Connection, key: &str) -> Result<Option<String>> {
             r.get(0)
         })
         .optional()?)
+}
+
+fn scope_key(when: Option<&str>) -> Option<String> {
+    when.map(|text| text.trim().to_ascii_lowercase())
+}
+
+fn observations_on(conn: &Connection, through: Id) -> Result<Vec<Entry>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM facts WHERE kind = 'reflected' AND id <= ?1
+         AND (json_type(body, '$.next_cue') = 'text' OR json_extract(body, '$.retire') = 1)
+         ORDER BY id DESC",
+    )?;
+    let ids = stmt
+        .query_map([through], |row| row.get::<_, Id>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seen = HashSet::new();
+    let mut active = Vec::new();
+    for id in ids {
+        let entry = read_on(conn, id)?;
+        let Fact::Reflected(reflection) = &entry.fact else {
+            continue;
+        };
+        if seen.insert(scope_key(reflection.when.as_deref())) && !reflection.retire {
+            active.push(entry);
+        }
+    }
+    Ok(active)
+}
+
+fn observation_on(conn: &Connection, through: Id) -> Result<Option<Entry>> {
+    Ok(observations_on(conn, through)?.into_iter().next())
+}
+
+fn reflection_for_on(conn: &Connection, feedback: Id) -> Result<Option<Entry>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM facts WHERE kind = 'reflected' AND ref_id = ?1",
+            [feedback],
+            |row| row.get(0),
+        )
+        .optional()?;
+    id.map(|id| read_on(conn, id)).transpose()
 }
 
 fn insert_fact(
@@ -424,6 +469,144 @@ impl Eja {
         self.transaction(|tx| tx.release(concern))
     }
 
+    /// The latest reflection carrying a changed retrieval cue at this revision.
+    pub fn observation_at(&self, through: Id) -> Result<Option<Entry>> {
+        observation_on(&self.db, through)
+    }
+
+    /// Active cue-bearing reflections at this revision, newest first, one per `when` scope.
+    pub fn observations_at(&self, through: Id) -> Result<Vec<Entry>> {
+        observations_on(&self.db, through)
+    }
+
+    pub fn reflection_for(&self, feedback: Id) -> Result<Option<Entry>> {
+        reflection_for_on(&self.db, feedback)
+    }
+
+    /// Record one reflection per correction and make its new cue visible to later reflections.
+    pub fn record_reflection(&self, mut reflection: Reflection) -> Result<Entry> {
+        reflection.finding = reflection.finding.trim().to_owned();
+        if reflection.finding.is_empty() || reflection.finding.len() > 2048 {
+            return Err(Error::invalid(
+                "reflection requires a finding of 1–2048 bytes",
+            ));
+        }
+        if let Some(cue) = &mut reflection.next_cue {
+            *cue = cue.trim().to_owned();
+            if cue.is_empty() || cue.len() > 256 || cue.chars().any(char::is_control) {
+                return Err(Error::invalid(
+                    "reflection cue must be 1–256 bytes on one line",
+                ));
+            }
+        }
+        if reflection.retire && reflection.next_cue.is_some() {
+            return Err(Error::invalid(
+                "retiring a reflection cannot also set next_cue",
+            ));
+        }
+        if reflection.next_cue.is_none() && !reflection.retire {
+            reflection.when = None;
+        } else if let Some(when) = &mut reflection.when {
+            *when = when.trim().to_owned();
+            if when.chars().count() < 2 || when.len() > 128 || when.chars().any(char::is_control) {
+                return Err(Error::invalid(
+                    "reflection scope must be at least 2 characters and at most 128 bytes on one line",
+                ));
+            }
+        }
+        self.transaction(|tx| {
+            let head = tx.revision()?;
+            if reflection.through > head || reflection.feedback > reflection.through {
+                return Err(Error::invalid(
+                    "reflection feedback is outside its snapshot",
+                ));
+            }
+            if !matches!(
+                read_on(&tx.tx, reflection.feedback)?.fact,
+                Fact::Noticed {
+                    source: Source::Person,
+                    ..
+                }
+            ) {
+                return Err(Error::invalid("reflection requires a person observation"));
+            }
+            if reflection_for_on(&tx.tx, reflection.feedback)?.is_some() {
+                return Err(Error::Conflict);
+            }
+            let active = observations_on(&tx.tx, head)?;
+            let parent_entry = match reflection.parent {
+                Some(parent_id) => {
+                    if parent_id > reflection.through {
+                        return Err(Error::Conflict);
+                    }
+                    let Some(entry) = active.iter().find(|entry| entry.id == parent_id) else {
+                        return Err(Error::Conflict);
+                    };
+                    Some(entry)
+                }
+                None => None,
+            };
+            if reflection.retire {
+                let Some(Entry {
+                    fact: Fact::Reflected(previous),
+                    ..
+                }) = parent_entry
+                else {
+                    return Err(Error::invalid(
+                        "retiring a reflection requires an active parent",
+                    ));
+                };
+                if reflection.when.is_some()
+                    && scope_key(reflection.when.as_deref()) != scope_key(previous.when.as_deref())
+                {
+                    return Err(Error::invalid(
+                        "retiring a reflection must match its parent scope",
+                    ));
+                }
+                reflection.when = previous.when.clone();
+            }
+            let target_key = scope_key(reflection.when.as_deref());
+            let existing_target = active.iter().find(|entry| match &entry.fact {
+                Fact::Reflected(other) => scope_key(other.when.as_deref()) == target_key,
+                _ => false,
+            });
+            if reflection.next_cue.is_some()
+                && existing_target.is_some_and(|entry| reflection.parent != Some(entry.id))
+            {
+                return Err(Error::Conflict);
+            }
+            if reflection.shown.len() > REFLECTION_FACTS {
+                return Err(Error::invalid("too many reflection observations"));
+            }
+            for (index, &id) in reflection.shown.iter().enumerate() {
+                if id > reflection.through
+                    || id == reflection.feedback
+                    || reflection.shown[..index].contains(&id)
+                {
+                    return Err(Error::invalid("invalid reflection observation reference"));
+                }
+                read_on(&tx.tx, id)?;
+            }
+            if let Some(Entry {
+                fact: Fact::Reflected(previous),
+                ..
+            }) = parent_entry
+            {
+                if scope_key(reflection.when.as_deref()) == scope_key(previous.when.as_deref())
+                    && reflection.next_cue == previous.next_cue
+                {
+                    reflection.next_cue = None;
+                    reflection.when = None;
+                }
+            }
+            let feedback = reflection.feedback;
+            let fact = Fact::Reflected(reflection);
+            let at = tx.now()?;
+            let id = insert_fact(&tx.tx, at, &fact, Some(feedback), None)?;
+            Ok(Entry { id, at, fact })
+        })
+    }
+
     pub fn act(&self, revision: Id, capability: impl Into<String>, input: Value) -> Result<Call> {
         self.transaction(|tx| {
             if tx.revision()? != revision {
@@ -532,12 +715,17 @@ fn initialize_schema(db: &Connection) -> Result<()> {
         |conn: &Connection| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0));
     match schema_version(db)? {
         SCHEMA_VERSION => return Ok(()),
-        0 => {}
+        0 | 4 => {}
         version => return Err(unsupported_schema(version)),
     }
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     match schema_version(&tx)? {
         SCHEMA_VERSION => return Ok(()),
+        4 => {
+            // A reflection is a new journal fact. Old rows have the same representation.
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            return Ok(tx.commit()?);
+        }
         0 => {}
         version => return Err(unsupported_schema(version)),
     }

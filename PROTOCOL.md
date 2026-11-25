@@ -15,7 +15,7 @@ eja-host --data-dir "<data_dir>"
 - 内核与用户数据使用同级目录。数据目录名为 `Eja` 时，内核目录为 `ai.eja.kernel`，其他目录名追加 `.kernel`。
 - 内核目录保存 `subject.db`、`config.json`、HTTP MCP OAuth 凭证 `oauth.json`、单实例锁 `host.lock`（以及启用语义编码器时按需生成的衍生缓存 `memory.db`）。macOS Seatbelt 限制 Shell、exec 插件和 stdio MCP 进程访问该目录。
 - `subject.db` 保存主体事实日志与宿主元数据。用户消息、普通唤醒与守望命中均按事实 ID 处理。命中时，宿主原子地写入世界观察并排入主动回合。回复与回合进度原子结算。
-- 宿主在恢复时按照已保存的回合游标继续处理，将中断的执行记为未知。`subject.db` 使用当前版本的格式，格式不符时启动报错。语义缓存会校验编码器和已索引的日志内容，失效时从当前日志重建。
+- 宿主在恢复时按照已保存的回合游标继续处理，将中断的执行记为未知。`subject.db` 首次打开时可从 v4 升级到 v5，保留原事实。其他不受支持的格式会在启动时报错。语义缓存会校验编码器和已索引的日志内容，失效时从当前日志重建。
 - 能力授权采用“OS 沙箱边界 + 宿主暴露即授权”契约。宿主使用固定目录句柄读写 `capabilities.json` 和 `outputs/`，拒绝跟随符号链接。关闭或改动能力后，宿主在下一次执行前作废旧工具定义。
 - macOS 的 `promote_tool({name, file, equals?, contains?, not_equals?})` 注册有固定名称的本地检查（至少提供 `equals`、`contains`、`not_equals` 之一）。规则保存在宿主元数据，复用同名规则需要参数一致。宿主只读数据目录直属的普通文件，最多读取 4096 字节的 UTF-8 文本，忽略末尾换行后校验所有给定谓词。
 - `wake({delay_seconds, reason, guard_tool, max_checks})` 可按间隔复查指定规则，默认最多 60 次。相同 `reason` 或相同 `guard_tool` 会覆盖旧预约；`delay_seconds: 0` 取消匹配预约。文件缺失或尚未匹配时，复查不写主体事实、不调用模型。读取出错时停止守望并报告错误。省略 `guard_tool` 时仍是普通提醒。
@@ -33,6 +33,7 @@ eja-host --data-dir "<data_dir>"
 ## 输入指令（Frontend -> Host，每行一条 JSON）
 
 - 发送消息 `{"cmd":"send","text":"你好"}`
+- 反思一条已有的用户纠正 `{"cmd":"reflect","feedback":7}`。宿主按 `when` 作用域匹配当前活跃反思（支持字面匹配与向量语义打分，无命中时回退到无作用域线索），把本次纠正和召回的原始事实（包含成对的动作与最新回执）组装为一个证据包，再调用判断模型。常规对话回合中，主体也可直接调用内核工具 `reflect` 自主创建、升级或退役（`retire: true`）线索；折叠头中的 `observations` 保留滑出窗口的活跃作用域索引，命中有作用域 `when` 时自动将滑出窗口的原始证据附在触发消息前。
 - 保存配置 `{"cmd":"save_config","id":"请求标识","config":{...}}`。各配置域可单独更新。带 `id` 时，保存后的状态快照会带回 `save_id`。空 `api_key` 只复用当前数据目录下同一 Provider ID、接口类型及 API 根地址的密钥。
 - 测试 Provider `{"cmd":"test_provider","id":"openai","provider":{...},"model":"gpt-4o"}`。密钥复用规则与保存配置一致。
 - 获取模型列表 `{"cmd":"list_models","id":"请求标识","provider":{...}}`。由宿主按当前数据目录和 Provider 配置请求。
@@ -49,4 +50,5 @@ eja-host --data-dir "<data_dir>"
 - Provider 测试结果 `{"event":"provider_test","id":"openai","ok":true,"message":"..."}`
 - 模型列表 `{"event":"provider_models","id":"请求标识","models":["..."]}`。请求失败时返回 `error` 字段。
 - 系统通知 `{"event":"notify","title":"EJA","body":"..."}`
+- 反思结果 `{"event":"reflection","entry":{...}}`。条目包含 `parent`、`through`、`feedback`、`shown`、`finding`、可选 `when`、`next_cue` 与可选 `retire`。新线索按 `when` 作用域隔离保留，退役后立即移出活跃集合。
 - 错误提示 `{"event":"error","message":"..."}`
