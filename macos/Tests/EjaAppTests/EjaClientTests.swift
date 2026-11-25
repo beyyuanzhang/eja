@@ -53,12 +53,13 @@ for line in sys.stdin:
     msg = json.loads(line)
     mid = msg.get("id")
     method = msg.get("method")
-    if method == "initialize":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"echo","version":"1"}}}), flush=True)
-    elif method == "tools/list":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}), flush=True)
+    meta = msg["params"]["_meta"]
+    assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+    assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+    if method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"resultType":"complete","tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}), flush=True)
     elif method == "tools/call":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"ok"}]}}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"resultType":"complete","content":[{"type":"text","text":"ok"}]}}), flush=True)
 """
         try scriptBody.write(toFile: mcpScript, atomically: true, encoding: .utf8)
 

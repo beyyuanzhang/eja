@@ -5,7 +5,9 @@ use crate::state::entries_for_turn;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use eja_core::{Eja, Entry, Evidence, Fact, Id, Outcome};
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
@@ -780,6 +782,30 @@ fn complete_wire(
     }
 }
 
+fn apply_prompt_cache(provider: &ProviderConfig, api_root: &str, body: &mut Value) {
+    match provider.kind {
+        ProviderKind::OpenAi if api_root.eq_ignore_ascii_case("https://api.openai.com/v1") => {
+            let mut hasher = DefaultHasher::new();
+            provider.id.hash(&mut hasher);
+            body["prompt_cache_key"] = json!(format!("eja-{:016x}", hasher.finish()));
+        }
+        ProviderKind::Anthropic
+            if api_root.eq_ignore_ascii_case("https://api.anthropic.com/v1") =>
+        {
+            let cache = json!({ "type": "ephemeral" });
+            if let Some(tool) = body["tools"]
+                .as_array_mut()
+                .and_then(|tools| tools.last_mut())
+            {
+                // The tool definitions precede the system prompt, which can vary by turn.
+                tool["cache_control"] = cache.clone();
+            }
+            body["cache_control"] = cache;
+        }
+        _ => {}
+    }
+}
+
 fn call_openai(
     provider: &ProviderConfig,
     model: &str,
@@ -788,7 +814,8 @@ fn call_openai(
     tools: Option<&[ToolSpec]>,
     mut on_delta: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ModelReply, String> {
-    let url = format!("{}/chat/completions", provider.api_root()?);
+    let api_root = provider.api_root()?;
+    let url = format!("{api_root}/chat/completions");
     let system_message = json!({ "role": "system", "content": system });
     let messages: Vec<_> = std::iter::once(&system_message).chain(messages).collect();
     let seed = messages.len();
@@ -798,6 +825,7 @@ fn call_openai(
             .iter()
             .map(|s| json!({"type": "function", "function": {"name": s.name, "description": s.description, "parameters": s.schema}}))
             .collect::<Vec<_>>());
+        apply_prompt_cache(provider, &api_root, &mut body);
     }
     let headers = provider_headers(provider);
     if on_delta.is_some() {
@@ -949,7 +977,8 @@ fn call_anthropic(
     tools: Option<&[ToolSpec]>,
     mut on_delta: Option<&mut dyn FnMut(&str)>,
 ) -> Result<ModelReply, String> {
-    let url = format!("{}/messages", provider.api_root()?);
+    let api_root = provider.api_root()?;
+    let url = format!("{api_root}/messages");
     let mut body = json!({
         "model": model, "max_tokens": 16384, "system": system, "messages": messages
     });
@@ -960,6 +989,7 @@ fn call_anthropic(
                 |s| json!({"name": s.name, "description": s.description, "input_schema": s.schema})
             )
             .collect::<Vec<_>>());
+        apply_prompt_cache(provider, &api_root, &mut body);
     }
     let headers = provider_headers(provider);
     if on_delta.is_some() {
@@ -1189,6 +1219,48 @@ mod tests {
     use super::*;
     use eja_core::Source;
 
+    #[test]
+    fn prompt_cache_depends_on_provider_endpoint_and_preserves_prompt_content() {
+        let mut provider = ProviderConfig {
+            id: "judge".into(),
+            name: "Judge".into(),
+            kind: ProviderKind::OpenAi,
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: String::new(),
+            has_api_key: false,
+            models: Vec::new(),
+        };
+        let mut first =
+            json!({"model":"first-model","messages":[{"role":"system","content":"time A"}]});
+        let mut second =
+            json!({"model":"another-model","messages":[{"role":"system","content":"time B"}]});
+        let root = provider.api_root().unwrap();
+        apply_prompt_cache(&provider, &root, &mut first);
+        apply_prompt_cache(&provider, &root, &mut second);
+        assert!(first["prompt_cache_key"].is_string());
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_eq!(first["messages"][0]["content"], "time A");
+        assert_eq!(second["messages"][0]["content"], "time B");
+
+        provider.kind = ProviderKind::Anthropic;
+        provider.base_url = "https://api.anthropic.com".into();
+        let prompt = json!({"model":"another-model","system":"time C","tools":[{"name":"search"}]});
+        let mut request = prompt.clone();
+        apply_prompt_cache(&provider, &provider.api_root().unwrap(), &mut request);
+        assert_eq!(request["system"], prompt["system"]);
+        assert_eq!(request["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(
+            request["tools"][0]["cache_control"],
+            request["cache_control"]
+        );
+
+        let mut custom = prompt.clone();
+        for kind in [ProviderKind::Anthropic, ProviderKind::OpenAi] {
+            provider.kind = kind;
+            apply_prompt_cache(&provider, "http://127.0.0.1:8080/v1", &mut custom);
+        }
+        assert_eq!(custom, prompt);
+    }
     #[test]
     fn deterministic_window_projection_is_strictly_append_only_until_reset() -> eja_core::Result<()>
     {

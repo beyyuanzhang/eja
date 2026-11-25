@@ -23,6 +23,7 @@ const MCP_TIMEOUT: Duration = Duration::from_secs(30);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTCOME_BYTES: usize = 32 * 1024;
 const MAX_STDERR_BYTES: usize = 4 * 1024;
+const PROTOCOL_VERSION: &str = "2026-07-28";
 
 #[derive(Debug, PartialEq, Eq)]
 enum RequestError {
@@ -51,6 +52,7 @@ pub struct CapabilityTool {
     pub description: String,
     pub input_schema: Value,
     pub capability: String,
+    http_header_params: Vec<HeaderParam>,
 }
 
 impl CapabilityTool {
@@ -77,11 +79,14 @@ pub struct CapabilityStatus {
     pub tools: Vec<CapabilityToolSummary>,
 }
 
-fn init_params() -> Value {
+fn request_message(id: u64, method: &str, mut params: Value) -> Value {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
+    });
     json!({
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": { "name": "eja", "version": env!("CARGO_PKG_VERSION") }
+        "jsonrpc": "2.0", "id": id, "method": method, "params": params
     })
 }
 
@@ -139,23 +144,14 @@ impl StdioConnection {
             }
         });
 
-        let mut conn = Self {
+        Ok(Self {
             child,
             stdin,
             rx,
             stderr,
             next_id: 1,
             broken: false,
-        };
-        conn.request("initialize", init_params(), MCP_TIMEOUT)
-            .map_err(RequestError::into_message)?;
-        conn.notify("notifications/initialized", json!({}))?;
-        Ok(conn)
-    }
-
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
-        let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        self.send(&msg, Instant::now() + MCP_TIMEOUT)
+        })
     }
 
     fn send(&mut self, msg: &Value, deadline: Instant) -> Result<(), String> {
@@ -175,12 +171,7 @@ impl StdioConnection {
     ) -> Result<Value, RequestError> {
         let id = self.next_id;
         self.next_id += 1;
-        let msg = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        });
+        let msg = request_message(id, method, params);
         let deadline = Instant::now() + timeout;
         self.send(&msg, deadline).map_err(RequestError::Unknown)?;
         loop {
@@ -204,7 +195,7 @@ impl StdioConnection {
             let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
-            if val.get("id").and_then(|v| v.as_u64()) != Some(id) {
+            if !matches_response_id(&val, id) {
                 continue;
             }
             return extract_jsonrpc_result(&val, "MCP 返回错误");
@@ -230,25 +221,30 @@ impl Drop for StdioConnection {
 struct HttpConnection {
     url: String,
     headers: BTreeMap<String, String>,
-    session_id: Option<String>,
     next_id: u64,
 }
 
 impl HttpConnection {
-    fn connect(url: &str, headers: &BTreeMap<String, String>) -> Result<Self, String> {
-        let mut conn = Self {
+    fn new(url: &str, headers: &BTreeMap<String, String>) -> Self {
+        Self {
             url: url.trim().to_string(),
-            headers: headers.clone(),
-            session_id: None,
+            headers: headers
+                .iter()
+                .filter(|(name, _)| {
+                    let name = name.to_ascii_lowercase();
+                    !matches!(
+                        name.as_str(),
+                        "accept"
+                            | "content-type"
+                            | "mcp-protocol-version"
+                            | "mcp-method"
+                            | "mcp-name"
+                    ) && !name.starts_with("mcp-param-")
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
             next_id: 1,
-        };
-        conn.request("initialize", init_params(), MCP_TIMEOUT)
-            .map_err(RequestError::into_message)?;
-        let _ = conn.post_raw(
-            &json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
-            Duration::from_secs(5),
-        );
-        Ok(conn)
+        }
     }
 
     fn set_bearer_token(&mut self, token: &str) {
@@ -262,70 +258,167 @@ impl HttpConnection {
         &mut self,
         method: &str,
         params: Value,
+        tool: Option<&CapabilityTool>,
         timeout: Duration,
     ) -> Result<Value, RequestError> {
         let id = self.next_id;
         self.next_id += 1;
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        });
-        let (resp_headers, body) = self.post_raw(&payload, timeout)?;
-        for line in resp_headers.lines() {
-            if let Some((key, val)) = line.split_once(':') {
-                if key.eq_ignore_ascii_case("mcp-session-id") {
-                    let trimmed = val.trim();
-                    if !trimmed.is_empty() {
-                        self.session_id = Some(trimmed.to_string());
-                    }
+        let mut headers = vec![
+            ("Content-Type".into(), "application/json".into()),
+            (
+                "Accept".into(),
+                "application/json, text/event-stream".into(),
+            ),
+            ("MCP-Protocol-Version".into(), PROTOCOL_VERSION.into()),
+            ("Mcp-Method".into(), method.into()),
+        ];
+        if let Some(name) = params["name"].as_str() {
+            headers.push(("Mcp-Name".into(), encode_header_value(name)));
+        }
+        if let Some(tool) = tool {
+            for param in &tool.http_header_params {
+                if let Some(header) = param.header(&params["arguments"])? {
+                    headers.push(header);
                 }
             }
         }
+        headers.extend(self.headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let payload = request_message(id, method, params).to_string();
+        let resp = post_bytes(
+            &self.url,
+            &headers,
+            payload.as_bytes(),
+            timeout.as_secs().max(1),
+        )
+        .map_err(|err| match err {
+            HttpError::Launch(msg) => RequestError::Failed(msg),
+            HttpError::Wait(msg) => RequestError::Unknown(format!("MCP {msg}")),
+            HttpError::Transport { exit_code, message } => {
+                let msg = format!("MCP HTTP 请求失败: {message}");
+                match exit_code {
+                    Some(3 | 6 | 7) => RequestError::Failed(msg),
+                    _ => RequestError::Unknown(msg),
+                }
+            }
+            HttpError::InvalidResponse(msg) => RequestError::Unknown(msg),
+        })?;
+        let body = check_mcp_http_status(resp)?;
         let parsed = parse_http_jsonrpc(&body, id).map_err(RequestError::Unknown)?;
         extract_jsonrpc_result(&parsed, "MCP HTTP 返回错误")
     }
+}
 
-    fn post_raw(
-        &self,
-        payload: &Value,
-        timeout: Duration,
-    ) -> Result<(String, String), RequestError> {
-        let body_bytes =
-            serde_json::to_vec(payload).map_err(|err| RequestError::Failed(err.to_string()))?;
-        let mut headers = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-            (
-                "Accept".to_string(),
-                "application/json, text/event-stream".to_string(),
-            ),
-        ];
-        if let Some(sid) = &self.session_id {
-            headers.push(("Mcp-Session-Id".to_string(), sid.clone()));
-        }
-        for (key, value) in &self.headers {
-            headers.push((key.clone(), value.clone()));
-        }
-        let resp = post_bytes(&self.url, &headers, &body_bytes, timeout.as_secs().max(1)).map_err(
-            |err| match err {
-                HttpError::Launch(msg) => RequestError::Failed(msg),
-                HttpError::Wait(msg) => RequestError::Unknown(format!("MCP {msg}")),
-                HttpError::Transport { exit_code, message } => {
-                    let msg = format!("MCP HTTP 请求失败: {message}");
-                    match exit_code {
-                        Some(3 | 6 | 7) => RequestError::Failed(msg),
-                        _ => RequestError::Unknown(msg),
-                    }
-                }
-                HttpError::InvalidResponse(msg) => RequestError::Unknown(msg),
-            },
-        )?;
-        check_mcp_http_status(resp)
+#[derive(Debug, Clone)]
+struct HeaderParam {
+    name: String,
+    path: Vec<String>,
+}
+
+impl HeaderParam {
+    fn header(&self, arguments: &Value) -> Result<Option<(String, String)>, RequestError> {
+        let value = self.path.iter().fold(arguments, |value, key| &value[key]);
+        let encoded = match value {
+            Value::Null => return Ok(None),
+            Value::String(value) => encode_header_value(value),
+            Value::Bool(value) => value.to_string(),
+            value => value
+                .as_f64()
+                .filter(|n| n.fract() == 0.0 && n.abs() < ((1u64 << 53) as f64))
+                .map(|n| (n as i64).to_string())
+                .ok_or_else(|| {
+                    RequestError::Failed(format!("MCP 请求头参数无效: {}", self.name))
+                })?,
+        };
+        Ok(Some((format!("Mcp-Param-{}", self.name), encoded)))
     }
 }
 
-fn check_mcp_http_status(resp: HttpResponse) -> Result<(String, String), RequestError> {
+fn encode_header_value(value: &str) -> String {
+    if !value.is_empty()
+        && value.trim() == value
+        && value.bytes().all(|c| matches!(c, b'\t' | b' '..=b'~'))
+        && !(value.starts_with("=?base64?") && value.ends_with("?="))
+    {
+        value.into()
+    } else {
+        format!("=?base64?{}?=", STANDARD.encode(value))
+    }
+}
+
+fn collect_header_params(
+    schema: &Value,
+    path: Option<&[String]>,
+    params: &mut Vec<HeaderParam>,
+) -> Result<(), &'static str> {
+    let Some(schema) = schema.as_object() else {
+        return Ok(());
+    };
+    if let Some(name) = schema.get("x-mcp-header") {
+        let path = path.filter(|path| !path.is_empty()).ok_or("位置无效")?;
+        let name = name
+            .as_str()
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^`_|~".contains(&c))
+            })
+            .ok_or("名称无效")?;
+        if !matches!(
+            schema.get("type").and_then(Value::as_str),
+            Some("string" | "integer" | "boolean")
+        ) || params
+            .iter()
+            .any(|param| param.name.eq_ignore_ascii_case(name))
+        {
+            return Err("类型无效或名称重复");
+        }
+        params.push(HeaderParam {
+            name: name.into(),
+            path: path.to_vec(),
+        });
+    }
+    for (key, nested) in schema {
+        match key.as_str() {
+            "properties" | "patternProperties" | "dependentSchemas" | "dependencies" | "$defs"
+            | "definitions" => {
+                if let Some(properties) = nested.as_object() {
+                    for (name, child) in properties {
+                        let child_path = path.filter(|_| key == "properties").map(|path| {
+                            let mut path = path.to_vec();
+                            path.push(name.clone());
+                            path
+                        });
+                        collect_header_params(child, child_path.as_deref(), params)?;
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" | "items" if nested.is_array() => {
+                for child in nested.as_array().into_iter().flatten() {
+                    collect_header_params(child, None, params)?;
+                }
+            }
+            "not"
+            | "if"
+            | "then"
+            | "else"
+            | "items"
+            | "contains"
+            | "additionalItems"
+            | "additionalProperties"
+            | "propertyNames"
+            | "unevaluatedItems"
+            | "unevaluatedProperties"
+            | "contentSchema" => {
+                collect_header_params(nested, None, params)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_mcp_http_status(resp: HttpResponse) -> Result<String, RequestError> {
     if !(200..300).contains(&resp.status) {
         let message = format!(
             "MCP HTTP {}: {}",
@@ -337,11 +430,11 @@ fn check_mcp_http_status(resp: HttpResponse) -> Result<(String, String), Request
             _ => RequestError::Unknown(message),
         });
     }
-    Ok((resp.headers, resp.body))
+    Ok(resp.body)
 }
 
 #[cfg(test)]
-fn split_http_response(raw: &str) -> Result<(String, String), RequestError> {
+fn split_http_response(raw: &str) -> Result<String, RequestError> {
     let resp = crate::http::parse_http_response(raw).map_err(|err| match err {
         HttpError::InvalidResponse(msg) => RequestError::Unknown(msg),
         other => RequestError::Unknown(format!("{other:?}")),
@@ -366,69 +459,35 @@ fn extract_jsonrpc_result(val: &Value, default_error: &str) -> Result<Value, Req
     )))
 }
 
-fn find_matching_jsonrpc(val: Value, id: u64) -> Option<Value> {
-    let matches_id =
-        |item: &Value| item.is_object() && item.get("id").and_then(Value::as_u64) == Some(id);
-    if matches_id(&val) {
-        return Some(val);
-    }
-    if let Value::Array(items) = val {
-        return items.into_iter().find(matches_id);
-    }
-    None
+fn matches_response_id(value: &Value, id: u64) -> bool {
+    value["id"].as_u64() == Some(id)
 }
 
 fn parse_http_jsonrpc(body: &str, id: u64) -> Result<Value, String> {
-    let trimmed = body.trim();
-    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-        return find_matching_jsonrpc(val, id).ok_or_else(|| {
-            format!(
-                "MCP HTTP 响应缺少匹配请求 ID ({id}) 的结果: {}",
-                truncate_utf8(trimmed, 240)
-            )
-        });
-    }
-    let mut matched: Option<Value> = None;
-    let mut event_data = String::new();
-    let flush_event = |buf: &mut String, out: &mut Option<Value>| {
-        if buf.is_empty() {
-            return;
-        }
-        if let Ok(val) = serde_json::from_str::<Value>(buf.trim()) {
-            if let Some(found) = find_matching_jsonrpc(val, id) {
-                *out = Some(found);
-            }
-        }
-        buf.clear();
+    let parse_matching = |data: &str| {
+        serde_json::from_str::<Value>(data)
+            .ok()
+            .filter(|value| matches_response_id(value, id))
     };
-    for line in trimmed.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            flush_event(&mut event_data, &mut matched);
-            continue;
-        }
+    if let Some(result) = parse_matching(body) {
+        return Ok(result);
+    }
+    let mut event_data = String::new();
+    for line in body.lines().chain(std::iter::once("")) {
         if let Some(data) = line.strip_prefix("data:") {
-            let chunk = data.trim();
-            if let Ok(val) = serde_json::from_str::<Value>(chunk) {
-                if let Some(found) = find_matching_jsonrpc(val, id) {
-                    matched = Some(found);
-                    event_data.clear();
-                    continue;
-                }
+            event_data.push_str(data.strip_prefix(' ').unwrap_or(data));
+            event_data.push('\n');
+        } else if line.is_empty() && !event_data.is_empty() {
+            if let Some(result) = parse_matching(&event_data) {
+                return Ok(result);
             }
-            if !event_data.is_empty() {
-                event_data.push('\n');
-            }
-            event_data.push_str(chunk);
+            event_data.clear();
         }
     }
-    flush_event(&mut event_data, &mut matched);
-    matched.ok_or_else(|| {
-        format!(
-            "MCP HTTP 响应缺少匹配请求 ID ({id}) 的结果: {}",
-            truncate_utf8(trimmed, 240)
-        )
-    })
+    Err(format!(
+        "MCP HTTP 响应缺少匹配请求 ID ({id}) 的结果: {}",
+        truncate_utf8(body.trim(), 240)
+    ))
 }
 
 enum ActiveConnection {
@@ -447,15 +506,36 @@ impl ActiveConnection {
         &mut self,
         method: &str,
         params: Value,
+        tool: Option<&CapabilityTool>,
         timeout: Duration,
     ) -> Result<Value, RequestError> {
         match self {
             Self::Stdio(conn) => conn.request(method, params, timeout),
-            Self::Http(conn) => conn.request(method, params, timeout),
+            Self::Http(conn) => conn.request(method, params, tool, timeout),
             Self::Builtin | Self::Exec { .. } => Err(RequestError::Failed(
                 "非 MCP 能力不支持 JSON-RPC 请求".into(),
             )),
         }
+    }
+
+    fn refresh_http_auth(
+        &mut self,
+        cfg: &CapabilityConfig,
+        oauth: &mut OAuthStore,
+        error: &str,
+    ) -> bool {
+        let (Self::Http(http), CapabilityTransport::Http { headers, .. }) = (self, &cfg.transport)
+        else {
+            return false;
+        };
+        if !is_auth_error(error) || has_authorization_header(headers) {
+            return false;
+        }
+        let Some(token) = oauth.refresh(&cfg.id, &http.url) else {
+            return false;
+        };
+        http.set_bearer_token(&token);
+        true
     }
 
     fn is_alive(&mut self) -> bool {
@@ -674,20 +754,22 @@ impl CapabilityPool {
             }
             ActiveConnection::Stdio(_) | ActiveConnection::Http(_) => {}
         }
-        let call_params = json!({ "name": tool.name, "arguments": args });
-        let mut response = connection.request("tools/call", call_params.clone(), TOOL_TIMEOUT);
-        if let Err(RequestError::Failed(ref err)) = response {
-            if let CapabilityTransport::Http { headers, .. } = &config.transport {
-                if is_auth_error(err) && !has_authorization_header(headers) {
-                    if let ActiveConnection::Http(http_conn) = connection {
-                        if let Some(new_token) = self.oauth.refresh(&config.id, &http_conn.url) {
-                            http_conn.set_bearer_token(&new_token);
-                            response = http_conn.request("tools/call", call_params, TOOL_TIMEOUT);
-                        }
-                    }
-                }
+        let request = |connection: &mut ActiveConnection| {
+            connection.request(
+                "tools/call",
+                json!({ "name": tool.name, "arguments": args }),
+                Some(tool),
+                TOOL_TIMEOUT,
+            )
+        };
+        let response = match request(connection) {
+            Err(RequestError::Failed(err))
+                if connection.refresh_http_auth(config, &mut self.oauth, &err) =>
+            {
+                request(connection)
             }
-        }
+            response => response,
+        };
         match response {
             Ok(result) => tool_result(&result),
             Err(RequestError::Failed(err)) => {
@@ -720,6 +802,7 @@ fn connect_and_list(
                     "required": ["command"]
                 }),
                 capability: "shell".into(),
+                http_header_params: Vec::new(),
             };
             return Ok((ActiveConnection::Builtin, vec![tool]));
         }
@@ -749,6 +832,7 @@ fn connect_and_list(
                 description: desc,
                 input_schema,
                 capability: format!("cap.{id}"),
+                http_header_params: Vec::new(),
             };
             return Ok((
                 ActiveConnection::Exec {
@@ -763,46 +847,51 @@ fn connect_and_list(
             StdioConnection::connect(sandbox, command, args, env).map(ActiveConnection::Stdio)?
         }
         CapabilityTransport::Http { url, headers } => {
-            let mut effective = headers.clone();
-            let manual_auth = has_authorization_header(&effective);
-            if !manual_auth {
+            let mut http = HttpConnection::new(url, headers);
+            if !has_authorization_header(headers) {
                 if let Some(token) = oauth.access_token(&cfg.id, url) {
-                    effective.insert("Authorization".to_string(), format!("Bearer {token}"));
+                    http.set_bearer_token(&token);
                 }
             }
-            match HttpConnection::connect(url, &effective) {
-                Ok(http) => ActiveConnection::Http(http),
-                Err(err) if !manual_auth && is_auth_error(&err) => {
-                    if let Some(refreshed) = oauth.refresh(&cfg.id, url) {
-                        effective
-                            .insert("Authorization".to_string(), format!("Bearer {refreshed}"));
-                        HttpConnection::connect(url, &effective).map(ActiveConnection::Http)?
-                    } else {
-                        return Err(err);
-                    }
-                }
-                Err(err) => return Err(err),
-            }
+            ActiveConnection::Http(http)
         }
     };
-    let result = conn
-        .request("tools/list", json!({}), MCP_TIMEOUT)
-        .map_err(RequestError::into_message)?;
+    let tools = match list_tools(&mut conn, cfg) {
+        Err(err) if conn.refresh_http_auth(cfg, oauth, &err) => list_tools(&mut conn, cfg)?,
+        tools => tools?,
+    };
+    Ok((conn, tools))
+}
+
+fn list_tools(
+    conn: &mut ActiveConnection,
+    cfg: &CapabilityConfig,
+) -> Result<Vec<CapabilityTool>, String> {
     let id = route_component(&cfg.id);
     let mut names = HashSet::new();
-    let tools = result
-        .get("tools")
-        .and_then(Value::as_array)
-        .ok_or("MCP 工具列表无效")?
-        .iter()
-        .map(|item| {
+    let mut cursors = HashSet::new();
+    let mut params = json!({});
+    let mut tools = Vec::new();
+    let deadline = Instant::now() + MCP_TIMEOUT;
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err("MCP 工具列表请求超时".into());
+        }
+        let result = conn
+            .request("tools/list", params, None, timeout)
+            .map_err(RequestError::into_message)?;
+        if result["resultType"] != "complete" {
+            return Err("MCP 工具列表缺少完整结果".into());
+        }
+        for item in result["tools"].as_array().ok_or("MCP 工具列表无效")? {
             let name = item
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or("MCP 工具名称无效")?;
-            if !names.insert(name) {
-                return Err("MCP 工具名称重复");
+            if !names.insert(name.to_owned()) {
+                return Err("MCP 工具名称重复".into());
             }
             let description = item["description"].as_str().unwrap_or("").to_string();
             let input_schema = item
@@ -811,19 +900,43 @@ fn connect_and_list(
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
             let capability = format!("cap.{id}.{}", route_component(name));
-            Ok(CapabilityTool {
+            let mut http_header_params = Vec::new();
+            if matches!(conn, ActiveConnection::Http(_)) {
+                if let Err(err) =
+                    collect_header_params(&input_schema, Some(&[]), &mut http_header_params)
+                {
+                    eprintln!("MCP 工具 {capability} 的 x-mcp-header {err}");
+                    continue;
+                }
+            }
+            tools.push(CapabilityTool {
                 name: name.into(),
                 description,
                 input_schema,
                 capability,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((conn, tools))
+                http_header_params,
+            });
+        }
+        let Some(next) = result.get("nextCursor") else {
+            break;
+        };
+        let next = next.as_str().ok_or("MCP 工具列表游标无效")?;
+        if !cursors.insert(next.to_owned()) {
+            return Err("MCP 工具列表游标重复".into());
+        }
+        params = json!({ "cursor": next });
+    }
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tools)
 }
 
 fn tool_result(result: &Value) -> ToolExecution {
     let invalid = || Outcome::Unknown("MCP 工具返回了无效结果".into()).into();
+    match result["resultType"].as_str() {
+        Some("complete") => {}
+        Some("input_required") => return Outcome::Unknown("MCP 工具需要额外输入".into()).into(),
+        _ => return invalid(),
+    }
     let Some(blocks) = result.get("content").and_then(Value::as_array) else {
         return invalid();
     };
@@ -836,13 +949,18 @@ fn tool_result(result: &Value) -> ToolExecution {
     let mut parts = Vec::new();
     let mut images = Vec::new();
     let mut image_bytes = MAX_TOOL_IMAGE_BYTES;
+    let structured = result.get("structuredContent");
     for block in blocks {
         match block["type"].as_str() {
             Some("text") => {
                 let Some(text) = block["text"].as_str() else {
                     return invalid();
                 };
-                parts.push(text.to_string());
+                if !structured.is_some_and(|value| {
+                    serde_json::from_str::<Value>(text).is_ok_and(|text| text == *value)
+                }) {
+                    parts.push(text.to_string());
+                }
             }
             Some("image") => {
                 let image = block["data"]
@@ -881,6 +999,9 @@ fn tool_result(result: &Value) -> ToolExecution {
             Some(kind) if !kind.is_empty() => parts.push(format!("工具返回 {kind} 内容")),
             _ => return invalid(),
         }
+    }
+    if let Some(value) = structured {
+        parts.insert(0, value.to_string());
     }
     if parts.is_empty() {
         parts.push("(no output)".into());
@@ -949,7 +1070,7 @@ mod tests {
 
         let picture = b"\x89PNG\r\n\x1a\n";
         let encoded = STANDARD.encode(picture);
-        let result = tool_result(&json!({"content":[
+        let result = tool_result(&json!({"resultType":"complete","content":[
             {"type":"text","text":"完整回执"},
             {"type":"image","mimeType":"image/png","data":encoded},
         ]}));
@@ -961,9 +1082,8 @@ mod tests {
 
     #[test]
     fn split_http_response_preserves_sse_blank_lines_and_handles_continue() {
-        let raw = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nMcp-Session-Id: s1\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\r\n\r\n";
-        let (headers, body) = split_http_response(raw).unwrap();
-        assert!(headers.contains("Mcp-Session-Id: s1"));
+        let raw = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\r\ndata: \"result\":{\"ok\":true}}\r\n\r\n";
+        let body = split_http_response(raw).unwrap();
         let parsed = parse_http_jsonrpc(&body, 1).unwrap();
         let result = extract_jsonrpc_result(&parsed, "err").unwrap();
         assert_eq!(result["ok"], true);
@@ -1013,14 +1133,21 @@ for line in sys.stdin:
     msg = json.loads(line)
     mid = msg.get("id")
     method = msg.get("method")
-    if method == "initialize":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"1"}}}), flush=True)
-    elif method == "tools/list":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"op","description":"Op","inputSchema":{"type":"object"}}]}}), flush=True)
+    meta = msg["params"]["_meta"]
+    assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+    assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+    if method == "tools/list":
+        result = {"resultType":"complete"}
+        if "cursor" not in msg["params"]:
+            result.update(tools=[{"name":"z","inputSchema":{"type":"object"}}], nextCursor="next")
+        else:
+            assert msg["params"]["cursor"] == "next"
+            result["tools"] = [{"name":"op","description":"Op","inputSchema":{"type":"object"}}]
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":result}), flush=True)
     elif method == "tools/call":
         mode = msg["params"]["arguments"].get("mode")
-        if mode in ("null", "empty", "bad_flag", "bad_block"):
-            result = {"null": None, "empty": {"content":[]}, "bad_flag":{"content":[], "isError":"yes"}, "bad_block":{"content":[None]}}[mode]
+        if mode in ("null", "empty", "bad_flag", "bad_block", "input_required"):
+            result = {"null": None, "empty": {"resultType":"complete","content":[]}, "bad_flag":{"resultType":"complete","content":[], "isError":"yes"}, "bad_block":{"resultType":"complete","content":[None]}, "input_required":{"resultType":"input_required","requestState":"more"}}[mode]
             print(json.dumps({"jsonrpc":"2.0","id":mid,"result":result}), flush=True)
         elif mode == "err":
             print(json.dumps({"jsonrpc":"2.0","id":mid,"error":{"code":-32000,"message":"rejected"}}), flush=True)
@@ -1046,7 +1173,9 @@ for line in sys.stdin:
             false,
         );
 
-        for mode in ["null", "bad_flag", "bad_block"] {
+        let names: Vec<_> = pool.tools().map(|(tool, _)| tool.name.as_str()).collect();
+        assert_eq!(names, ["op", "z"]);
+        for mode in ["null", "bad_flag", "bad_block", "input_required"] {
             assert!(matches!(
                 pool.call("cap.flaky.op", 1, &json!({"mode":mode}), &data_dir)
                     .outcome,
@@ -1083,14 +1212,15 @@ for line in sys.stdin:
     msg = json.loads(line)
     mid = msg.get("id")
     method = msg.get("method")
-    if method == "initialize":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"pid","version":"1"}}}), flush=True)
-    elif method == "tools/list":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"pid","description":"Pid","inputSchema":{"type":"object"}}]}}), flush=True)
+    meta = msg["params"]["_meta"]
+    assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+    assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+    if method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"resultType":"complete","tools":[{"name":"pid","description":"Pid","inputSchema":{"type":"object"}}]}}), flush=True)
     elif method == "tools/call":
         if msg.get("params", {}).get("arguments", {}).get("exit"):
             sys.exit(0)
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":str(os.getpid())}]}}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"resultType":"complete","content":[{"type":"text","text":str(os.getpid())}]}}), flush=True)
 "#,
         )
         .unwrap();
@@ -1167,12 +1297,13 @@ for line in sys.stdin:
     msg = json.loads(line)
     mid = msg.get("id")
     method = msg.get("method")
-    if method == "initialize":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"lock","version":"1"}}}), flush=True)
-    elif method == "tools/list":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"ping","description":"Ping","inputSchema":{"type":"object"}}]}}), flush=True)
+    meta = msg["params"]["_meta"]
+    assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+    assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+    if method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"resultType":"complete","tools":[{"name":"ping","description":"Ping","inputSchema":{"type":"object"}}]}}), flush=True)
     elif method == "tools/call":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"ok"}]}}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"resultType":"complete","content":[{"type":"text","text":"ok"}]}}), flush=True)
 "#,
         )
         .unwrap();

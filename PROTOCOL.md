@@ -26,6 +26,8 @@ eja-host --data-dir "<data_dir>"
 
 `exec` 插件可直接向 `stdout` 输出图像，MCP 服务可通过 `image` 内容块返回图像。JPEG、PNG、GIF 和 WebP 共用模型图像接口。图像只发给收到该工具回执的下一步模型请求。主体日志只保存文字回执，模型请求会用 `images_omitted` 表明超出窗口而省略的图像数。
 
+`stdio` 和 Streamable HTTP MCP 服务须支持 `2026-07-28`。OpenAI 和 Anthropic 官方端点的提示缓存参数由 Provider 适配器设置。
+
 前端与 `eja-host` 使用同一构建的协议。
 
 ## 输入指令（Frontend -> Host，每行一条 JSON）

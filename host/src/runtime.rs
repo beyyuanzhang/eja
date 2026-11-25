@@ -132,7 +132,7 @@ pub struct HostRuntime {
     emit: EventSink,
 }
 
-fn needs_handshake(capability: &CapabilityConfig) -> bool {
+fn needs_mcp_connection(capability: &CapabilityConfig) -> bool {
     capability.enabled && capability.transport.is_mcp()
 }
 
@@ -191,7 +191,7 @@ impl HostRuntime {
                 (emit)(json!({"event":"error", "message":err}));
                 vec![CapabilityConfig::builtin_shell()]
             });
-        let status = if config.capabilities.iter().any(needs_handshake) {
+        let status = if config.capabilities.iter().any(needs_mcp_connection) {
             ("connecting".into(), "连接能力…".into())
         } else {
             ("idle".into(), "在线".into())
@@ -229,7 +229,7 @@ impl HostRuntime {
     }
 
     pub fn connect_external_capabilities(&mut self) {
-        if self.config.capabilities.iter().any(needs_handshake) {
+        if self.config.capabilities.iter().any(needs_mcp_connection) {
             self.hands.reload(&self.config.capabilities, false);
             self.set_status("idle", "在线");
         }
@@ -1303,13 +1303,14 @@ for line in sys.stdin:
     msg = json.loads(line)
     mid = msg.get("id")
     method = msg.get("method")
-    if method == "initialize":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"1"}}}), flush=True)
-    elif method == "tools/list":
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"Echo tool","inputSchema":{"type":"object","properties":{"msg":{"type":"string"}},"required":["msg"]}}]}}), flush=True)
+    meta = msg["params"]["_meta"]
+    assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+    assert meta["io.modelcontextprotocol/clientCapabilities"] == {}
+    if method == "tools/list":
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"resultType":"complete","tools":[{"name":"echo","description":"Echo tool","inputSchema":{"type":"object","properties":{"msg":{"type":"string"}},"required":["msg"]}}]}}), flush=True)
     elif method == "tools/call":
         arg = msg["params"]["arguments"].get("msg", "")
-        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"pong:" + arg}]}}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":mid,"result":{"resultType":"complete","content":[{"type":"text","text":"pong:" + arg}]}}), flush=True)
 "#,
         )
         .unwrap();
@@ -2720,7 +2721,7 @@ for line in sys.stdin:
 
     #[test]
     fn http_mcp_capability_oauth_flow_persists_kernel_token_and_auto_refreshes() {
-        use std::io::Read;
+        use std::io::{BufRead, BufReader, Read};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2741,18 +2742,28 @@ for line in sys.stdin:
                 };
                 let _ = stream.set_nonblocking(false);
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let mut buf = [0u8; 8192];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                if n == 0 {
+                let mut reader = BufReader::new(&mut stream);
+                let mut req = String::new();
+                if reader.read_line(&mut req).unwrap() == 0 {
                     continue;
                 }
-                let req = String::from_utf8_lossy(&buf[..n]);
+                let mut body_len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            body_len = value.trim().parse().unwrap();
+                        }
+                    }
+                    req.push_str(&line);
+                }
+                let mut body = vec![0; body_len];
+                reader.read_exact(&mut body).unwrap();
+                let body_part = std::str::from_utf8(&body).unwrap();
                 let first_line = req.lines().next().unwrap_or("");
-                let body_part = req
-                    .split_once("\r\n\r\n")
-                    .map(|(_, b)| b)
-                    .unwrap_or("")
-                    .trim();
 
                 let (status, extra_hdr, resp_body) = if first_line
                     .contains("/.well-known/oauth-protected-resource")
@@ -2828,44 +2839,55 @@ for line in sys.stdin:
                             json!({"error": "unauthorized"}).to_string(),
                         )
                     } else {
-                        let rpc: Value = serde_json::from_str(body_part).unwrap_or_default();
-                        let id = rpc.get("id").cloned().unwrap_or(Value::Null);
-                        let method = rpc.get("method").and_then(Value::as_str).unwrap_or("");
+                        let rpc: Value = serde_json::from_str(body_part).unwrap();
+                        let id = &rpc["id"];
+                        let method = rpc["method"].as_str().unwrap();
+                        let headers = req.to_ascii_lowercase();
+                        assert!(headers.contains("mcp-protocol-version: 2026-07-28\r\n"));
+                        assert!(headers.contains(&format!("mcp-method: {method}\r\n")));
+                        assert_eq!(
+                            rpc["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                            "2026-07-28"
+                        );
+                        assert_eq!(
+                            rpc["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
+                            json!({})
+                        );
                         let body = match method {
-                            "initialize" => json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "protocolVersion": "2024-11-05",
-                                    "capabilities": {},
-                                    "serverInfo": { "name": "mock-http", "version": "1" }
-                                }
-                            })
-                            .to_string(),
                             "tools/list" => json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
                                 "result": {
+                                    "resultType": "complete",
                                     "tools": [{
                                         "name": "whoami",
                                         "description": "Return current identity",
-                                        "inputSchema": { "type": "object", "properties": {} }
+                                        "inputSchema": {"type": "object", "properties": {
+                                            "context": {"type": "object", "properties": {
+                                                "region": {"type": "string", "x-mcp-header": "Region"}
+                                            }}
+                                        }}
                                     }]
                                 }
                             })
                             .to_string(),
-                            "tools/call" => json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "content": [{
-                                        "type": "text",
-                                        "text": format!("authed:{}", active_token_srv.lock().unwrap())
-                                    }]
-                                }
-                            })
-                            .to_string(),
-                            _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}).to_string(),
+                            "tools/call" => {
+                                assert!(headers.contains("mcp-name: whoami\r\n"));
+                                assert!(req.lines().any(|line| line == "Mcp-Param-Region: =?base64?5LiK5rW3?="));
+                                assert_eq!(rpc["params"]["arguments"]["context"]["region"], "上海");
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "resultType": "complete",
+                                        "content": [],
+                                        "structuredContent": {
+                                            "identity": format!("authed:{}", active_token_srv.lock().unwrap())
+                                        }
+                                    }
+                                }).to_string()
+                            }
+                            _ => panic!("unexpected MCP method {method}"),
                         };
                         ("200 OK", String::new(), body)
                     }
@@ -2938,7 +2960,11 @@ for line in sys.stdin:
         // Rotate server token to force 401 -> automatic refresh_token exchange during tool call!
         *active_token.lock().unwrap() = "rotated_away".into();
         brain.replies.lock().unwrap().extend([
-            Ok(tool_reply("c1", "cap_gh_whoami", json!({}))),
+            Ok(tool_reply(
+                "c1",
+                "cap_gh_whoami",
+                json!({"context":{"region":"上海"}}),
+            )),
             Ok(text_reply("调用成功")),
         ]);
         rt.handle_user_message("测试刷新");
@@ -2953,7 +2979,7 @@ for line in sys.stdin:
         );
 
         stop.store(true, Ordering::Relaxed);
-        let _ = server.join();
+        server.join().unwrap();
     }
 
     #[test]
