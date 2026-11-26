@@ -48,7 +48,7 @@ eja-host --data-dir "<data_dir>"
 
 ## 输出事件（Host -> Frontend，每行一条 JSON）
 
-- 状态快照 `{"event":"state","protocol_version":2,"kernel_version":"1.0.4","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"capability_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
+- 状态快照 `{"event":"state","protocol_version":2,"kernel_version":"1.0.5","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"capability_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
   `config.providers[].api_key` 始终为空字符串，`has_api_key` 表示是否已保存密钥。工具事件可附带 `outcome_status`、原始回执 ID `receipt_id` 与 `truncated`，这些字段由事实日志生成。`wakes[]` 可附带 `guard`，其中 `checker` 为规则名，`remaining` 为剩余检查次数。
 - 历史分页 `{"event":"history","items":[...],"more":true}`。`items` 与 `stream` 条目格式相同，`more` 表示是否还有更早的日志。
 - 回合内活动 `{"event":"activity","status_detail":"执行 Shell"}`。回合开始和结束仍发送状态快照。
