@@ -132,16 +132,20 @@ struct ContentView: View {
                     .font(.system(size: 13, weight: .regular))
             }
             .buttonStyle(EjaIconButtonStyle(size: 28))
+            .accessibilityLabel("设置")
+            .disabled(!client.isReady)
             .padding(.top, 10)
             .padding(.trailing, 14)
             .ignoresSafeArea(edges: .top)
-
-            if ui.showSettingsSheet && client.isReady {
-                SettingsView(client: client, isPresented: $ui.showSettingsSheet)
-                    .transition(.opacity)
-            }
         }
         .tint(EjaTheme.ink)
+        .sheet(isPresented: $ui.showSettingsSheet, onDismiss: { composerFocused = true }) {
+            SettingsView(client: client, isPresented: $ui.showSettingsSheet)
+                .frame(minWidth: 340, idealWidth: 700, minHeight: 260, idealHeight: 500)
+        }
+        .onChange(of: ui.showSettingsSheet) { _, presented in
+            if presented { composerFocused = false }
+        }
         .onAppear {
             composerFocused = true
             ui.captureBaselineIfNeeded(isReady: client.isReady, dataDir: client.dataDir, from: client.stream)
@@ -281,9 +285,9 @@ struct ContentView: View {
 
     private func sendDraft() {
         let text = ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard client.isReady, !text.isEmpty else { return }
+        guard client.isReady, !ui.showSettingsSheet, !text.isEmpty else { return }
         if !client.isConfigured {
-            ui.showSettingsSheet = true
+            showSettings()
             return
         }
         ui.draftText = ""

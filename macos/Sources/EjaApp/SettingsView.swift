@@ -413,6 +413,7 @@ struct SettingsView: View {
                     .font(.system(size: 11, weight: .medium))
             }
             .buttonStyle(EjaIconButtonStyle(size: 24))
+            .accessibilityLabel("关闭设置")
             .keyboardShortcut(.cancelAction)
             .padding(.leading, 4)
             .padding(.bottom, 10)

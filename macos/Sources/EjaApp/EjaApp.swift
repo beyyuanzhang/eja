@@ -87,6 +87,7 @@ struct EjaApp: App {
                     ui.showSettingsSheet.toggle()
                 }
                 .keyboardShortcut(",", modifiers: .command)
+                .disabled(!client.isReady)
             }
         }
     }
