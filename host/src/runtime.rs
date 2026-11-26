@@ -520,8 +520,7 @@ impl HostRuntime {
         let has_model_update = patch.providers.is_some()
             || patch.judge.is_some()
             || patch.window_max_bytes.is_some()
-            || patch.max_steps.is_some()
-            || patch.recall_learning.is_some();
+            || patch.max_steps.is_some();
         if has_model_update {
             let mut updated = self.config.clone();
             if let Some(providers) = patch.providers {
@@ -532,7 +531,6 @@ impl HostRuntime {
             }
             updated.window_max_bytes = patch.window_max_bytes.or(updated.window_max_bytes);
             updated.max_steps = patch.max_steps.or(updated.max_steps);
-            updated.recall_learning = patch.recall_learning.or(updated.recall_learning);
             updated.preserve_api_keys(&self.config);
             if updated != self.config {
                 updated
@@ -798,8 +796,7 @@ impl HostRuntime {
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
         let mut recoverable = false;
-        let mut search_turn = (!proactive && self.config.recall_learning())
-            .then(|| recall::SearchTurn::new(policy_head));
+        let mut search_turn = (!proactive).then(|| recall::SearchTurn::new(policy_head));
         for _ in 0..max_steps {
             self.drain_turn_commands();
             if self.cancelled() {
@@ -1360,7 +1357,6 @@ mod tests {
             capabilities: HostConfig::normalize_capabilities(capabilities).unwrap(),
             window_max_bytes: None,
             max_steps: None,
-            recall_learning: None,
         }
     }
 
@@ -2074,7 +2070,6 @@ for line in sys.stdin:
             capabilities: Vec::new(),
             window_max_bytes: None,
             max_steps: None,
-            recall_learning: None,
         });
         watch::schedule_wakes(
             &rt.eja,
@@ -2303,8 +2298,9 @@ for line in sys.stdin:
             _model: &str,
             _system: &str,
             messages: &[Value],
-            _tools: &[ToolSpec],
+            tools: &[ToolSpec],
         ) -> Result<ModelReply, String> {
+            assert!(tools.iter().any(|tool| tool.name == ANSWER_WITH_RECEIPT));
             let bytes = messages_bytes(messages);
             let mut guard = self.max_seen_bytes.lock().unwrap();
             *guard = (*guard).max(bytes);

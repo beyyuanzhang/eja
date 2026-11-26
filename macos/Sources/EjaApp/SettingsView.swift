@@ -465,16 +465,6 @@ struct SettingsView: View {
                     providerCard(index: idx)
                 }
                 addProviderMenu
-                Toggle("检索学习（实验）", isOn: Binding(
-                    get: { client.config.recallLearning ?? false },
-                    set: { client.saveConfig(recallLearning: $0) }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .font(.system(size: 12))
-                .foregroundStyle(EjaTheme.inkSecondary)
-                .help("开启后，EJA 可从带回执的回答中学习检索线索，失效线索会自动退回上一版本")
-                .padding(.top, 6)
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)

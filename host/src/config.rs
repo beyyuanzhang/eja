@@ -167,8 +167,6 @@ pub struct HostConfig {
     pub window_max_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recall_learning: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
@@ -184,8 +182,6 @@ pub struct ConfigPatch {
     pub window_max_bytes: Option<usize>,
     #[serde(default)]
     pub max_steps: Option<usize>,
-    #[serde(default)]
-    pub recall_learning: Option<bool>,
 }
 
 impl From<HostConfig> for ConfigPatch {
@@ -196,7 +192,6 @@ impl From<HostConfig> for ConfigPatch {
             capabilities: Some(config.capabilities),
             window_max_bytes: config.window_max_bytes,
             max_steps: config.max_steps,
-            recall_learning: config.recall_learning,
         }
     }
 }
@@ -220,7 +215,6 @@ impl Default for HostConfig {
             capabilities: vec![CapabilityConfig::builtin_shell()],
             window_max_bytes: None,
             max_steps: None,
-            recall_learning: None,
         }
     }
 }
@@ -319,10 +313,6 @@ impl HostConfig {
 
     pub fn max_steps(&self) -> usize {
         self.max_steps.filter(|&steps| steps > 0).unwrap_or(40)
-    }
-
-    pub fn recall_learning(&self) -> bool {
-        self.recall_learning.unwrap_or(false)
     }
 
     pub fn redacted_for_ui(&self) -> Self {

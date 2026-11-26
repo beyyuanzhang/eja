@@ -265,7 +265,6 @@ fn search_live_rsi_from_identity() {
     config.capabilities.clear();
     config.window_max_bytes = Some(8192);
     config.max_steps = Some(8);
-    config.recall_learning = Some(true);
     println!("model={}", config.resolve_judge().unwrap().1);
     run_rsi_lineage(Some(&config));
 }

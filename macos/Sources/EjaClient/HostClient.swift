@@ -156,13 +156,11 @@ public struct HostConfigDTO: Codable, Equatable, Sendable {
     public var capabilities: [CapabilityConfigDTO]
     public var windowMaxBytes: Int?
     public var maxSteps: Int?
-    public var recallLearning: Bool?
 
     enum CodingKeys: String, CodingKey {
         case providers, judge, capabilities
         case windowMaxBytes = "window_max_bytes"
         case maxSteps = "max_steps"
-        case recallLearning = "recall_learning"
     }
 
     public init(
@@ -170,15 +168,13 @@ public struct HostConfigDTO: Codable, Equatable, Sendable {
         judge: ModelRefDTO = ModelRefDTO(),
         capabilities: [CapabilityConfigDTO] = [],
         windowMaxBytes: Int? = nil,
-        maxSteps: Int? = nil,
-        recallLearning: Bool? = nil
+        maxSteps: Int? = nil
     ) {
         self.providers = providers
         self.judge = judge
         self.capabilities = capabilities
         self.windowMaxBytes = windowMaxBytes
         self.maxSteps = maxSteps
-        self.recallLearning = recallLearning
     }
 }
 
@@ -340,7 +336,6 @@ public final class HostClient: ObservableObject {
         providers: [ProviderConfigDTO]? = nil,
         judge: ModelRefDTO? = nil,
         capabilities: [CapabilityConfigDTO]? = nil,
-        recallLearning: Bool? = nil,
         id: UUID = UUID(),
         completion: ((HostConfigDTO) -> Void)? = nil
     ) {
@@ -348,16 +343,8 @@ public final class HostClient: ObservableObject {
             var providers: [ProviderConfigDTO]?
             var judge: ModelRefDTO?
             var capabilities: [CapabilityConfigDTO]?
-            var recallLearning: Bool?
-
-            enum CodingKeys: String, CodingKey {
-                case providers, judge, capabilities
-                case recallLearning = "recall_learning"
-            }
         }
-        let patch = Patch(
-            providers: providers, judge: judge, capabilities: capabilities, recallLearning: recallLearning
-        )
+        let patch = Patch(providers: providers, judge: judge, capabilities: capabilities)
         guard let data = try? JSONEncoder().encode(patch),
               let fields = try? JSONSerialization.jsonObject(with: data) else {
             completion?(config)
