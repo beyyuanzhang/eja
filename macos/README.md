@@ -1,29 +1,31 @@
-# eja macOS
+# eja for macOS
 
-## 结构
+## App structure
 
-- `Sources/ejaLauncher/` 加载 eja 界面并选择数据目录。
-- `Sources/ejaClient/` 负责宿主通信和界面热加载。
-- `Sources/ejaApp/` 提供 SwiftUI 对话界面、模型设置和能力管理。
+- `Sources/ejaLauncher/` starts the app, loads the interface, and selects the data directory.
+- `Sources/ejaClient/` communicates with the host and supports live interface updates.
+- `Sources/ejaApp/` contains the SwiftUI chat interface, model settings, and capability controls.
 
-## 构建与运行
+## Build and run
 
-从仓库根目录打包并运行 `.app`（支持系统通知）：
+Build the app bundle, then open it (system notifications are supported):
 
 ```sh
 ./macos/scripts/build-app.sh
 open macos/build/eja.app
 ```
 
-生成拖拽安装的 `.dmg` 安装包：
+To create a `.dmg` installer:
 
 ```sh
 ./macos/scripts/build-dmg.sh
 ```
 
-打包脚本需要 Python 3.10 或更高版本，在 `macos/build/` 下的虚拟环境中安装 Finder 布局工具。
+The packaging script requires Python 3.10 or later. It creates a virtual environment under `macos/build/` and installs the Finder layout tool there.
 
-在仓库根目录运行以下命令，用 SwiftPM 测试并启动开发版：
+## Run the development build
+
+From the repository root, build the host, then use SwiftPM to test and launch the development app:
 
 ```sh
 cargo build -p eja-host
@@ -34,7 +36,7 @@ swift build --product ejaUI
 swift run ejaApp
 ```
 
-若仅安装了 Command Line Tools（未安装完整 Xcode），执行 Swift Testing 测试时需显式加载宏插件：
+If you have Command Line Tools but not the full Xcode installation, load the Swift Testing macro plug-in explicitly when running tests:
 
 ```sh
 swift test --disable-xctest --enable-swift-testing \
@@ -42,4 +44,4 @@ swift test --disable-xctest --enable-swift-testing \
   -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing/libTestingMacros.dylib
 ```
 
-宿主和数据目录见 [eja 项目说明](../README.md)。
+For the host and data-directory details, see the [project README](../README.md).
