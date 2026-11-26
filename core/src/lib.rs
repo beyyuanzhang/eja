@@ -86,6 +86,8 @@ pub enum Fact {
     },
     Released {
         concern: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        witness_fact_id: Option<Id>,
     },
     Acted {
         capability: String,

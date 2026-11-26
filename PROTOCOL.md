@@ -19,7 +19,7 @@ eja-host --data-dir "<data_dir>"
 - 能力授权采用“OS 沙箱边界 + 宿主暴露即授权”契约。宿主使用固定目录句柄读写 `capabilities.json` 和 `outputs/`，拒绝跟随符号链接。关闭或改动能力后，宿主在下一次执行前作废旧工具定义。
 - macOS 的 `promote_tool({name, file, equals?, contains?, not_equals?})` 注册有固定名称的本地检查（至少提供 `equals`、`contains`、`not_equals` 之一）。规则保存在宿主元数据，复用同名规则需要参数一致。宿主只读数据目录直属的普通文件，最多读取 4096 字节的 UTF-8 文本，忽略末尾换行后校验所有给定谓词。
 - `wake({delay_seconds, reason, guard_tool, max_checks})` 可按间隔复查指定规则，默认最多 60 次。相同 `reason` 或相同 `guard_tool` 会覆盖旧预约；`delay_seconds: 0` 取消匹配预约。文件缺失或尚未匹配时，复查不写主体事实、不调用模型。读取出错时停止守望并报告错误。省略 `guard_tool` 时仍是普通提醒。
-- `keep({text, checker})` 可绑定检查规则。绑定后，`release({concern, witness_fact_id})` 要求引用当前挂念版本之后的同一规则命中记录，并在该规则不再被其他活跃挂念引用时自动清理其剩余守望。
+- `keep({text, checker})` 可绑定检查规则。绑定后，`release({concern, witness_fact_id})` 要求引用当前挂念版本之后的同一规则命中记录。通过校验的证据 ID 随 `Released` 事实一起写入。该规则无其他活跃挂念引用时会自动清理其剩余守望。
 - 模型回合至少需要 256 字节的上下文窗口。设置低于下限时，宿主保留待处理请求，并在设置恢复后继续处理。
 - `search` 与相关学习回放共用本地向量检索。macOS 包自带默认模型，`EJA_ONNX_MODEL_DIR` 可指定首选模型目录。模型、索引或向量查询不可用时使用关键词检索。
 - 以 `EJA_RECALL_LEARNING=1` 启动宿主可启用实验性检索学习。模型可单独调用 `answer_with_receipt({text, receipt})` 结束回合，宿主验证该整数 ID 对应本回合检索已返回的已观测回执。候选线索必须来自首查事实，在两份独立回执的原快照和预算下提前召回目标，并保留首查的已观测回执。宿主用 `eja.recall` 的 `Acted/Returned` 提交更新。之后相同查询仅在学到的线索能保留原查询可见的已观测回执时采用它，并以 `used_cue` 标出线索。

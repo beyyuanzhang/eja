@@ -300,9 +300,20 @@ impl Tx<'_> {
     }
 
     pub fn release(&self, concern: Id) -> Result<Entry> {
+        self.release_with_witness(concern, None)
+    }
+
+    /// Close a concern and optionally link to a fact that already exists in this journal.
+    pub fn release_with_witness(&self, concern: Id, witness_fact_id: Option<Id>) -> Result<Entry> {
         require_live_concern(&self.tx, concern)?;
+        if let Some(witness) = witness_fact_id {
+            read_on(&self.tx, witness)?;
+        }
         let at = self.now()?;
-        let fact = Fact::Released { concern };
+        let fact = Fact::Released {
+            concern,
+            witness_fact_id,
+        };
         let id = insert_fact(&self.tx, at, &fact, Some(concern), Some(false))?;
         Ok(Entry { id, at, fact })
     }

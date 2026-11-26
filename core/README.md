@@ -13,7 +13,7 @@ EJA 是一个连续的、有自我同一性的主体。它与人共同成长，�
   - `transaction(|tx| ...)` 提供独占 `IMMEDIATE` SQLite 事务，允许宿主将事实写入与无业务语义的键值元数据槽（`get_meta` / `set_meta`）原子提交。
   - `notice(source, text)` 写入人的原话、世界事件或时钟信号。
   - `say(text)` 记录主体的文本回复。
-  - `keep(concern, text)` / `release(concern)` 维护开放关切生命周期。
+  - `keep(concern, text)` / `release(concern)` 维护开放关切生命周期。事务可用 `release_with_witness` 在关闭时关联一条已有事实。
   - `act(revision, capability, input)` 在事务内校验日志版本（CAS）并先落盘，再交出 `Call`（能力授权由宿主负责）。
   - `finish(action, outcome)` 记录执行回执，支持相同回执幂等重交与 `Unknown` 单次终结，单条事实上限 64 KiB，超大回执截断并保留原始字节数与 SHA-256。
 - **严格只读查询**：`revision()`、`read(id)`、`evidence(id)`、`evidence_at(id, revision)`、`entries_after(after, through)`、`recent(limit)`、`concerns(revision)`、`unfinished_actions()` 均无任何写副作用。

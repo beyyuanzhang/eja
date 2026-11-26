@@ -904,11 +904,18 @@ impl HostRuntime {
                 Some(id) => {
                     let witness = call.args["witness_fact_id"].as_i64();
                     state::release_with_witness(&self.eja, id, witness).map(|entry| {
+                        let Fact::Released {
+                            concern,
+                            witness_fact_id,
+                        } = entry.fact
+                        else {
+                            unreachable!()
+                        };
                         ToolOutput::Value(json!({
                             "status": "released",
-                            "concern": id,
+                            "concern": concern,
                             "fact_id": entry.id,
-                            "witness_fact_id": witness
+                            "witness_fact_id": witness_fact_id
                         }))
                     })
                 }
@@ -2522,6 +2529,14 @@ for line in sys.stdin:
         assert!(matches!(rt.eja.read(hit).unwrap().fact, Fact::Noticed {
             source: Source::World, text
         } if text.contains("ready")));
+        let persisted = open_subject().evidence(concern).unwrap().latest.unwrap();
+        assert_eq!(
+            persisted.fact,
+            Fact::Released {
+                concern,
+                witness_fact_id: Some(hit)
+            }
+        );
         assert!(rt
             .eja
             .concerns(rt.eja.revision().unwrap())

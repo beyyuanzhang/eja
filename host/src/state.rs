@@ -351,7 +351,7 @@ pub fn release_with_witness(
     witness: Option<Id>,
 ) -> eja_core::Result<Entry> {
     update_state(eja, |tx, state| {
-        if let Some(checker) = state.concern_checks.get(&concern) {
+        let entry = if let Some(checker) = state.concern_checks.get(&concern) {
             let basis = tx.evidence(concern)?;
             let since = basis.latest.unwrap_or(basis.entry).id;
             let witness = witness
@@ -365,8 +365,10 @@ pub fn release_with_witness(
                     "证据须来自检查规则 {checker} 的命中记录"
                 )));
             }
-        }
-        let entry = tx.release(concern)?;
+            tx.release_with_witness(concern, Some(witness))?
+        } else {
+            tx.release(concern)?
+        };
         if let Some(checker) = state.concern_checks.remove(&concern) {
             let still_bound = state.concern_checks.values().any(|item| item == &checker);
             if !still_bound {

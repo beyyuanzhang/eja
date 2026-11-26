@@ -44,7 +44,29 @@ fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
         }
     ));
 
-    let released = eja.release(concern)?;
+    let legacy_release = json!({"kind": "released", "concern": concern});
+    let decoded = serde_json::from_value::<Fact>(legacy_release.clone())?;
+    assert_eq!(
+        decoded,
+        Fact::Released {
+            concern,
+            witness_fact_id: None
+        }
+    );
+    assert_eq!(serde_json::to_value(decoded)?, legacy_release);
+    assert!(matches!(
+        eja.transaction(|tx| tx.release_with_witness(concern, Some(i64::MAX))),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(eja.revision()?, tick);
+    let released = eja.transaction(|tx| tx.release_with_witness(concern, Some(correction)))?;
+    assert_eq!(
+        eja.read(released.id)?.fact,
+        Fact::Released {
+            concern,
+            witness_fact_id: Some(correction)
+        }
+    );
     assert!(eja.concerns(eja.revision()?)?.is_empty());
     assert_eq!(
         eja.evidence(concern)?.latest.as_ref().unwrap().id,
