@@ -1,39 +1,40 @@
 # eja Core
 
-eja 是一个连续的、有自我同一性的主体。它与人共同成长，借助 LLM 形成判断，持续关心某些事，并在授权范围内主动行动。它的价值在于让一个人能关心和影响的范围，超出此刻能够亲自关注的范围。
+EJA is a continuous assistant that can build a lasting relationship with one person. It uses a language model to make decisions, remembers what it has experienced, keeps track of things that matter, and can take actions within the permissions it has been given. Its goal is to help people keep up with more than they can personally attend to at any one moment.
 
-内核用一份日志维持一个主体的经历。一次模型调用只负责当下的判断。人的反馈、eja 留下的关切、它实际做过的事和后果，都可以改变下一次判断。宿主决定哪些世界事件能被它看见，以及它获准怎样行动。
+## How it works
 
-## 接入一个应用
+A single event log holds the history of one EJA instance. Each model call handles the decision at hand; it does not define a new assistant or a new history. Feedback from the person, ongoing concerns, actions, and their outcomes all inform future decisions. The host application decides which events EJA can see and which actions it is allowed to take.
 
-`eja-core` 是最小闭合的独立 Rust crate，零 ML 与向量扩展依赖，零宿主调度或 UI 概念。应用通过 `eja::open(path)` 打开主体，宿主自行决定何时唤醒、如何授权与调度，并通过原子原语读写日志。离线示例见 `examples/loop.rs`。
+## Using the core in an application
 
-- **物理时间与永久日志**：每条 `Entry` 均附带单调非降的物理时间戳 `at: Timestamp`（SQLite 存 Unix 秒，JSON 输出 RFC 3339 UTC，测试与仿真可通过 `with_clock` 注入时钟），`now()` 返回当前单调物理时间。永久日志只记录 6 种纯粹的扁平 `Fact`：`Noticed`、`Said`、`Kept`、`Released`、`Acted`、`Returned`。
-- **原子原语与组合事务**：
-  - `transaction(|tx| ...)` 提供独占 `IMMEDIATE` SQLite 事务，允许宿主将事实写入与无业务语义的键值元数据槽（`get_meta` / `set_meta`）原子提交。
-  - `notice(source, text)` 写入人的原话、世界事件或时钟信号。
-  - `say(text)` 记录主体的文本回复。
-  - `keep(concern, text)` / `release(concern)` 维护开放关切生命周期。事务可用 `release_with_witness` 在关闭时关联一条已有事实。
-  - `act(revision, capability, input)` 在事务内校验日志版本（CAS）并先落盘，再交出 `Call`（能力授权由宿主负责）。
-  - `finish(action, outcome)` 记录执行回执，支持相同回执幂等重交与 `Unknown` 单次终结，单条事实上限 64 KiB，超大回执截断并保留原始字节数与 SHA-256。
-- **严格只读查询**：`revision()`、`read(id)`、`evidence(id)`、`evidence_at(id, revision)`、`entries_after(after, through)`、`recent(limit)`、`concerns(revision)`、`unfinished_actions()` 均无任何写副作用。
-- **内核错误模型**：`Error` 仅包含 `Conflict`（版本竞争）、`Invalid`（违反结构、引用或状态机不变量）与 `Storage`。
+`eja-core` is a small, self-contained Rust crate. It has no machine-learning, vector-search, scheduling, or user-interface dependencies. An application opens an identity with `eja::open(path)`, decides when to wake it and which actions to authorize, and uses the core's atomic operations to read and write its history. See `examples/loop.rs` for an offline example.
 
-全历史关键词与语义召回位于独立 crate `../memory`（`eja-memory`），仅依赖 `eja-core` 公开只读 API。
+- **A permanent, time-ordered history:** Every `Entry` has a non-decreasing physical timestamp (`at: Timestamp`). SQLite stores Unix seconds; JSON uses RFC 3339 UTC. Tests and simulations can inject a clock with `with_clock`, and `now()` returns the current monotonic physical time. The log records six flat fact types: `Noticed`, `Said`, `Kept`, `Released`, `Acted`, and `Returned`.
+- **Atomic operations and transactions:**
+  - `transaction(|tx| ...)` opens an exclusive SQLite `IMMEDIATE` transaction. It can atomically write facts and key-value metadata (`get_meta` / `set_meta`), without imposing application-specific meaning on that metadata.
+  - `notice(source, text)` records a person's words, a world event, or a clock signal.
+  - `say(text)` records EJA's reply.
+  - `keep(concern, text)` and `release(concern)` open and close ongoing concerns. A transaction can use `release_with_witness` to link a concern's closure to an existing fact.
+  - `act(revision, capability, input)` checks the log revision using compare-and-swap, records the action, and then returns a `Call`. The host is responsible for authorizing the capability.
+  - `finish(action, outcome)` records the result. Replaying the same receipt is idempotent; an `Unknown` result can only be finalized once. Each fact is limited to 64 KiB. Larger receipts are truncated while preserving their original byte count and SHA-256 hash.
+- **Read-only queries:** `revision()`, `read(id)`, `evidence(id)`, `evidence_at(id, revision)`, `entries_after(after, through)`, `recent(limit)`, `concerns(revision)`, and `unfinished_actions()` do not write to the log.
+- **Errors:** `Error` has three variants: `Conflict` (revision race), `Invalid` (a structural, reference, or state-machine invariant was violated), and `Storage`.
 
-宿主在普通检索回合中用已有的 `Acted`、`Returned` 与事务元数据学习检索线索。变更记录引用原始事实与前一版本。内核按通用动作处理这类写入。
+Full-history keyword and semantic search are provided by the separate `eja-memory` crate in `../memory`. It depends only on `eja-core`'s public read-only API.
 
-## 验证
+During ordinary search, the host learns useful search cues from existing `Acted` and `Returned` facts and transaction metadata. Search changes cite the source facts and previous version; the core treats these writes as generic actions.
+
+## Verify
 
 ```sh
 cargo test -p eja-core --all-targets
 cargo run -p eja-core --example loop
 ```
 
-长程验证覆盖四代检索更新和逐代重启。离线回放还验证了退化候选的拒绝与历史增长后的召回上限。实测在同一日志上对比继承版本与原查询，记录留出回执首次出现的请求、模型调用次数和答案正确性。
+Long-running checks cover four generations of search updates across restarts. Offline replay also checks that degraded candidates are rejected and retrieval stays bounded as history grows. On the same log, evaluation compares an inherited version with the original query and records the first request that surfaces a held-out receipt, the number of model calls, and answer correctness.
 
 ```sh
 cargo test -p eja-host search_replay_rsi_from_identity -- --nocapture
 eja_EVAL_CONFIG=/path/to/config.json cargo test -p eja-host search_live_rsi_from_identity -- --ignored --nocapture
 ```
-
