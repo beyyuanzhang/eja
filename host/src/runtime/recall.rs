@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{cmp::Reverse, collections::BTreeSet};
 
-const CHANGE: &str = "eja.recall";
+pub(super) const CHANGE: &str = "eja.recall";
 
 #[cfg(test)]
 mod tests;
@@ -18,6 +18,12 @@ mod tests;
 pub(super) struct SearchTurn {
     pub batch: usize,
     visits: Vec<Visit>,
+}
+
+impl SearchTurn {
+    pub(super) fn received(&self, id: Id) -> bool {
+        self.visits.iter().any(|visit| visit.receipts.contains(&id))
+    }
 }
 
 struct Visit {
@@ -59,6 +65,13 @@ struct Case {
     witness: Id,
     action: Id,
     retained: BTreeSet<Id>,
+}
+
+impl Case {
+    fn covered_by(&self, packet: &Value) -> bool {
+        let seen: BTreeSet<_> = receipts(packet).collect();
+        seen.contains(&self.witness) && self.retained.is_subset(&seen)
+    }
 }
 
 fn key(query: &str) -> String {
@@ -152,6 +165,43 @@ impl HostRuntime {
         Ok(result)
     }
 
+    fn pack_search(
+        &mut self,
+        query: &str,
+        effective: &str,
+        through: Id,
+        provider: &ProviderKind,
+        budget: usize,
+    ) -> Result<Value> {
+        let matches = self
+            .memory
+            .search_at(&self.eja, effective, through)
+            .map_err(|err| match err {
+                eja_memory::Error::Invalid(text) => Error::Invalid(text),
+                err => Error::Storage(err.to_string()),
+            })?;
+        let mut packed = json!({"cue": query, "matches": []});
+        if effective != query {
+            packed["used_cue"] = json!(effective);
+        }
+        let mut result = packed.clone();
+        result["matches"] = json!(matches);
+        if result_fits(&result.to_string(), provider, budget) {
+            return Ok(result);
+        }
+        packed["truncated"] = json!(true);
+        for hit in result["matches"].as_array().unwrap() {
+            packed["matches"].as_array_mut().unwrap().push(hit.clone());
+            if !result_fits(&packed.to_string(), provider, budget) {
+                packed["matches"].as_array_mut().unwrap().pop();
+            }
+        }
+        if found(&packed).next().is_some() {
+            return Ok(packed);
+        }
+        Ok(cap_tool_result(provider, result, budget))
+    }
+
     fn search_packet(
         &mut self,
         query: &str,
@@ -160,40 +210,11 @@ impl HostRuntime {
         provider: &ProviderKind,
         budget: usize,
     ) -> Result<Value> {
-        let mut pack = |effective| -> Result<Value> {
-            let matches = self
-                .memory
-                .search_at(&self.eja, effective, through)
-                .map_err(|err| match err {
-                    eja_memory::Error::Invalid(text) => Error::Invalid(text),
-                    err => Error::Storage(err.to_string()),
-                })?;
-            let mut packed = json!({"cue": query, "matches": []});
-            if effective != query {
-                packed["used_cue"] = json!(effective);
-            }
-            let mut result = packed.clone();
-            result["matches"] = json!(matches);
-            if result_fits(&result.to_string(), provider, budget) {
-                return Ok(result);
-            }
-            packed["truncated"] = json!(true);
-            for hit in result["matches"].as_array().unwrap() {
-                packed["matches"].as_array_mut().unwrap().push(hit.clone());
-                if !result_fits(&packed.to_string(), provider, budget) {
-                    packed["matches"].as_array_mut().unwrap().pop();
-                }
-            }
-            if found(&packed).next().is_some() {
-                return Ok(packed);
-            }
-            Ok(cap_tool_result(provider, result, budget))
-        };
-        let original = pack(query)?;
+        let original = self.pack_search(query, query, through, provider, budget)?;
         if cue == query {
             return Ok(original);
         }
-        let learned = pack(cue)?;
+        let learned = self.pack_search(query, cue, through, provider, budget)?;
         if found(&learned).next().is_some()
             && receipts(&original).all(|id| receipts(&learned).any(|learned_id| learned_id == id))
         {
@@ -206,23 +227,17 @@ impl HostRuntime {
         &mut self,
         trigger: Id,
         trace: &SearchTurn,
-        answer: &str,
+        witness: Id,
         provider: &ProviderKind,
     ) -> Result<()> {
         let Some(root) = trace.visits.first() else {
             return Ok(());
         };
         let follows = |visit: &Visit, id| visit.batch > root.batch && visit.receipts.contains(&id);
-        let mut witnesses = answer
-            .split("[#")
-            .skip(1)
-            .filter_map(|part| part.split_once(']')?.0.parse::<Id>().ok())
-            .filter(|id| *id <= root.through && !root.seen.contains(id))
-            .filter(|&id| trace.visits.iter().any(|visit| follows(visit, id)));
-        let Some(witness) = witnesses.next() else {
-            return Ok(());
-        };
-        if witnesses.any(|id| id != witness) {
+        if witness > root.through
+            || root.seen.contains(&witness)
+            || !trace.visits.iter().any(|visit| follows(visit, witness))
+        {
             return Ok(());
         }
         let Fact::Returned { action, .. } = self.eja.read(witness)?.fact else {
@@ -250,7 +265,10 @@ impl HostRuntime {
                 return Ok(());
             }
             let cue = cue_text(&self.eja, candidate.cue)?;
-            if self.reaches(query, &cue, &candidate.case)? && self.reaches(query, &cue, &case)? {
+            let prior = &candidate.case;
+            let replay =
+                self.search_packet(query, &cue, prior.through, &prior.provider, prior.budget)?;
+            if prior.covered_by(&replay) && self.reaches(query, &cue, &case)? {
                 return self.eja.transaction(|tx| {
                     if tx.get_meta(&key)? != stored {
                         return Ok(());
@@ -324,8 +342,8 @@ impl HostRuntime {
     }
 
     fn reaches(&mut self, query: &str, cue: &str, case: &Case) -> Result<bool> {
-        let packet = self.search_packet(query, cue, case.through, &case.provider, case.budget)?;
-        let seen: BTreeSet<_> = receipts(&packet).collect();
-        Ok(seen.contains(&case.witness) && case.retained.is_subset(&seen))
+        // The delivered first packet already preserves every original-query receipt.
+        let packet = self.pack_search(query, cue, case.through, &case.provider, case.budget)?;
+        Ok(case.covered_by(&packet))
     }
 }

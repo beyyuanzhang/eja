@@ -206,6 +206,14 @@ public struct StreamItemDTO: Codable, Equatable, Identifiable, Sendable {
     public var id: Int64
     public var kind: String
     public var text: String
+    public var outcomeStatus: String?
+    public var receiptID: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, text
+        case outcomeStatus = "outcome_status"
+        case receiptID = "receipt_id"
+    }
 }
 
 public struct ProviderTestResult: Equatable, Sendable {

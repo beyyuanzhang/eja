@@ -1,8 +1,10 @@
 use crate::config::{
     write_json_atomic, CapabilityConfig, CapabilityTransport, ConfigPatch, HostConfig,
-    ProviderConfig,
+    ProviderConfig, ProviderKind,
 };
-use crate::hands::{activity_label, format_local_unix, Hands, ToolSpec, ToolTarget};
+use crate::hands::{
+    activity_label, format_local_unix, Hands, ToolSpec, ToolTarget, ANSWER_WITH_RECEIPT,
+};
 use crate::http::truncate_utf8;
 use crate::llm::{
     apply_tool_exchange, expire_tool_images, list_models, project_window_through, tool_messages,
@@ -83,6 +85,8 @@ pub struct StreamItem {
     pub proactive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<Id>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
 }
@@ -737,15 +741,7 @@ impl HostRuntime {
             self.set_status("thinking", "思考中…");
             self.refresh_capabilities(false);
             self.poll_oauth_events();
-            let mut tools = self.hands.tools();
-            if let Some(search) = tools
-                .iter_mut()
-                .find(|tool| search_turn.is_some() && tool.name == "search")
-            {
-                search.description.push_str(
-                    "查档案标签时只用完整标签作为 cue。证据足够就作答，用 [#123] 引用已观测回执。",
-                );
-            }
+            let tools = self.hands.tools(search_turn.is_some());
             let emit = &self.emit;
             let reply = match self.brain.complete_streaming(
                 &provider,
@@ -768,14 +764,24 @@ impl HostRuntime {
             };
             expire_tool_images(&mut messages, &provider.kind);
 
-            if reply.calls.is_empty() {
-                let text = normalize_reply_text(&reply.text, proactive);
+            let answer = match (reply.calls.as_slice(), &search_turn) {
+                ([], _) => Some((reply.text.as_str(), None)),
+                ([call], Some(trace)) if call.name == ANSWER_WITH_RECEIPT => call.args["text"]
+                    .as_str()
+                    .zip(call.args["receipt"].as_i64())
+                    .filter(|(text, id)| !text.trim().is_empty() && trace.received(*id))
+                    .map(|(text, id)| (text, Some(id))),
+                _ => None,
+            };
+            if let Some((text, receipt)) = answer {
+                let text = normalize_reply_text(text, proactive);
                 if let Err(err) = state::complete_turn(&self.eja, trigger_id, text) {
                     fatal_error = Some(format!("保存回合结算状态失败: {err}"));
                     break;
                 }
-                if let Some(trace) = &search_turn {
-                    if let Err(err) = self.learn_search(trigger_id, trace, text, &provider.kind) {
+                if let (Some(trace), Some(receipt)) = (&search_turn, receipt) {
+                    if let Err(err) = self.learn_search(trigger_id, trace, receipt, &provider.kind)
+                    {
                         self.emit_error(format!("保存检索策略失败: {err}"));
                     }
                 }
@@ -800,19 +806,18 @@ impl HostRuntime {
                 self.drain_turn_commands();
                 self.refresh_capabilities(false);
                 self.set_status("thinking", activity_label(&call.name));
-                if call.name == "search" {
-                    let query = call.args["cue"].as_str().unwrap_or("").trim();
-                    let result =
-                        self.search_turn(query, &provider.kind, budget, search_turn.as_mut());
-                    return match result {
-                        Ok(value) => Ok(ToolOutput::Value(value)),
-                        Err(eja_core::Error::Invalid(text)) => {
-                            Ok(ToolOutput::Value(json!({"error": text})))
-                        }
-                        Err(err) => Err(err.to_string()),
-                    };
+                match self.execute_tool_call(
+                    call,
+                    &tools,
+                    &provider.kind,
+                    budget,
+                    search_turn.as_mut(),
+                ) {
+                    Err(eja_core::Error::Invalid(msg)) => {
+                        Ok(ToolOutput::Value(json!({"error":msg})))
+                    }
+                    result => result.map_err(|err| err.to_string()),
                 }
-                self.execute_tool_call(call, &tools)
             });
             let mut anchor = self.anchor;
             let applied = step.and_then(|step| {
@@ -859,19 +864,31 @@ impl HostRuntime {
         &mut self,
         call: &ToolCall,
         tools: &[ToolSpec],
-    ) -> Result<ToolOutput, String> {
-        let result = match call.name.as_str() {
+        provider: &ProviderKind,
+        budget: usize,
+        trace: Option<&mut recall::SearchTurn>,
+    ) -> eja_core::Result<ToolOutput> {
+        match call.name.as_str() {
+            "search" => self
+                .search_turn(
+                    call.args["cue"].as_str().unwrap_or("").trim(),
+                    provider,
+                    budget,
+                    trace,
+                )
+                .map(ToolOutput::Value),
+            ANSWER_WITH_RECEIPT if trace.is_some() => Err(eja_core::Error::Invalid(
+                "请单独提交非空回复，并提供本回合检索已返回的已观测回执 ID".into(),
+            )),
             "keep" => {
                 let text = call.args["text"].as_str().unwrap_or("").trim();
-                let checker = match call.args.get("checker") {
-                    None | Some(Value::Null) => None,
-                    Some(value) => match value.as_str() {
-                        Some(name) => Some(name),
-                        None => {
-                            return Ok(ToolOutput::Value(json!({"error":"checker 需要规则名称"})))
-                        }
-                    },
-                };
+                let checker =
+                    match call.args.get("checker") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(value.as_str().ok_or_else(|| {
+                            eja_core::Error::Invalid("checker 需要规则名称".into())
+                        })?),
+                    };
                 state::keep_with_check(&self.eja, call.args["concern"].as_i64(), text, checker).map(
                     |entry| {
                         let Fact::Kept { concern, .. } = entry.fact else {
@@ -905,33 +922,20 @@ impl HostRuntime {
                 None => Err(eja_core::Error::Invalid("read 需要整数 fact".into())),
             },
             other => {
-                let Some(spec) = tools
+                let spec = tools
                     .iter()
-                    .find(|t| t.target != ToolTarget::Kernel && t.name == other)
-                else {
-                    return Ok(ToolOutput::Value(
-                        json!({ "error": format!("未知工具: {other}") }),
-                    ));
-                };
+                    .find(|tool| tool.target != ToolTarget::Kernel && tool.name == other)
+                    .ok_or_else(|| eja_core::Error::Invalid(format!("未知工具: {other}")))?;
                 if !self.hands.is_current(spec) {
-                    return Ok(ToolOutput::Value(
-                        json!({"error":"能力已关闭或变更，请按当前工具列表重试"}),
+                    return Err(eja_core::Error::Invalid(
+                        "能力已关闭或变更，请按当前工具列表重试".into(),
                     ));
                 }
-                let revision = self.eja.revision().map_err(|err| err.to_string())?;
-                let acted = self.eja.act(revision, &spec.capability, call.args.clone());
-                let acted = match acted {
-                    Ok(c) => c,
-                    Err(eja_core::Error::Invalid(msg)) => {
-                        return Ok(ToolOutput::Value(json!({ "error": msg })))
-                    }
-                    Err(err) => return Err(err.to_string()),
-                };
+                let acted =
+                    self.eja
+                        .act(self.eja.revision()?, &spec.capability, call.args.clone())?;
                 let execution = self.hands.execute(&acted, &self.eja);
-                let receipt = self
-                    .eja
-                    .finish(acted.id, execution.outcome)
-                    .map_err(|err| err.to_string())?;
+                let receipt = self.eja.finish(acted.id, execution.outcome)?;
                 if self.hands.disconnect_dead() {
                     self.emit_state(None);
                 }
@@ -945,11 +949,6 @@ impl HostRuntime {
                     ToolOutput::Images(value, execution.images)
                 })
             }
-        };
-        match result {
-            Ok(output) => Ok(output),
-            Err(eja_core::Error::Invalid(msg)) => Ok(ToolOutput::Value(json!({"error":msg}))),
-            Err(err) => Err(err.to_string()),
         }
     }
 
@@ -994,62 +993,43 @@ fn open_memory(index_path: &Path, resources_dir: Option<&Path>) -> MemoryIndex {
 }
 
 fn build_stream(entries: &[Entry], proactive_replies: &HashSet<Id>) -> Vec<StreamItem> {
-    let mut returns: HashMap<Id, &Outcome> = HashMap::new();
+    let mut returns = HashMap::new();
     for entry in entries {
         if let Fact::Returned { action, outcome } = &entry.fact {
-            returns.insert(*action, outcome);
+            returns.insert(*action, (entry.id, outcome));
         }
     }
     let mut items = Vec::new();
     for entry in entries {
         match &entry.fact {
-            Fact::Noticed { source, text } => {
-                let kind = if *source == Source::Person {
-                    "person"
-                } else {
-                    "event"
+            Fact::Noticed { text, .. } | Fact::Said { text } => {
+                let kind = match entry.fact {
+                    Fact::Noticed {
+                        source: Source::Person,
+                        ..
+                    } => "person",
+                    Fact::Said { .. } => "eja",
+                    _ => "event",
                 };
                 items.push(StreamItem {
                     id: entry.id,
                     kind: kind.into(),
                     text: text.clone(),
                     detail: None,
-                    proactive: None,
+                    proactive: (kind == "eja" && proactive_replies.contains(&entry.id))
+                        .then_some(true),
                     outcome_status: None,
+                    receipt_id: None,
                     truncated: None,
                 });
             }
-            Fact::Said { text } => {
-                let proactive = proactive_replies.contains(&entry.id);
-                items.push(StreamItem {
-                    id: entry.id,
-                    kind: "eja".into(),
-                    text: text.clone(),
-                    detail: None,
-                    proactive: proactive.then_some(true),
-                    outcome_status: None,
-                    truncated: None,
-                });
-            }
-            Fact::Acted { capability, input } => {
-                let outcome = returns.get(&entry.id).copied();
-                let (outcome_text, outcome_status, truncated) = match outcome {
-                    Some(Outcome::Observed(s)) => (
-                        Some(s.clone()),
-                        Some("observed".to_string()),
-                        is_truncated_receipt(s).then_some(true),
-                    ),
-                    Some(Outcome::Failed(s)) => (
-                        Some(format!("失败: {s}")),
-                        Some("failed".to_string()),
-                        is_truncated_receipt(s).then_some(true),
-                    ),
-                    Some(Outcome::Unknown(s)) => (
-                        Some(format!("未知: {s}")),
-                        Some("unknown".to_string()),
-                        is_truncated_receipt(s).then_some(true),
-                    ),
-                    None => (None, Some("pending".to_string()), None),
+            Fact::Acted { capability, input } if capability != recall::CHANGE => {
+                let receipt = returns.get(&entry.id).copied();
+                let (status, prefix, detail) = match receipt.map(|(_, outcome)| outcome) {
+                    Some(Outcome::Observed(text)) => ("observed", "", Some(text)),
+                    Some(Outcome::Failed(text)) => ("failed", "失败: ", Some(text)),
+                    Some(Outcome::Unknown(text)) => ("unknown", "未知: ", Some(text)),
+                    None => ("pending", "", None),
                 };
                 let label = match capability.as_str() {
                     "wake" => format!(
@@ -1069,10 +1049,15 @@ fn build_stream(entries: &[Entry], proactive_replies: &HashSet<Id>) -> Vec<Strea
                     id: entry.id,
                     kind: "event".into(),
                     text: label,
-                    detail: outcome_text.or_else(|| serde_json::to_string_pretty(input).ok()),
+                    detail: detail
+                        .map(|text| format!("{prefix}{text}"))
+                        .or_else(|| serde_json::to_string_pretty(input).ok()),
                     proactive: None,
-                    outcome_status,
-                    truncated,
+                    outcome_status: Some(status.into()),
+                    receipt_id: receipt.map(|(id, _)| id),
+                    truncated: detail
+                        .filter(|text| is_truncated_receipt(text))
+                        .map(|_| true),
                 });
             }
             _ => {}
@@ -3011,6 +2996,19 @@ for line in sys.stdin:
 
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn execution_status_comes_from_the_journal_receipt() {
+        let eja = Eja::open(":memory:").unwrap();
+        let said = eja.say("已经执行并核验。").unwrap();
+        let acted = eja.act(said, "check", json!({})).unwrap().id;
+        let observed = eja.finish(acted, Outcome::Observed("ok".into())).unwrap();
+        let stream = build_stream(&eja.recent(10).unwrap(), &HashSet::new());
+        assert_eq!(stream.len(), 2);
+        assert!(stream[0].outcome_status.is_none() && stream[0].receipt_id.is_none());
+        assert_eq!(stream[1].outcome_status.as_deref(), Some("observed"));
+        assert_eq!(stream[1].receipt_id, Some(observed.id));
     }
 
     #[test]

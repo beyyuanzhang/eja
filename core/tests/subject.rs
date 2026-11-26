@@ -71,6 +71,13 @@ fn tx_evidence_reflects_in_tx_settlement() -> Result<()> {
         assert_eq!(ev.latest.as_ref().map(|e| e.id), Some(obs.id));
         Ok(())
     })?;
+    let settled = eja.evidence(unk.id)?.latest.unwrap();
+    assert!(eja.evidence_at(unk.id, unk.id)?.latest.is_none());
+    assert!(matches!(
+        eja.evidence_at(settled.id, unk.id),
+        Err(eja_core::Error::Invalid(_))
+    ));
+    assert_eq!(eja.evidence_at(settled.id, settled.id)?.entry, settled);
     Ok(())
 }
 

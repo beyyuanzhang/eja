@@ -97,6 +97,9 @@ fn receipt_at_on(conn: &Connection, action: Id, through: Id) -> Result<Option<En
 }
 
 fn evidence_at_on(conn: &Connection, id: Id, revision: Id) -> Result<Evidence> {
+    if id > revision {
+        return Err(Error::invalid("fact is outside the requested revision"));
+    }
     let entry = read_on(conn, id)?;
     let latest = match &entry.fact {
         Fact::Returned { action, .. } => receipt_at_on(conn, *action, revision)?,
@@ -447,6 +450,7 @@ impl Eja {
         self.evidence_at(id, self.revision()?)
     }
 
+    /// Read the fact and any superseding update visible at this revision.
     pub fn evidence_at(&self, id: Id, revision: Id) -> Result<Evidence> {
         evidence_at_on(&self.db, id, revision)
     }

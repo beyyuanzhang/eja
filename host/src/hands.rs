@@ -51,6 +51,8 @@ pub enum ToolTarget {
     Capability(u64),
 }
 
+pub const ANSWER_WITH_RECEIPT: &str = "answer_with_receipt";
+
 fn builtin_spec(name: &str, description: &str, schema: Value, target: ToolTarget) -> ToolSpec {
     ToolSpec {
         capability: name.into(),
@@ -128,7 +130,7 @@ impl Hands {
         self.capabilities.statuses()
     }
 
-    pub fn tools(&self) -> Vec<ToolSpec> {
+    pub fn tools(&self, receipt_answer: bool) -> Vec<ToolSpec> {
         let mut specs = vec![
             builtin_spec(
                 "keep",
@@ -214,6 +216,22 @@ impl Hands {
             ),
         ];
 
+        if receipt_answer {
+            specs.push(builtin_spec(
+                ANSWER_WITH_RECEIPT,
+                "用检索已返回的已观测回执结束回合。此调用须单独提交。",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "minLength": 1 },
+                        "receipt": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["text", "receipt"],
+                    "additionalProperties": false
+                }),
+                ToolTarget::Kernel,
+            ));
+        }
         let mut used: HashSet<String> = specs.iter().map(|spec| spec.name.clone()).collect();
 
         for (tool, generation) in self.capabilities.tools() {

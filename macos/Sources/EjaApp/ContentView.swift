@@ -186,7 +186,7 @@ struct ContentView: View {
     private var visibleItems: [StreamItemDTO] {
         guard ui.baselineId >= 0 else { return [] }
         return client.stream.filter { item in
-            item.id > ui.baselineId && (item.kind == "person" || item.kind == "eja")
+            item.id > ui.baselineId && (item.kind == "person" || item.kind == "eja" || item.outcomeStatus != nil)
         }
     }
 
@@ -243,6 +243,20 @@ struct ContentView: View {
                     .padding(.vertical, 8.5)
                     .background(EjaTheme.surfaceSubtle)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+            }
+        case "event":
+            if let status = item.outcomeStatus {
+                let label = switch status {
+                case "observed": "已观测"
+                case "failed": "失败"
+                case "unknown": "未知"
+                default: "等待回执"
+                }
+                let reference = item.receiptID.map { "回执 #\($0)" } ?? "工具"
+                Text(verbatim: "\(reference) · \(label) · \(item.text)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(EjaTheme.inkSecondary)
+                    .textSelection(.enabled)
             }
         default:
             ejaTextRow(item.text)

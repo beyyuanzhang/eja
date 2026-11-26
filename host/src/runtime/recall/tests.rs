@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     config::{HostConfig, ProviderConfig},
-    hands::ToolSpec,
+    hands::{ToolSpec, ANSWER_WITH_RECEIPT},
     llm::{Brain, HttpBrain, ModelReply},
     state,
 };
@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 struct Judge {
     requests: Mutex<Vec<Vec<String>>>,
     searches: Mutex<Vec<String>>,
+    answer_receipts: Mutex<Vec<Id>>,
 }
 
 impl Brain for Judge {
@@ -23,9 +24,7 @@ impl Brain for Judge {
         tools: &[ToolSpec],
     ) -> std::result::Result<ModelReply, String> {
         assert!(!system.contains("[#123]"));
-        for tool in tools {
-            assert_eq!(tool.description.contains("[#123]"), tool.name == "search");
-        }
+        assert!(tools.iter().any(|tool| tool.name == ANSWER_WITH_RECEIPT));
         let results = messages
             .iter()
             .flat_map(|message| {
@@ -46,6 +45,13 @@ impl Brain for Judge {
                 .iter()
                 .filter(|call| call.name == "search")
                 .filter_map(|call| call.args["cue"].as_str().map(str::to_owned)),
+        );
+        self.answer_receipts.lock().unwrap().extend(
+            reply
+                .calls
+                .iter()
+                .filter(|call| call.name == ANSWER_WITH_RECEIPT)
+                .filter_map(|call| call.args["receipt"].as_i64()),
         );
         Ok(reply)
     }
@@ -114,6 +120,8 @@ fn search_keeps_complete_receipts_when_a_higher_ranked_match_overflows() {
             [id]
         );
         assert_eq!(trace.visits[0].receipts, BTreeSet::from([id]));
+        assert!(trace.received(id));
+        assert!(!trace.received(id + 1));
         assert!(rt
             .search_turn("", &provider, 0, Some(&mut trace))
             .unwrap()
@@ -152,13 +160,7 @@ fn independent_receipt_rejects_a_draft_route_and_commits_the_shared_route() {
         trace.batch = usize::from(independent_batch);
         rt.search_turn(query, &provider, 4096, Some(&mut trace))
             .unwrap();
-        rt.learn_search(
-            trigger,
-            &trace,
-            &format!("signed [#{cited}] from directory [#{directory}]"),
-            &provider,
-        )
-        .unwrap();
+        rt.learn_search(trigger, &trace, cited, &provider).unwrap();
     };
     let stored =
         |rt: &HostRuntime| read_policy(rt.eja.get_meta(&key("ROOT")).unwrap().as_deref()).unwrap();
@@ -268,7 +270,7 @@ fn search_replay_rsi_with_vectors() {
         trace.batch = 1;
         let followup = search(&mut rt, cue, Some(&mut trace));
         assert!(receipts(&followup).any(|seen| seen == id));
-        rt.learn_search(trigger, &trace, &format!("[#{id}]"), &ProviderKind::OpenAi)
+        rt.learn_search(trigger, &trace, id, &ProviderKind::OpenAi)
             .unwrap();
     }
     let id = receipt(
@@ -341,7 +343,7 @@ fn run_rsi_lineage(config: Option<&HostConfig>) {
     );
     let question = |name: &str, generation: usize| {
         format!(
-            "请先用归档入口 {root} 搜索，核验第 {generation} 批{name}的场地预约。其余档案标签只从档案材料取得。只输出该厅的正式凭证码以及对应的原始回执编号 [#ID]。"
+            "核验第 {generation} 批{name}的场地预约。首次 search 的 cue 只填完整入口 {root}。看到其他档案标签时同样原样搜索。看到目标凭证和对应回执 ID 后，用 answer_with_receipt 提交，text 填凭证码，receipt 填整数 ID。"
         )
     };
     let add_receipt = |rt: &HostRuntime, name: &str, index: usize, link: bool| {
@@ -373,6 +375,7 @@ fn run_rsi_lineage(config: Option<&HostConfig>) {
         let cursor = rt.eja.revision().unwrap();
         let start = judge.requests.lock().unwrap().len();
         let search_start = judge.searches.lock().unwrap().len();
+        let answer_start = judge.answer_receipts.lock().unwrap().len();
         rt.handle_user_message(prompt);
         let answer = rt
             .eja
@@ -401,15 +404,16 @@ fn run_rsi_lineage(config: Option<&HostConfig>) {
             })
             .map(|index| index + 1);
         let errors = errors.lock().unwrap();
-        println!("receipt={id} receipt_call={receipt_call:?} calls={} searches={:?} answer={answer:?} errors={errors:?}",
-            requests.len() - start, &searches[search_start..]);
+        let answer_receipts = judge.answer_receipts.lock().unwrap();
+        println!("receipt={id} receipt_call={receipt_call:?} calls={} searches={:?} answer={answer:?} selected={:?} errors={errors:?}",
+            requests.len() - start, &searches[search_start..], &answer_receipts[answer_start..]);
         assert!(errors.iter().all(|message| {
             message
                 .as_str()
                 .is_some_and(|message| message == "达到单回合最大步数上限 (8)，回合已暂停")
         }));
-        let correct = answer
-            .is_some_and(|answer| answer.contains(code) && answer.contains(&format!("[#{id}]")));
+        let correct = answer.is_some_and(|answer| answer.contains(code))
+            && answer_receipts[answer_start..].contains(&id);
         (receipt_call, requests.len() - start, correct)
     };
 
@@ -473,8 +477,7 @@ fn run_rsi_lineage(config: Option<&HostConfig>) {
                     .search_turn(&routes[index], &provider, 6000, Some(&mut trace))
                     .unwrap();
                 assert!(visible(&second, id));
-                rt.learn_search(trigger, &trace, &format!("{code} [#{id}]"), &provider)
-                    .unwrap();
+                rt.learn_search(trigger, &trace, id, &provider).unwrap();
             }
             witnesses.push(id);
             if which == 0 {
@@ -571,8 +574,7 @@ fn run_rsi_lineage(config: Option<&HostConfig>) {
             .search_turn(alternative, &provider, 6000, Some(&mut trace))
             .unwrap();
         assert!(visible(&second, id) && confirmed.iter().all(|&id| !visible(&second, id)));
-        rt.learn_search(trigger, &trace, &format!("签发 [#{id}]"), &provider)
-            .unwrap();
+        rt.learn_search(trigger, &trace, id, &provider).unwrap();
     }
     let policy = read_policy(rt.eja.get_meta(&key(&root)).unwrap().as_deref()).unwrap();
     assert_eq!(policy.active, parent);
@@ -635,7 +637,7 @@ fn search_replay_inherited_policy_helps_next_update() {
             .search_turn(local, &provider, 4096, Some(&mut trace))
             .unwrap();
         inherited
-            .learn_search(trigger, &trace, &format!("核验成功 [#{id}]"), &provider)
+            .learn_search(trigger, &trace, id, &provider)
             .unwrap();
     }
     let (parent, _) = active(&inherited, root).unwrap();
@@ -693,8 +695,7 @@ fn search_replay_inherited_policy_helps_next_update() {
             let visible = receipts(&second).any(|seen| seen == id);
             assert_eq!(visible, learned);
             if visible {
-                rt.learn_search(trigger, &trace, &format!("核验成功 [#{id}]"), &provider)
-                    .unwrap();
+                rt.learn_search(trigger, &trace, id, &provider).unwrap();
             }
         }
     }
