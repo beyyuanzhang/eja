@@ -5,7 +5,8 @@ use std::io::{self, Read, Write};
 use std::os::{fd::AsRawFd, unix::process::CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(target_os = "macos")]
@@ -23,8 +24,6 @@ use std::fs::File;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::io::{FromRawFd, OwnedFd};
-#[cfg(target_os = "macos")]
-use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -270,6 +269,7 @@ pub struct Sandbox {
     profile: String,
     #[cfg(target_os = "macos")]
     params: Vec<OsString>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Sandbox {
@@ -289,12 +289,23 @@ impl Sandbox {
         let ancestors = collect_ancestors(&[protected.as_path(), host_exe.as_path()]);
         let (profile, params) =
             build_seatbelt_policy(&protected, &host_exe, app_bundle.as_deref(), &ancestors);
-        Ok(Self { profile, params })
+        Ok(Self {
+            profile,
+            params,
+            cancel: Arc::default(),
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
     pub fn new(_protected_dir: &Path) -> Result<Self, String> {
-        Ok(Self {})
+        Ok(Self {
+            cancel: Arc::default(),
+        })
+    }
+
+    /// Shared stop switch for work started under this sandbox; clones observe the same flag.
+    pub fn cancel_flag(&self) -> &Arc<AtomicBool> {
+        &self.cancel
     }
 
     pub fn command<I, S>(&self, program: impl AsRef<OsStr>, args: I) -> Command

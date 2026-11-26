@@ -9,6 +9,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
+use std::sync::atomic::AtomicBool;
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
 const TOOL_IMAGE_CONTEXT: &str = "图像来自工具调用 ";
@@ -37,6 +38,7 @@ pub trait Brain: Send + Sync {
         tools: &[ToolSpec],
     ) -> Result<ModelReply, String>;
 
+    #[allow(clippy::too_many_arguments)]
     fn complete_streaming(
         &self,
         provider: &ProviderConfig,
@@ -45,6 +47,7 @@ pub trait Brain: Send + Sync {
         messages: &[Value],
         tools: &[ToolSpec],
         on_delta: &mut dyn FnMut(&str),
+        _cancel: &AtomicBool,
     ) -> Result<ModelReply, String> {
         let reply = self.complete(provider, model, system, messages, tools)?;
         if !reply.text.is_empty() {
@@ -67,7 +70,7 @@ impl Brain for HttpBrain {
         messages: &[Value],
         tools: &[ToolSpec],
     ) -> Result<ModelReply, String> {
-        complete_wire(provider, model, system, messages, Some(tools), None)
+        complete_wire(provider, model, system, messages, Some(tools), None, None)
     }
 
     fn complete_streaming(
@@ -78,6 +81,7 @@ impl Brain for HttpBrain {
         messages: &[Value],
         tools: &[ToolSpec],
         on_delta: &mut dyn FnMut(&str),
+        cancel: &AtomicBool,
     ) -> Result<ModelReply, String> {
         complete_wire(
             provider,
@@ -86,6 +90,7 @@ impl Brain for HttpBrain {
             messages,
             Some(tools),
             Some(on_delta),
+            Some(cancel),
         )
     }
 
@@ -95,6 +100,7 @@ impl Brain for HttpBrain {
             model,
             "Reply with OK.",
             &[user_message("ping")],
+            None,
             None,
             None,
         )?
@@ -749,11 +755,14 @@ fn complete_wire(
     messages: &[Value],
     tools: Option<&[ToolSpec]>,
     on_delta: Option<&mut dyn FnMut(&str)>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ModelReply, String> {
     match provider.kind {
-        ProviderKind::OpenAi => call_openai(provider, model, system, messages, tools, on_delta),
+        ProviderKind::OpenAi => {
+            call_openai(provider, model, system, messages, tools, on_delta, cancel)
+        }
         ProviderKind::Anthropic => {
-            call_anthropic(provider, model, system, messages, tools, on_delta)
+            call_anthropic(provider, model, system, messages, tools, on_delta, cancel)
         }
     }
 }
@@ -789,6 +798,7 @@ fn call_openai(
     messages: &[Value],
     tools: Option<&[ToolSpec]>,
     mut on_delta: Option<&mut dyn FnMut(&str)>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ModelReply, String> {
     let api_root = provider.api_root()?;
     let url = format!("{api_root}/chat/completions");
@@ -813,7 +823,7 @@ fn call_openai(
         }
     };
     let mut acc = OpenAiStreamAcc::default();
-    let resp = post_json(&url, &headers, &body, |line| {
+    let resp = post_json(&url, &headers, &body, cancel, |line| {
         acc.feed_line(line, &mut notify);
     })?;
     if !acc.saw_sse {
@@ -952,6 +962,7 @@ fn call_anthropic(
     messages: &[Value],
     tools: Option<&[ToolSpec]>,
     mut on_delta: Option<&mut dyn FnMut(&str)>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ModelReply, String> {
     let api_root = provider.api_root()?;
     let url = format!("{api_root}/messages");
@@ -977,7 +988,7 @@ fn call_anthropic(
         }
     };
     let mut acc = AnthropicStreamAcc::default();
-    let resp = post_json(&url, &headers, &body, |line| {
+    let resp = post_json(&url, &headers, &body, cancel, |line| {
         acc.feed_line(line, &mut notify);
     })?;
     if acc.saw_sse {
@@ -1160,10 +1171,12 @@ fn post_json(
     url: &str,
     headers: &[(String, String)],
     body: &Value,
+    cancel: Option<&AtomicBool>,
     on_line: impl FnMut(&str),
 ) -> Result<Value, String> {
     let bytes = serde_json::to_vec(body).map_err(|err| err.to_string())?;
-    let resp = post_stream(url, headers, &bytes, 300, on_line).map_err(http_error_message)?;
+    let resp =
+        post_stream(url, headers, &bytes, 300, cancel, on_line).map_err(http_error_message)?;
     let parsed: Value =
         serde_json::from_str(&resp.body).unwrap_or_else(|_| json!({ "raw": resp.body }));
     if !(200..300).contains(&resp.status) {

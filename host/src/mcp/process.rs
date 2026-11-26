@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -193,12 +194,21 @@ pub(super) fn run_process(
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) if out_handle.is_finished() && err_handle.is_finished() => break Some(st),
-            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(_)
+                if Instant::now() < deadline && !sandbox.cancel_flag().load(Ordering::Relaxed) =>
+            {
+                thread::sleep(Duration::from_millis(10))
+            }
             _ => {
                 kill_process_tree(&mut child);
                 break None;
             }
         }
+    };
+    let stopped = if sandbox.cancel_flag().load(Ordering::Relaxed) {
+        "已中止".to_string()
+    } else {
+        format!("命令超时 ({}s)", timeout.as_secs())
     };
     let succeeded = status.is_some_and(|status| status.success()) && input_error.is_none();
     let bounded = match (out_handle.join(), err_handle.join()) {
@@ -233,15 +243,14 @@ pub(super) fn run_process(
     };
     if let Some(err) = input_error {
         if err.kind() == io::ErrorKind::TimedOut || status.is_none() {
-            return Outcome::Unknown(format!("命令超时 ({}s): {bounded}", timeout.as_secs()))
-                .into();
+            return Outcome::Unknown(format!("{stopped}: {bounded}")).into();
         }
         return Outcome::Unknown(format!("工具输入未完整写入: {err}\n{bounded}")).into();
     }
     match status {
         Some(st) if st.success() => Outcome::Observed(bounded),
         Some(st) => Outcome::Failed(format!("exit {}: {bounded}", st.code().unwrap_or(-1))),
-        None => Outcome::Unknown(format!("命令超时 ({}s): {bounded}", timeout.as_secs())),
+        None => Outcome::Unknown(format!("{stopped}: {bounded}")),
     }
     .into()
 }
@@ -399,5 +408,31 @@ mod tests {
         );
         assert!(matches!(result.outcome, Outcome::Unknown(ref msg) if msg.contains("命令超时")));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn cancel_flag_stops_a_running_process_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = TrustedDir::open(dir.path()).unwrap();
+        let core = dir.path().join("private");
+        fs::create_dir(&core).unwrap();
+        let sandbox = Sandbox::new(&core).unwrap();
+        let flag = std::sync::Arc::clone(sandbox.cancel_flag());
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let outcome = run_shell(
+            &sandbox,
+            "sleep 30",
+            dir.path(),
+            Duration::from_secs(60),
+            &data,
+            1,
+        );
+        stopper.join().unwrap();
+        assert!(matches!(outcome, Outcome::Unknown(ref msg) if msg.starts_with("已中止")));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

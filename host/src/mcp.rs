@@ -15,6 +15,7 @@ use std::fmt::Write;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
     Arc, Mutex,
 };
@@ -170,6 +171,7 @@ impl StdioConnection {
         method: &str,
         params: Value,
         timeout: Duration,
+        cancel: Option<&AtomicBool>,
     ) -> Result<Value, RequestError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -184,11 +186,23 @@ impl StdioConnection {
                     self.with_stderr(format!("MCP 请求超时 ({method})")),
                 ));
             }
-            let Ok(raw) = self.rx.recv_timeout(remaining) else {
-                self.broken = true;
-                return Err(RequestError::Unknown(
-                    self.with_stderr(format!("MCP 响应超时或进程退出 ({method})")),
-                ));
+            let raw = match self
+                .rx
+                .recv_timeout(remaining.min(Duration::from_millis(50)))
+            {
+                Ok(raw) => raw,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                        return Err(RequestError::Unknown(format!("MCP 请求已中止 ({method})")));
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.broken = true;
+                    return Err(RequestError::Unknown(
+                        self.with_stderr(format!("MCP 响应超时或进程退出 ({method})")),
+                    ));
+                }
             };
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -267,6 +281,7 @@ impl HttpConnection {
         params: Value,
         tool: Option<&CapabilityTool>,
         timeout: Duration,
+        cancel: Option<&AtomicBool>,
     ) -> Result<Value, RequestError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -296,6 +311,7 @@ impl HttpConnection {
             &headers,
             payload.as_bytes(),
             timeout.as_secs().max(1),
+            cancel,
         )
         .map_err(|err| match err {
             HttpError::Launch(msg) => RequestError::Failed(msg),
@@ -515,10 +531,11 @@ impl ActiveConnection {
         params: Value,
         tool: Option<&CapabilityTool>,
         timeout: Duration,
+        cancel: Option<&AtomicBool>,
     ) -> Result<Value, RequestError> {
         match self {
-            Self::Stdio(conn) => conn.request(method, params, timeout),
-            Self::Http(conn) => conn.request(method, params, tool, timeout),
+            Self::Stdio(conn) => conn.request(method, params, timeout, cancel),
+            Self::Http(conn) => conn.request(method, params, tool, timeout, cancel),
             Self::Builtin | Self::Exec { .. } => Err(RequestError::Failed(
                 "非 MCP 能力不支持 JSON-RPC 请求".into(),
             )),
@@ -864,6 +881,7 @@ impl CapabilityPool {
                 json!({ "name": tool.name, "arguments": args }),
                 Some(tool),
                 TOOL_TIMEOUT,
+                Some(self.sandbox.cancel_flag().as_ref()),
             )
         };
         let response = match request(connection) {
@@ -983,7 +1001,7 @@ fn list_tools(
             return Err("MCP 工具列表请求超时".into());
         }
         let result = conn
-            .request("tools/list", params, None, timeout)
+            .request("tools/list", params, None, timeout, None)
             .map_err(RequestError::into_message)?;
         if result["resultType"] != "complete" {
             return Err("MCP 工具列表缺少完整结果".into());

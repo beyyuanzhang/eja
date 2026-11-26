@@ -154,18 +154,18 @@ struct ContentView: View {
             .padding(.leading, 8)
             .padding(.vertical, 5)
 
-            Button { sendDraft() } label: {
-                Image(systemName: "arrow.up")
+            Button { canStop ? client.cancelTurn() : sendDraft() } label: {
+                Image(systemName: canStop ? "stop.fill" : "arrow.up")
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(canSend ? EjaTheme.canvas : EjaTheme.inkMuted)
+                    .foregroundStyle(canSend || canStop ? EjaTheme.canvas : EjaTheme.inkMuted)
                     .frame(width: 26, height: 26)
                     .background(
                         Circle()
-                            .fill(canSend ? EjaTheme.ink.opacity(ui.sendHovered ? 0.86 : 1.0) : EjaTheme.surfaceSubtle)
+                            .fill(canSend || canStop ? EjaTheme.ink.opacity(ui.sendHovered ? 0.86 : 1.0) : EjaTheme.surfaceSubtle)
                     )
             }
             .buttonStyle(SendScaleButtonStyle())
-            .disabled(!canSend)
+            .disabled(!canSend && !canStop)
             .onHover { ui.sendHovered = $0 }
             .animation(.easeOut(duration: 0.15), value: canSend)
         }
@@ -215,6 +215,10 @@ struct ContentView: View {
 
     private var canSend: Bool {
         client.isReady && !ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canStop: Bool {
+        client.status == "thinking" && ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func sendDraft() {

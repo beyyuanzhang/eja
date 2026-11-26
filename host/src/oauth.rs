@@ -165,7 +165,13 @@ pub fn discover_oauth_metadata(
         for (k, v) in custom_headers {
             probe_headers.push((k.clone(), v.clone()));
         }
-        if let Ok(resp) = post_bytes(mcp_url, &probe_headers, b"{}", OAUTH_HTTP_TIMEOUT_SECS) {
+        if let Ok(resp) = post_bytes(
+            mcp_url,
+            &probe_headers,
+            b"{}",
+            OAUTH_HTTP_TIMEOUT_SECS,
+            None,
+        ) {
             if let Some(meta_url) =
                 extract_www_authenticate_param(&resp.headers, "resource_metadata")
             {
@@ -517,6 +523,7 @@ fn register_dynamic_client(
         ],
         &body,
         OAUTH_HTTP_TIMEOUT_SECS,
+        None,
     )
     .map_err(|err| format!("OAuth 动态注册请求失败: {err:?}"))?;
     if !(200..300).contains(&resp.status) {
@@ -698,6 +705,7 @@ fn post_form(url: &str, pairs: &[(&str, String)]) -> Result<HttpResponse, String
         ],
         body.as_bytes(),
         OAUTH_HTTP_TIMEOUT_SECS,
+        None,
     )
     .map_err(|err| format!("{err:?}"))
 }

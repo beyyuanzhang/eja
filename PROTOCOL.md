@@ -36,6 +36,8 @@ eja-host --data-dir "<data_dir>"
 ## 输入指令（Frontend -> Host，每行一条 JSON）
 
 - 发送消息 `{"cmd":"send","text":"你好"}`
+  回合进行中发送的消息立即写入日志并推送状态快照，当前回合结束后按顺序触发新回合。
+- 中止当前回合 `{"cmd":"cancel"}`。宿主立即终止进行中的模型流、本地进程与 MCP 等待，被中断的工具回执记为未知，当前回合不回复且不重试。空闲时忽略。
 - 保存配置 `{"cmd":"save_config","id":"请求标识","config":{...}}`。各配置域可单独更新。带 `id` 时，保存后的状态快照会带回 `save_id`。空 `api_key` 只复用当前数据目录下同一 Provider ID、接口类型及 API 根地址的密钥。
 - 测试 Provider `{"cmd":"test_provider","id":"openai","provider":{...},"model":"gpt-4o"}`。密钥复用规则与保存配置一致。
 - 获取模型列表 `{"cmd":"list_models","id":"请求标识","provider":{...}}`。由宿主按当前数据目录和 Provider 配置请求。

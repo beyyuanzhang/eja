@@ -14,17 +14,25 @@ use serde_json::{json, Value};
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
 
-fn read_commands(reader: impl BufRead, sender: Sender<Result<HostCommand, String>>) {
+fn read_commands(
+    reader: impl BufRead,
+    sender: Sender<Result<HostCommand, String>>,
+    cancel: Arc<AtomicBool>,
+) {
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
         let command = serde_json::from_str(&line).map_err(|err| format!("无效指令: {err}"));
+        if matches!(command, Ok(HostCommand::Cancel)) {
+            cancel.store(true, Ordering::Relaxed);
+        }
         if sender.send(command).is_err() {
             return;
         }
@@ -69,7 +77,8 @@ fn main() {
         }
     };
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || read_commands(io::stdin().lock(), tx));
+    let cancel = runtime.cancel_handle();
+    thread::spawn(move || read_commands(io::stdin().lock(), tx, cancel));
     if let Err(err) = runtime.run(rx) {
         runtime.emit_error(err);
     }

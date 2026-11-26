@@ -74,6 +74,7 @@ pub enum HostCommand {
         id: String,
     },
     ReloadCapabilities,
+    Cancel,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,6 +139,7 @@ pub struct HostRuntime {
     status: (String, String),
     brain: Arc<dyn Brain>,
     emit: EventSink,
+    cancel: Arc<AtomicBool>,
 }
 
 fn needs_mcp_connection(capability: &CapabilityConfig) -> bool {
@@ -204,6 +206,7 @@ impl HostRuntime {
         } else {
             ("idle".into(), "在线".into())
         };
+        let cancel = Arc::clone(sandbox.cancel_flag());
         let hands = Hands::open(
             data_dir.clone(),
             core_dir.clone(),
@@ -233,7 +236,17 @@ impl HostRuntime {
             status,
             brain,
             emit,
+            cancel,
         })
+    }
+
+    /// Flag the command reader sets as soon as `cancel` arrives, even while a turn blocks.
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     pub fn connect_external_capabilities(&mut self) {
@@ -290,6 +303,7 @@ impl HostRuntime {
                 }
                 Ok(HostCommand::OauthCapability { id }) => self.oauth_capability(id),
                 Ok(HostCommand::ReloadCapabilities) => self.reload_capabilities(),
+                Ok(HostCommand::Cancel) => self.cancel.store(false, Ordering::Relaxed),
                 Err(err) => self.emit_error(err),
             }
         }
@@ -298,11 +312,29 @@ impl HostRuntime {
     fn drain_turn_commands(&mut self) {
         while let Some(command) = self.inbox.as_ref().and_then(|inbox| inbox.try_recv().ok()) {
             match command {
+                Ok(HostCommand::Send { text }) => {
+                    if self.record_user_message(&text) {
+                        self.emit_state(None);
+                    }
+                }
                 Ok(HostCommand::SaveConfig { config, id }) => {
                     self.save_config_request(config, id, false)
                 }
                 Ok(HostCommand::ReloadCapabilities) => self.reload_capabilities(),
+                Ok(HostCommand::Cancel) => {}
                 command => self.deferred.push_back(command),
+            }
+        }
+        if self
+            .next_wake_delay()
+            .is_ok_and(|delay| delay.is_some_and(|delay| delay.is_zero()))
+        {
+            match watch::tick(&self.eja, &self.data_dir, format_local_unix, |error| {
+                self.emit_error(error)
+            }) {
+                Ok((false, false)) => {}
+                Ok(_) => self.emit_state(None),
+                Err(err) => self.emit_error(err.to_string()),
             }
         }
     }
@@ -348,7 +380,9 @@ impl HostRuntime {
         loop {
             match state::next_trigger(&self.eja) {
                 Ok(Some((id, source))) => {
-                    if !self.run_turn(source != Source::Person, id) {
+                    let completed = self.run_turn(source != Source::Person, id);
+                    self.cancel.store(false, Ordering::Relaxed);
+                    if !completed {
                         return;
                     }
                 }
@@ -573,13 +607,20 @@ impl HostRuntime {
         });
     }
 
-    pub fn handle_user_message(&mut self, raw: &str) {
+    fn record_user_message(&mut self, raw: &str) -> bool {
         let text = raw.trim();
         if text.is_empty() {
-            return;
+            return false;
         }
         if let Err(err) = self.eja.notice(Source::Person, text) {
             self.emit_error(format!("写入消息失败: {err}"));
+            return false;
+        }
+        true
+    }
+
+    pub fn handle_user_message(&mut self, raw: &str) {
+        if !self.record_user_message(raw) {
             return;
         }
         self.clear_retry();
@@ -721,6 +762,9 @@ impl HostRuntime {
         .then(|| recall::SearchTurn::new(policy_head));
         for _ in 0..max_steps {
             self.drain_turn_commands();
+            if self.cancelled() {
+                break;
+            }
             self.set_status("thinking", "思考中…");
             self.refresh_capabilities(false);
             self.poll_oauth_events();
@@ -737,6 +781,7 @@ impl HostRuntime {
                         (emit)(json!({ "event": "delta", "text": delta }));
                     }
                 },
+                &self.cancel,
             ) {
                 Ok(r) => r,
                 Err(err) => {
@@ -812,6 +857,9 @@ impl HostRuntime {
 
         if completed {
             self.clear_retry();
+        } else if self.cancelled() {
+            self.clear_retry();
+            completed = state::complete_turn(&self.eja, trigger_id, "").is_ok();
         } else if let Some(err) = fatal_error {
             if recoverable && self.retry_attempts < MAX_RETRY_ATTEMPTS {
                 let delay_secs = 5u64 * 3u64.pow(u32::from(self.retry_attempts));
@@ -846,6 +894,9 @@ impl HostRuntime {
         let mut index = 0;
         while index < calls.len() {
             self.drain_turn_commands();
+            if self.cancelled() {
+                return Err("回合已中止".into());
+            }
             self.refresh_capabilities(false);
             let mut end = index;
             while end < calls.len() {
@@ -1736,6 +1787,80 @@ for line in sys.stdin:
                 && event["save_id"] == "switch"
                 && event["config"]["capabilities"][1]["enabled"] == false
         }));
+    }
+
+    #[test]
+    fn mid_turn_messages_are_recorded_at_once_and_cancel_settles_the_turn() {
+        type Inject = (mpsc::Sender<Result<HostCommand, String>>, Arc<AtomicBool>);
+        struct CancellingBrain(Mutex<Option<Inject>>, AtomicUsize);
+        impl Brain for CancellingBrain {
+            fn complete(
+                &self,
+                _: &ProviderConfig,
+                _: &str,
+                _: &str,
+                _: &[Value],
+                _: &[ToolSpec],
+            ) -> Result<ModelReply, String> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                if let Some((send, cancel)) = self.0.lock().unwrap().take() {
+                    send.send(Ok(HostCommand::Send {
+                        text: "补充".into(),
+                    }))
+                    .unwrap();
+                    send.send(Ok(HostCommand::Cancel)).unwrap();
+                    cancel.store(true, Ordering::Relaxed);
+                    return Ok(tool_reply("a1", "shell", json!({"command": "echo never"})));
+                }
+                Ok(text_reply("收到补充"))
+            }
+
+            fn test_connection(&self, _: &ProviderConfig, _: &str) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let brain = Arc::new(CancellingBrain(Mutex::new(None), AtomicUsize::new(0)));
+        let mut rt =
+            HostRuntime::open_with_brain(dir.path().join("Eja"), brain.clone(), Arc::new(|_| {}))
+                .unwrap();
+        rt.save_config(configured(vec![CapabilityConfig::builtin_shell()]));
+        let (tx, rx) = mpsc::channel();
+        *brain.0.lock().unwrap() = Some((tx, rt.cancel_handle()));
+        rt.inbox = Some(rx);
+        rt.handle_user_message("第一条");
+
+        let facts: Vec<Fact> = rt
+            .eja
+            .recent(20)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.fact)
+            .collect();
+        assert!(!facts.iter().any(|fact| matches!(fact, Fact::Acted { .. })));
+        let persons: Vec<&str> = facts
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::Noticed {
+                    source: Source::Person,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(persons, ["第一条", "补充"]);
+        let said: Vec<&str> = facts
+            .iter()
+            .filter_map(|fact| match fact {
+                Fact::Said { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said, ["收到补充"]);
+        assert_eq!(brain.1.load(Ordering::SeqCst), 2);
+        assert!(!rt.cancelled());
+        assert!(state::next_trigger(&rt.eja).unwrap().is_none());
     }
 
     #[test]

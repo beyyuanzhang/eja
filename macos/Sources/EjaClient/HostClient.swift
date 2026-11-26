@@ -287,6 +287,10 @@ public final class HostClient: ObservableObject {
         sendCommand(["cmd": "send", "text": trimmed])
     }
 
+    public func cancelTurn() {
+        sendCommand(["cmd": "cancel"])
+    }
+
     public func saveConfig(
         providers: [ProviderConfigDTO]? = nil,
         judge: ModelRefDTO? = nil,
