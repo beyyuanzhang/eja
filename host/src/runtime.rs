@@ -591,17 +591,17 @@ impl HostRuntime {
             self.refresh_capabilities(false);
         }
         self.poll_oauth_events();
-        let wakes = watch::tick(&self.eja, &self.data_dir, format_local_unix)
+        let (fired, checked_guards) =
+            watch::tick(&self.eja, &self.data_dir, format_local_unix, |error| {
+                self.emit_error(error)
+            })
             .map_err(|err| err.to_string())?;
-        for error in wakes.errors {
-            self.emit_error(error);
-        }
-        if wakes.fired {
+        if fired {
             self.clear_retry();
             self.process_pending_turn();
             return Ok(());
         }
-        if wakes.checked_guards {
+        if checked_guards {
             self.emit_state(None);
         }
         if self.retry_at.is_some_and(|at| Instant::now() >= at) {
@@ -869,15 +869,16 @@ impl HostRuntime {
             )),
             "keep" => {
                 let text = call.args["text"].as_str().unwrap_or("").trim();
-                let checker =
-                    match call.args.get("checker") {
-                        None | Some(Value::Null) => None,
-                        Some(value) => Some(value.as_str().ok_or_else(|| {
+                let checker = match call.args.get("checker") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => {
+                        let name = value.as_str().ok_or_else(|| {
                             eja_core::Error::Invalid("checker 需要规则名称".into())
-                        })?),
+                        })?;
+                        watch::registered_check(&self.eja, name)?;
+                        Some(name)
                     }
-                    .map(|name| watch::check_id(&self.eja, name))
-                    .transpose()?;
+                };
                 concern::keep_with_check(&self.eja, call.args["concern"].as_i64(), text, checker)
                     .map(|entry| {
                         let Fact::Kept { concern, .. } = entry.fact else {
@@ -3060,13 +3061,7 @@ for line in sys.stdin:
         for idx in 0..65 {
             let name = format!("check{idx}");
             watch::register_check(&eja, &name, "status.txt", Some("ok"), None, None).unwrap();
-            concern::keep_with_check(
-                &eja,
-                None,
-                &format!("挂念 {idx}"),
-                Some(watch::check_id(&eja, &name).unwrap()),
-            )
-            .unwrap();
+            concern::keep_with_check(&eja, None, &format!("挂念 {idx}"), Some(&name)).unwrap();
             alarms.push(WakeAlarm {
                 id: name.clone(),
                 fire_at_unix: 100,

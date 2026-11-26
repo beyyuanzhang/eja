@@ -1,12 +1,8 @@
 //! Owns registered file rules and the pending wake queue.
-use super::{
-    check_evidence::{self, CheckId},
-    decode_meta, write_meta,
-};
+use super::{check_evidence, decode_meta, write_meta};
 use crate::sandbox::{validate_single_name, TrustedDir};
 use eja_core::{Eja, Error, Fact, Result, Source, Tx, FACT_BYTES};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 const META_WAKES: &str = "host.wakes";
 const MAX_GUARDED_WAKES: usize = 64;
@@ -70,27 +66,6 @@ fn rule_key(name: &str) -> String {
     format!("host.check-rule:{name}")
 }
 
-fn read_check(raw: Option<String>, name: &str) -> Result<FileCheck> {
-    let raw = raw.ok_or_else(|| Error::Invalid(format!("未知检查规则 {name}")))?;
-    Ok(serde_json::from_str(&raw)?)
-}
-
-fn check_identity(name: &str, check: &FileCheck) -> Result<CheckId> {
-    let digest = Sha256::digest(serde_json::to_vec(check)?);
-    Ok(CheckId {
-        name: name.to_owned(),
-        revision: format!("{digest:x}"),
-    })
-}
-
-pub fn check_id(eja: &Eja, name: &str) -> Result<CheckId> {
-    check_identity(name, &registered_check(eja, name)?)
-}
-
-fn check_id_in(tx: &Tx<'_>, name: &str) -> Result<CheckId> {
-    check_identity(name, &read_check(tx.get_meta(&rule_key(name))?, name)?)
-}
-
 fn update_wakes<T>(
     eja: &Eja,
     f: impl FnOnce(&Tx<'_>, &mut Vec<WakeAlarm>) -> Result<T>,
@@ -141,7 +116,7 @@ pub fn register_check(
     eja.transaction(|tx| {
         let key = rule_key(name);
         if let Some(raw) = tx.get_meta(&key)? {
-            return if read_check(Some(raw), name)? == check {
+            return if serde_json::from_str::<FileCheck>(&raw)? == check {
                 Ok(())
             } else {
                 Err(Error::Invalid("检查名称已绑定，请使用新名称".into()))
@@ -152,7 +127,10 @@ pub fn register_check(
 }
 
 pub fn registered_check(eja: &Eja, name: &str) -> Result<FileCheck> {
-    read_check(eja.get_meta(&rule_key(name))?, name)
+    let raw = eja
+        .get_meta(&rule_key(name))?
+        .ok_or_else(|| Error::Invalid(format!("未知检查规则 {name}")))?;
+    Ok(serde_json::from_str(&raw)?)
 }
 
 fn wake_notice_text(reason: &str) -> String {
@@ -215,20 +193,14 @@ pub fn next_wake_at(eja: &Eja) -> Result<Option<i64>> {
     Ok(pending_wakes(eja)?.first().map(|alarm| alarm.fire_at_unix))
 }
 
-pub struct WakeTick {
-    pub fired: bool,
-    pub checked_guards: bool,
-    pub errors: Vec<String>,
-}
-
 pub fn tick(
     eja: &Eja,
     data_dir: &TrustedDir,
     format_at: impl Fn(i64) -> String,
-) -> Result<WakeTick> {
+    mut report_error: impl FnMut(String),
+) -> Result<(bool, bool)> {
     let (mut fired, due_guarded, now) = collect_due_wakes(eja)?;
     let checked_guards = !due_guarded.is_empty();
-    let mut errors = Vec::new();
     for alarm in due_guarded {
         let guard = alarm.guard.as_ref().ok_or(Error::Conflict)?;
         let observation = registered_check(eja, &guard.checker)
@@ -242,14 +214,10 @@ pub fn tick(
         };
         fired |= settle_guarded_wake(eja, &alarm, matches!(observation, Ok(true)), retry)?;
         if let Err(err) = observation {
-            errors.push(format!("守望「{}」已停止：{err}", alarm.reason));
+            report_error(format!("守望「{}」已停止：{err}", alarm.reason));
         }
     }
-    Ok(WakeTick {
-        fired,
-        checked_guards,
-        errors,
-    })
+    Ok((fired, checked_guards))
 }
 
 /// Atomically record due unguarded wakes and return due guarded wakes for out-of-tx probe evaluation.
@@ -295,8 +263,7 @@ fn settle_guarded_wake(
             return Err(Error::Conflict);
         };
         if matched {
-            let check = check_id_in(tx, &guard.checker)?;
-            check_evidence::publish(tx, &check)?;
+            check_evidence::publish(tx, &guard.checker)?;
         } else if let Some((at, display)) = retry_at {
             guard.remaining -= 1;
             alarm.fire_at_unix = at;
