@@ -28,24 +28,41 @@ private func isSafeModeRequested() -> Bool {
     return CGEventSource.flagsState(.combinedSessionState).contains(.maskAlternate)
 }
 
-private func syncFactoryClient(from templateClientDir: URL, into uiDir: URL, fm: FileManager) -> Bool {
-    guard fm.fileExists(atPath: templateClientDir.path) else { return false }
-    let sourcesDir = uiDir.appendingPathComponent("Sources", isDirectory: true)
-    let targetClientDir = sourcesDir.appendingPathComponent("ejaClient", isDirectory: true)
-    let stagingDir = sourcesDir.appendingPathComponent(".ejaClient-sync-\(UUID().uuidString)", isDirectory: true)
+private func replaceAtomically(from src: URL, to dst: URL, fm: FileManager) -> Bool {
+    guard fm.fileExists(atPath: src.path) else { return false }
+    let parent = dst.deletingLastPathComponent()
+    let staging = parent.appendingPathComponent(".sync-\(UUID().uuidString)")
     do {
-        try fm.createDirectory(at: sourcesDir, withIntermediateDirectories: true)
-        try fm.copyItem(at: templateClientDir, to: stagingDir)
-        if fm.fileExists(atPath: targetClientDir.path) {
-            _ = try fm.replaceItemAt(targetClientDir, withItemAt: stagingDir)
+        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+        try fm.copyItem(at: src, to: staging)
+        if fm.fileExists(atPath: dst.path) {
+            _ = try fm.replaceItemAt(dst, withItemAt: staging)
         } else {
-            try fm.moveItem(at: stagingDir, to: targetClientDir)
+            try fm.moveItem(at: staging, to: dst)
         }
         return true
     } catch {
-        try? fm.removeItem(at: stagingDir)
+        try? fm.removeItem(at: staging)
         return false
     }
+}
+
+private func syncFactoryFiles(from templateDir: URL, into uiDir: URL, fm: FileManager) {
+    _ = replaceAtomically(
+        from: templateDir.appendingPathComponent("Package.swift"),
+        to: uiDir.appendingPathComponent("Package.swift"),
+        fm: fm
+    )
+    _ = replaceAtomically(
+        from: templateDir.appendingPathComponent("Sources/ejaClient", isDirectory: true),
+        to: uiDir.appendingPathComponent("Sources/ejaClient", isDirectory: true),
+        fm: fm
+    )
+    _ = replaceAtomically(
+        from: templateDir.appendingPathComponent("Sources/ejaLauncher", isDirectory: true),
+        to: uiDir.appendingPathComponent("Sources/ejaLauncher", isDirectory: true),
+        fm: fm
+    )
 }
 
 private func rebuildEvolvedUI(applyScript: URL, fm: FileManager) -> String? {
@@ -105,8 +122,8 @@ let evolvedDylib = uiDir.appendingPathComponent("libejaUI.dylib")
 let stampFile = uiDir.appendingPathComponent(".factory-digest")
 let bootMarker = uiDir.appendingPathComponent(".booting")
 let applyScript = uiDir.appendingPathComponent("apply.sh")
-let templateClientDir = Bundle.main.resourceURL?
-    .appendingPathComponent("ui-template/Sources/ejaClient", isDirectory: true)
+let templateDir = Bundle.main.resourceURL?
+    .appendingPathComponent("ui-template", isDirectory: true)
 
 let safeMode = isSafeModeRequested()
 setenv("eja_SAFE_MODE", safeMode ? "1" : "0", 1)
@@ -128,8 +145,8 @@ if let factoryDigest {
         .trimmingCharacters(in: .whitespacesAndNewlines)
     if recorded != factoryDigest {
         if canLoadEvolved && fm.fileExists(atPath: evolvedDylib.path) {
-            if let templateClientDir {
-                _ = syncFactoryClient(from: templateClientDir, into: uiDir, fm: fm)
+            if let templateDir {
+                syncFactoryFiles(from: templateDir, into: uiDir, fm: fm)
             }
             if let failureMessage = rebuildEvolvedUI(applyScript: applyScript, fm: fm) {
                 try? fm.removeItem(at: evolvedDylib)

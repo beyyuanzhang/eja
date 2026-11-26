@@ -239,29 +239,6 @@ for line in sys.stdin:
     }
 
     @Test
-    @MainActor
-    func clearsBootMarkerOnValidStateAndAlreadyRunning() throws {
-        let dir = try makeTempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let marker = UiRuntime.bootMarkerFile(in: dir)
-        try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "digest".write(to: marker, atomically: true, encoding: .utf8)
-        #expect(FileManager.default.fileExists(atPath: marker.path))
-
-        let client = HostClient(hostExecutableURL: URL(fileURLWithPath: "/bin/cat"), dataDir: dir)
-        defer { client.shutdown() }
-
-        client.handleEventLine(
-            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"\#(dir.path)","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
-        )
-        #expect(!FileManager.default.fileExists(atPath: marker.path))
-
-        try "digest".write(to: marker, atomically: true, encoding: .utf8)
-        client.handleEventLine(Data(#"{"event":"already_running","ui_pid":42}"#.utf8))
-        #expect(!FileManager.default.fileExists(atPath: marker.path))
-    }
-
-    @Test
     func updaterComparesVersionsAndParsesGitHubRelease() throws {
         #expect(AppUpdater.isNewerVersion("v1.0.7", than: "1.0.6"))
         #expect(AppUpdater.isNewerVersion("1.10.0", than: "1.2.9"))

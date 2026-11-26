@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -28,6 +29,7 @@ struct ScreenError: LocalizedError {
 struct Screen {
     @MainActor
     static func main() async {
+        _ = NSApplication.shared
         do {
             let request = try JSONDecoder().decode(
                 Request.self, from: FileHandle.standardInput.readDataToEndOfFile()

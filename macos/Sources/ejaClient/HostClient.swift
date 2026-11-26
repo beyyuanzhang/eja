@@ -289,7 +289,6 @@ public final class HostClient: ObservableObject {
     private var process: Process?
     private var stdinHandle: FileHandle?
     private let decoder = JSONDecoder()
-    private let resolvedDataDir: URL?
     private var configSaves: [String: (HostConfigDTO) -> Void] = [:]
     private var modelLists: [String: ([String]?) -> Void] = [:]
 
@@ -298,10 +297,9 @@ public final class HostClient: ObservableObject {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
         let resolvedHost = hostExecutableURL ?? Self.resolveHostExecutable()
-        let resolved = dataDir ?? ProcessInfo.processInfo.environment["eja_DATA_DIR"]
+        let resolvedDataDir = dataDir ?? ProcessInfo.processInfo.environment["eja_DATA_DIR"]
             .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
-        self.resolvedDataDir = resolved
-        startHost(executableURL: resolvedHost, dataDir: resolved)
+        startHost(executableURL: resolvedHost, dataDir: resolvedDataDir)
     }
 
     public func shutdown(wait: Bool = true) {
@@ -500,9 +498,6 @@ public final class HostClient: ObservableObject {
             concerns = state.concerns ?? []
             wakes = state.wakes ?? []
             isReady = true
-            if !state.dataDir.isEmpty {
-                UiRuntime.markBootSucceeded(in: URL(fileURLWithPath: state.dataDir, isDirectory: true))
-            }
             if let id = state.saveId {
                 configSaves.removeValue(forKey: id)?(config)
             }
@@ -523,9 +518,6 @@ public final class HostClient: ObservableObject {
         case "already_running":
             alreadyRunning = true
             alreadyRunningPid = (json["ui_pid"] as? Int).map { Int32($0) }
-            if let dir = resolvedDataDir {
-                UiRuntime.markBootSucceeded(in: dir)
-            }
         case "error":
             if let msg = json["message"] as? String {
                 errorBanner = msg

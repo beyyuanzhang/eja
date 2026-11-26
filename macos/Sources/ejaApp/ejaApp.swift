@@ -84,7 +84,7 @@ struct ejaApp: App {
                 checkHotReload(in: URL(fileURLWithPath: client.dataDir, isDirectory: true))
             }
         }
-        .onChange(of: client.alreadyRunning) { _, _ in
+        .onChange(of: client.alreadyRunning, initial: true) { _, _ in
             handleAlreadyRunning()
         }
         .commands {
@@ -112,7 +112,7 @@ struct ejaApp: App {
             running.activate()
         }
         client.shutdown(wait: false)
-        NSApp.terminate(nil)
+        exit(0)
     }
 
     @MainActor

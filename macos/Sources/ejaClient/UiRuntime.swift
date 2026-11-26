@@ -20,14 +20,6 @@ public enum UiRuntime {
         dataDir.appendingPathComponent("ui/.reload-baseline")
     }
 
-    public static func bootMarkerFile(in dataDir: URL) -> URL {
-        dataDir.appendingPathComponent("ui/.booting")
-    }
-
-    public static func markBootSucceeded(in dataDir: URL) {
-        try? FileManager.default.removeItem(at: bootMarkerFile(in: dataDir))
-    }
-
     public static func resolveTemplateDir() -> URL? {
         let fm = FileManager.default
         if let res = Bundle.main.resourceURL?.appendingPathComponent("ui-template", isDirectory: true),
@@ -50,23 +42,65 @@ public enum UiRuntime {
     public static func bootstrapIfNeeded(dataDir: URL, templateDir: URL? = nil) -> Bool {
         let uiDir = dataDir.appendingPathComponent("ui", isDirectory: true)
         let fm = FileManager.default
-        if !fm.fileExists(atPath: uiDir.appendingPathComponent("Package.swift").path) {
-            guard let source = templateDir ?? resolveTemplateDir(),
-                  (try? copyTemplate(from: source, to: uiDir)) != nil else { return false }
+        if let source = templateDir ?? resolveTemplateDir() {
+            guard (try? syncFactoryScaffold(from: source, to: uiDir, fm: fm)) != nil else {
+                return false
+            }
+        } else if !fm.fileExists(atPath: uiDir.appendingPathComponent("Package.swift").path) {
+            return false
         }
         writeApplyScript(in: uiDir)
         return true
     }
 
-    private static func copyTemplate(from source: URL, to target: URL) throws {
-        let fm = FileManager.default
+    private static func syncFactoryScaffold(from source: URL, to target: URL, fm: FileManager) throws {
         try fm.createDirectory(at: target, withIntermediateDirectories: true)
-        for item in ["Package.swift", "Sources", "Tests"] {
-            let src = source.appendingPathComponent(item)
-            guard fm.fileExists(atPath: src.path) else { continue }
-            let dst = target.appendingPathComponent(item)
-            if fm.fileExists(atPath: dst.path) { continue }
-            try fm.copyItem(at: src, to: dst)
+        let sourcesDir = target.appendingPathComponent("Sources", isDirectory: true)
+        try fm.createDirectory(at: sourcesDir, withIntermediateDirectories: true)
+
+        try replaceAtomically(
+            from: source.appendingPathComponent("Package.swift"),
+            to: target.appendingPathComponent("Package.swift"),
+            fm: fm
+        )
+        try replaceAtomically(
+            from: source.appendingPathComponent("Sources/ejaClient", isDirectory: true),
+            to: sourcesDir.appendingPathComponent("ejaClient", isDirectory: true),
+            fm: fm
+        )
+        let userAppDst = sourcesDir.appendingPathComponent("ejaApp", isDirectory: true)
+        if !fm.fileExists(atPath: userAppDst.path) {
+            let userAppSrc = source.appendingPathComponent("Sources/ejaApp", isDirectory: true)
+            if fm.fileExists(atPath: userAppSrc.path) {
+                try fm.copyItem(at: userAppSrc, to: userAppDst)
+            }
+        }
+        let launcherSrc = source.appendingPathComponent("Sources/ejaLauncher", isDirectory: true)
+        let launcherDst = sourcesDir.appendingPathComponent("ejaLauncher", isDirectory: true)
+        if fm.fileExists(atPath: launcherSrc.path) {
+            try replaceAtomically(from: launcherSrc, to: launcherDst, fm: fm)
+        }
+        let testsSrc = source.appendingPathComponent("Tests", isDirectory: true)
+        let testsDst = target.appendingPathComponent("Tests", isDirectory: true)
+        if fm.fileExists(atPath: testsSrc.path), !fm.fileExists(atPath: testsDst.path) {
+            try fm.copyItem(at: testsSrc, to: testsDst)
+        }
+    }
+
+    private static func replaceAtomically(from src: URL, to dst: URL, fm: FileManager) throws {
+        guard fm.fileExists(atPath: src.path) else { return }
+        let parent = dst.deletingLastPathComponent()
+        let staging = parent.appendingPathComponent(".sync-\(UUID().uuidString)")
+        do {
+            try fm.copyItem(at: src, to: staging)
+            if fm.fileExists(atPath: dst.path) {
+                _ = try fm.replaceItemAt(dst, withItemAt: staging)
+            } else {
+                try fm.moveItem(at: staging, to: dst)
+            }
+        } catch {
+            try? fm.removeItem(at: staging)
+            throw error
         }
     }
 

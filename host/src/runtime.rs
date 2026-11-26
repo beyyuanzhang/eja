@@ -181,6 +181,7 @@ impl HostRuntime {
         let instance_lock = match lock_core_dir(&core_path) {
             Ok(lock) => lock,
             Err(LockError::AlreadyRunning(ui_pid)) => {
+                let _ = fs::remove_file(data_dir.path().join("ui").join(".booting"));
                 (emit)(json!({ "event": "already_running", "ui_pid": ui_pid }));
                 return Err(OpenError::AlreadyRunning);
             }
@@ -202,6 +203,7 @@ impl HostRuntime {
             PROTOCOL_VERSION,
             ui_fallback_reason.as_deref(),
         )?;
+        let _ = fs::remove_file(data_dir.path().join("ui").join(".booting"));
         let mut config = HostConfig::load(&core_dir);
         let capabilities_bytes = HostConfig::read_capabilities(&data_dir).unwrap_or_else(|err| {
             (emit)(json!({"event":"error", "message":err}));
