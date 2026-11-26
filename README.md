@@ -1,10 +1,8 @@
 # eja
 
-**EJA is a personal AI assistant for your Mac that remembers what matters and helps you follow through.**
+**EJA is a persistent AI companion that remembers your shared history, keeps track of what matters, and acts with your permission.**
 
-It can remember useful details across conversations, keep track of things you care about, and remind you when something needs attention. You choose which tools it can use, and its history stays on your Mac.
-
-EJA is designed to feel like one ongoing assistant, rather than a series of unrelated chat sessions. Under the hood, it uses an append-only history to carry context across conversations and keep a record of actions and their outcomes.
+EJA is one continuing presence across conversations, not a series of unrelated chat sessions. It carries forward what it has learned about you and the things you care about, and records what it does and what happens next. You decide which tools it can use.
 
 ## Install
 
