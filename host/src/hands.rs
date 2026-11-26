@@ -4,7 +4,7 @@ use crate::llm::{ModelImage, MAX_TOOL_IMAGE_BYTES};
 use crate::mcp::{CapabilityPool, CapabilityStatus};
 use crate::oauth::OAuthToken;
 use crate::sandbox::{kill_process_tree, write_process_input, ProcessOutput, Sandbox, TrustedDir};
-use crate::state::{self, schedule_wakes, WakeAlarm, WakeGuard};
+use crate::state::watch::{self, WakeAlarm, WakeGuard};
 use eja_core::{Call, Eja, Outcome};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -148,7 +148,7 @@ impl Hands {
             ),
             builtin_spec(
                 "release",
-                "放下挂念。绑定规则的挂念需要该规则的新命中记录 ID。",
+                "放下挂念。绑定规则的挂念需要该规则的新命中记录 ID。如需结束另行预约的守望，请显式调用 wake 取消。",
                 json!({
                     "type": "object",
                     "properties": {
@@ -279,7 +279,7 @@ impl Hands {
                         return Outcome::Failed(e).into();
                     }
                 };
-                match state::register_check(eja, name, file, equals, contains, not_equals) {
+                match watch::register_check(eja, name, file, equals, contains, not_equals) {
                     Ok(()) => Outcome::Observed(format!("已注册检查规则 {name}")),
                     Err(err) => Outcome::Failed(err.to_string()),
                 }
@@ -365,11 +365,11 @@ fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
             ),
         };
         if delay == 0 {
-            let removed = state::cancel_wakes(eja, reason, guard_name)?;
+            let removed = watch::cancel_wakes(eja, reason, guard_name)?;
             return Ok(format!("cancelled {removed} wake(s) ({reason})"));
         }
         let guard = if let Some(checker) = guard_name {
-            state::registered_check(eja, checker)?;
+            watch::registered_check(eja, checker)?;
             let remaining = match input.get("max_checks") {
                 None => 60,
                 Some(value) => value
@@ -395,7 +395,7 @@ fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
             .checked_add(delay)
             .ok_or_else(|| invalid("唤醒时间超出范围"))?;
         let display = format_local_unix(fire_at);
-        schedule_wakes(
+        watch::schedule_wakes(
             eja,
             &[WakeAlarm {
                 id: format!("w-{fire_at}-{call_id}"),

@@ -4,7 +4,7 @@ EJA 是一个连续的、有自我同一性的主体。仓库采用清晰分层�
 
 - `core/`（`eja-core`）：最小闭合主体内核（零 ML/向量扩展依赖，零宿主调度策略），仅负责 SQLite 只追加事实日志、单调物理时间、关切与行动-回执状态机，以及供宿主共享原子事务的 `host_meta` 元数据槽。详见 `core/README.md`。
 - `memory/`（`eja-memory`）：独立的全历史检索层，仅消费 `eja-core` 公开只读 API。向量检索使用可重建的 `sqlite-vec` 索引，后端不可用时回退到无缓存的关键词检索。
-- `host/`（`eja-host`）：Rust 驱动循环与统一能力层：`state.rs` 通过 `core` 原子事务统一管理回合游标、定时唤醒、窗口锚点与版本升级；`llm.rs` 基于锚点将日志确定性投影到模型上下文；`hands.rs` 与 `mcp.rs` 统一注册并执行内核原语与热加载能力层（内嵌常驻 `shell`、自由实现的 `exec` 本地插件，以及 `stdio` / `http` MCP 能力）；`http.rs` 统一封装 HTTP 传输与文本截断；`runtime.rs` 驱动判断回合与前端事件桥接。
+- `host/`（`eja-host`）：Rust 驱动循环与统一能力层：`state.rs` 通过 `core` 原子事务管理回合游标与窗口锚点，守望和挂念各自持有状态，通过日志中的命中证据衔接；`llm.rs` 基于锚点将日志确定性投影到模型上下文；`hands.rs` 与 `mcp.rs` 统一注册并执行内核原语与热加载能力层（内嵌常驻 `shell`、自由实现的 `exec` 本地插件，以及 `stdio` / `http` MCP 能力）；`http.rs` 统一封装 HTTP 传输与文本截断；`runtime.rs` 驱动判断回合与前端事件桥接。
 - `macos/`（`EjaLauncher` + `EjaClient` + `EjaUI`）：纯薄 macOS 原生 SwiftUI 交互壳（不可变启动器、宿主通信、对话、模型与统一能力管理）。详见 `macos/README.md`。
 
 macOS 安装包自带本地多语言向量模型，默认向量优先。普通搜索与检索学习共用该入口。

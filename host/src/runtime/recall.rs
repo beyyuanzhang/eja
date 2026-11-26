@@ -1,9 +1,9 @@
-use super::HostRuntime;
 use crate::{
     config::ProviderKind,
     llm::{cap_tool_result, result_fits},
 };
 use eja_core::{Eja, Entry, Error, Fact, Id, Outcome, Result, Source};
+use eja_memory::MemoryIndex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -14,13 +14,21 @@ pub(super) const CHANGE: &str = "eja.recall";
 #[cfg(test)]
 mod tests;
 
-#[derive(Default)]
 pub(super) struct SearchTurn {
+    policy_head: Id,
     pub batch: usize,
     visits: Vec<Visit>,
 }
 
 impl SearchTurn {
+    pub(super) fn new(policy_head: Id) -> Self {
+        Self {
+            policy_head,
+            batch: 0,
+            visits: Vec::new(),
+        }
+    }
+
     pub(super) fn received(&self, id: Id) -> bool {
         self.visits.iter().any(|visit| visit.receipts.contains(&id))
     }
@@ -103,6 +111,38 @@ fn read_policy(stored: Option<&str>) -> Result<Policy> {
     Ok(serde_json::from_str(stored.unwrap_or("{}"))?)
 }
 
+#[derive(Deserialize)]
+struct Route {
+    key: String,
+    parent: Option<Id>,
+    cue: Cue,
+}
+
+fn route_at(eja: &Eja, key: &str, head: Id) -> Result<Option<(Id, Cue)>> {
+    let mut version = read_policy(eja.get_meta(key)?.as_deref())?.active;
+    while let Some(id) = version {
+        let Fact::Acted { capability, input } = eja.read(id)?.fact else {
+            return Err(Error::Invalid("无效的检索版本".into()));
+        };
+        if capability != CHANGE {
+            return Err(Error::Invalid("无效的检索版本".into()));
+        }
+        let route: Route = serde_json::from_value(input)?;
+        if route.key != key
+            || route
+                .parent
+                .is_some_and(|parent| parent <= 0 || parent >= id)
+        {
+            return Err(Error::Invalid("无效的检索版本沿革".into()));
+        }
+        if id <= head {
+            return Ok(Some((id, route.cue)));
+        }
+        version = route.parent;
+    }
+    Ok(None)
+}
+
 fn receipt_id(entry: &Value) -> Option<Id> {
     let id = entry["id"].as_i64()?;
     let outcome = &entry["fact"]["outcome"];
@@ -122,9 +162,18 @@ fn receipts(result: &Value) -> impl Iterator<Item = Id> + '_ {
     found(result).filter_map(receipt_id)
 }
 
-impl HostRuntime {
-    pub(super) fn search_turn(
+pub(super) struct Recall {
+    memory: MemoryIndex,
+}
+
+impl Recall {
+    pub(super) fn new(memory: MemoryIndex) -> Self {
+        Self { memory }
+    }
+
+    pub(super) fn search(
         &mut self,
+        eja: &Eja,
         query: &str,
         provider: &ProviderKind,
         budget: usize,
@@ -133,21 +182,17 @@ impl HostRuntime {
         if budget == 0 {
             return Ok(Value::Null);
         }
-        let through = self.eja.revision()?;
+        let through = eja.revision()?;
         let Some(trace) = trace.filter(|_| !query.is_empty() && query.len() <= 256) else {
-            return self.search_packet(query, query, through, provider, budget);
+            return self.search_packet(eja, query, query, through, provider, budget);
         };
-        let version = read_policy(self.eja.get_meta(&key(query))?.as_deref())?.active;
-        let effective = match version {
-            Some(id) => match self.eja.read(id)?.fact {
-                Fact::Acted { capability, input } if capability == CHANGE => {
-                    cue_text(&self.eja, serde_json::from_value(input["cue"].clone())?)?
-                }
-                _ => return Err(Error::Invalid("无效的检索版本".into())),
-            },
+        let route = route_at(eja, &key(query), trace.policy_head)?;
+        let version = route.map(|(id, _)| id);
+        let effective = match route {
+            Some((_, cue)) => cue_text(eja, cue)?,
             None => query.to_owned(),
         };
-        let result = self.search_packet(query, &effective, through, provider, budget)?;
+        let result = self.search_packet(eja, query, &effective, through, provider, budget)?;
         if result["matches"].is_array() {
             trace.visits.push(Visit {
                 requested: query.to_owned(),
@@ -167,6 +212,7 @@ impl HostRuntime {
 
     fn pack_search(
         &mut self,
+        eja: &Eja,
         query: &str,
         effective: &str,
         through: Id,
@@ -175,7 +221,7 @@ impl HostRuntime {
     ) -> Result<Value> {
         let matches = self
             .memory
-            .search_at(&self.eja, effective, through)
+            .search_at(eja, effective, through)
             .map_err(|err| match err {
                 eja_memory::Error::Invalid(text) => Error::Invalid(text),
                 err => Error::Storage(err.to_string()),
@@ -204,17 +250,18 @@ impl HostRuntime {
 
     fn search_packet(
         &mut self,
+        eja: &Eja,
         query: &str,
         cue: &str,
         through: Id,
         provider: &ProviderKind,
         budget: usize,
     ) -> Result<Value> {
-        let original = self.pack_search(query, query, through, provider, budget)?;
+        let original = self.pack_search(eja, query, query, through, provider, budget)?;
         if cue == query {
             return Ok(original);
         }
-        let learned = self.pack_search(query, cue, through, provider, budget)?;
+        let learned = self.pack_search(eja, query, cue, through, provider, budget)?;
         if found(&learned).next().is_some()
             && receipts(&original).all(|id| receipts(&learned).any(|learned_id| learned_id == id))
         {
@@ -223,8 +270,9 @@ impl HostRuntime {
         Ok(original)
     }
 
-    pub(super) fn learn_search(
+    pub(super) fn learn(
         &mut self,
+        eja: &Eja,
         trigger: Id,
         trace: &SearchTurn,
         witness: Id,
@@ -240,7 +288,7 @@ impl HostRuntime {
         {
             return Ok(());
         }
-        let Fact::Returned { action, .. } = self.eja.read(witness)?.fact else {
+        let Fact::Returned { action, .. } = eja.read(witness)?.fact else {
             return Ok(());
         };
         let case = Case {
@@ -254,7 +302,7 @@ impl HostRuntime {
         };
         let query = &root.requested;
         let key = key(query);
-        let stored = self.eja.get_meta(&key)?;
+        let stored = eja.get_meta(&key)?;
         let mut policy = read_policy(stored.as_deref())?;
         if policy.active != root.version {
             return Ok(());
@@ -264,12 +312,18 @@ impl HostRuntime {
             if candidate.case.action == action || candidate.case.trigger >= trigger {
                 return Ok(());
             }
-            let cue = cue_text(&self.eja, candidate.cue)?;
+            let cue = cue_text(eja, candidate.cue)?;
             let prior = &candidate.case;
-            let replay =
-                self.search_packet(query, &cue, prior.through, &prior.provider, prior.budget)?;
-            if prior.covered_by(&replay) && self.reaches(query, &cue, &case)? {
-                return self.eja.transaction(|tx| {
+            let replay = self.search_packet(
+                eja,
+                query,
+                &cue,
+                prior.through,
+                &prior.provider,
+                prior.budget,
+            )?;
+            if prior.covered_by(&replay) && self.reaches(eja, query, &cue, &case)? {
+                return eja.transaction(|tx| {
                     if tx.get_meta(&key)? != stored {
                         return Ok(());
                     }
@@ -289,7 +343,7 @@ impl HostRuntime {
         let evidence = root
             .seen
             .iter()
-            .map(|&id| self.eja.read(id))
+            .map(|&id| eja.read(id))
             .collect::<Result<Vec<_>>>()?;
         let mut terms: Vec<_> = trace
             .visits
@@ -325,7 +379,7 @@ impl HostRuntime {
             })
             .take(4)
         {
-            if self.reaches(query, term, &case)? {
+            if self.reaches(eja, query, term, &case)? {
                 policy.pending = Some(Candidate { cue, case });
                 break;
             }
@@ -333,7 +387,7 @@ impl HostRuntime {
         if !had_pending && policy.pending.is_none() {
             return Ok(());
         }
-        self.eja.transaction(|tx| {
+        eja.transaction(|tx| {
             if tx.get_meta(&key)? == stored {
                 tx.set_meta(&key, &serde_json::to_string(&policy)?)?;
             }
@@ -341,9 +395,10 @@ impl HostRuntime {
         })
     }
 
-    fn reaches(&mut self, query: &str, cue: &str, case: &Case) -> Result<bool> {
+    fn reaches(&mut self, eja: &Eja, query: &str, cue: &str, case: &Case) -> Result<bool> {
         // The delivered first packet already preserves every original-query receipt.
-        let packet = self.pack_search(query, cue, case.through, &case.provider, case.budget)?;
+        let packet =
+            self.pack_search(eja, query, cue, case.through, &case.provider, case.budget)?;
         Ok(case.covered_by(&packet))
     }
 }

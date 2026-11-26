@@ -13,7 +13,10 @@ use crate::llm::{
 use crate::mcp::CapabilityStatus;
 use crate::oauth::{spawn_oauth_flow, OAuthEvent};
 use crate::sandbox::{Sandbox, TrustedDir};
-use crate::state::{self, WakeAlarm};
+use crate::state::{
+    self, concern,
+    watch::{self, WakeAlarm},
+};
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, Timestamp};
 use eja_memory::MemoryIndex;
 use serde::{Deserialize, Serialize};
@@ -120,7 +123,7 @@ pub struct HostRuntime {
     resources_dir: Option<PathBuf>,
     _instance_lock: fs::File,
     eja: Eja,
-    memory: MemoryIndex,
+    recall: recall::Recall,
     config: HostConfig,
     capabilities_bytes: Option<Vec<u8>>,
     hands: Hands,
@@ -215,7 +218,7 @@ impl HostRuntime {
             resources_dir,
             _instance_lock: instance_lock,
             eja,
-            memory,
+            recall: recall::Recall::new(memory),
             config,
             capabilities_bytes,
             hands,
@@ -310,7 +313,7 @@ impl HostRuntime {
             .now()
             .unwrap_or_else(|_| Timestamp::now())
             .as_unix();
-        state::next_wake_at(&self.eja)
+        watch::next_wake_at(&self.eja)
             .map(|at| at.map(|at| Duration::from_secs(at.saturating_sub(now).max(0) as u64)))
             .map_err(|err| err.to_string())
     }
@@ -396,7 +399,7 @@ impl HostRuntime {
             capability_statuses: self.hands.capability_statuses(),
             stream: build_stream(&entries, &proactive_replies),
             concerns,
-            wakes: state::pending_wakes(&self.eja).unwrap_or_default(),
+            wakes: watch::pending_wakes(&self.eja).unwrap_or_default(),
         }
     }
 
@@ -588,38 +591,18 @@ impl HostRuntime {
             self.refresh_capabilities(false);
         }
         self.poll_oauth_events();
-        let (mut fired, due_guarded, now) =
-            state::collect_due_wakes(&self.eja).map_err(|err| err.to_string())?;
-        let checked_watches = !due_guarded.is_empty();
-        for alarm in due_guarded {
-            let Some(guard) = &alarm.guard else { continue };
-            let observation = state::registered_check(&self.eja, &guard.checker)
-                .map_err(|err| err.to_string())
-                .and_then(|check| check.matches(&self.data_dir).map_err(|err| err.to_string()));
-            let retry = match &observation {
-                Ok(false) if guard.remaining > 1 => now
-                    .checked_add(guard.interval_seconds)
-                    .map(|at| (at, format_local_unix(at))),
-                _ => None,
-            };
-            fired |= state::settle_guarded_wake(
-                &self.eja,
-                &alarm,
-                matches!(observation, Ok(true)),
-                retry,
-            )
+        let wakes = watch::tick(&self.eja, &self.data_dir, format_local_unix)
             .map_err(|err| err.to_string())?;
-            if let Err(err) = observation {
-                self.emit_error(format!("守望「{}」已停止：{err}", alarm.reason));
-            }
+        for error in wakes.errors {
+            self.emit_error(error);
         }
-        if checked_watches && !fired {
-            self.emit_state(None);
-        }
-        if fired {
+        if wakes.fired {
             self.clear_retry();
             self.process_pending_turn();
             return Ok(());
+        }
+        if wakes.checked_guards {
+            self.emit_state(None);
         }
         if self.retry_at.is_some_and(|at| Instant::now() >= at) {
             self.retry_at = None;
@@ -667,7 +650,7 @@ impl HostRuntime {
         self.refresh_capabilities(false);
         let window_max_bytes = self.config.window_max_bytes();
         let max_steps = self.config.max_steps();
-        let setup = (|| -> Result<(ProviderConfig, String, Vec<Value>), (bool, String)> {
+        let setup = (|| -> Result<_, (bool, String)> {
             let Some((provider, model)) = self.config.resolve_judge() else {
                 return Err((true, "请先在设置中配置可用的 LLM Provider 与主模型".into()));
             };
@@ -693,9 +676,9 @@ impl HostRuntime {
             .map_err(|err| (false, format!("构建日志窗口失败: {err}")))?;
             self.persist_anchor(next_anchor)
                 .map_err(|err| (false, err))?;
-            Ok((provider, model, messages))
+            Ok((provider, model, messages, head))
         })();
-        let (provider, model, mut messages) = match setup {
+        let (provider, model, mut messages, policy_head) = match setup {
             Ok(ready) => ready,
             Err((clear_retry, msg)) => {
                 if clear_retry {
@@ -735,7 +718,7 @@ impl HostRuntime {
         let mut recoverable = false;
         let mut search_turn = (!proactive
             && std::env::var_os("EJA_RECALL_LEARNING").is_some_and(|value| value == "1"))
-        .then(recall::SearchTurn::default);
+        .then(|| recall::SearchTurn::new(policy_head));
         for _ in 0..max_steps {
             self.drain_turn_commands();
             self.set_status("thinking", "思考中…");
@@ -780,7 +763,9 @@ impl HostRuntime {
                     break;
                 }
                 if let (Some(trace), Some(receipt)) = (&search_turn, receipt) {
-                    if let Err(err) = self.learn_search(trigger_id, trace, receipt, &provider.kind)
+                    if let Err(err) =
+                        self.recall
+                            .learn(&self.eja, trigger_id, trace, receipt, &provider.kind)
                     {
                         self.emit_error(format!("保存检索策略失败: {err}"));
                     }
@@ -870,7 +855,9 @@ impl HostRuntime {
     ) -> eja_core::Result<ToolOutput> {
         match call.name.as_str() {
             "search" => self
-                .search_turn(
+                .recall
+                .search(
+                    &self.eja,
                     call.args["cue"].as_str().unwrap_or("").trim(),
                     provider,
                     budget,
@@ -888,22 +875,23 @@ impl HostRuntime {
                         Some(value) => Some(value.as_str().ok_or_else(|| {
                             eja_core::Error::Invalid("checker 需要规则名称".into())
                         })?),
-                    };
-                state::keep_with_check(&self.eja, call.args["concern"].as_i64(), text, checker).map(
-                    |entry| {
+                    }
+                    .map(|name| watch::check_id(&self.eja, name))
+                    .transpose()?;
+                concern::keep_with_check(&self.eja, call.args["concern"].as_i64(), text, checker)
+                    .map(|entry| {
                         let Fact::Kept { concern, .. } = entry.fact else {
                             unreachable!()
                         };
                         ToolOutput::Value(
                             json!({"status":"kept", "concern":concern, "fact_id":entry.id}),
                         )
-                    },
-                )
+                    })
             }
             "release" => match call.args["concern"].as_i64() {
                 Some(id) => {
                     let witness = call.args["witness_fact_id"].as_i64();
-                    state::release_with_witness(&self.eja, id, witness).map(|entry| {
+                    concern::release_with_witness(&self.eja, id, witness).map(|entry| {
                         let Fact::Released {
                             concern,
                             witness_fact_id,
@@ -1844,7 +1832,7 @@ for line in sys.stdin:
             window_max_bytes: None,
             max_steps: None,
         });
-        state::schedule_wakes(
+        watch::schedule_wakes(
             &rt.eja,
             &[WakeAlarm {
                 id: "w-1".into(),
@@ -2323,11 +2311,11 @@ for line in sys.stdin:
         rt.save_config(configured(vec![]));
         rt.handle_user_message("请预约一次，随后保持沉默");
         assert!(!rt.has_pending_trigger());
-        assert_eq!(state::pending_wakes(&rt.eja).unwrap().len(), 1);
+        assert_eq!(watch::pending_wakes(&rt.eja).unwrap().len(), 1);
         drop(rt);
         let mut rt = HostRuntime::open_with_brain(data, brain.clone(), Arc::new(|_| {})).unwrap();
         rt.process_pending_turn();
-        assert_eq!(state::pending_wakes(&rt.eja).unwrap().len(), 1);
+        assert_eq!(watch::pending_wakes(&rt.eja).unwrap().len(), 1);
         assert_eq!(brain.seen_windows.lock().unwrap().len(), 2);
     }
 
@@ -2376,7 +2364,7 @@ for line in sys.stdin:
             reason: format!("{marker} {}", "x".repeat(1400)),
             guard: None,
         });
-        state::schedule_wakes(&rt.eja, &alarms).unwrap();
+        watch::schedule_wakes(&rt.eja, &alarms).unwrap();
         rt.tick_timers().unwrap();
         let windows = brain.seen_windows.lock().unwrap();
         assert_eq!(windows.len(), 2);
@@ -2501,10 +2489,13 @@ for line in sys.stdin:
         fs::write(&status, "waiting").unwrap();
         rt.handle_user_message("检查状态");
         let concern = rt.eja.concerns(rt.eja.revision().unwrap()).unwrap()[0].id;
-        let passive = rt.eja.notice(Source::World, "unrelated").unwrap();
+        let passive = rt
+            .eja
+            .notice(Source::World, "检查规则 ready 已命中")
+            .unwrap();
         assert!(!rt.has_pending_trigger());
-        assert!(state::release_with_witness(&rt.eja, concern, None).is_err());
-        assert!(state::release_with_witness(&rt.eja, concern, Some(passive)).is_err());
+        assert!(concern::release_with_witness(&rt.eja, concern, None).is_err());
+        assert!(concern::release_with_witness(&rt.eja, concern, Some(passive)).is_err());
 
         clock.store(110, Ordering::SeqCst);
         rt.tick_timers().unwrap();
@@ -2518,6 +2509,11 @@ for line in sys.stdin:
         rt.eja = open_subject();
         let hit = passive + 1;
         brain.replies.lock().unwrap().extend([
+            Ok(tool_reply(
+                "reschedule",
+                "wake",
+                json!({"delay_seconds":10, "reason":"重复检查", "guard_tool":"ready"}),
+            )),
             Ok(tool_reply(
                 "release",
                 "release",
@@ -2542,9 +2538,29 @@ for line in sys.stdin:
             .concerns(rt.eja.revision().unwrap())
             .unwrap()
             .is_empty());
-        assert!(state::pending_wakes(&rt.eja).unwrap().is_empty());
+        let pending = watch::pending_wakes(&rt.eja).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].reason, "重复检查");
+        assert_eq!(brain.seen_windows.lock().unwrap().len(), 7);
+        drop(rt);
+
+        let mut rt = open();
+        rt.eja = open_subject();
+        assert_eq!(watch::pending_wakes(&rt.eja).unwrap(), pending);
+        let before = rt.eja.revision().unwrap();
+        clock.store(130, Ordering::SeqCst);
+        brain.replies.lock().unwrap().push(Ok(text_reply("")));
         rt.tick_timers().unwrap();
-        assert_eq!(brain.seen_windows.lock().unwrap().len(), 6);
+        assert_eq!(rt.eja.revision().unwrap(), before + 1);
+        assert!(matches!(
+            rt.eja.read(before + 1).unwrap().fact,
+            Fact::Noticed {
+                source: Source::World,
+                ..
+            }
+        ));
+        assert!(watch::pending_wakes(&rt.eja).unwrap().is_empty());
+        assert_eq!(brain.seen_windows.lock().unwrap().len(), 8);
         assert_eq!(
             events
                 .lock()
@@ -2564,13 +2580,13 @@ for line in sys.stdin:
         let data = TrustedDir::open(dir.path()).unwrap();
         let eja = Eja::open(":memory:").unwrap();
         assert!(
-            state::register_check(&eja, "unsafe", "../private", Some("yes"), None, None).is_err()
+            watch::register_check(&eja, "unsafe", "../private", Some("yes"), None, None).is_err()
         );
-        state::register_check(&eja, "ready", "status.txt", Some("yes"), None, None).unwrap();
+        watch::register_check(&eja, "ready", "status.txt", Some("yes"), None, None).unwrap();
         assert!(
-            state::register_check(&eja, "ready", "other.txt", Some("yes"), None, None).is_err()
+            watch::register_check(&eja, "ready", "other.txt", Some("yes"), None, None).is_err()
         );
-        let check = state::registered_check(&eja, "ready").unwrap();
+        let check = watch::registered_check(&eja, "ready").unwrap();
         assert!(!check.matches(&data).unwrap());
         fs::write(dir.path().join("target"), "yes").unwrap();
         symlink("target", dir.path().join("status.txt")).unwrap();
@@ -2673,7 +2689,7 @@ for line in sys.stdin:
         let concern_id = concerns[0].id;
 
         // 2. Wakes deduplicated by reason and cancelled via delay_seconds: 0
-        let wakes = state::pending_wakes(&rt.eja).unwrap();
+        let wakes = watch::pending_wakes(&rt.eja).unwrap();
         assert_eq!(wakes.len(), 2);
         let drink_wake = wakes.iter().find(|w| w.reason == "提醒喝水").unwrap();
         assert_eq!(drink_wake.fire_at_unix, 1_700_000_120);
@@ -2738,7 +2754,7 @@ for line in sys.stdin:
             .concerns(rt.eja.revision().unwrap())
             .unwrap()
             .is_empty());
-        assert!(state::pending_wakes(&rt.eja).unwrap().is_empty());
+        assert!(watch::pending_wakes(&rt.eja).unwrap().is_empty());
         assert_eq!(
             events
                 .lock()
@@ -3038,31 +3054,41 @@ for line in sys.stdin:
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn register_check_reclaims_unreferenced_slots_at_capacity() {
+    fn rule_registration_does_not_depend_on_bindings_or_pending_wake_limit() {
         let eja = Eja::open(":memory:").unwrap();
-        for idx in 0..64 {
-            state::register_check(
+        let mut alarms = Vec::new();
+        for idx in 0..65 {
+            let name = format!("check{idx}");
+            watch::register_check(&eja, &name, "status.txt", Some("ok"), None, None).unwrap();
+            concern::keep_with_check(
                 &eja,
-                &format!("old_{idx}"),
-                "status.txt",
-                Some("ok"),
                 None,
-                None,
+                &format!("挂念 {idx}"),
+                Some(watch::check_id(&eja, &name).unwrap()),
             )
             .unwrap();
+            alarms.push(WakeAlarm {
+                id: name.clone(),
+                fire_at_unix: 100,
+                fire_at_display: "at 100".into(),
+                reason: name.clone(),
+                guard: Some(watch::WakeGuard {
+                    checker: name,
+                    interval_seconds: 1,
+                    remaining: 1,
+                }),
+            });
         }
-        state::register_check(&eja, "fresh", "status.txt", Some("ok"), None, None).unwrap();
-        assert!(state::registered_check(&eja, "fresh").is_ok());
-
-        let busy_eja = Eja::open(":memory:").unwrap();
-        for idx in 0..64 {
-            let name = format!("active_{idx}");
-            state::register_check(&busy_eja, &name, "status.txt", Some("ok"), None, None).unwrap();
-            state::keep_with_check(&busy_eja, None, &format!("挂念 {idx}"), Some(&name)).unwrap();
-        }
-        assert!(
-            state::register_check(&busy_eja, "overflow", "status.txt", Some("ok"), None, None)
-                .is_err()
-        );
+        assert!(watch::registered_check(&eja, "check0").is_ok());
+        assert!(watch::registered_check(&eja, "check64").is_ok());
+        watch::schedule_wakes(&eja, &alarms[..64]).unwrap();
+        let pending = watch::pending_wakes(&eja).unwrap();
+        assert_eq!(pending.len(), 64);
+        assert!(watch::schedule_wakes(&eja, &alarms[64..]).is_err());
+        assert_eq!(watch::pending_wakes(&eja).unwrap(), pending);
+        watch::cancel_wakes(&eja, "check0", None).unwrap();
+        watch::schedule_wakes(&eja, &alarms[64..]).unwrap();
+        assert_eq!(watch::pending_wakes(&eja).unwrap().len(), 64);
+        assert!(watch::registered_check(&eja, "check0").is_ok());
     }
 }
