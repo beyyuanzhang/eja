@@ -31,7 +31,7 @@ eja-host --data-dir "<data_dir>"
 
 `stdio` 和 Streamable HTTP MCP 服务须支持 `2026-07-28`。OpenAI 和 Anthropic 官方端点的提示缓存参数由 Provider 适配器设置。
 
-前端与 `eja-host` 使用同一构建的协议。
+前端与 `eja-host` 使用同一构建的协议。`cancel`、`history`、`dismiss_wake` 是协议 v2 内的增量指令，不改变已有指令和事件，未使用它们的 v2 前端可继续工作，因此协议版本不变。
 
 ## 输入指令（Frontend -> Host，每行一条 JSON）
 
