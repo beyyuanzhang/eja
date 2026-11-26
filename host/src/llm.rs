@@ -130,7 +130,7 @@ pub fn tool_messages(
     provider: &ProviderKind,
     reply: ModelReply,
     window_bytes: usize,
-    mut execute: impl FnMut(&ToolCall, usize) -> Result<ToolOutput, String>,
+    mut execute_batch: impl FnMut(&[ToolCall], usize) -> Result<Vec<ToolOutput>, String>,
 ) -> Result<Option<Vec<Value>>, String> {
     let count = reply.calls.len();
     if count == 0 {
@@ -154,9 +154,15 @@ pub fn tool_messages(
     };
     let per_call = budget.saturating_sub(framing) / count;
     let keep_exchange = per_call >= 128;
+    let outputs = execute_batch(&reply.calls, if keep_exchange { per_call } else { 0 })?;
     let mut attachments = Vec::new();
-    for (index, (call, slot)) in reply.calls.into_iter().zip(&mut slots).enumerate() {
-        let output = execute(&call, if keep_exchange { per_call } else { 0 })?;
+    for (index, ((call, output), slot)) in reply
+        .calls
+        .into_iter()
+        .zip(outputs)
+        .zip(&mut slots)
+        .enumerate()
+    {
         if !keep_exchange {
             continue;
         }
@@ -1278,8 +1284,11 @@ mod tests {
                 text: String::new(),
                 calls,
             };
-            let Some(messages) = tool_messages(&provider, reply, WINDOW_MAX_BYTES, |call, _| {
-                Ok(ToolOutput::Value(call.args.clone()))
+            let Some(messages) = tool_messages(&provider, reply, WINDOW_MAX_BYTES, |calls, _| {
+                Ok(calls
+                    .iter()
+                    .map(|call| ToolOutput::Value(call.args.clone()))
+                    .collect())
             })
             .unwrap() else {
                 panic!("expected tool exchange");
@@ -1327,15 +1336,20 @@ mod tests {
                 ],
             };
             let run = |budget, bytes| {
-                tool_messages(&provider, reply.clone(), budget, |call, _| {
-                    if call.name == "image-tool" {
-                        Ok(ToolOutput::Images(
-                            json!({"id":2,"action":1,"outcome":{"status":"observed","detail":"已发送输入"}}),
-                            vec![ModelImage { media_type: "image/jpeg", bytes: vec![42; bytes] }],
-                        ))
-                    } else {
-                        Ok(ToolOutput::Value(json!({"status":"ok"})))
-                    }
+                tool_messages(&provider, reply.clone(), budget, |calls, _| {
+                    Ok(calls
+                        .iter()
+                        .map(|call| {
+                            if call.name == "image-tool" {
+                                ToolOutput::Images(
+                                    json!({"id":2,"action":1,"outcome":{"status":"observed","detail":"已发送输入"}}),
+                                    vec![ModelImage { media_type: "image/jpeg", bytes: vec![42; bytes] }],
+                                )
+                            } else {
+                                ToolOutput::Value(json!({"status":"ok"}))
+                            }
+                        })
+                        .collect())
                 })
                 .unwrap()
                 .unwrap()

@@ -247,6 +247,14 @@ impl Hands {
                 .call(other, call.id, &call.input, &self.data_dir),
         }
     }
+
+    pub fn can_run_parallel(&self, capability: &str) -> bool {
+        self.capabilities.can_run_parallel(capability)
+    }
+
+    pub fn execute_parallel(&self, calls: &[Call]) -> Vec<ToolExecution> {
+        self.capabilities.call_parallel_batch(calls, &self.data_dir)
+    }
 }
 
 fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {

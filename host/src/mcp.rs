@@ -124,7 +124,7 @@ impl StdioConnection {
             thread::spawn(move || {
                 let reader = BufReader::new(err_pipe);
                 for line in reader.lines().map_while(Result::ok) {
-                    let mut guard = buf.lock().unwrap();
+                    let mut guard = buf.lock().unwrap_or_else(|err| err.into_inner());
                     if !guard.is_empty() {
                         guard.push('\n');
                     }
@@ -205,7 +205,12 @@ impl StdioConnection {
     }
 
     fn with_stderr(&self, message: String) -> String {
-        let err = self.stderr.lock().unwrap().trim().to_string();
+        let err = self
+            .stderr
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .trim()
+            .to_string();
         if err.is_empty() {
             message
         } else {
@@ -708,6 +713,103 @@ impl CapabilityPool {
     pub fn is_current(&self, capability: &str, generation: u64) -> bool {
         self.tools()
             .any(|(tool, current)| current == generation && tool.capability == capability)
+    }
+
+    pub fn can_run_parallel(&self, capability: &str) -> bool {
+        self.entries.iter().any(|entry| {
+            let Some(Some(active)) = entry.connection.as_ref().ok() else {
+                return false;
+            };
+            matches!(
+                active.connection,
+                ActiveConnection::Builtin | ActiveConnection::Exec { .. }
+            ) && active
+                .tools
+                .iter()
+                .any(|tool| tool.capability == capability)
+        })
+    }
+
+    pub fn call_parallel_batch(
+        &self,
+        calls: &[eja_core::Call],
+        data_dir: &TrustedDir,
+    ) -> Vec<ToolExecution> {
+        enum LocalTarget<'a> {
+            Builtin,
+            Exec {
+                command: &'a str,
+                args: &'a [String],
+                env: &'a BTreeMap<String, String>,
+            },
+            Missing,
+        }
+        let targets: Vec<LocalTarget<'_>> = calls
+            .iter()
+            .map(|call| {
+                let Some(connection) = self.entries.iter().find_map(|entry| {
+                    let active = entry.connection.as_ref().ok()?.as_ref()?;
+                    active
+                        .tools
+                        .iter()
+                        .any(|tool| tool.capability == call.capability)
+                        .then_some(&active.connection)
+                }) else {
+                    return LocalTarget::Missing;
+                };
+                match connection {
+                    ActiveConnection::Builtin => LocalTarget::Builtin,
+                    ActiveConnection::Exec { command, args, env } => LocalTarget::Exec {
+                        command: command.as_str(),
+                        args: args.as_slice(),
+                        env,
+                    },
+                    ActiveConnection::Stdio(_) | ActiveConnection::Http(_) => LocalTarget::Missing,
+                }
+            })
+            .collect();
+        let sandbox = &self.sandbox;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = calls
+                .iter()
+                .zip(targets)
+                .map(|(call, target)| {
+                    scope.spawn(move || match target {
+                        LocalTarget::Builtin => {
+                            execute_shell(sandbox, data_dir, call.id, &call.input).into()
+                        }
+                        LocalTarget::Exec { command, args, env } => {
+                            let payload = if call.input.is_object() {
+                                serde_json::to_vec(&call.input).unwrap_or_else(|_| b"{}".to_vec())
+                            } else {
+                                b"{}".to_vec()
+                            };
+                            run_process(
+                                sandbox,
+                                command,
+                                args,
+                                env,
+                                ProcessInput::Exec(&payload),
+                                data_dir.path(),
+                                TOOL_TIMEOUT,
+                                data_dir,
+                                call.id,
+                            )
+                        }
+                        LocalTarget::Missing => {
+                            Outcome::Failed(format!("未知能力: {}", call.capability)).into()
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(exec) => exec,
+                    Err(_) => Outcome::Unknown("并发工具执行线程中断".into()).into(),
+                })
+                .collect()
+        })
     }
 
     pub fn call(

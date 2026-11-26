@@ -786,22 +786,8 @@ impl HostRuntime {
             if let Some(trace) = &mut search_turn {
                 trace.batch += 1;
             }
-            let step = tool_messages(&provider.kind, reply, window_max_bytes, |call, budget| {
-                self.drain_turn_commands();
-                self.refresh_capabilities(false);
-                self.set_status("thinking", activity_label(&call.name));
-                match self.execute_tool_call(
-                    call,
-                    &tools,
-                    &provider.kind,
-                    budget,
-                    search_turn.as_mut(),
-                ) {
-                    Err(eja_core::Error::Invalid(msg)) => {
-                        Ok(ToolOutput::Value(json!({"error":msg})))
-                    }
-                    result => result.map_err(|err| err.to_string()),
-                }
+            let step = tool_messages(&provider.kind, reply, window_max_bytes, |calls, budget| {
+                self.execute_tool_batch(calls, &tools, &provider.kind, budget, search_turn.as_mut())
             });
             let mut anchor = self.anchor;
             let applied = step.and_then(|step| {
@@ -842,6 +828,83 @@ impl HostRuntime {
         }
         self.set_status("idle", "在线");
         completed
+    }
+
+    fn execute_tool_batch(
+        &mut self,
+        calls: &[ToolCall],
+        tools: &[ToolSpec],
+        provider: &ProviderKind,
+        budget: usize,
+        mut trace: Option<&mut recall::SearchTurn>,
+    ) -> Result<Vec<ToolOutput>, String> {
+        let mut outputs = Vec::with_capacity(calls.len());
+        let mut index = 0;
+        while index < calls.len() {
+            self.drain_turn_commands();
+            self.refresh_capabilities(false);
+            let mut end = index;
+            while end < calls.len() {
+                let Some(spec) = tools
+                    .iter()
+                    .find(|tool| tool.target != ToolTarget::Kernel && tool.name == calls[end].name)
+                else {
+                    break;
+                };
+                if !self.hands.is_current(spec) || !self.hands.can_run_parallel(&spec.capability) {
+                    break;
+                }
+                end += 1;
+            }
+            if end - index >= 2 {
+                self.set_status("thinking", "并发执行工具");
+                let mut acted = Vec::with_capacity(end - index);
+                for call in &calls[index..end] {
+                    let spec = tools
+                        .iter()
+                        .find(|tool| tool.target != ToolTarget::Kernel && tool.name == call.name)
+                        .expect("validated parallel tool spec");
+                    let entry = self
+                        .eja
+                        .act(
+                            self.eja.revision().map_err(|err| err.to_string())?,
+                            &spec.capability,
+                            call.args.clone(),
+                        )
+                        .map_err(|err| err.to_string())?;
+                    acted.push(entry);
+                }
+                let executions = self.hands.execute_parallel(&acted);
+                for (action, execution) in acted.into_iter().zip(executions) {
+                    let receipt = self
+                        .eja
+                        .finish(action.id, execution.outcome)
+                        .map_err(|err| err.to_string())?;
+                    let Fact::Returned { outcome, .. } = receipt.fact else {
+                        unreachable!()
+                    };
+                    let value =
+                        json!({ "id": receipt.id, "action": action.id, "outcome": outcome });
+                    outputs.push(if execution.images.is_empty() {
+                        ToolOutput::Value(value)
+                    } else {
+                        ToolOutput::Images(value, execution.images)
+                    });
+                }
+                index = end;
+                continue;
+            }
+            let call = &calls[index];
+            self.set_status("thinking", activity_label(&call.name));
+            let output =
+                match self.execute_tool_call(call, tools, provider, budget, trace.as_deref_mut()) {
+                    Err(eja_core::Error::Invalid(msg)) => ToolOutput::Value(json!({"error": msg})),
+                    result => result.map_err(|err| err.to_string())?,
+                };
+            outputs.push(output);
+            index += 1;
+        }
+        Ok(outputs)
     }
 
     fn execute_tool_call(

@@ -158,8 +158,8 @@ fn request_bytes(
             .take()
             .ok_or_else(|| HttpError::Launch("无法获取 curl stdout".into()))?,
     );
-    let (mut raw, mut line_buf, mut in_headers, mut status_code) =
-        (String::new(), Vec::new(), true, 0u16);
+    let (mut raw, mut line_buf, mut in_headers, mut status_code, mut is_sse) =
+        (String::new(), Vec::new(), true, 0u16, false);
     let mut on_line = on_line;
     loop {
         line_buf.clear();
@@ -171,21 +171,33 @@ fn request_bytes(
             break;
         }
         let line = String::from_utf8_lossy(&line_buf);
-        raw.push_str(&line);
         if in_headers {
+            raw.push_str(&line);
             if let Some(rest) = line.strip_prefix("HTTP/") {
                 status_code = rest
                     .split_whitespace()
                     .nth(1)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
+                is_sse = false;
+            } else if line.to_ascii_lowercase().starts_with("content-type:")
+                && line.to_ascii_lowercase().contains("text/event-stream")
+            {
+                is_sse = true;
             } else if (line == "\r\n" || line == "\n") && !(100..200).contains(&status_code) {
                 in_headers = false;
             }
         } else if (200..300).contains(&status_code) {
             if let Some(cb) = on_line.as_deref_mut() {
                 cb(line.trim_end_matches(['\r', '\n']));
+                if !is_sse {
+                    raw.push_str(&line);
+                }
+            } else {
+                raw.push_str(&line);
             }
+        } else {
+            raw.push_str(&line);
         }
     }
     let status = child
@@ -369,6 +381,7 @@ mod tests {
         assert!(raw_req.contains("Authorization: Bearer sec-\"quoted\"\\tok\r\n"));
         assert!(raw_req.ends_with(r#"{"ping":true}"#));
         assert_eq!(resp.status, 200);
+        assert!(resp.body.is_empty());
         assert_eq!(lines, vec!["data: {\"chunk\":1}", "", "data: [DONE]"]);
     }
 }
