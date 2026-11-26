@@ -192,11 +192,15 @@ impl HostRuntime {
         let eja = eja::open(core_dir.path().join("subject.db")).map_err(|err| err.to_string())?;
         let resources_dir = resolve_resources_dir();
         let memory = open_memory(&core_dir.path().join("memory.db"), resources_dir.as_deref());
+        let ui_fallback_reason = std::env::var("eja_UI_FALLBACK_REASON")
+            .ok()
+            .filter(|reason| !reason.trim().is_empty());
         let anchor = state::bootstrap(
             &eja,
             resources_dir.as_deref(),
             KERNEL_VERSION,
             PROTOCOL_VERSION,
+            ui_fallback_reason.as_deref(),
         )?;
         let mut config = HostConfig::load(&core_dir);
         let capabilities_bytes = HostConfig::read_capabilities(&data_dir).unwrap_or_else(|err| {

@@ -27,6 +27,7 @@ final class ContentUIState: ObservableObject {
 struct ContentView: View {
     @ObservedObject var client: HostClient
     @ObservedObject var ui: ContentUIState
+    @ObservedObject var updater: AppUpdater
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -126,6 +127,7 @@ struct ContentView: View {
                         withAnimation(.smooth) { ui.settingsOpen = false }
                     }
                     .transition(.opacity)
+                    .zIndex(1)
 
                 GeometryReader { window in
                     let portrait = window.size.width < window.size.height
@@ -139,22 +141,30 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                 }
                 .transition(.move(edge: .trailing))
+                .zIndex(2)
             }
 
-            Button {
-                withAnimation(.smooth) { ui.settingsOpen.toggle() }
-            } label: {
-                Image(systemName: ui.settingsOpen ? "xmark" : "slider.horizontal.3")
-                    .font(.body)
-                    .contentTransition(.symbolEffect(.replace))
-                    .symbolEffect(.pulse, isActive: client.isReady && !client.isConfigured)
+            HStack(spacing: 6) {
+                if updater.shouldShowBadge || updater.panelOpen {
+                    updateBadgeButton
+                }
+
+                Button {
+                    withAnimation(.smooth) { ui.settingsOpen.toggle() }
+                } label: {
+                    Image(systemName: ui.settingsOpen ? "xmark" : "slider.horizontal.3")
+                        .font(.body)
+                        .contentTransition(.symbolEffect(.replace))
+                        .symbolEffect(.pulse, isActive: client.isReady && !client.isConfigured)
+                }
+                .buttonStyle(ejaIconButtonStyle())
+                .accessibilityLabel("设置")
+                .keyboardShortcut(ui.settingsOpen ? .cancelAction : nil)
+                .disabled(!client.isReady)
             }
-            .buttonStyle(ejaIconButtonStyle())
-            .accessibilityLabel("设置")
-            .keyboardShortcut(ui.settingsOpen ? .cancelAction : nil)
-            .disabled(!client.isReady)
             .padding(.top, 4)
             .padding(.trailing, 14)
+            .zIndex(3)
         }
         .tint(ejaTheme.ink)
         .onChange(of: ui.settingsOpen) { _, open in
@@ -167,6 +177,112 @@ struct ContentView: View {
         .onChange(of: client.isReady) { _, ready in
             ui.captureBaselineIfNeeded(isReady: ready, dataDir: client.dataDir, from: client.stream)
         }
+    }
+
+    private var updateBadgeButton: some View {
+        Button {
+            updater.panelOpen.toggle()
+        } label: {
+            if updater.isBusy {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: "arrow.down.circle")
+                    .font(.body)
+            }
+        }
+        .buttonStyle(ejaIconButtonStyle())
+        .help(updater.availableUpdate.map { "v\($0.version)" } ?? "更新")
+        .accessibilityLabel("更新")
+        .popover(isPresented: $updater.panelOpen, arrowEdge: .bottom) {
+            updatePopover
+        }
+    }
+
+    @ViewBuilder
+    private var updatePopover: some View {
+        HStack(spacing: 10) {
+            switch updater.phase {
+            case .idle, .checking:
+                ProgressView().controlSize(.small)
+            case .upToDate(let version):
+                Image(systemName: "checkmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(ejaTheme.inkMuted)
+                Text("v\(version)")
+                    .font(.callout.monospaced())
+                    .foregroundStyle(ejaTheme.inkMuted)
+            case .available(let update):
+                updateActionsRow(update: update, errorMessage: nil)
+            case .downloading(let update), .installing(let update):
+                ProgressView().controlSize(.small)
+                Text("v\(update.version)")
+                    .font(.callout.monospaced())
+                    .foregroundStyle(ejaTheme.inkMuted)
+            case .failed(let message, let update):
+                if let update {
+                    updateActionsRow(update: update, errorMessage: message)
+                } else {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundStyle(ejaTheme.danger)
+                        .help(message)
+                    Button {
+                        updater.checkForUpdates(userInitiated: true)
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(ejaIconButtonStyle())
+                    .help("重试")
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private func updateActionsRow(update: AppUpdate, errorMessage: String?) -> some View {
+        let busyWithTurn = client.status != "idle"
+        if let errorMessage {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(ejaTheme.danger)
+                .help(errorMessage)
+        }
+        Text("v\(update.version)")
+            .font(.callout.monospaced())
+            .foregroundStyle(ejaTheme.ink)
+            .help(update.notes)
+        Button {
+            updater.installUpdate(
+                update,
+                dataDir: client.dataDir,
+                baselineId: ui.baselineId
+            ) {
+                client.shutdown(wait: true)
+            }
+        } label: {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.body)
+        }
+        .buttonStyle(ejaIconButtonStyle())
+        .disabled(busyWithTurn)
+        .help(busyWithTurn ? "空闲后可更新" : "更新")
+        Button {
+            updater.openReleasePage(update)
+        } label: {
+            Image(systemName: "arrow.up.right")
+                .font(.caption)
+        }
+        .buttonStyle(ejaIconButtonStyle())
+        .help("GitHub")
+        Button {
+            updater.dismissCurrentUpdate()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.caption)
+        }
+        .buttonStyle(ejaIconButtonStyle())
+        .help("忽略")
     }
 
     private var composer: some View {

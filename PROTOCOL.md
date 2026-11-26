@@ -25,7 +25,7 @@ eja-host --data-dir "<data_dir>"
 - 检索学习是普通用户回合的内建机制。模型可单独调用 `answer_with_receipt({text, receipt})` 结束回合，宿主验证该整数 ID 对应本回合检索已返回的已观测回执。候选线索必须来自首查事实，在两份独立回执的原快照和预算下提前召回目标，并保留首查的已观测回执。宿主用 `eja.recall` 的 `Acted/Returned` 提交更新。每个回合固定使用启动时可见的检索策略，更新从后续回合起生效。查询按忽略大小写、空白与标点后的文本共用策略。相同查询仅在学到的线索能保留原查询可见的已观测回执时采用它，并以 `used_cue` 标出线索；未能保留时，该版本在回合结束后以 `eja.recall` 的 `retired` 记录退回上一版本。
 - 检索结果超出工具预算时按排序保留装得下的完整事实，并标记 `truncated`。检索仍受返回条数与字节预算限制，日志增长会改变同一线索的可见结果。
 - `capabilities.json` 保存统一能力数组（内嵌默认常驻的 `builtin` `shell` 能力、自由实现的 `exec` 本地插件能力，以及 `stdio` / `http` MCP 能力），文件变更在运行期自动热加载。`exec` 插件通过 `stdin` 接收参数 JSON、向 `stdout` 输出结果文本（退出码 `0` 为 `Observed`，非 `0` 为 `Failed`），零协议框架绑定。HTTP 能力支持标准 MCP OAuth 2.1（RFC 9728 / RFC 8414 元数据发现、RFC 7591 动态客户端注册 + PKCE 本地回环回调，以及 RFC 8628 设备码授权流；要求预注册 Client ID 的服务可在能力键值中提供 `X-OAuth-Client-Id`）；OAuth Token 保存在内核目录 `oauth.json` 并由宿主自动注入与刷新，`capabilities.json` 无需保存明文 Token。
-- `ui/` 保存用户空间前端源码。运行 `ui/apply.sh` 会生成 `ui/libejaUI.dylib`。eja 空闲时沿用当前数据目录重启，启动器加载新的动态库。已安装的应用包保持原样。加载失败或启动时按住 Option 键会使用包内出厂界面。
+- `ui/` 保存用户空间前端源码，`ui/Sources/ejaClient` 归出厂应用所有并在更新时自动同步，`ui/libejaUI.dylib` 仅作为编译缓存。运行 `ui/apply.sh` 会生成 `ui/libejaUI.dylib`，eja 空闲时沿用当前数据目录重启，启动器加载新的动态库。应用更新时，启动器自动同步 `ejaClient` 并重编 `ui/`；重编失败、加载失败、上次启动异常退出或启动时按住 Option 键会回退到出厂界面，并将原因写入主体日志。
 
 `exec` 插件可直接向 `stdout` 输出图像，MCP 服务可通过 `image` 内容块返回图像。JPEG、PNG、GIF 和 WebP 共用模型图像接口。图像只发给收到该工具回执的下一步模型请求。主体日志只保存文字回执，模型请求会用 `images_omitted` 表明超出窗口而省略的图像数。
 

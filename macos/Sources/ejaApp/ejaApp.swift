@@ -54,6 +54,7 @@ struct ejaApp: App {
     @Environment(\.openWindow) private var openWindow
     @StateObject private var client = HostClient()
     @StateObject private var ui = ContentUIState()
+    @StateObject private var updater = AppUpdater()
 
     private var windowSize: CGSize {
         let screen = NSScreen.main?.visibleFrame.size ?? .zero
@@ -62,7 +63,7 @@ struct ejaApp: App {
 
     var body: some Scene {
         Window("eja", id: "main") {
-            ContentView(client: client, ui: ui)
+            ContentView(client: client, ui: ui, updater: updater)
         }
         .defaultSize(windowSize)
         .windowStyle(.hiddenTitleBar)
@@ -74,6 +75,7 @@ struct ejaApp: App {
                 }
                 appDelegate.reopenWindow = { openWindow(id: "main") }
                 openWindow(id: "main")
+                updater.checkOnLaunchIfBundled()
             }
             bootstrapUI(dataDirPath: newDir)
         }
@@ -86,6 +88,12 @@ struct ejaApp: App {
             handleAlreadyRunning()
         }
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("检查更新…") {
+                    updater.checkForUpdates(userInitiated: true)
+                }
+                .disabled(updater.isBusy)
+            }
             CommandGroup(replacing: .appSettings) {
                 Button("设置…") {
                     withAnimation(.smooth) { ui.settingsOpen.toggle() }

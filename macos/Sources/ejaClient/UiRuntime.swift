@@ -20,6 +20,14 @@ public enum UiRuntime {
         dataDir.appendingPathComponent("ui/.reload-baseline")
     }
 
+    public static func bootMarkerFile(in dataDir: URL) -> URL {
+        dataDir.appendingPathComponent("ui/.booting")
+    }
+
+    public static func markBootSucceeded(in dataDir: URL) {
+        try? FileManager.default.removeItem(at: bootMarkerFile(in: dataDir))
+    }
+
     public static func resolveTemplateDir() -> URL? {
         let fm = FileManager.default
         if let res = Bundle.main.resourceURL?.appendingPathComponent("ui-template", isDirectory: true),

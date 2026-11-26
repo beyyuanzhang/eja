@@ -85,6 +85,7 @@ pub fn bootstrap(
     resources_dir: Option<&Path>,
     kernel_version: &str,
     protocol_version: u32,
+    ui_fallback_reason: Option<&str>,
 ) -> std::result::Result<Id, String> {
     eja.transaction(|tx| {
         let stored = tx.get_meta(META_STATE)?;
@@ -112,6 +113,15 @@ pub fn bootstrap(
                 format!(
                     "内核已从 {old} 升级到 {kernel_version}（协议 v{protocol_version}）。{suffix}"
                 ),
+            )?;
+        }
+        if let Some(reason) = ui_fallback_reason.map(str::trim).filter(|s| !s.is_empty()) {
+            let suffix = resources_dir
+                .map(|dir| format!(" 默认界面与协议文档位于 {}。", dir.display()))
+                .unwrap_or_default();
+            tx.notice(
+                Source::World,
+                format!("自定义界面已回退到出厂界面：{reason}{suffix}"),
             )?;
         }
         state.kernel_version = Some(kernel_version.to_string());
@@ -203,5 +213,32 @@ mod tests {
         let head = eja.revision().unwrap();
         assert!(proactive_reply_ids(&eja).contains(&head));
         assert_eq!(next_trigger(&eja).unwrap(), None);
+    }
+
+    #[test]
+    fn bootstrap_records_ui_fallback_notice_only_when_present() {
+        let eja = eja::open(":memory:").unwrap();
+        bootstrap(&eja, None, "1.0.0", 2, None).unwrap();
+        assert_eq!(eja.revision().unwrap(), 0);
+
+        bootstrap(
+            &eja,
+            Some(Path::new("/Applications/eja.app/Contents/Resources")),
+            "1.0.0",
+            2,
+            Some("编译失败：missing member"),
+        )
+        .unwrap();
+        let entries = eja.entries_after(0, eja.revision().unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].fact {
+            Fact::Noticed { source, text } => {
+                assert_eq!(*source, Source::World);
+                assert!(text.contains("自定义界面已回退到出厂界面"));
+                assert!(text.contains("编译失败：missing member"));
+                assert!(text.contains("/Applications/eja.app/Contents/Resources"));
+            }
+            other => panic!("unexpected entry: {other:?}"),
+        }
     }
 }

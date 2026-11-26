@@ -237,4 +237,68 @@ for line in sys.stdin:
         #expect(client.stream.map(\.id) == [3, 5, 6])
         #expect(client.wakes.isEmpty)
     }
+
+    @Test
+    @MainActor
+    func clearsBootMarkerOnValidStateAndAlreadyRunning() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let marker = UiRuntime.bootMarkerFile(in: dir)
+        try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "digest".write(to: marker, atomically: true, encoding: .utf8)
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+
+        let client = HostClient(hostExecutableURL: URL(fileURLWithPath: "/bin/cat"), dataDir: dir)
+        defer { client.shutdown() }
+
+        client.handleEventLine(
+            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"\#(dir.path)","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
+        )
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+
+        try "digest".write(to: marker, atomically: true, encoding: .utf8)
+        client.handleEventLine(Data(#"{"event":"already_running","ui_pid":42}"#.utf8))
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test
+    func updaterComparesVersionsAndParsesGitHubRelease() throws {
+        #expect(AppUpdater.isNewerVersion("v1.0.7", than: "1.0.6"))
+        #expect(AppUpdater.isNewerVersion("1.10.0", than: "1.2.9"))
+        #expect(AppUpdater.isNewerVersion("1.0.7", than: "1.0.7-beta.1"))
+        #expect(!AppUpdater.isNewerVersion("1.0.6", than: "1.0.6"))
+        #expect(!AppUpdater.isNewerVersion("1.0.5", than: "1.0.6"))
+
+        let releaseJSON = Data("""
+        {
+          "tag_name": "v1.0.7",
+          "html_url": "https://github.com/beyyuanzhang/eja/releases/tag/v1.0.7",
+          "body": "修复若干问题",
+          "draft": false,
+          "prerelease": false,
+          "assets": [
+            {
+              "name": "eja-1.0.7.dmg",
+              "browser_download_url": "https://github.com/beyyuanzhang/eja/releases/download/v1.0.7/eja-1.0.7.dmg"
+            },
+            {
+              "name": "SHA256SUMS.txt",
+              "browser_download_url": "https://github.com/beyyuanzhang/eja/releases/download/v1.0.7/SHA256SUMS.txt"
+            }
+          ]
+        }
+        """.utf8)
+
+        let update = try AppUpdater.parseReleaseUpdate(from: releaseJSON, currentVersion: "1.0.6")
+        #expect(update?.version == "1.0.7")
+        #expect(update?.dmgFilename == "eja-1.0.7.dmg")
+        #expect(update?.sha256URL?.lastPathComponent == "SHA256SUMS.txt")
+        #expect(try AppUpdater.parseReleaseUpdate(from: releaseJSON, currentVersion: "1.0.7") == nil)
+
+        let sums = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  eja-1.0.7.dmg\n"
+        #expect(
+            AppUpdater.parseExpectedSHA256(from: sums, filename: "eja-1.0.7.dmg")
+                == "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+    }
 }
