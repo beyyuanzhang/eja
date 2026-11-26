@@ -172,7 +172,7 @@ impl HostRuntime {
             .file_name()
             .ok_or_else(|| OpenError::Failed("数据目录不能是文件系统根目录".into()))?;
         let mut core_name = name.to_os_string();
-        if name == "eja" {
+        if name.to_str().is_some_and(|s| s.eq_ignore_ascii_case("eja")) {
             core_name = "ai.eja.kernel".into();
         } else {
             core_name.push(".kernel");
