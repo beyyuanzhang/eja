@@ -340,7 +340,7 @@ fn subject_db_rejects_other_schema_versions_without_changing_the_file() -> Resul
 
     drop(conn);
 
-    for version in [0, 3, 99] {
+    for version in [0, 3, 5, 99] {
         let conn = rusqlite::Connection::open(&path)?;
         conn.pragma_update(None, "user_version", version)?;
         drop(conn);
@@ -363,26 +363,5 @@ fn unfinished_actions_finds_only_unsettled_actions_on_long_journal() -> Result<(
     let pending = eja.act(rev, "shell", json!({ "n": 300 }))?;
 
     assert_eq!(eja.unfinished_actions()?, vec![pending.id]);
-    Ok(())
-}
-
-#[test]
-fn experimental_reflections_remain_readable_as_history() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("subject.db");
-    drop(Eja::open(&path)?);
-    let db = rusqlite::Connection::open(&path)?;
-    db.pragma_update(None, "user_version", 5)?;
-    db.execute(
-        "INSERT INTO facts(id, at, kind, body) VALUES(1, 0, 'reflected', ?1)",
-        [r#"{"kind":"reflected","feedback":1,"next_cue":"archive"}"#],
-    )?;
-    drop(db);
-    let eja = Eja::open(&path)?;
-    let Fact::LegacyReflection(history) = eja.read(1)?.fact else {
-        panic!("expected a historical reflection");
-    };
-    assert_eq!(history["next_cue"], "archive");
-    assert_eq!(eja.notice(Source::Person, "继续")?, 2);
     Ok(())
 }

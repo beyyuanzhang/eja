@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 const SCHEMA_VERSION: i32 = 4;
-const EXPERIMENTAL_REFLECTION_SCHEMA: i32 = 5;
 const UNFINISHED_ACTIONS_SQL: &str = "SELECT action.id FROM facts AS action
     WHERE action.kind = 'acted'
       AND NOT EXISTS (
@@ -114,8 +113,7 @@ fn evidence_at_on(conn: &Connection, id: Id, revision: Id) -> Result<Evidence> {
             .optional()?
             .map(|later| read_on(conn, later))
             .transpose()?,
-        Fact::Noticed { .. } | Fact::Said { .. } | Fact::Released { .. }
-        | Fact::LegacyReflection(_) => None,
+        Fact::Noticed { .. } | Fact::Said { .. } | Fact::Released { .. } => None,
     };
     Ok(Evidence {
         latest: latest.filter(|later| later.id > id),
@@ -548,13 +546,13 @@ fn initialize_schema(db: &Connection) -> Result<()> {
     let schema_version =
         |conn: &Connection| conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0));
     match schema_version(db)? {
-        SCHEMA_VERSION | EXPERIMENTAL_REFLECTION_SCHEMA => return Ok(()),
+        SCHEMA_VERSION => return Ok(()),
         0 => {}
         version => return Err(unsupported_schema(version)),
     }
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     match schema_version(&tx)? {
-        SCHEMA_VERSION | EXPERIMENTAL_REFLECTION_SCHEMA => return Ok(()),
+        SCHEMA_VERSION => return Ok(()),
         0 => {}
         version => return Err(unsupported_schema(version)),
     }

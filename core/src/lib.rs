@@ -97,9 +97,6 @@ pub enum Fact {
         action: Id,
         outcome: Outcome,
     },
-    #[doc(hidden)]
-    #[serde(rename = "reflected")]
-    LegacyReflection(Value),
 }
 
 impl Fact {
@@ -111,7 +108,6 @@ impl Fact {
             Self::Released { .. } => "released",
             Self::Acted { .. } => "acted",
             Self::Returned { .. } => "returned",
-            Self::LegacyReflection(_) => "reflected",
         }
     }
 }

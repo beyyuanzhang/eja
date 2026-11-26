@@ -185,7 +185,7 @@ fn fact_text(fact: &Fact) -> Option<String> {
             outcome: Outcome::Observed(text) | Outcome::Failed(text) | Outcome::Unknown(text),
             ..
         } => Some(text.clone()),
-        Fact::Released { .. } | Fact::LegacyReflection(_) => None,
+        Fact::Released { .. } => None,
     }
 }
 
