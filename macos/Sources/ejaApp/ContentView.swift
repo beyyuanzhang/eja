@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor
 final class ContentUIState: ObservableObject {
     @Published var draftText: String = ""
-    @Published var showSettingsSheet: Bool = false
+    @Published var settingsOpen: Bool = false
     @Published var baselineId: Int64 = -1
     @Published var sendHovered: Bool = false
     @Published var showAgenda: Bool = false
@@ -37,12 +37,13 @@ struct ContentView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 18) {
+                            edgeSpace
                             if canLoadEarlier {
                                 Button(action: loadEarlier) {
                                     Image(systemName: "chevron.up")
                                 }
                                 .buttonStyle(.plain)
-                                .font(.system(size: 12))
+                                .font(.callout)
                                 .foregroundStyle(ejaTheme.inkMuted)
                                 .frame(maxWidth: .infinity)
                             }
@@ -53,20 +54,18 @@ struct ContentView: View {
                             if client.status != "idle" {
                                 busyRow
                             }
-                            Color.clear
-                                .frame(height: 42)
+                            edgeSpace
                                 .accessibilityHidden(true)
                                 .id("eja-conversation-bottom")
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 28)
                     }
-                    .contentMargins(.top, 72, for: .scrollContent)
                     .scrollIndicators(.never)
                     .clipped()
                     .mask {
                         GeometryReader { geometry in
-                            let fadeHeight = min(60, geometry.size.height / 2)
+                            let fadeHeight = geometry.size.height * 0.1
                             VStack(spacing: 0) {
                                 LinearGradient(stops: Self.edgeFadeStops, startPoint: .bottom, endPoint: .top)
                                     .frame(height: fadeHeight)
@@ -96,7 +95,7 @@ struct ContentView: View {
                     if let err = client.errorBanner {
                         Button { client.errorBanner = nil } label: {
                             Image(systemName: "exclamationmark.circle.fill")
-                                .font(.system(size: 14))
+                                .font(.title3)
                                 .foregroundStyle(ejaTheme.danger)
                                 .symbolEffect(.bounce, value: err)
                         }
@@ -120,25 +119,46 @@ struct ContentView: View {
                 .animation(.easeOut(duration: 0.16), value: client.errorBanner != nil)
             }
 
-            Button(action: showSettings) {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.system(size: 13, weight: .regular))
+            if ui.settingsOpen {
+                Color.black.opacity(0.12)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.smooth) { ui.settingsOpen = false }
+                    }
+                    .transition(.opacity)
+
+                GeometryReader { window in
+                    let portrait = window.size.width < window.size.height
+                    HStack(spacing: 0) {
+                        Divider()
+                            .ignoresSafeArea(edges: .top)
+                        SettingsView(client: client)
+                    }
+                    .frame(width: window.size.width * (portrait ? 1 : 0.5))
+                    .shadow(color: ejaTheme.subtleShadow, radius: 16, x: -4)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .transition(.move(edge: .trailing))
+            }
+
+            Button {
+                withAnimation(.smooth) { ui.settingsOpen.toggle() }
+            } label: {
+                Image(systemName: ui.settingsOpen ? "xmark" : "slider.horizontal.3")
+                    .font(.body)
+                    .contentTransition(.symbolEffect(.replace))
                     .symbolEffect(.pulse, isActive: client.isReady && !client.isConfigured)
             }
-            .buttonStyle(ejaIconButtonStyle(size: 28))
+            .buttonStyle(ejaIconButtonStyle())
             .accessibilityLabel("设置")
+            .keyboardShortcut(ui.settingsOpen ? .cancelAction : nil)
             .disabled(!client.isReady)
-            .padding(.top, 10)
+            .padding(.top, 4)
             .padding(.trailing, 14)
-            .ignoresSafeArea(edges: .top)
         }
         .tint(ejaTheme.ink)
-        .sheet(isPresented: $ui.showSettingsSheet, onDismiss: { composerFocused = true }) {
-            SettingsView(client: client, isPresented: $ui.showSettingsSheet)
-                .frame(minWidth: 340, idealWidth: 700, minHeight: 260, idealHeight: 500)
-        }
-        .onChange(of: ui.showSettingsSheet) { _, presented in
-            if presented { composerFocused = false }
+        .onChange(of: ui.settingsOpen) { _, open in
+            composerFocused = !open
         }
         .onAppear {
             composerFocused = true
@@ -149,14 +169,10 @@ struct ContentView: View {
         }
     }
 
-    private func showSettings() {
-        ui.showSettingsSheet = true
-    }
-
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
             TextField("", text: $ui.draftText, axis: .vertical)
-            .font(.system(size: 13.5))
+            .font(.body)
             .foregroundStyle(ejaTheme.ink)
             .textFieldStyle(.plain)
             .lineLimit(1...6)
@@ -166,13 +182,12 @@ struct ContentView: View {
             .padding(.vertical, 5)
 
             Button { canStop ? client.cancelTurn() : sendDraft() } label: {
-                Image(systemName: canStop ? "stop.fill" : "arrow.up")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(canSend || canStop ? ejaTheme.canvas : ejaTheme.inkMuted)
-                    .frame(width: 26, height: 26)
-                    .background(
-                        Circle()
-                            .fill(canSend || canStop ? ejaTheme.ink.opacity(ui.sendHovered ? 0.86 : 1.0) : ejaTheme.surfaceSubtle)
+                Image(systemName: canStop ? "stop.circle.fill" : "arrow.up.circle.fill")
+                    .font(.title)
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(
+                        canSend || canStop ? ejaTheme.canvas : ejaTheme.inkMuted,
+                        canSend || canStop ? ejaTheme.ink.opacity(ui.sendHovered ? 0.86 : 1.0) : ejaTheme.surfaceSubtle
                     )
             }
             .buttonStyle(SendScaleButtonStyle())
@@ -216,7 +231,7 @@ struct ContentView: View {
                     Image(systemName: "alarm")
                     Text(verbatim: "\(client.wakes.count)")
                     Image(systemName: ui.showAgenda ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9))
+                        .font(.caption2)
                 }
             }
             .buttonStyle(.plain)
@@ -228,17 +243,21 @@ struct ContentView: View {
                         Spacer(minLength: 8)
                         Button { client.dismissWake(id: wake.id) } label: {
                             Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .medium))
+                                .font(.caption2.weight(.medium))
                         }
-                        .buttonStyle(ejaIconButtonStyle(size: 18))
+                        .buttonStyle(ejaIconButtonStyle())
                     }
                 }
             }
         }
-        .font(.system(size: 12))
+        .font(.callout)
         .foregroundStyle(ejaTheme.inkSecondary)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 8)
+    }
+
+    private var edgeSpace: some View {
+        Color.clear.containerRelativeFrame(.vertical) { height, _ in height * 0.1 }
     }
 
     private var streamingPreview: String {
@@ -252,7 +271,8 @@ struct ContentView: View {
             ejaTextRow(preview)
         } else {
             Image(systemName: "circle.fill")
-                .font(.system(size: 7))
+                .font(.caption2)
+                .imageScale(.small)
                 .foregroundStyle(ejaTheme.inkMuted)
                 .symbolEffect(.pulse)
                 .padding(.leading, 4)
@@ -269,9 +289,9 @@ struct ContentView: View {
 
     private func sendDraft() {
         let text = ui.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard client.isReady, !ui.showSettingsSheet, !text.isEmpty else { return }
+        guard client.isReady, !text.isEmpty else { return }
         if !client.isConfigured {
-            showSettings()
+            withAnimation(.smooth) { ui.settingsOpen = true }
             return
         }
         ui.draftText = ""
@@ -284,7 +304,7 @@ struct ContentView: View {
             HStack {
                 Spacer(minLength: 48)
                 Text(item.text)
-                    .font(.system(size: 13.5))
+                    .font(.body)
                     .lineSpacing(3)
                     .foregroundStyle(ejaTheme.ink)
                     .textSelection(.enabled)
@@ -300,7 +320,7 @@ struct ContentView: View {
 
     private func ejaTextRow(_ text: String) -> some View {
         markdownText(text)
-            .font(.system(size: 13.5))
+            .font(.body)
             .lineSpacing(4.5)
             .foregroundStyle(ejaTheme.ink)
             .textSelection(.enabled)

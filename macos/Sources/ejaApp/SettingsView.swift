@@ -371,16 +371,11 @@ struct ProviderPreset: Identifiable {
 
 struct SettingsView: View {
     @ObservedObject var client: HostClient
-    @Binding var isPresented: Bool
     @StateObject private var draft = SettingsDraft()
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-            Rectangle()
-                .fill(ejaTheme.hairline)
-                .frame(width: 1)
-                .ignoresSafeArea(edges: .vertical)
+        VStack(spacing: 0) {
+            tabs
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -400,42 +395,30 @@ struct SettingsView: View {
         .onDisappear { draft.flushSave() }
     }
 
-    private var sidebar: some View {
-        VStack(spacing: 2) {
-            sideItem(.models, icon: "brain")
-            sideItem(.capabilities, icon: "point.3.connected.trianglepath.dotted")
-            Spacer(minLength: 0)
-            Button {
-                draft.flushSave()
-                isPresented = false
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 11, weight: .medium))
-            }
-            .buttonStyle(ejaIconButtonStyle(size: 24))
-            .accessibilityLabel("关闭设置")
-            .keyboardShortcut(.cancelAction)
-            .padding(.bottom, 10)
+    private var tabs: some View {
+        HStack(spacing: 4) {
+            tab(.models, icon: "brain")
+            tab(.capabilities, icon: "point.3.connected.trianglepath.dotted")
         }
-        .padding(.horizontal, 10)
-        .padding(.top, 8)
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
     }
 
-    private func sideItem(_ section: SettingsSection, icon: String) -> some View {
+    private func tab(_ section: SettingsSection, icon: String) -> some View {
         let active = draft.section == section
         return Button {
-            withAnimation(.easeOut(duration: 0.14)) { draft.section = section }
+            withAnimation(.smooth) { draft.section = section }
         } label: {
             Image(systemName: icon)
-                .font(.system(size: 13))
+                .font(.body)
                 .foregroundStyle(active ? ejaTheme.ink : ejaTheme.inkSecondary)
-                .frame(width: 32, height: 28)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(active ? ejaTheme.surfaceSubtle : .clear)
-            )
-            .contentShape(Rectangle())
+                .padding(6)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(active ? ejaTheme.surfaceSubtle : .clear)
+                )
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -474,9 +457,9 @@ struct SettingsView: View {
             }
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 11, weight: .medium))
+                .font(.subheadline.weight(.medium))
                 .foregroundStyle(ejaTheme.inkMuted)
-                .frame(width: 26, height: 26)
+                .padding(7)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .fill(ejaTheme.surface)
@@ -499,42 +482,33 @@ struct SettingsView: View {
         let testResult = client.providerTestResults[provider.id]
         let activeModel = draft.judge.providerId == provider.id ? draft.judge.model : ""
 
-        return VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(.easeOut(duration: 0.14)) {
-                    draft.expandedProvider = expanded ? nil : provider.id
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Text(provider.name.isEmpty ? provider.id : provider.name)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(ejaTheme.ink)
-                        .lineLimit(1)
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 8.5, weight: .semibold))
-                        .foregroundStyle(ejaTheme.inkMuted)
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
-                    Spacer(minLength: 4)
-                    if !activeModel.isEmpty {
-                        Text(activeModel)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(ejaTheme.inkSecondary)
-                            .lineLimit(1)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                title(providerBinding(index, \.name, ""), placeholder: provider.id)
+                Button {
+                    withAnimation(.smooth) {
+                        draft.expandedProvider = expanded ? nil : provider.id
                     }
+                } label: {
+                    HStack(spacing: 6) {
+                        chevron(expanded)
+                        Spacer(minLength: 4)
+                        if !expanded && !activeModel.isEmpty {
+                            Text(activeModel)
+                                .font(.system(.subheadline, design: .monospaced))
+                                .foregroundStyle(ejaTheme.inkSecondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(expanded ? "已展开" : "已收起")
-            .padding(.horizontal, 11)
-            .padding(.vertical, 9)
+                .buttonStyle(.plain)
+                .accessibilityValue(expanded ? "已展开" : "已收起")
 
-            if expanded {
-                HStack(spacing: 6) {
-                    Spacer(minLength: 0)
+                if expanded {
                     if let testResult {
                         Image(systemName: testResult.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .font(.system(size: 12))
+                            .font(.callout)
                             .foregroundStyle(testResult.ok ? ejaTheme.positive : ejaTheme.danger)
                             .help(testResult.message)
                     }
@@ -544,40 +518,39 @@ struct SettingsView: View {
                         client.testProvider(provider, model: model)
                     } label: {
                         Image(systemName: "bolt")
-                            .font(.system(size: 10.5, weight: .medium))
+                            .font(.subheadline.weight(.medium))
                     }
-                    .buttonStyle(ejaIconButtonStyle(size: 22))
+                    .buttonStyle(ejaIconButtonStyle())
                     .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty)
 
                     Button {
                         draft.fetchModels(for: provider.id)
                     } label: {
                         Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 10.5, weight: .medium))
+                            .font(.subheadline.weight(.medium))
                             .rotationEffect(.degrees(isFetching ? 180 : 0))
                             .animation(.easeInOut(duration: 0.25), value: isFetching)
                     }
-                    .buttonStyle(ejaIconButtonStyle(size: 22))
+                    .buttonStyle(ejaIconButtonStyle())
                     .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty || isFetching)
 
                     Button {
                         draft.removeProvider(id: provider.id)
                     } label: {
                         Image(systemName: "trash")
-                            .font(.system(size: 10.5))
+                            .font(.subheadline)
                     }
-                    .buttonStyle(ejaIconButtonStyle(size: 22, destructive: true))
+                    .buttonStyle(ejaIconButtonStyle(destructive: true))
                 }
-                .padding(.horizontal, 11)
-                .padding(.bottom, 7)
+            }
 
+            if expanded {
                 providerModelPills(index: index)
-                    .padding(.horizontal, 11)
-                    .padding(.bottom, 10)
-
+                Divider()
                 providerEditor(index: index)
             }
         }
+        .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(ejaTheme.surface)
@@ -598,7 +571,7 @@ struct SettingsView: View {
                     draft.selectModel(providerId: provider.id, model: model)
                 } label: {
                     Text(model)
-                        .font(.system(size: 11.5, weight: selected ? .medium : .regular, design: .monospaced))
+                        .font(.system(.callout, design: .monospaced, weight: selected ? .medium : .regular))
                         .lineLimit(1)
                         .foregroundStyle(selected ? ejaTheme.canvas : ejaTheme.ink)
                         .padding(.horizontal, 8)
@@ -626,12 +599,11 @@ struct SettingsView: View {
             }
 
             if isAdding {
-                TextField("", text: $draft.newModelInput)
-                    .font(.system(size: 11, design: .monospaced))
+                TextField("", text: $draft.newModelInput, prompt: Text("模型").foregroundStyle(ejaTheme.inkMuted))
+                    .font(.system(.subheadline, design: .monospaced))
                     .foregroundStyle(ejaTheme.ink)
                     .textFieldStyle(.plain)
                     .fixedSize(horizontal: true, vertical: false)
-                    .frame(minWidth: 64)
                     .onSubmit {
                         draft.addModel(providerId: provider.id, model: draft.newModelInput)
                     }
@@ -655,7 +627,7 @@ struct SettingsView: View {
                     draft.addingModelProvider = provider.id
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 9.5, weight: .medium))
+                        .font(.caption.weight(.medium))
                         .foregroundStyle(ejaTheme.inkMuted)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 5.5)
@@ -675,22 +647,15 @@ struct SettingsView: View {
 
     private func providerEditor(index: Int) -> some View {
         let provider = draft.providers[index]
-        let nameBinding = providerBinding(index, \.name, "")
         let urlBinding = Binding(
             get: { draft.providers.indices.contains(index) ? draft.providers[index].baseUrl : "" },
             set: { draft.changeEndpoint(index, field: \.baseUrl, to: $0) }
         )
         let keyBinding = providerBinding(index, \.apiKey, "")
 
-        return VStack(alignment: .leading, spacing: 6) {
-            divider
+        return VStack(spacing: 6) {
             HStack(spacing: 6) {
-                TextField("", text: nameBinding, prompt: Text(Image(systemName: "tag")).foregroundStyle(ejaTheme.inkMuted))
-                    .font(.system(size: 12))
-                    .foregroundStyle(ejaTheme.ink)
-                    .textFieldStyle(.plain)
-                    .modifier(CardField())
-
+                field("URL", text: urlBinding)
                 HStack(spacing: 2) {
                     kindSegment("OpenAI", tag: "openai", index: index)
                     kindSegment("Anthropic", tag: "anthropic", index: index)
@@ -703,14 +668,8 @@ struct SettingsView: View {
                 .fixedSize()
             }
 
-            TextField("", text: urlBinding, prompt: Text(Image(systemName: "link")).foregroundStyle(ejaTheme.inkMuted))
-                .font(.system(size: 11.5, design: .monospaced))
-                .foregroundStyle(ejaTheme.ink)
-                .textFieldStyle(.plain)
-                .modifier(CardField())
-
-            SecureField("", text: keyBinding, prompt: Text(Image(systemName: provider.hasApiKey ? "key.fill" : "key")).foregroundStyle(ejaTheme.inkMuted))
-                .font(.system(size: 11.5, design: .monospaced))
+            SecureField("", text: keyBinding, prompt: Text(provider.hasApiKey ? "密钥 ••••" : "密钥").foregroundStyle(ejaTheme.inkMuted))
+                .font(.system(.callout, design: .monospaced))
                 .foregroundStyle(ejaTheme.ink)
                 .textFieldStyle(.plain)
                 .onSubmit {
@@ -719,8 +678,6 @@ struct SettingsView: View {
                 }
                 .modifier(CardField())
         }
-        .padding(.horizontal, 11)
-        .padding(.bottom, 10)
     }
 
     private func kindSegment(_ label: String, tag: String, index: Int) -> some View {
@@ -731,7 +688,7 @@ struct SettingsView: View {
             }
         } label: {
             Text(label)
-                .font(.system(size: 11, weight: active ? .medium : .regular))
+                .font(.subheadline.weight(active ? .medium : .regular))
                 .foregroundStyle(active ? ejaTheme.ink : ejaTheme.inkSecondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3.5)
@@ -758,9 +715,9 @@ struct SettingsView: View {
                     draft.addCapability()
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.subheadline.weight(.medium))
                         .foregroundStyle(ejaTheme.inkMuted)
-                        .frame(width: 26, height: 26)
+                        .padding(7)
                         .background(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
                                 .fill(ejaTheme.surface)
@@ -797,6 +754,10 @@ struct SettingsView: View {
             if let err = status?.error, !err.isEmpty { return ejaTheme.warning }
             return ejaTheme.inkMuted
         }()
+        let nameBinding = Binding<String>(
+            get: { draft.capabilities.indices.contains(index) ? draft.capabilities[index].name : "" },
+            set: { if draft.capabilities.indices.contains(index) { draft.capabilities[index].name = $0 } }
+        )
         let enabledBinding = Binding<Bool>(
             get: { enabled },
             set: {
@@ -807,26 +768,23 @@ struct SettingsView: View {
             }
         )
 
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "circle.fill")
+                    .font(.caption2)
+                    .imageScale(.small)
+                    .foregroundStyle(dotColor)
+                title(nameBinding, placeholder: cap.id)
+                    .foregroundStyle((enabled || isBuiltin) ? ejaTheme.ink : ejaTheme.inkSecondary)
+                    .allowsHitTesting(!isBuiltin)
                 Button {
-                    withAnimation(.easeOut(duration: 0.14)) {
+                    withAnimation(.smooth) {
                         draft.expandedCapability = expanded ? nil : cap.id
                     }
                 } label: {
-                    HStack(spacing: 7) {
-                        Circle()
-                            .fill(dotColor)
-                            .frame(width: 6, height: 6)
-                        Text(cap.name.isEmpty ? cap.id : cap.name)
-                            .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle((enabled || isBuiltin) ? ejaTheme.ink : ejaTheme.inkSecondary)
-                            .lineLimit(1)
+                    HStack(spacing: 6) {
                         if canExpand {
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 8.5, weight: .semibold))
-                                .foregroundStyle(ejaTheme.inkMuted)
-                                .rotationEffect(.degrees(expanded ? 90 : 0))
+                            chevron(expanded)
                         }
                         Spacer(minLength: 4)
                     }
@@ -836,28 +794,21 @@ struct SettingsView: View {
                 .disabled(!canExpand)
                 .accessibilityValue(canExpand ? (expanded ? "已展开" : "已收起") : "")
 
-                if !isBuiltin {
-                    Toggle("启用能力", isOn: enabledBinding)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .disabled(savingSwitch)
+                if let error, !error.isEmpty {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(ejaTheme.warning)
+                        .help(error)
                 }
-            }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 9)
 
-            if expanded {
-                if !isBuiltin {
-                    HStack(spacing: 6) {
-                        Spacer(minLength: 0)
-                        if let code = status?.oauthCode, !code.isEmpty {
+                if expanded && !isBuiltin {
+                    if let code = status?.oauthCode, !code.isEmpty {
                             Button {
                                 NSPasteboard.general.clearContents()
                                 NSPasteboard.general.setString(code, forType: .string)
                             } label: {
                                 Text(code)
-                                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                    .font(.system(.caption, design: .monospaced, weight: .medium))
                                     .foregroundStyle(ejaTheme.ink)
                                     .padding(.horizontal, 6.5)
                                     .padding(.vertical, 2.5)
@@ -877,7 +828,7 @@ struct SettingsView: View {
                                 client.oauthCapability(id: cap.id)
                             } label: {
                                 Image(systemName: "key.fill")
-                                    .font(.system(size: 10.5, weight: .medium))
+                                    .font(.subheadline.weight(.medium))
                                     .foregroundStyle(ejaTheme.canvas)
                                     .padding(.horizontal, 7.5)
                                     .padding(.vertical, 2.5)
@@ -894,36 +845,34 @@ struct SettingsView: View {
                             client.reloadCapabilities()
                         } label: {
                             Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 10.5, weight: .medium))
+                                .font(.subheadline.weight(.medium))
                         }
-                        .buttonStyle(ejaIconButtonStyle(size: 22))
+                        .buttonStyle(ejaIconButtonStyle())
 
                         Button {
                             draft.removeCapability(id: cap.id)
                         } label: {
                             Image(systemName: "trash")
-                                .font(.system(size: 10.5))
+                                .font(.subheadline)
                         }
-                        .buttonStyle(ejaIconButtonStyle(size: 22, destructive: true))
-                    }
-                    .padding(.horizontal, 11)
-                    .padding(.bottom, 7)
+                        .buttonStyle(ejaIconButtonStyle(destructive: true))
                 }
 
-                if let error, !error.isEmpty {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(ejaTheme.warning)
-                        .help(error)
-                        .padding(.horizontal, 11)
-                        .padding(.bottom, 9)
+                if !isBuiltin {
+                    Toggle("启用能力", isOn: enabledBinding)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .disabled(savingSwitch)
                 }
+            }
 
+            if expanded {
                 if !tools.isEmpty {
                     FlowLayout(spacing: 5, lineSpacing: 5) {
                         ForEach(tools) { tool in
                             Text(tool.name)
-                                .font(.system(size: 10.5, design: .monospaced))
+                                .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(ejaTheme.inkSecondary)
                                 .padding(.horizontal, 6.5)
                                 .padding(.vertical, 2.5)
@@ -937,15 +886,15 @@ struct SettingsView: View {
                                 )
                         }
                     }
-                    .padding(.horizontal, 11)
-                    .padding(.bottom, 9)
                 }
 
                 if !isBuiltin {
+                    Divider()
                     capabilityEditor(index: index)
                 }
             }
         }
+        .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(ejaTheme.surface)
@@ -958,10 +907,6 @@ struct SettingsView: View {
 
     private func capabilityEditor(index: Int) -> some View {
         let cap = draft.capabilities[index]
-        let nameBinding = Binding<String>(
-            get: { draft.capabilities.indices.contains(index) ? draft.capabilities[index].name : "" },
-            set: { if draft.capabilities.indices.contains(index) { draft.capabilities[index].name = $0 } }
-        )
         let urlBinding = transportBinding(index, \.url, "")
         let descBinding = transportBinding(index, \.description, "")
         let cmdLineBinding = commandLineBinding(index)
@@ -969,15 +914,13 @@ struct SettingsView: View {
         let isHTTP = cap.transport.type == "http"
         let isExec = cap.transport.type == "exec"
 
-        return VStack(alignment: .leading, spacing: 6) {
-            divider
+        return VStack(spacing: 6) {
             HStack(spacing: 6) {
-                TextField("", text: nameBinding, prompt: Text(Image(systemName: "tag")).foregroundStyle(ejaTheme.inkMuted))
-                    .font(.system(size: 12))
-                    .foregroundStyle(ejaTheme.ink)
-                    .textFieldStyle(.plain)
-                    .modifier(CardField())
-
+                if isHTTP {
+                    field("URL", text: urlBinding)
+                } else {
+                    field("命令", text: cmdLineBinding)
+                }
                 HStack(spacing: 2) {
                     transportSegment("Exec", tag: "exec", index: index)
                     transportSegment("Stdio", tag: "stdio", index: index)
@@ -991,37 +934,17 @@ struct SettingsView: View {
                 .fixedSize()
             }
 
-            if isHTTP {
-                TextField("", text: urlBinding, prompt: Text(Image(systemName: "link")).foregroundStyle(ejaTheme.inkMuted))
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(ejaTheme.ink)
-                    .textFieldStyle(.plain)
-                    .modifier(CardField())
-            } else {
-                TextField("", text: cmdLineBinding, prompt: Text(Image(systemName: "terminal")).foregroundStyle(ejaTheme.inkMuted))
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(ejaTheme.ink)
-                    .textFieldStyle(.plain)
-                    .modifier(CardField())
-            }
-
             if isExec {
-                TextField("", text: descBinding, prompt: Text(Image(systemName: "text.alignleft")).foregroundStyle(ejaTheme.inkMuted))
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(ejaTheme.ink)
-                    .textFieldStyle(.plain)
-                    .modifier(CardField())
+                field("描述", text: descBinding)
             }
 
             TextField("", text: kvBinding, prompt: Text("KEY=VALUE").foregroundStyle(ejaTheme.inkMuted), axis: .vertical)
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(.subheadline, design: .monospaced))
                 .foregroundStyle(ejaTheme.ink)
                 .textFieldStyle(.plain)
                 .lineLimit(1...4)
                 .modifier(CardField())
         }
-        .padding(.horizontal, 11)
-        .padding(.bottom, 10)
     }
 
     private func transportSegment(_ label: String, tag: String, index: Int) -> some View {
@@ -1058,7 +981,7 @@ struct SettingsView: View {
             }
         } label: {
             Text(label)
-                .font(.system(size: 11, weight: active ? .medium : .regular))
+                .font(.subheadline.weight(active ? .medium : .regular))
                 .foregroundStyle(active ? ejaTheme.ink : ejaTheme.inkSecondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3.5)
@@ -1075,10 +998,27 @@ struct SettingsView: View {
 
     // MARK: - 通用辅助
 
-    private var divider: some View {
-        Rectangle()
-            .fill(ejaTheme.hairline)
-            .frame(height: 1)
+    private func title(_ text: Binding<String>, placeholder: String) -> some View {
+        TextField("", text: text, prompt: Text(placeholder).foregroundStyle(ejaTheme.inkMuted))
+            .font(.body.weight(.medium))
+            .textFieldStyle(.plain)
+            .fixedSize()
+    }
+
+    private func chevron(_ expanded: Bool) -> some View {
+        Image(systemName: "chevron.right")
+            .font(.caption2.weight(.semibold))
+            .imageScale(.small)
+            .foregroundStyle(ejaTheme.inkMuted)
+            .rotationEffect(.degrees(expanded ? 90 : 0))
+    }
+
+    private func field(_ placeholder: String, text: Binding<String>) -> some View {
+        TextField("", text: text, prompt: Text(placeholder).foregroundStyle(ejaTheme.inkMuted))
+            .font(.system(.callout, design: .monospaced))
+            .foregroundStyle(ejaTheme.ink)
+            .textFieldStyle(.plain)
+            .modifier(CardField())
     }
 
     private func providerBinding<T>(

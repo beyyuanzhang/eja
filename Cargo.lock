@@ -285,7 +285,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "eja-core"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "rusqlite",
  "serde",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "eja-host"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "base64 0.23.1",
  "eja-core",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "eja-memory"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "eja-core",
  "fastembed",

@@ -55,12 +55,16 @@ struct ejaApp: App {
     @StateObject private var client = HostClient()
     @StateObject private var ui = ContentUIState()
 
+    private var windowSize: CGSize {
+        let screen = NSScreen.main?.visibleFrame.size ?? .zero
+        return CGSize(width: screen.width * 0.5, height: screen.height * 0.65)
+    }
+
     var body: some Scene {
         Window("eja", id: "main") {
             ContentView(client: client, ui: ui)
-                .frame(minWidth: 280, minHeight: 220)
         }
-        .defaultSize(width: 780, height: 600)
+        .defaultSize(windowSize)
         .windowStyle(.hiddenTitleBar)
         .onChange(of: client.dataDir, initial: true) { _, newDir in
             if appDelegate.reopenWindow == nil {
@@ -84,7 +88,7 @@ struct ejaApp: App {
         .commands {
             CommandGroup(replacing: .appSettings) {
                 Button("设置…") {
-                    ui.showSettingsSheet.toggle()
+                    withAnimation(.smooth) { ui.settingsOpen.toggle() }
                 }
                 .keyboardShortcut(",", modifiers: .command)
                 .disabled(!client.isReady)

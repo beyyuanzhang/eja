@@ -81,16 +81,14 @@ final class HoverState: ObservableObject {
 }
 
 struct ejaIconButtonStyle: ButtonStyle {
-    var size: CGFloat = 28
     var destructive: Bool = false
 
     func makeBody(configuration: Configuration) -> some View {
-        BodyView(configuration: configuration, size: size, destructive: destructive)
+        BodyView(configuration: configuration, destructive: destructive)
     }
 
     private struct BodyView: View {
         let configuration: Configuration
-        let size: CGFloat
         let destructive: Bool
         @StateObject private var hover = HoverState()
 
@@ -103,7 +101,7 @@ struct ejaIconButtonStyle: ButtonStyle {
                 : .clear
             configuration.label
                 .foregroundStyle(fg)
-                .frame(width: size, height: size)
+                .padding(6)
                 .background(
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                         .fill(bg)
