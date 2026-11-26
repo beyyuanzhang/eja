@@ -3,7 +3,7 @@ use crate::http::{get_bytes, post_stream, truncate_utf8, HttpError};
 use crate::state::entries_for_turn;
 use crate::tool::{ModelImage, ToolSpec};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use eja_core::{Eja, Entry, Evidence, Fact, Id, Outcome};
+use eja_core::{eja, Entry, Evidence, Fact, Id, Outcome};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
@@ -289,7 +289,7 @@ pub fn expire_tool_images(messages: &mut Vec<Value>, provider: &ProviderKind) {
 pub fn apply_tool_exchange(
     exchange: Option<Vec<Value>>,
     messages: &mut Vec<Value>,
-    eja: &Eja,
+    eja: &eja,
     anchor: &mut Id,
     before: Id,
     trigger: Id,
@@ -312,7 +312,7 @@ pub fn apply_tool_exchange(
 
 /// Project a turn at a fixed revision, keeping its triggering notice in the window.
 pub fn project_window_through(
-    eja: &Eja,
+    eja: &eja,
     anchor: &mut Id,
     through: Id,
     max_bytes: usize,
@@ -600,7 +600,7 @@ fn bound_entry_message(entry: &Entry, message: Value, budget: usize) -> Value {
     json!({ "role": role, "content": bounded })
 }
 
-fn render_anchor_header(eja: &Eja, anchor: Id, budget: usize) -> eja_core::Result<Option<Value>> {
+fn render_anchor_header(eja: &eja, anchor: Id, budget: usize) -> eja_core::Result<Option<Value>> {
     let content_budget = budget.saturating_sub(1);
     let unknowns: Vec<Value> = eja
         .unsettled_unknowns(anchor, 8)?
@@ -1248,7 +1248,7 @@ mod tests {
     #[test]
     fn deterministic_window_projection_is_strictly_append_only_until_reset() -> eja_core::Result<()>
     {
-        let eja = Eja::open(":memory:")?;
+        let eja = eja::open(":memory:")?;
         let mut anchor = 0;
         let first = eja.notice(Source::Person, "first notice")?;
         let w1 = project_window_through(&eja, &mut anchor, first, 4096, first)?;
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn project_window_enforces_budget_even_with_large_open_concerns() -> eja_core::Result<()> {
-        let eja = Eja::open(":memory:")?;
+        let eja = eja::open(":memory:")?;
         let payload = "a".repeat(60_000);
         for index in 0..5 {
             eja.keep(None, format!("concern-{index}-{payload}"))?;
@@ -1423,7 +1423,7 @@ mod tests {
         assert!(capped.to_string().len() <= 180);
         assert_eq!(capped["truncated"], true);
 
-        let eja = Eja::open(":memory:")?;
+        let eja = eja::open(":memory:")?;
         let large_text = "文".repeat(18_000);
         let fact_id = eja.notice(Source::World, &large_text)?;
         let evidence = eja.evidence(fact_id)?;
@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn tiny_windows_bound_the_protected_message() -> eja_core::Result<()> {
-        let eja = Eja::open(":memory:")?;
+        let eja = eja::open(":memory:")?;
         let id = eja.notice(Source::Person, "用户消息")?;
         for budget in 1..=4 {
             let window = project_window_through(&eja, &mut 0, id, budget, id)?;
@@ -1466,7 +1466,7 @@ mod tests {
     #[test]
     fn project_window_through_preserves_protected_trigger_and_handles_many_concerns(
     ) -> eja_core::Result<()> {
-        let eja = Eja::open(":memory:")?;
+        let eja = eja::open(":memory:")?;
         for index in 0..400 {
             eja.keep(None, format!("concern-{index}-{}", "x".repeat(80)))?;
         }
@@ -1493,7 +1493,7 @@ mod tests {
     #[test]
     fn anchor_header_surfaces_unsettled_unknowns_and_capped_receipts_keep_status(
     ) -> eja_core::Result<()> {
-        let eja = Eja::open(":memory:")?;
+        let eja = eja::open(":memory:")?;
         let act = eja.act(eja.revision()?, "shell", json!({"command": "deploy"}))?;
         let unk = eja.finish(act.id, Outcome::Unknown("宿主中断未完成".into()))?;
         for i in 0..4 {

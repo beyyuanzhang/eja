@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MACOS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="$(cd "${MACOS_DIR}/.." && pwd)"
-APP_DIR="${MACOS_DIR}/build/Eja.app"
+APP_DIR="${MACOS_DIR}/build/eja.app"
 MODEL_DIR="${MACOS_DIR}/build/memory-model"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${REPO_DIR}/Cargo.toml" | head -n 1)"
 : "${VERSION:?Failed to read version from Cargo.toml}"
@@ -14,12 +14,12 @@ VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${REPO_DIR}/Cargo.toml" | hea
 echo "[1/3] Building eja-host (Rust release)..."
 (cd "${REPO_DIR}" && MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release -p eja-host)
 
-echo "[2/3] Building EjaApp & EjaUI (SwiftPM release)..."
-(cd "${MACOS_DIR}" && swift build -c release -debug-info-format none --product EjaApp --disable-sandbox)
-(cd "${MACOS_DIR}" && swift build -c release -debug-info-format none --product EjaUI --disable-sandbox)
+echo "[2/3] Building ejaApp & ejaUI (SwiftPM release)..."
+(cd "${MACOS_DIR}" && swift build -c release -debug-info-format none --product ejaApp --disable-sandbox)
+(cd "${MACOS_DIR}" && swift build -c release -debug-info-format none --product ejaUI --disable-sandbox)
 
-APP_BIN="${MACOS_DIR}/.build/release/EjaApp"
-UI_DYLIB="${MACOS_DIR}/.build/release/libEjaUI.dylib"
+APP_BIN="${MACOS_DIR}/.build/release/ejaApp"
+UI_DYLIB="${MACOS_DIR}/.build/release/libejaUI.dylib"
 HOST_BIN="${REPO_DIR}/target/release/eja-host"
 
 echo "[3/3] Assembling ${APP_DIR}..."
@@ -29,8 +29,8 @@ MODEL_RESOURCES="${APP_DIR}/Contents/Resources/memory-model"
 mkdir -p "${MODEL_RESOURCES}"
 install -m 644 "${MODEL_DIR}"/{config.json,encoder.json,model_quantized.onnx,special_tokens_map.json,tokenizer.json,tokenizer_config.json} \
     "${REPO_DIR}/memory/scripts/multilingual-e5.LICENSE" "${MODEL_RESOURCES}/"
-cp "${APP_BIN}" "${APP_DIR}/Contents/MacOS/EjaApp"
-cp "${UI_DYLIB}" "${APP_DIR}/Contents/MacOS/libEjaUI.dylib"
+cp "${APP_BIN}" "${APP_DIR}/Contents/MacOS/ejaApp"
+cp "${UI_DYLIB}" "${APP_DIR}/Contents/MacOS/libejaUI.dylib"
 cp "${HOST_BIN}" "${APP_DIR}/Contents/MacOS/eja-host"
 cp "${REPO_DIR}/PROTOCOL.md" "${APP_DIR}/Contents/Resources/PROTOCOL.md"
 cp "${MACOS_DIR}/Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
@@ -43,7 +43,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<EOF
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
-    <string>EjaApp</string>
+    <string>ejaApp</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
@@ -51,7 +51,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<EOF
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>EJA</string>
+    <string>eja</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

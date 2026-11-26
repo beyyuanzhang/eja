@@ -1,13 +1,13 @@
 //! Owns concern bindings and consumes journal evidence.
 use super::{check_evidence, decode_meta, write_meta};
-use eja_core::{Eja, Entry, Error, Id, Result};
+use eja_core::{eja, Entry, Error, Id, Result};
 use std::collections::BTreeMap;
 
 const META_BINDINGS: &str = "host.concern-bindings";
 type Bindings = BTreeMap<Id, String>;
 
 pub fn keep_with_check(
-    eja: &Eja,
+    eja: &eja,
     concern: Option<Id>,
     text: &str,
     checker: Option<&str>,
@@ -41,7 +41,7 @@ pub fn keep_with_check(
     })
 }
 
-pub fn release_with_witness(eja: &Eja, concern: Id, witness: Option<Id>) -> Result<Entry> {
+pub fn release_with_witness(eja: &eja, concern: Id, witness: Option<Id>) -> Result<Entry> {
     eja.transaction(|tx| {
         let mut bindings: Bindings = decode_meta(tx.get_meta(META_BINDINGS)?)?;
         let Some(rule) = bindings.remove(&concern) else {
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn release_requires_a_fresh_hit_from_the_bound_rule() {
-        let eja = Eja::open(":memory:").unwrap();
+        let eja = eja::open(":memory:").unwrap();
         let record = |rule| {
             eja.transaction(|tx| check_evidence::publish(tx, rule))
                 .unwrap()

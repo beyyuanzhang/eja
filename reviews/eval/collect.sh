@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only collector for the EJA proposition test.
+# Read-only collector for the eja proposition test.
 # Usage: collect.sh <data_dir>          full export
 #        collect.sh <data_dir> check    window checkpoint
 set -euo pipefail
@@ -11,7 +11,7 @@ fi
 
 data_dir="${1%/}"
 mode="${2:-collect}"
-if [[ "$(basename "$data_dir")" == "Eja" ]]; then
+if [[ "$(basename "$data_dir")" == "eja" ]]; then
   kernel_dir="$(dirname "$data_dir")/ai.eja.kernel"
 else
   kernel_dir="${data_dir}.kernel"

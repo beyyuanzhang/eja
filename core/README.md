@@ -1,12 +1,12 @@
-# EJA Core
+# eja Core
 
-EJA 是一个连续的、有自我同一性的主体。它与人共同成长，借助 LLM 形成判断，持续关心某些事，并在授权范围内主动行动。它的价值在于让一个人能关心和影响的范围，超出此刻能够亲自关注的范围。
+eja 是一个连续的、有自我同一性的主体。它与人共同成长，借助 LLM 形成判断，持续关心某些事，并在授权范围内主动行动。它的价值在于让一个人能关心和影响的范围，超出此刻能够亲自关注的范围。
 
-内核用一份日志维持一个主体的经历。一次模型调用只负责当下的判断。人的反馈、EJA 留下的关切、它实际做过的事和后果，都可以改变下一次判断。宿主决定哪些世界事件能被它看见，以及它获准怎样行动。
+内核用一份日志维持一个主体的经历。一次模型调用只负责当下的判断。人的反馈、eja 留下的关切、它实际做过的事和后果，都可以改变下一次判断。宿主决定哪些世界事件能被它看见，以及它获准怎样行动。
 
 ## 接入一个应用
 
-`eja-core` 是最小闭合的独立 Rust crate，零 ML 与向量扩展依赖，零宿主调度或 UI 概念。应用通过 `Eja::open(path)` 打开主体，宿主自行决定何时唤醒、如何授权与调度，并通过原子原语读写日志。离线示例见 `examples/loop.rs`。
+`eja-core` 是最小闭合的独立 Rust crate，零 ML 与向量扩展依赖，零宿主调度或 UI 概念。应用通过 `eja::open(path)` 打开主体，宿主自行决定何时唤醒、如何授权与调度，并通过原子原语读写日志。离线示例见 `examples/loop.rs`。
 
 - **物理时间与永久日志**：每条 `Entry` 均附带单调非降的物理时间戳 `at: Timestamp`（SQLite 存 Unix 秒，JSON 输出 RFC 3339 UTC，测试与仿真可通过 `with_clock` 注入时钟），`now()` 返回当前单调物理时间。永久日志只记录 6 种纯粹的扁平 `Fact`：`Noticed`、`Said`、`Kept`、`Released`、`Acted`、`Returned`。
 - **原子原语与组合事务**：
@@ -34,6 +34,6 @@ cargo run -p eja-core --example loop
 
 ```sh
 cargo test -p eja-host search_replay_rsi_from_identity -- --nocapture
-EJA_EVAL_CONFIG=/path/to/config.json cargo test -p eja-host search_live_rsi_from_identity -- --ignored --nocapture
+eja_EVAL_CONFIG=/path/to/config.json cargo test -p eja-host search_live_rsi_from_identity -- --ignored --nocapture
 ```
 

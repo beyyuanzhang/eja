@@ -2,7 +2,7 @@ use crate::{
     config::ProviderKind,
     llm::{cap_tool_result, result_fits},
 };
-use eja_core::{Eja, Entry, Error, Fact, Id, Outcome, Result, Source};
+use eja_core::{eja, Entry, Error, Fact, Id, Outcome, Result, Source};
 use eja_memory::MemoryIndex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -113,7 +113,7 @@ fn evidence_text(entry: &Entry) -> Option<&str> {
     }
 }
 
-fn cue_text(eja: &Eja, cue: Cue) -> Result<String> {
+fn cue_text(eja: &eja, cue: Cue) -> Result<String> {
     evidence_text(&eja.read(cue.fact)?)
         .and_then(|text| text.get(cue.start..cue.end))
         .map(str::to_owned)
@@ -131,7 +131,7 @@ struct Route {
     cue: Cue,
 }
 
-fn route_at(eja: &Eja, key: &str, head: Id) -> Result<Option<(Id, Cue)>> {
+fn route_at(eja: &eja, key: &str, head: Id) -> Result<Option<(Id, Cue)>> {
     let mut version = read_policy(eja.get_meta(key)?.as_deref())?.active;
     while let Some(id) = version {
         let Fact::Acted { capability, input } = eja.read(id)?.fact else {
@@ -184,13 +184,13 @@ impl Recall {
         Self { memory }
     }
 
-    pub(super) fn warm(&mut self, eja: &Eja) {
+    pub(super) fn warm(&mut self, eja: &eja) {
         let _ = self.memory.warm(eja);
     }
 
     pub(super) fn search(
         &mut self,
-        eja: &Eja,
+        eja: &eja,
         query: &str,
         provider: &ProviderKind,
         budget: usize,
@@ -235,7 +235,7 @@ impl Recall {
 
     /// Retire routes whose learned cue no longer kept this turn's original receipts.
     /// Runs after the turn so the turn's policy snapshot never changes mid-turn.
-    pub(super) fn settle(&self, eja: &Eja, trace: &SearchTurn) -> Result<()> {
+    pub(super) fn settle(&self, eja: &eja, trace: &SearchTurn) -> Result<()> {
         for (key, version) in &trace.stale {
             eja.transaction(|tx| {
                 let mut policy = read_policy(tx.get_meta(key)?.as_deref())?;
@@ -257,7 +257,7 @@ impl Recall {
 
     fn pack_search(
         &mut self,
-        eja: &Eja,
+        eja: &eja,
         query: &str,
         effective: &str,
         through: Id,
@@ -295,7 +295,7 @@ impl Recall {
 
     fn search_packet(
         &mut self,
-        eja: &Eja,
+        eja: &eja,
         query: &str,
         cue: &str,
         through: Id,
@@ -317,7 +317,7 @@ impl Recall {
 
     pub(super) fn learn(
         &mut self,
-        eja: &Eja,
+        eja: &eja,
         trigger: Id,
         trace: &SearchTurn,
         witness: Id,
@@ -440,7 +440,7 @@ impl Recall {
         })
     }
 
-    fn reaches(&mut self, eja: &Eja, query: &str, cue: &str, case: &Case) -> Result<bool> {
+    fn reaches(&mut self, eja: &eja, query: &str, cue: &str, case: &Case) -> Result<bool> {
         // The delivered first packet already preserves every original-query receipt.
         let packet =
             self.pack_search(eja, query, cue, case.through, &case.provider, case.budget)?;

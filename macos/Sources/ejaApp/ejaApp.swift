@@ -1,11 +1,11 @@
 import AppKit
-import EjaClient
+import ejaClient
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var onTerminate: (() -> Void)?
     var reopenWindow: (() -> Void)?
-    let safeMode = ProcessInfo.processInfo.environment["EJA_SAFE_MODE"] == "1"
+    let safeMode = ProcessInfo.processInfo.environment["eja_SAFE_MODE"] == "1"
     private var uiWatch: DispatchSourceFileSystemObject?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -46,17 +46,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 @_cdecl("eja_ui_main")
 public func eja_ui_main() {
-    EjaApp.main()
+    ejaApp.main()
 }
 
-struct EjaApp: App {
+struct ejaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.openWindow) private var openWindow
     @StateObject private var client = HostClient()
     @StateObject private var ui = ContentUIState()
 
     var body: some Scene {
-        Window("EJA", id: "main") {
+        Window("eja", id: "main") {
             ContentView(client: client, ui: ui)
                 .frame(minWidth: 280, minHeight: 220)
         }

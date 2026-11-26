@@ -14,15 +14,15 @@ private func resolveDataDir() -> URL {
     if let idx = args.firstIndex(of: "--data-dir"), idx + 1 < args.count {
         return URL(fileURLWithPath: args[idx + 1], isDirectory: true)
     }
-    if let env = ProcessInfo.processInfo.environment["EJA_DATA_DIR"], !env.isEmpty {
+    if let env = ProcessInfo.processInfo.environment["eja_DATA_DIR"], !env.isEmpty {
         return URL(fileURLWithPath: env, isDirectory: true)
     }
     return FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Eja", isDirectory: true)
+        .appendingPathComponent("Library/Application Support/eja", isDirectory: true)
 }
 
 private func isSafeModeRequested() -> Bool {
-    if ProcessInfo.processInfo.environment["EJA_SAFE_MODE"] == "1" {
+    if ProcessInfo.processInfo.environment["eja_SAFE_MODE"] == "1" {
         return true
     }
     return CGEventSource.flagsState(.combinedSessionState).contains(.maskAlternate)
@@ -35,7 +35,7 @@ private func loadAndRun(dylibURL: URL, digest: String) -> Bool {
         dlclose(handle)
         return false
     }
-    setenv("EJA_LOADED_UI_DIGEST", digest, 1)
+    setenv("eja_LOADED_UI_DIGEST", digest, 1)
     typealias EntryPoint = @convention(c) () -> Void
     let entry = unsafeBitCast(sym, to: EntryPoint.self)
     entry()
@@ -45,15 +45,15 @@ private func loadAndRun(dylibURL: URL, digest: String) -> Bool {
 let fm = FileManager.default
 let execURL = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
     .resolvingSymlinksInPath()
-let factoryDylib = execURL.deletingLastPathComponent().appendingPathComponent("libEjaUI.dylib")
+let factoryDylib = execURL.deletingLastPathComponent().appendingPathComponent("libejaUI.dylib")
 let dataDir = resolveDataDir().standardizedFileURL
-setenv("EJA_DATA_DIR", dataDir.path, 1)
+setenv("eja_DATA_DIR", dataDir.path, 1)
 let uiDir = dataDir.appendingPathComponent("ui", isDirectory: true)
-let evolvedDylib = uiDir.appendingPathComponent("libEjaUI.dylib")
+let evolvedDylib = uiDir.appendingPathComponent("libejaUI.dylib")
 let stampFile = uiDir.appendingPathComponent(".factory-digest")
 
 let safeMode = isSafeModeRequested()
-setenv("EJA_SAFE_MODE", safeMode ? "1" : "0", 1)
+setenv("eja_SAFE_MODE", safeMode ? "1" : "0", 1)
 if safeMode {
     try? fm.removeItem(at: evolvedDylib)
 }
@@ -78,6 +78,6 @@ if let factoryDigest {
 if let factoryDigest, loadAndRun(dylibURL: factoryDylib, digest: factoryDigest) {
     exit(0)
 } else {
-    fputs("Failed to load EJA UI runtime at \(factoryDylib.path)\n", stderr)
+    fputs("Failed to load eja UI runtime at \(factoryDylib.path)\n", stderr)
     exit(1)
 }

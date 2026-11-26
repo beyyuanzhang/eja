@@ -163,7 +163,7 @@ pub(super) fn run_process(
         .command(&resolved, args)
         .current_dir(cwd)
         .envs(env)
-        .env("EJA_DATA_DIR", data_dir.path())
+        .env("eja_DATA_DIR", data_dir.path())
         .stdin(if matches!(input, ProcessInput::Exec(_)) {
             Stdio::piped()
         } else {
@@ -366,7 +366,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
+        let data_dir = dir.path().join("eja");
         let core_dir = dir.path().join("ai.eja.kernel");
         fs::create_dir_all(&data_dir).unwrap();
         fs::create_dir_all(&core_dir).unwrap();

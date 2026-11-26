@@ -2,7 +2,7 @@ import Combine
 import AppKit
 import SwiftUI
 
-enum EjaTheme {
+enum ejaTheme {
     static let canvas = dynamicColor(
         light: NSColor(srgbRed: 0.965, green: 0.961, blue: 0.949, alpha: 1.0), // #F6F5F2
         dark: NSColor(srgbRed: 0.086, green: 0.086, blue: 0.082, alpha: 1.0)   // #161615
@@ -80,7 +80,7 @@ final class HoverState: ObservableObject {
     @Published var hovered = false
 }
 
-struct EjaIconButtonStyle: ButtonStyle {
+struct ejaIconButtonStyle: ButtonStyle {
     var size: CGFloat = 28
     var destructive: Bool = false
 
@@ -96,10 +96,10 @@ struct EjaIconButtonStyle: ButtonStyle {
 
         var body: some View {
             let fg: Color = destructive
-                ? (hover.hovered ? EjaTheme.danger : EjaTheme.inkMuted)
-                : (hover.hovered ? EjaTheme.ink : EjaTheme.inkSecondary)
+                ? (hover.hovered ? ejaTheme.danger : ejaTheme.inkMuted)
+                : (hover.hovered ? ejaTheme.ink : ejaTheme.inkSecondary)
             let bg: Color = hover.hovered
-                ? (destructive ? EjaTheme.dangerTint : EjaTheme.surfaceSubtle)
+                ? (destructive ? ejaTheme.dangerTint : ejaTheme.surfaceSubtle)
                 : .clear
             configuration.label
                 .foregroundStyle(fg)

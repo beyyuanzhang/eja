@@ -1,5 +1,5 @@
 use crate::{
-    Call, Concern, Eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Source, Timestamp,
+    Call, Concern, eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Source, Timestamp,
     FACT_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -381,7 +381,7 @@ impl Tx<'_> {
     }
 }
 
-impl Eja {
+impl eja {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Connection::open(path.as_ref())?;
         db.execute_batch("PRAGMA busy_timeout = 5000;")?;
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn transaction_rolls_back_fact_and_metadata_together() -> Result<()> {
-        let eja = Eja::open(":memory:")?;
+        let eja = eja::open(":memory:")?;
         eja.db.execute_batch(
             "CREATE TRIGGER fail_meta BEFORE INSERT ON host_meta
              BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;",
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn unfinished_actions_query_searches_facts_ref_index() -> Result<()> {
-        let eja = Eja::open(":memory:")?;
+        let eja = eja::open(":memory:")?;
         let mut stmt = eja
             .db
             .prepare(&format!("EXPLAIN QUERY PLAN {UNFINISHED_ACTIONS_SQL}"))?;

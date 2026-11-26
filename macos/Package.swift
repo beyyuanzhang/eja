@@ -2,33 +2,33 @@
 import PackageDescription
 
 let package = Package(
-    name: "EjaMacOS",
+    name: "ejaMacOS",
     platforms: [
         .macOS(.v14),
     ],
     products: [
-        .library(name: "EjaClient", targets: ["EjaClient"]),
-        .library(name: "EjaUI", type: .dynamic, targets: ["EjaUI"]),
-        .executable(name: "EjaApp", targets: ["EjaLauncher"]),
+        .library(name: "ejaClient", targets: ["ejaClient"]),
+        .library(name: "ejaUI", type: .dynamic, targets: ["ejaUI"]),
+        .executable(name: "ejaApp", targets: ["ejaLauncher"]),
     ],
     targets: [
         .target(
-            name: "EjaClient",
-            path: "Sources/EjaClient"
+            name: "ejaClient",
+            path: "Sources/ejaClient"
         ),
         .target(
-            name: "EjaUI",
-            dependencies: ["EjaClient"],
-            path: "Sources/EjaApp"
+            name: "ejaUI",
+            dependencies: ["ejaClient"],
+            path: "Sources/ejaApp"
         ),
         .executableTarget(
-            name: "EjaLauncher",
-            path: "Sources/EjaLauncher"
+            name: "ejaLauncher",
+            path: "Sources/ejaLauncher"
         ),
         .testTarget(
-            name: "EjaAppTests",
-            dependencies: ["EjaClient"],
-            path: "Tests/EjaAppTests"
+            name: "ejaAppTests",
+            dependencies: ["ejaClient"],
+            path: "Tests/ejaAppTests"
         ),
     ]
 )

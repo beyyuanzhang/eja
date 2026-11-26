@@ -6,14 +6,14 @@ public enum UiRuntime {
     #!/usr/bin/env bash
     set -euo pipefail
     UI_DIR="$(cd "$(dirname "$0")" && pwd)"
-    swift build --package-path "$UI_DIR" --product EjaUI --disable-sandbox
-    BIN="$(swift build --package-path "$UI_DIR" --product EjaUI --disable-sandbox --show-bin-path)/libEjaUI.dylib"
-    STAGE="$(mktemp "$UI_DIR/.EjaUI.XXXXXX")"
+    swift build --package-path "$UI_DIR" --product ejaUI --disable-sandbox
+    BIN="$(swift build --package-path "$UI_DIR" --product ejaUI --disable-sandbox --show-bin-path)/libejaUI.dylib"
+    STAGE="$(mktemp "$UI_DIR/.ejaUI.XXXXXX")"
     trap 'rm -f "$STAGE"' EXIT
     cp "$BIN" "$STAGE"
     chmod 755 "$STAGE"
     codesign --force --sign - "$STAGE"
-    mv "$STAGE" "$UI_DIR/libEjaUI.dylib"
+    mv "$STAGE" "$UI_DIR/libejaUI.dylib"
     """
 
     public static func reloadBaselineFile(in dataDir: URL) -> URL {
@@ -73,7 +73,7 @@ public enum UiRuntime {
 
     private static func isTemplateDir(_ url: URL, fm: FileManager) -> Bool {
         fm.fileExists(atPath: url.appendingPathComponent("Package.swift").path)
-            && fm.fileExists(atPath: url.appendingPathComponent("Sources/EjaApp").path)
+            && fm.fileExists(atPath: url.appendingPathComponent("Sources/ejaApp").path)
     }
 
     private static func binaryDigest(at url: URL) -> String? {
@@ -89,8 +89,8 @@ public enum UiRuntime {
         shutdown: () -> Void
     ) -> Bool {
         guard Bundle.main.bundleURL.pathExtension == "app",
-              let loaded = ProcessInfo.processInfo.environment["EJA_LOADED_UI_DIGEST"],
-              let staged = binaryDigest(at: dataDir.appendingPathComponent("ui/libEjaUI.dylib")),
+              let loaded = ProcessInfo.processInfo.environment["eja_LOADED_UI_DIGEST"],
+              let staged = binaryDigest(at: dataDir.appendingPathComponent("ui/libejaUI.dylib")),
               staged != loaded else { return false }
         if baselineId >= 0 {
             try? "\(baselineId)".write(

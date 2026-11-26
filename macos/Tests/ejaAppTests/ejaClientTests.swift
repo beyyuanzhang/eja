@@ -1,8 +1,8 @@
 import Foundation
 import Testing
-@testable import EjaClient
+@testable import ejaClient
 
-struct EjaClientTests {
+struct ejaClientTests {
     private func makeTempDir() throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("eja-test-\(UUID().uuidString)", isDirectory: true)
@@ -11,7 +11,7 @@ struct EjaClientTests {
     }
 
     private func resolveHostBinary() -> URL {
-        if let env = ProcessInfo.processInfo.environment["EJA_HOST_BIN"] {
+        if let env = ProcessInfo.processInfo.environment["eja_HOST_BIN"] {
             let url = URL(fileURLWithPath: env)
             if FileManager.default.isExecutableFile(atPath: url.path) { return url }
         }

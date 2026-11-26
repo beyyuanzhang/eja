@@ -44,7 +44,7 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from(home)
         .join("Library")
         .join("Application Support")
-        .join("Eja")
+        .join("eja")
 }
 
 fn parse_data_dir() -> PathBuf {

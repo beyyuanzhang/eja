@@ -4,7 +4,7 @@ pub mod watch;
 
 mod check_evidence;
 
-use eja_core::{Eja, Entry, Error, Fact, Id, Outcome, Result, Source, Tx};
+use eja_core::{eja, Entry, Error, Fact, Id, Outcome, Result, Source, Tx};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -32,7 +32,7 @@ fn write_meta(tx: &Tx<'_>, key: &str, value: &impl Serialize) -> Result<()> {
     tx.set_meta(key, &serde_json::to_string(value)?)
 }
 
-fn update_state<T>(eja: &Eja, f: impl FnOnce(&Tx<'_>, &mut HostState) -> Result<T>) -> Result<T> {
+fn update_state<T>(eja: &eja, f: impl FnOnce(&Tx<'_>, &mut HostState) -> Result<T>) -> Result<T> {
     eja.transaction(|tx| {
         let mut state = decode_meta(tx.get_meta(META_STATE)?)?;
         let out = f(tx, &mut state)?;
@@ -70,7 +70,7 @@ fn find_trigger(
     Ok(None)
 }
 
-pub fn entries_for_turn(eja: &Eja, after: Id, through: Id, trigger: Id) -> Result<Vec<Entry>> {
+pub fn entries_for_turn(eja: &eja, after: Id, through: Id, trigger: Id) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for entry in eja.entries_after(after, through)? {
         if entry.id <= trigger || is_trigger_entry(&entry, &|key| eja.get_meta(key))?.is_none() {
@@ -81,7 +81,7 @@ pub fn entries_for_turn(eja: &Eja, after: Id, through: Id, trigger: Id) -> Resul
 }
 
 pub fn bootstrap(
-    eja: &Eja,
+    eja: &eja,
     resources_dir: Option<&Path>,
     kernel_version: &str,
     protocol_version: u32,
@@ -121,7 +121,7 @@ pub fn bootstrap(
     .map_err(|err| err.to_string())
 }
 
-pub fn save_anchor(eja: &Eja, anchor: Id) -> std::result::Result<(), String> {
+pub fn save_anchor(eja: &eja, anchor: Id) -> std::result::Result<(), String> {
     update_state(eja, |_, state| {
         state.window_anchor = anchor.max(0);
         Ok(())
@@ -129,7 +129,7 @@ pub fn save_anchor(eja: &Eja, anchor: Id) -> std::result::Result<(), String> {
     .map_err(|err| err.to_string())
 }
 
-pub fn next_trigger(eja: &Eja) -> Result<Option<(Id, Source)>> {
+pub fn next_trigger(eja: &eja) -> Result<Option<(Id, Source)>> {
     let state: HostState = decode_meta(eja.get_meta(META_STATE)?)?;
     let cursor = state.turn_cursor;
     let head = eja.revision()?;
@@ -137,7 +137,7 @@ pub fn next_trigger(eja: &Eja) -> Result<Option<(Id, Source)>> {
 }
 
 /// Atomically record an optional reply and advance the host turn cursor for `trigger`.
-pub fn complete_turn(eja: &Eja, trigger: Id, reply: &str) -> Result<()> {
+pub fn complete_turn(eja: &eja, trigger: Id, reply: &str) -> Result<()> {
     update_state(eja, |tx, state| {
         let cursor = state.turn_cursor;
         let head = tx.revision()?;
@@ -164,7 +164,7 @@ pub fn complete_turn(eja: &Eja, trigger: Id, reply: &str) -> Result<()> {
     })
 }
 
-pub fn proactive_reply_ids(eja: &Eja) -> HashSet<Id> {
+pub fn proactive_reply_ids(eja: &eja) -> HashSet<Id> {
     decode_meta::<HostState>(eja.get_meta(META_STATE).ok().flatten())
         .ok()
         .map(|state| state.proactive_replies.into_iter().collect())
@@ -172,7 +172,7 @@ pub fn proactive_reply_ids(eja: &Eja) -> HashSet<Id> {
 }
 
 #[cfg(test)]
-pub fn set_kernel_version_for_test(eja: &Eja, version: &str) -> Result<()> {
+pub fn set_kernel_version_for_test(eja: &eja, version: &str) -> Result<()> {
     update_state(eja, |_, state| {
         state.kernel_version = Some(version.to_string());
         Ok(())
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn complete_turn_enforces_order_and_marks_proactive_replies() {
-        let eja = Eja::open(":memory:").unwrap();
+        let eja = eja::open(":memory:").unwrap();
         let person = eja.notice(Source::Person, "first").unwrap();
         let clock = eja.notice(Source::Clock, "second").unwrap();
         assert!(matches!(

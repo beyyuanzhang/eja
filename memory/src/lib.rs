@@ -5,7 +5,7 @@ mod onnx;
 #[cfg(feature = "onnx")]
 pub use onnx::OnnxEncoder;
 
-use eja_core::{Eja, Entry, Evidence, Fact, Id, Outcome, FACT_BYTES};
+use eja_core::{eja, Entry, Evidence, Fact, Id, Outcome, FACT_BYTES};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -113,7 +113,7 @@ impl Checkpoint {
 }
 
 impl MemoryIndex {
-    /// Keyword-only search directly over `Eja` public read APIs (zero disk cache, zero ML).
+    /// Keyword-only search directly over `eja` public read APIs (zero disk cache, zero ML).
     pub fn keyword() -> Self {
         Self { semantic: None }
     }
@@ -134,13 +134,13 @@ impl MemoryIndex {
     }
 
     /// Search all text-bearing history in `eja`.
-    pub fn search(&mut self, eja: &Eja, cue: &str) -> Result<Vec<Match>> {
+    pub fn search(&mut self, eja: &eja, cue: &str) -> Result<Vec<Match>> {
         self.search_at(eja, cue, eja.revision()?)
     }
 
     /// Incrementally index up to one batch of new journal entries into the derived cache.
     /// Returns `Ok(true)` when a batch was processed and more entries may still remain.
-    pub fn warm(&mut self, eja: &Eja) -> Result<bool> {
+    pub fn warm(&mut self, eja: &eja) -> Result<bool> {
         let Some(index) = self.semantic.as_mut() else {
             return Ok(false);
         };
@@ -152,7 +152,7 @@ impl MemoryIndex {
     }
 
     /// Rank observations at the given revision. Use keywords if vectors are unavailable.
-    pub fn search_at(&mut self, eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
+    pub fn search_at(&mut self, eja: &eja, cue: &str, head: Id) -> Result<Vec<Match>> {
         if cue.trim().is_empty() || cue.len() > FACT_BYTES {
             return Err(Error::Invalid(
                 "search requires a bounded non-empty cue".into(),
@@ -232,7 +232,7 @@ fn fuse_scores(vector: f64, lexical: f64) -> f64 {
     1.0 - (1.0 - v) * (1.0 - 0.5 * l)
 }
 
-fn rank_matches(eja: &Eja, head: Id, mut scored: Vec<(Id, f64)>) -> Result<Vec<Match>> {
+fn rank_matches(eja: &eja, head: Id, mut scored: Vec<(Id, f64)>) -> Result<Vec<Match>> {
     scored.sort_unstable_by(|(lid, lscore), (rid, rscore)| {
         rscore.total_cmp(lscore).then(rid.cmp(lid))
     });
@@ -248,7 +248,7 @@ fn rank_matches(eja: &Eja, head: Id, mut scored: Vec<(Id, f64)>) -> Result<Vec<M
         .collect()
 }
 
-fn keyword_search_at(eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
+fn keyword_search_at(eja: &eja, cue: &str, head: Id) -> Result<Vec<Match>> {
     let words = tokenize_cue(cue);
     let mut scored = Vec::new();
     let mut cursor = 0;
@@ -393,7 +393,7 @@ impl SemanticIndex {
         .ok_or(Error::Conflict)
     }
 
-    fn verify_prefix(&mut self, eja: &Eja, through: Id) -> Result<Checkpoint> {
+    fn verify_prefix(&mut self, eja: &eja, through: Id) -> Result<Checkpoint> {
         let instance = eja.instance_id();
         let mut proof = self
             .verified
@@ -408,7 +408,7 @@ impl SemanticIndex {
         Ok(proof)
     }
 
-    fn catch_up_step(&mut self, eja: &Eja, through: Id) -> Result<bool> {
+    fn catch_up_step(&mut self, eja: &eja, through: Id) -> Result<bool> {
         loop {
             let cached = self.checkpoint(&self.db)?;
             let cursor = cached.through;
@@ -496,12 +496,12 @@ impl SemanticIndex {
         }
     }
 
-    fn catch_up(&mut self, eja: &Eja, through: Id) -> Result<Checkpoint> {
+    fn catch_up(&mut self, eja: &eja, through: Id) -> Result<Checkpoint> {
         while self.catch_up_step(eja, through)? {}
         self.checkpoint(&self.db)
     }
 
-    fn search(&mut self, eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
+    fn search(&mut self, eja: &eja, cue: &str, head: Id) -> Result<Vec<Match>> {
         let verified = self.catch_up(eja, head)?;
         let chunks = passages(cue);
         let queries = self.encode(InputKind::Query, &chunks)?;

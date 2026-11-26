@@ -2,7 +2,7 @@
 set -euo pipefail
 
 source_dir="$(cd "$(dirname "$0")" && pwd)"
-data_dir="${1:-${EJA_DATA_DIR:-"$HOME/Library/Application Support/Eja"}}"
+data_dir="${1:-${eja_DATA_DIR:-"$HOME/Library/Application Support/eja"}}"
 plugin_dir="$data_dir/capabilities/screen"
 mkdir -p "$plugin_dir"
 staged_bin="$(mktemp "$plugin_dir/.eja-screen.XXXXXX")"

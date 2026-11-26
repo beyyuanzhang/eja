@@ -1,4 +1,4 @@
-use eja_core::{Eja, Error, Fact, Outcome, Source, Timestamp, FACT_BYTES};
+use eja_core::{eja, Error, Fact, Outcome, Source, Timestamp, FACT_BYTES};
 use serde_json::json;
 use std::sync::{
     atomic::{AtomicI64, Ordering},
@@ -11,7 +11,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + 
 fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
-    let eja = Eja::open(&path)?;
+    let eja = eja::open(&path)?;
     eja.notice(Source::Person, "评审让我有点累")?;
     let initial = eja.keep(None, "也许想讨论评审")?;
     let concern = initial.id;
@@ -21,7 +21,7 @@ fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
     assert!(matches!(eja.read(said)?.fact, Fact::Said { ref text, .. } if text == "我记住了"));
     drop(eja);
 
-    let eja = Eja::open(&path)?;
+    let eja = eja::open(&path)?;
     let correction = eja.notice(Source::Person, "下次听我说完就好")?;
     let revised = eja.keep(Some(concern), "先听完")?;
     let tick = eja.notice(Source::Clock, "第二天")?;
@@ -83,7 +83,7 @@ fn concerns_revisions_releases_and_evidence_preserve_history() -> Result<()> {
 
 #[test]
 fn tx_evidence_reflects_in_tx_settlement() -> Result<()> {
-    let eja = Eja::open(":memory:")?;
+    let eja = eja::open(":memory:")?;
     let act = eja.act(eja.revision()?, "shell", json!({"command": "check"}))?;
     let unk = eja.finish(act.id, Outcome::Unknown("timeout".into()))?;
     eja.transaction(|tx| {
@@ -105,7 +105,7 @@ fn tx_evidence_reflects_in_tx_settlement() -> Result<()> {
 
 #[test]
 fn unsettled_unknowns_tracks_only_unresolved_unknown_receipts_at_revision() -> Result<()> {
-    let eja = Eja::open(":memory:")?;
+    let eja = eja::open(":memory:")?;
     let a1 = eja.act(eja.revision()?, "shell", json!({"command": "a1"}))?;
     let u1 = eja.finish(a1.id, Outcome::Unknown("timeout 1".into()))?;
     let a2 = eja.act(eja.revision()?, "shell", json!({"command": "a2"}))?;
@@ -135,8 +135,8 @@ fn unsettled_unknowns_tracks_only_unresolved_unknown_receipts_at_revision() -> R
 fn only_a_fresh_granted_act_can_issue_a_call() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
-    let first = Eja::open(&path)?;
-    let second = Eja::open(&path)?;
+    let first = eja::open(&path)?;
+    let second = eja::open(&path)?;
     let basis = first.notice(Source::World, "an observation")?;
     assert!(matches!(
         first.act(basis, "", json!({"x": 1})),
@@ -160,7 +160,7 @@ fn only_a_fresh_granted_act_can_issue_a_call() -> Result<()> {
     // Simulate the host disappearing after dispatch and before observing the result.
     drop(first);
     drop(second);
-    let resumed = Eja::open(&path)?;
+    let resumed = eja::open(&path)?;
     assert_eq!(resumed.revision()?, call.id);
     let unknown = || Outcome::Unknown("host stopped".into());
     let receipt = resumed.finish(call.id, unknown())?;
@@ -182,7 +182,7 @@ fn only_a_fresh_granted_act_can_issue_a_call() -> Result<()> {
 
 #[test]
 fn range_queries_and_byte_budget_enforce_bounds() -> Result<()> {
-    let eja = Eja::open(":memory:")?;
+    let eja = eja::open(":memory:")?;
     let first = eja.notice(Source::Person, "initial")?;
     for n in 0..12 {
         eja.keep(None, n.to_string())?;
@@ -206,12 +206,12 @@ fn range_queries_and_byte_budget_enforce_bounds() -> Result<()> {
 fn simultaneous_acts_issue_only_one_call() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
-    let first = Eja::open(&path)?;
-    let second = Eja::open(&path)?;
+    let first = eja::open(&path)?;
+    let second = eja::open(&path)?;
     let revision = first.notice(Source::Clock, "wake")?;
     let barrier = std::sync::Barrier::new(2);
     std::thread::scope(|scope| {
-        let run = |eja: Eja| {
+        let run = |eja: eja| {
             barrier.wait();
             match eja.act(revision, "one", json!(null)) {
                 Ok(_) => true,
@@ -223,13 +223,13 @@ fn simultaneous_acts_issue_only_one_call() -> Result<()> {
         let b = scope.spawn(move || run(second));
         assert_ne!(a.join().unwrap(), b.join().unwrap());
     });
-    assert_eq!(Eja::open(&path)?.revision()?, revision + 1);
+    assert_eq!(eja::open(&path)?.revision()?, revision + 1);
     Ok(())
 }
 
 #[test]
 fn oversized_receipt_truncates_to_fact_budget_and_stays_idempotent() -> Result<()> {
-    let eja = Eja::open(":memory:")?;
+    let eja = eja::open(":memory:")?;
     assert_eq!(eja.revision()?, 0);
     let basis = eja.notice(Source::Person, "test")?;
     let call = eja.act(basis, "read", json!(null))?;
@@ -253,16 +253,16 @@ fn oversized_receipt_truncates_to_fact_budget_and_stays_idempotent() -> Result<(
 fn an_unknown_receipt_can_be_settled_only_once_by_competing_hosts() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("subject.db");
-    let seed = Eja::open(&db)?;
+    let seed = eja::open(&db)?;
     let notice = seed.notice(Source::World, "tick")?;
     let call = seed.act(notice, "read", json!(null))?;
     let unknown = seed.finish(call.id, Outcome::Unknown("lost".into()))?;
     drop(seed);
-    let a = Eja::open(&db)?;
-    let b = Eja::open(&db)?;
+    let a = eja::open(&db)?;
+    let b = eja::open(&db)?;
     let barrier = std::sync::Barrier::new(2);
     std::thread::scope(|s| {
-        let settle = |host: Eja, outcome| {
+        let settle = |host: eja, outcome| {
             barrier.wait();
             host.finish(call.id, outcome).is_ok()
         };
@@ -270,7 +270,7 @@ fn an_unknown_receipt_can_be_settled_only_once_by_competing_hosts() -> Result<()
         let right = s.spawn(move || settle(b, Outcome::Failed("no".into())));
         assert_ne!(left.join().unwrap(), right.join().unwrap());
     });
-    let e = Eja::open(db)?;
+    let e = eja::open(db)?;
     assert_eq!(e.finish(call.id, Outcome::Unknown("lost".into()))?, unknown);
     assert_eq!(e.revision()?, unknown.id + 1);
     Ok(())
@@ -301,7 +301,7 @@ fn physical_time_is_rfc3339_monotonic_and_visible_across_reopen() -> Result<()> 
     };
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
-    let eja = Eja::open(&path)?.with_clock(make_clock(&clock));
+    let eja = eja::open(&path)?.with_clock(make_clock(&clock));
     let first = eja.notice(Source::Person, "feeling tired")?;
     assert_eq!(eja.read(first)?.at, t0);
 
@@ -320,7 +320,7 @@ fn physical_time_is_rfc3339_monotonic_and_visible_across_reopen() -> Result<()> 
     // Reopen three weeks later with no new write: now() still reflects elapsed physical time.
     let t2 = Timestamp::parse_rfc3339("2026-11-23T09:00:00Z")?;
     clock.store(t2.as_unix(), Ordering::SeqCst);
-    let reopened = Eja::open(&path)?.with_clock(make_clock(&clock));
+    let reopened = eja::open(&path)?.with_clock(make_clock(&clock));
     assert_eq!(reopened.now()?, t2);
     assert_eq!(reopened.concerns(reopened.revision()?)?[0].at, t1);
     assert_eq!(reopened.read(first)?.at, t0);
@@ -331,7 +331,7 @@ fn physical_time_is_rfc3339_monotonic_and_visible_across_reopen() -> Result<()> 
 fn subject_db_rejects_other_schema_versions_without_changing_the_file() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subject.db");
-    let eja = Eja::open(&path)?;
+    let eja = eja::open(&path)?;
     drop(eja);
 
     let conn = rusqlite::Connection::open(&path)?;
@@ -345,7 +345,7 @@ fn subject_db_rejects_other_schema_versions_without_changing_the_file() -> Resul
         conn.pragma_update(None, "user_version", version)?;
         drop(conn);
         let before = std::fs::read(&path)?;
-        assert!(matches!(Eja::open(&path), Err(Error::Storage(_))));
+        assert!(matches!(eja::open(&path), Err(Error::Storage(_))));
         assert_eq!(std::fs::read(&path)?, before);
     }
     Ok(())
@@ -353,7 +353,7 @@ fn subject_db_rejects_other_schema_versions_without_changing_the_file() -> Resul
 
 #[test]
 fn unfinished_actions_finds_only_unsettled_actions_on_long_journal() -> Result<()> {
-    let eja = Eja::open(":memory:")?;
+    let eja = eja::open(":memory:")?;
     for index in 0..300 {
         let rev = eja.revision()?;
         let call = eja.act(rev, "shell", json!({ "n": index }))?;

@@ -145,7 +145,8 @@ pub struct Call {
     pub input: Value,
 }
 
-pub struct Eja {
+#[allow(non_camel_case_types)]
+pub struct eja {
     pub(crate) db: Connection,
     pub(crate) clock: Box<dyn Fn() -> Timestamp + Send>,
     pub(crate) instance_id: u64,

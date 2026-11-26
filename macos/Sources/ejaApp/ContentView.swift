@@ -1,4 +1,4 @@
-import EjaClient
+import ejaClient
 import SwiftUI
 
 @MainActor
@@ -32,7 +32,7 @@ struct ContentView: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            EjaTheme.canvas.ignoresSafeArea()
+            ejaTheme.canvas.ignoresSafeArea()
 
             VStack(spacing: 0) {
                 ScrollViewReader { proxy in
@@ -42,7 +42,7 @@ struct ContentView: View {
                                 Button("加载更早", action: loadEarlier)
                                     .buttonStyle(.plain)
                                     .font(.system(size: 12))
-                                    .foregroundStyle(EjaTheme.inkMuted)
+                                    .foregroundStyle(ejaTheme.inkMuted)
                                     .frame(maxWidth: .infinity)
                             }
                             ForEach(visibleItems) { item in
@@ -96,20 +96,20 @@ struct ContentView: View {
                         HStack(spacing: 8) {
                             Text(err)
                                 .font(.system(size: 12))
-                                .foregroundStyle(EjaTheme.danger)
+                                .foregroundStyle(ejaTheme.danger)
                                 .textSelection(.enabled)
                             Spacer(minLength: 8)
                             Button { client.errorBanner = nil } label: {
                                 Image(systemName: "xmark")
                                     .font(.system(size: 10, weight: .medium))
                             }
-                            .buttonStyle(EjaIconButtonStyle(size: 20))
+                            .buttonStyle(ejaIconButtonStyle(size: 20))
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 7)
                         .background(
                             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .fill(EjaTheme.dangerTint)
+                                .fill(ejaTheme.dangerTint)
                         )
                         .transition(.opacity.combined(with: .offset(y: 4)))
                     }
@@ -131,14 +131,14 @@ struct ContentView: View {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 13, weight: .regular))
             }
-            .buttonStyle(EjaIconButtonStyle(size: 28))
+            .buttonStyle(ejaIconButtonStyle(size: 28))
             .accessibilityLabel("设置")
             .disabled(!client.isReady)
             .padding(.top, 10)
             .padding(.trailing, 14)
             .ignoresSafeArea(edges: .top)
         }
-        .tint(EjaTheme.ink)
+        .tint(ejaTheme.ink)
         .sheet(isPresented: $ui.showSettingsSheet, onDismiss: { composerFocused = true }) {
             SettingsView(client: client, isPresented: $ui.showSettingsSheet)
                 .frame(minWidth: 340, idealWidth: 700, minHeight: 260, idealHeight: 500)
@@ -163,7 +163,7 @@ struct ContentView: View {
         HStack(alignment: .bottom, spacing: 8) {
             TextField("", text: $ui.draftText, axis: .vertical)
             .font(.system(size: 13.5))
-            .foregroundStyle(EjaTheme.ink)
+            .foregroundStyle(ejaTheme.ink)
             .textFieldStyle(.plain)
             .lineLimit(1...6)
             .focused($composerFocused)
@@ -174,11 +174,11 @@ struct ContentView: View {
             Button { canStop ? client.cancelTurn() : sendDraft() } label: {
                 Image(systemName: canStop ? "stop.fill" : "arrow.up")
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(canSend || canStop ? EjaTheme.canvas : EjaTheme.inkMuted)
+                    .foregroundStyle(canSend || canStop ? ejaTheme.canvas : ejaTheme.inkMuted)
                     .frame(width: 26, height: 26)
                     .background(
                         Circle()
-                            .fill(canSend || canStop ? EjaTheme.ink.opacity(ui.sendHovered ? 0.86 : 1.0) : EjaTheme.surfaceSubtle)
+                            .fill(canSend || canStop ? ejaTheme.ink.opacity(ui.sendHovered ? 0.86 : 1.0) : ejaTheme.surfaceSubtle)
                     )
             }
             .buttonStyle(SendScaleButtonStyle())
@@ -190,12 +190,12 @@ struct ContentView: View {
         .padding(.vertical, 6)
         .background(
             RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .fill(EjaTheme.surface)
-                .shadow(color: EjaTheme.subtleShadow, radius: 8, x: 0, y: 2)
+                .fill(ejaTheme.surface)
+                .shadow(color: ejaTheme.subtleShadow, radius: 8, x: 0, y: 2)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 15, style: .continuous)
-                .stroke(composerFocused ? EjaTheme.hairlineStrong : EjaTheme.hairline, lineWidth: 1)
+                .stroke(composerFocused ? ejaTheme.hairlineStrong : ejaTheme.hairline, lineWidth: 1)
         )
         .animation(.easeOut(duration: 0.16), value: composerFocused)
     }
@@ -240,14 +240,14 @@ struct ContentView: View {
                             Image(systemName: "xmark")
                                 .font(.system(size: 9, weight: .medium))
                         }
-                        .buttonStyle(EjaIconButtonStyle(size: 18))
+                        .buttonStyle(ejaIconButtonStyle(size: 18))
                         .help("取消此唤醒")
                     }
                 }
             }
         }
         .font(.system(size: 12))
-        .foregroundStyle(EjaTheme.inkSecondary)
+        .foregroundStyle(ejaTheme.inkSecondary)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 8)
     }
@@ -268,7 +268,7 @@ struct ContentView: View {
                 if !client.statusDetail.isEmpty {
                     Text(client.statusDetail)
                         .font(.system(size: 12))
-                        .foregroundStyle(EjaTheme.inkMuted)
+                        .foregroundStyle(ejaTheme.inkMuted)
                 }
             }
             .padding(.leading, 4)
@@ -303,11 +303,11 @@ struct ContentView: View {
                 Text(item.text)
                     .font(.system(size: 13.5))
                     .lineSpacing(3)
-                    .foregroundStyle(EjaTheme.ink)
+                    .foregroundStyle(ejaTheme.ink)
                     .textSelection(.enabled)
                     .padding(.horizontal, 13)
                     .padding(.vertical, 8.5)
-                    .background(EjaTheme.surfaceSubtle)
+                    .background(ejaTheme.surfaceSubtle)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
         case "event":
@@ -347,7 +347,7 @@ struct ContentView: View {
                 if expanded {
                     Text(verbatim: detail)
                         .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(EjaTheme.inkMuted)
+                        .foregroundStyle(ejaTheme.inkMuted)
                         .textSelection(.enabled)
                 }
             } else {
@@ -356,14 +356,14 @@ struct ContentView: View {
             }
         }
         .font(.system(size: 12))
-        .foregroundStyle(EjaTheme.inkSecondary)
+        .foregroundStyle(ejaTheme.inkSecondary)
     }
 
     private func ejaTextRow(_ text: String) -> some View {
         markdownText(text)
             .font(.system(size: 13.5))
             .lineSpacing(4.5)
-            .foregroundStyle(EjaTheme.ink)
+            .foregroundStyle(ejaTheme.ink)
             .textSelection(.enabled)
             .padding(.leading, 2)
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -297,7 +297,7 @@ public final class HostClient: ObservableObject {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
         let resolvedHost = hostExecutableURL ?? Self.resolveHostExecutable()
-        let resolvedDataDir = dataDir ?? ProcessInfo.processInfo.environment["EJA_DATA_DIR"]
+        let resolvedDataDir = dataDir ?? ProcessInfo.processInfo.environment["eja_DATA_DIR"]
             .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
         startHost(executableURL: resolvedHost, dataDir: resolvedDataDir)
     }
@@ -550,7 +550,7 @@ public final class HostClient: ObservableObject {
     }
 
     public static func resolveHostExecutable() -> URL? {
-        if let envPath = ProcessInfo.processInfo.environment["EJA_HOST_BIN"] {
+        if let envPath = ProcessInfo.processInfo.environment["eja_HOST_BIN"] {
             let url = URL(fileURLWithPath: envPath)
             if FileManager.default.isExecutableFile(atPath: url.path) { return url }
         }

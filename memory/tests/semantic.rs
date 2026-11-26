@@ -1,4 +1,4 @@
-use eja_core::{Eja, Fact, Outcome, Source, Timestamp};
+use eja_core::{eja, Fact, Outcome, Source, Timestamp};
 use eja_memory::{Encoder, InputKind, MemoryIndex};
 use serde_json::json;
 
@@ -44,7 +44,7 @@ impl Encoder for ToyEncoder {
 
 #[test]
 fn keyword_search_finds_older_evidence_without_writing_to_the_journal() -> TestResult {
-    let eja = Eja::open(":memory:")?;
+    let eja = eja::open(":memory:")?;
     let mut memory = MemoryIndex::keyword();
     let key_fact = eja.notice(Source::Person, "备用钥匙放在门口绿植花盆下面")?;
     for idx in 0..20 {
@@ -60,7 +60,7 @@ fn keyword_search_finds_older_evidence_without_writing_to_the_journal() -> TestR
 #[test]
 fn repeated_passages_occupy_at_most_one_slot_in_top_results() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let eja = Eja::open(dir.path().join("subject.db"))?;
+    let eja = eja::open(dir.path().join("subject.db"))?;
     let mut memory = MemoryIndex::open(
         dir.path().join("memory.db"),
         ToyEncoder {
@@ -81,7 +81,7 @@ fn repeated_passages_occupy_at_most_one_slot_in_top_results() -> TestResult {
 #[test]
 fn search_and_evidence_present_settled_receipts_without_polluting_journal() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let eja = Eja::open(dir.path().join("subject.db"))?;
+    let eja = eja::open(dir.path().join("subject.db"))?;
     let mut memory = MemoryIndex::open(
         dir.path().join("memory.db"),
         ToyEncoder {
@@ -116,7 +116,7 @@ fn switching_encoder_rebuilds_derived_index_without_touching_journal() -> TestRe
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("subject.db");
     let mem_path = dir.path().join("memory.db");
-    let eja = Eja::open(&db_path)?;
+    let eja = eja::open(&db_path)?;
     let first = eja.notice(Source::Person, "喜欢喝绿茶")?;
     let rev_before = eja.revision()?;
 
@@ -145,7 +145,7 @@ fn switching_encoder_rebuilds_derived_index_without_touching_journal() -> TestRe
 #[test]
 fn stale_vector_cache_falls_back_to_keywords_at_the_same_revision() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let eja = Eja::open(dir.path().join("subject.db"))?;
+    let eja = eja::open(dir.path().join("subject.db"))?;
     let mem_path = dir.path().join("memory.db");
     let old = eja.notice(Source::Person, "喜欢喝绿茶")?;
 
@@ -182,8 +182,8 @@ fn reused_cache_checks_the_full_indexed_journal_prefix() -> TestResult {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("memory.db");
     let encoder = || ToyEncoder { id: "toy", dims: 4 };
-    let journal = |name, middle| -> TestResult<Eja> {
-        let eja = Eja::open(dir.path().join(name))?.with_clock(|| Timestamp(1));
+    let journal = |name, middle| -> TestResult<eja> {
+        let eja = eja::open(dir.path().join(name))?.with_clock(|| Timestamp(1));
         eja.notice(Source::Person, "相同开头")?;
         eja.notice(Source::Person, middle)?;
         eja.notice(Source::Person, "相同结尾")?;
@@ -208,7 +208,7 @@ fn reused_cache_checks_the_full_indexed_journal_prefix() -> TestResult {
 #[test]
 fn keyword_search_folds_case_in_any_script_and_hybrid_boosts_exact_symbols() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let eja = Eja::open(dir.path().join("subject.db"))?;
+    let eja = eja::open(dir.path().join("subject.db"))?;
     let port_fact = eja.notice(Source::World, "服务监听端口 9421 Ошибка ERR_BIND_9421")?;
     let tea_fact = eja.notice(Source::Person, "日常偏好喝绿茶")?;
 

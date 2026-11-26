@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn seatbelt_blocks_core_access_rename_and_parent_signal_while_allowing_data_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
+        let data_dir = dir.path().join("eja");
         let core_dir = dir.path().join("ai.eja.kernel");
         fs::create_dir(&data_dir).unwrap();
         fs::create_dir_all(&core_dir).unwrap();
@@ -742,7 +742,7 @@ mod tests {
     fn seatbelt_protects_entire_app_bundle_for_writes_while_allowing_reads() {
         let dir = tempfile::tempdir().unwrap();
         let core_dir = dir.path().join("core");
-        let bundle = dir.path().join("Eja.app");
+        let bundle = dir.path().join("eja.app");
         let macos_dir = bundle.join("Contents/MacOS");
         let resources_dir = bundle.join("Contents/Resources");
         fs::create_dir_all(&core_dir).unwrap();
@@ -750,7 +750,7 @@ mod tests {
         fs::create_dir_all(&resources_dir).unwrap();
 
         let host_exe = macos_dir.join("eja-host");
-        let app_exe = macos_dir.join("EjaApp");
+        let app_exe = macos_dir.join("ejaApp");
         let protocol_doc = resources_dir.join("PROTOCOL.md");
         fs::write(&host_exe, "host").unwrap();
         fs::write(&app_exe, "app").unwrap();
@@ -777,7 +777,7 @@ mod tests {
             .unwrap();
         assert!(
             !write_app.status.success(),
-            "writing Eja.app binary must fail"
+            "writing eja.app binary must fail"
         );
 
         let write_doc = sandbox
@@ -789,7 +789,7 @@ mod tests {
             .unwrap();
         assert!(
             !write_doc.status.success(),
-            "writing Eja.app Resources must fail"
+            "writing eja.app Resources must fail"
         );
     }
 
@@ -798,7 +798,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("Eja");
+        let data_dir = dir.path().join("eja");
         let core_dir = dir.path().join("ai.eja.kernel");
         fs::create_dir_all(&data_dir).unwrap();
         fs::create_dir_all(&core_dir).unwrap();
@@ -832,7 +832,7 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read_to_string(ok_path).unwrap(), "clean");
 
-        let moved = dir.path().join("Eja.moved");
+        let moved = dir.path().join("eja.moved");
         fs::rename(&data_dir, &moved).unwrap();
         symlink(&core_dir, &data_dir).unwrap();
         assert!(TrustedDir::open(&data_dir).is_err());

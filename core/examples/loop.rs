@@ -1,5 +1,5 @@
 //! Offline application: a scripted judge and one host-owned file capability.
-use eja_core::{Call, Eja, Fact, Outcome, Source};
+use eja_core::{Call, eja, Fact, Outcome, Source};
 use serde_json::Value;
 use std::{error::Error, fs, path::Path};
 
@@ -7,7 +7,7 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const REQUEST: &str = "下次复看时，帮我看看草稿有几行";
 
-fn step(eja: &Eja, draft: &Path, grants: &[&str]) -> AppResult<()> {
+fn step(eja: &eja, draft: &Path, grants: &[&str]) -> AppResult<()> {
     let head = eja.revision()?;
     let concerns = eja.concerns(head)?;
     let recent = eja.recent(1)?;
@@ -50,12 +50,12 @@ fn main() -> AppResult<()> {
     let journal = dir.path().join("subject.db");
     let draft = dir.path().join("draft.txt");
     fs::write(&draft, "first line\nsecond line\n")?;
-    let eja = Eja::open(&journal)?;
+    let eja = eja::open(&journal)?;
     eja.notice(Source::Person, REQUEST)?;
     step(&eja, &draft, &[])?;
     drop(eja);
 
-    let eja = Eja::open(&journal)?;
+    let eja = eja::open(&journal)?;
     eja.notice(Source::Clock, "到了约定的复看时间")?;
     step(&eja, &draft, &["draft.lines"])?;
     let recent = eja.recent(8)?;

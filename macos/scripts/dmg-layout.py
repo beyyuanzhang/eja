@@ -6,4 +6,4 @@ background = defines["background"]
 window_rect = ((140, 160), (560, 248))
 icon_size = 96
 text_size = 13
-icon_locations = {"Eja.app": (150, 114), "Applications": (410, 114)}
+icon_locations = {"eja.app": (150, 114), "Applications": (410, 114)}

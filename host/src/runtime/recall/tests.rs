@@ -258,9 +258,9 @@ fn independent_receipt_rejects_a_draft_route_and_commits_the_shared_route() {
 }
 
 #[test]
-#[ignore = "requires a live model configured by EJA_EVAL_CONFIG"]
+#[ignore = "requires a live model configured by eja_EVAL_CONFIG"]
 fn search_live_rsi_from_identity() {
-    let path = std::env::var_os("EJA_EVAL_CONFIG").expect("set EJA_EVAL_CONFIG");
+    let path = std::env::var_os("eja_EVAL_CONFIG").expect("set eja_EVAL_CONFIG");
     let mut config: HostConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     config.capabilities.clear();
     config.window_max_bytes = Some(8192);
@@ -276,7 +276,7 @@ fn search_replay_rsi_from_identity() {
 
 #[cfg(feature = "onnx")]
 #[test]
-#[ignore = "requires the local model directory in EJA_ONNX_MODEL_DIR"]
+#[ignore = "requires the local model directory in eja_ONNX_MODEL_DIR"]
 fn search_replay_rsi_with_vectors() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = HostRuntime::open_with_brain(
@@ -333,7 +333,7 @@ fn search_replay_rsi_with_vectors() {
 }
 
 fn run_rsi_lineage(config: Option<&HostConfig>) {
-    let seed = std::env::var("EJA_RSL_TEST_SEED").unwrap_or_else(|_| "20261126".into());
+    let seed = std::env::var("eja_RSL_TEST_SEED").unwrap_or_else(|_| "20261126".into());
     let opaque = |label: &str| {
         let digest = format!("{:x}", Sha256::digest(format!("{seed}:{label}")));
         digest[..10].to_uppercase()

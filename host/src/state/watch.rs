@@ -1,7 +1,7 @@
 //! Owns registered file rules and the pending wake queue.
 use super::{check_evidence, decode_meta, write_meta};
 use crate::sandbox::{validate_single_name, TrustedDir};
-use eja_core::{Eja, Error, Fact, Result, Source, Tx, FACT_BYTES};
+use eja_core::{eja, Error, Fact, Result, Source, Tx, FACT_BYTES};
 use serde::{Deserialize, Serialize};
 
 const META_WAKES: &str = "host.wakes";
@@ -67,7 +67,7 @@ fn rule_key(name: &str) -> String {
 }
 
 fn update_wakes<T>(
-    eja: &Eja,
+    eja: &eja,
     f: impl FnOnce(&Tx<'_>, &mut Vec<WakeAlarm>) -> Result<T>,
 ) -> Result<T> {
     eja.transaction(|tx| {
@@ -79,7 +79,7 @@ fn update_wakes<T>(
 }
 
 pub fn register_check(
-    eja: &Eja,
+    eja: &eja,
     name: &str,
     file: &str,
     equals: Option<&str>,
@@ -126,7 +126,7 @@ pub fn register_check(
     })
 }
 
-pub fn registered_check(eja: &Eja, name: &str) -> Result<FileCheck> {
+pub fn registered_check(eja: &eja, name: &str) -> Result<FileCheck> {
     let raw = eja
         .get_meta(&rule_key(name))?
         .ok_or_else(|| Error::Invalid(format!("未知检查规则 {name}")))?;
@@ -169,11 +169,11 @@ fn merge_wakes(existing: &mut Vec<WakeAlarm>, alarms: &[WakeAlarm]) -> Result<()
     Ok(())
 }
 
-pub fn schedule_wakes(eja: &Eja, alarms: &[WakeAlarm]) -> Result<()> {
+pub fn schedule_wakes(eja: &eja, alarms: &[WakeAlarm]) -> Result<()> {
     update_wakes(eja, |_, wakes| merge_wakes(wakes, alarms))
 }
 
-pub fn cancel_wakes(eja: &Eja, reason: &str, guard_checker: Option<&str>) -> Result<usize> {
+pub fn cancel_wakes(eja: &eja, reason: &str, guard_checker: Option<&str>) -> Result<usize> {
     update_wakes(eja, |_, wakes| {
         let before = wakes.len();
         wakes.retain(|item| {
@@ -185,11 +185,11 @@ pub fn cancel_wakes(eja: &Eja, reason: &str, guard_checker: Option<&str>) -> Res
     })
 }
 
-pub fn pending_wakes(eja: &Eja) -> Result<Vec<WakeAlarm>> {
+pub fn pending_wakes(eja: &eja) -> Result<Vec<WakeAlarm>> {
     decode_meta(eja.get_meta(META_WAKES)?)
 }
 
-pub fn dismiss_wake(eja: &Eja, id: &str) -> Result<bool> {
+pub fn dismiss_wake(eja: &eja, id: &str) -> Result<bool> {
     update_wakes(eja, |tx, wakes| {
         let Some(index) = wakes.iter().position(|alarm| alarm.id == id) else {
             return Ok(false);
@@ -204,12 +204,12 @@ pub fn dismiss_wake(eja: &Eja, id: &str) -> Result<bool> {
     })
 }
 
-pub fn next_wake_at(eja: &Eja) -> Result<Option<i64>> {
+pub fn next_wake_at(eja: &eja) -> Result<Option<i64>> {
     Ok(pending_wakes(eja)?.first().map(|alarm| alarm.fire_at_unix))
 }
 
 pub fn tick(
-    eja: &Eja,
+    eja: &eja,
     data_dir: &TrustedDir,
     format_at: impl Fn(i64) -> String,
     mut report_error: impl FnMut(String),
@@ -236,7 +236,7 @@ pub fn tick(
 }
 
 /// Atomically record due unguarded wakes and return due guarded wakes for out-of-tx probe evaluation.
-fn collect_due_wakes(eja: &Eja) -> Result<(bool, Vec<WakeAlarm>, i64)> {
+fn collect_due_wakes(eja: &eja) -> Result<(bool, Vec<WakeAlarm>, i64)> {
     eja.transaction(|tx| {
         let wakes: Vec<WakeAlarm> = decode_meta(tx.get_meta(META_WAKES)?)?;
         let now = tx.now()?.as_unix();
@@ -264,7 +264,7 @@ fn collect_due_wakes(eja: &Eja) -> Result<(bool, Vec<WakeAlarm>, i64)> {
 }
 
 fn settle_guarded_wake(
-    eja: &Eja,
+    eja: &eja,
     alarm: &WakeAlarm,
     matched: bool,
     retry_at: Option<(i64, String)>,
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn collect_due_wakes_uses_subject_clock_and_removes_fired_alarms() {
-        let eja = Eja::open(":memory:").unwrap().with_clock(|| Timestamp(100));
+        let eja = eja::open(":memory:").unwrap().with_clock(|| Timestamp(100));
         schedule_wakes(
             &eja,
             &[
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn dismissing_a_wake_with_a_maximal_reason_still_fits_the_notice() {
-        let eja = Eja::open(":memory:").unwrap();
+        let eja = eja::open(":memory:").unwrap();
         let alarm = WakeAlarm {
             id: "w-big".into(),
             fire_at_unix: 100,

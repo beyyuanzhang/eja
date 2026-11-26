@@ -1,5 +1,5 @@
 import AppKit
-import EjaClient
+import ejaClient
 import SwiftUI
 
 enum SettingsSection: Hashable {
@@ -378,15 +378,15 @@ struct SettingsView: View {
         HStack(spacing: 0) {
             sidebar
             Rectangle()
-                .fill(EjaTheme.hairline)
+                .fill(ejaTheme.hairline)
                 .frame(width: 1)
                 .ignoresSafeArea(edges: .vertical)
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(EjaTheme.canvas.ignoresSafeArea())
-        .tint(EjaTheme.ink)
+        .background(ejaTheme.canvas.ignoresSafeArea())
+        .tint(ejaTheme.ink)
         .onAppear {
             draft.attach(client: client)
             draft.load(from: client.config)
@@ -412,7 +412,7 @@ struct SettingsView: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .medium))
             }
-            .buttonStyle(EjaIconButtonStyle(size: 24))
+            .buttonStyle(ejaIconButtonStyle(size: 24))
             .accessibilityLabel("关闭设置")
             .keyboardShortcut(.cancelAction)
             .padding(.leading, 4)
@@ -434,13 +434,13 @@ struct SettingsView: View {
                     .hidden()
                 Text(title)
                     .font(.system(size: 12.5, weight: active ? .medium : .regular))
-                    .foregroundStyle(active ? EjaTheme.ink : EjaTheme.inkSecondary)
+                    .foregroundStyle(active ? ejaTheme.ink : ejaTheme.inkSecondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(active ? EjaTheme.surfaceSubtle : .clear)
+                    .fill(active ? ejaTheme.surfaceSubtle : .clear)
             )
             .contentShape(Rectangle())
         }
@@ -482,15 +482,15 @@ struct SettingsView: View {
         } label: {
             Image(systemName: "plus")
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(EjaTheme.inkMuted)
+                .foregroundStyle(ejaTheme.inkMuted)
                 .frame(width: 26, height: 26)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(EjaTheme.surface)
+                        .fill(ejaTheme.surface)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(EjaTheme.hairline, lineWidth: 1)
+                        .stroke(ejaTheme.hairline, lineWidth: 1)
                 )
         }
         .menuStyle(.borderlessButton)
@@ -514,17 +514,17 @@ struct SettingsView: View {
                 HStack(spacing: 5) {
                     Text(provider.name.isEmpty ? provider.id : provider.name)
                         .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(EjaTheme.ink)
+                        .foregroundStyle(ejaTheme.ink)
                         .lineLimit(1)
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8.5, weight: .semibold))
-                        .foregroundStyle(EjaTheme.inkMuted)
+                        .foregroundStyle(ejaTheme.inkMuted)
                         .rotationEffect(.degrees(expanded ? 90 : 0))
                     Spacer(minLength: 4)
                     if !activeModel.isEmpty {
                         Text(activeModel)
                             .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(EjaTheme.inkSecondary)
+                            .foregroundStyle(ejaTheme.inkSecondary)
                             .lineLimit(1)
                     }
                 }
@@ -541,7 +541,7 @@ struct SettingsView: View {
                     if let testResult {
                         Text(testResult.message)
                             .font(.system(size: 10.5))
-                            .foregroundStyle(testResult.ok ? EjaTheme.positive : EjaTheme.danger)
+                            .foregroundStyle(testResult.ok ? ejaTheme.positive : ejaTheme.danger)
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
@@ -553,7 +553,7 @@ struct SettingsView: View {
                         Image(systemName: "bolt")
                             .font(.system(size: 10.5, weight: .medium))
                     }
-                    .buttonStyle(EjaIconButtonStyle(size: 22))
+                    .buttonStyle(ejaIconButtonStyle(size: 22))
                     .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty)
 
                     Button {
@@ -564,7 +564,7 @@ struct SettingsView: View {
                             .rotationEffect(.degrees(isFetching ? 180 : 0))
                             .animation(.easeInOut(duration: 0.25), value: isFetching)
                     }
-                    .buttonStyle(EjaIconButtonStyle(size: 22))
+                    .buttonStyle(ejaIconButtonStyle(size: 22))
                     .disabled(provider.baseUrl.trimmingCharacters(in: .whitespaces).isEmpty || isFetching)
 
                     Button {
@@ -573,7 +573,7 @@ struct SettingsView: View {
                         Image(systemName: "trash")
                             .font(.system(size: 10.5))
                     }
-                    .buttonStyle(EjaIconButtonStyle(size: 22, destructive: true))
+                    .buttonStyle(ejaIconButtonStyle(size: 22, destructive: true))
                 }
                 .padding(.horizontal, 11)
                 .padding(.bottom, 7)
@@ -587,11 +587,11 @@ struct SettingsView: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(EjaTheme.surface)
+                .fill(ejaTheme.surface)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(EjaTheme.hairline, lineWidth: 1)
+                .stroke(ejaTheme.hairline, lineWidth: 1)
         )
     }
 
@@ -607,16 +607,16 @@ struct SettingsView: View {
                     Text(model)
                         .font(.system(size: 11.5, weight: selected ? .medium : .regular, design: .monospaced))
                         .lineLimit(1)
-                        .foregroundStyle(selected ? EjaTheme.canvas : EjaTheme.ink)
+                        .foregroundStyle(selected ? ejaTheme.canvas : ejaTheme.ink)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                         .background(
                             RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                                .fill(selected ? EjaTheme.ink : EjaTheme.canvas)
+                                .fill(selected ? ejaTheme.ink : ejaTheme.canvas)
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                                .stroke(selected ? .clear : EjaTheme.hairline, lineWidth: 1)
+                                .stroke(selected ? .clear : ejaTheme.hairline, lineWidth: 1)
                         )
                 }
                 .buttonStyle(.plain)
@@ -631,9 +631,9 @@ struct SettingsView: View {
             }
 
             if isAdding {
-                TextField("", text: $draft.newModelInput, prompt: Text("模型 ID").foregroundStyle(EjaTheme.inkMuted))
+                TextField("", text: $draft.newModelInput, prompt: Text("模型 ID").foregroundStyle(ejaTheme.inkMuted))
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(EjaTheme.ink)
+                    .foregroundStyle(ejaTheme.ink)
                     .textFieldStyle(.plain)
                     .fixedSize(horizontal: true, vertical: false)
                     .frame(minWidth: 64)
@@ -648,11 +648,11 @@ struct SettingsView: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                            .fill(EjaTheme.canvas)
+                            .fill(ejaTheme.canvas)
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                            .stroke(EjaTheme.hairlineStrong, lineWidth: 1)
+                            .stroke(ejaTheme.hairlineStrong, lineWidth: 1)
                     )
             } else {
                 Button {
@@ -661,16 +661,16 @@ struct SettingsView: View {
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(EjaTheme.inkMuted)
+                        .foregroundStyle(ejaTheme.inkMuted)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 5.5)
                         .background(
                             RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                                .fill(EjaTheme.canvas)
+                                .fill(ejaTheme.canvas)
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                                .stroke(EjaTheme.hairline, lineWidth: 1)
+                                .stroke(ejaTheme.hairline, lineWidth: 1)
                         )
                 }
                 .buttonStyle(.plain)
@@ -690,9 +690,9 @@ struct SettingsView: View {
         return VStack(alignment: .leading, spacing: 6) {
             divider
             HStack(spacing: 6) {
-                TextField("", text: nameBinding, prompt: Text("名称").foregroundStyle(EjaTheme.inkMuted))
+                TextField("", text: nameBinding, prompt: Text("名称").foregroundStyle(ejaTheme.inkMuted))
                     .font(.system(size: 12))
-                    .foregroundStyle(EjaTheme.ink)
+                    .foregroundStyle(ejaTheme.ink)
                     .textFieldStyle(.plain)
                     .modifier(CardField())
 
@@ -703,20 +703,20 @@ struct SettingsView: View {
                 .padding(2)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(EjaTheme.canvas)
+                        .fill(ejaTheme.canvas)
                 )
                 .fixedSize()
             }
 
-            TextField("", text: urlBinding, prompt: Text("URL").foregroundStyle(EjaTheme.inkMuted))
+            TextField("", text: urlBinding, prompt: Text("URL").foregroundStyle(ejaTheme.inkMuted))
                 .font(.system(size: 11.5, design: .monospaced))
-                .foregroundStyle(EjaTheme.ink)
+                .foregroundStyle(ejaTheme.ink)
                 .textFieldStyle(.plain)
                 .modifier(CardField())
 
-            SecureField("", text: keyBinding, prompt: Text(provider.hasApiKey ? "密钥已保存" : "API Key").foregroundStyle(EjaTheme.inkMuted))
+            SecureField("", text: keyBinding, prompt: Text(provider.hasApiKey ? "密钥已保存" : "API Key").foregroundStyle(ejaTheme.inkMuted))
                 .font(.system(size: 11.5, design: .monospaced))
-                .foregroundStyle(EjaTheme.ink)
+                .foregroundStyle(ejaTheme.ink)
                 .textFieldStyle(.plain)
                 .onSubmit {
                     draft.flushSave()
@@ -737,14 +737,14 @@ struct SettingsView: View {
         } label: {
             Text(label)
                 .font(.system(size: 11, weight: active ? .medium : .regular))
-                .foregroundStyle(active ? EjaTheme.ink : EjaTheme.inkSecondary)
+                .foregroundStyle(active ? ejaTheme.ink : ejaTheme.inkSecondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3.5)
                 .background {
                     if active {
                         RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                            .fill(EjaTheme.surface)
-                            .shadow(color: EjaTheme.subtleShadow, radius: 2, x: 0, y: 1)
+                            .fill(ejaTheme.surface)
+                            .shadow(color: ejaTheme.subtleShadow, radius: 2, x: 0, y: 1)
                     }
                 }
         }
@@ -764,15 +764,15 @@ struct SettingsView: View {
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(EjaTheme.inkMuted)
+                        .foregroundStyle(ejaTheme.inkMuted)
                         .frame(width: 26, height: 26)
                         .background(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(EjaTheme.surface)
+                                .fill(ejaTheme.surface)
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .stroke(EjaTheme.hairline, lineWidth: 1)
+                                .stroke(ejaTheme.hairline, lineWidth: 1)
                         )
                 }
                 .buttonStyle(.plain)
@@ -797,10 +797,10 @@ struct SettingsView: View {
         let isHTTP = cap.transport.type == "http"
         let hasURL = !(cap.transport.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let dotColor: Color = {
-            if !enabled && !isBuiltin { return EjaTheme.inkMuted.opacity(0.35) }
-            if isBuiltin || status?.connected == true { return EjaTheme.positive }
-            if let err = status?.error, !err.isEmpty { return EjaTheme.warning }
-            return EjaTheme.inkMuted
+            if !enabled && !isBuiltin { return ejaTheme.inkMuted.opacity(0.35) }
+            if isBuiltin || status?.connected == true { return ejaTheme.positive }
+            if let err = status?.error, !err.isEmpty { return ejaTheme.warning }
+            return ejaTheme.inkMuted
         }()
         let enabledBinding = Binding<Bool>(
             get: { enabled },
@@ -825,12 +825,12 @@ struct SettingsView: View {
                             .frame(width: 6, height: 6)
                         Text(cap.name.isEmpty ? cap.id : cap.name)
                             .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle((enabled || isBuiltin) ? EjaTheme.ink : EjaTheme.inkSecondary)
+                            .foregroundStyle((enabled || isBuiltin) ? ejaTheme.ink : ejaTheme.inkSecondary)
                             .lineLimit(1)
                         if canExpand {
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 8.5, weight: .semibold))
-                                .foregroundStyle(EjaTheme.inkMuted)
+                                .foregroundStyle(ejaTheme.inkMuted)
                                 .rotationEffect(.degrees(expanded ? 90 : 0))
                         }
                         Spacer(minLength: 4)
@@ -864,16 +864,16 @@ struct SettingsView: View {
                             } label: {
                                 Text(code)
                                     .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(EjaTheme.ink)
+                                    .foregroundStyle(ejaTheme.ink)
                                     .padding(.horizontal, 6.5)
                                     .padding(.vertical, 2.5)
                                     .background(
                                         RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                            .fill(EjaTheme.canvas)
+                                            .fill(ejaTheme.canvas)
                                     )
                                     .overlay(
                                         RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                            .stroke(EjaTheme.hairlineStrong, lineWidth: 1)
+                                            .stroke(ejaTheme.hairlineStrong, lineWidth: 1)
                                     )
                             }
                             .buttonStyle(.plain)
@@ -884,12 +884,12 @@ struct SettingsView: View {
                             } label: {
                                 Text("授权")
                                     .font(.system(size: 10.5, weight: .medium))
-                                    .foregroundStyle(EjaTheme.canvas)
+                                    .foregroundStyle(ejaTheme.canvas)
                                     .padding(.horizontal, 7.5)
                                     .padding(.vertical, 2.5)
                                     .background(
                                         RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                            .fill(EjaTheme.ink)
+                                            .fill(ejaTheme.ink)
                                     )
                             }
                             .buttonStyle(.plain)
@@ -902,7 +902,7 @@ struct SettingsView: View {
                             Image(systemName: "arrow.clockwise")
                                 .font(.system(size: 10.5, weight: .medium))
                         }
-                        .buttonStyle(EjaIconButtonStyle(size: 22))
+                        .buttonStyle(ejaIconButtonStyle(size: 22))
 
                         Button {
                             draft.removeCapability(id: cap.id)
@@ -910,7 +910,7 @@ struct SettingsView: View {
                             Image(systemName: "trash")
                                 .font(.system(size: 10.5))
                         }
-                        .buttonStyle(EjaIconButtonStyle(size: 22, destructive: true))
+                        .buttonStyle(ejaIconButtonStyle(size: 22, destructive: true))
                     }
                     .padding(.horizontal, 11)
                     .padding(.bottom, 7)
@@ -919,7 +919,7 @@ struct SettingsView: View {
                 if let error, !error.isEmpty {
                     Text(error)
                         .font(.system(size: 11))
-                        .foregroundStyle(EjaTheme.warning)
+                        .foregroundStyle(ejaTheme.warning)
                         .padding(.horizontal, 11)
                         .padding(.bottom, 9)
                 }
@@ -929,16 +929,16 @@ struct SettingsView: View {
                         ForEach(tools) { tool in
                             Text(tool.name)
                                 .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(EjaTheme.inkSecondary)
+                                .foregroundStyle(ejaTheme.inkSecondary)
                                 .padding(.horizontal, 6.5)
                                 .padding(.vertical, 2.5)
                                 .background(
                                     RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                        .fill(EjaTheme.canvas)
+                                        .fill(ejaTheme.canvas)
                                 )
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                        .stroke(EjaTheme.hairline, lineWidth: 1)
+                                        .stroke(ejaTheme.hairline, lineWidth: 1)
                                 )
                         }
                     }
@@ -953,11 +953,11 @@ struct SettingsView: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(EjaTheme.surface)
+                .fill(ejaTheme.surface)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(EjaTheme.hairline, lineWidth: 1)
+                .stroke(ejaTheme.hairline, lineWidth: 1)
         )
     }
 
@@ -977,9 +977,9 @@ struct SettingsView: View {
         return VStack(alignment: .leading, spacing: 6) {
             divider
             HStack(spacing: 6) {
-                TextField("", text: nameBinding, prompt: Text("名称").foregroundStyle(EjaTheme.inkMuted))
+                TextField("", text: nameBinding, prompt: Text("名称").foregroundStyle(ejaTheme.inkMuted))
                     .font(.system(size: 12))
-                    .foregroundStyle(EjaTheme.ink)
+                    .foregroundStyle(ejaTheme.ink)
                     .textFieldStyle(.plain)
                     .modifier(CardField())
 
@@ -991,36 +991,36 @@ struct SettingsView: View {
                 .padding(2)
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(EjaTheme.canvas)
+                        .fill(ejaTheme.canvas)
                 )
                 .fixedSize()
             }
 
             if isHTTP {
-                TextField("", text: urlBinding, prompt: Text("URL").foregroundStyle(EjaTheme.inkMuted))
+                TextField("", text: urlBinding, prompt: Text("URL").foregroundStyle(ejaTheme.inkMuted))
                     .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(EjaTheme.ink)
+                    .foregroundStyle(ejaTheme.ink)
                     .textFieldStyle(.plain)
                     .modifier(CardField())
             } else {
-                TextField("", text: cmdLineBinding, prompt: Text("命令").foregroundStyle(EjaTheme.inkMuted))
+                TextField("", text: cmdLineBinding, prompt: Text("命令").foregroundStyle(ejaTheme.inkMuted))
                     .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(EjaTheme.ink)
+                    .foregroundStyle(ejaTheme.ink)
                     .textFieldStyle(.plain)
                     .modifier(CardField())
             }
 
             if isExec {
-                TextField("", text: descBinding, prompt: Text("描述").foregroundStyle(EjaTheme.inkMuted))
+                TextField("", text: descBinding, prompt: Text("描述").foregroundStyle(ejaTheme.inkMuted))
                     .font(.system(size: 11.5))
-                    .foregroundStyle(EjaTheme.ink)
+                    .foregroundStyle(ejaTheme.ink)
                     .textFieldStyle(.plain)
                     .modifier(CardField())
             }
 
-            TextField("", text: kvBinding, prompt: Text("KEY=VALUE").foregroundStyle(EjaTheme.inkMuted), axis: .vertical)
+            TextField("", text: kvBinding, prompt: Text("KEY=VALUE").foregroundStyle(ejaTheme.inkMuted), axis: .vertical)
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(EjaTheme.ink)
+                .foregroundStyle(ejaTheme.ink)
                 .textFieldStyle(.plain)
                 .lineLimit(1...4)
                 .modifier(CardField())
@@ -1064,14 +1064,14 @@ struct SettingsView: View {
         } label: {
             Text(label)
                 .font(.system(size: 11, weight: active ? .medium : .regular))
-                .foregroundStyle(active ? EjaTheme.ink : EjaTheme.inkSecondary)
+                .foregroundStyle(active ? ejaTheme.ink : ejaTheme.inkSecondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3.5)
                 .background {
                     if active {
                         RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                            .fill(EjaTheme.surface)
-                            .shadow(color: EjaTheme.subtleShadow, radius: 2, x: 0, y: 1)
+                            .fill(ejaTheme.surface)
+                            .shadow(color: ejaTheme.subtleShadow, radius: 2, x: 0, y: 1)
                     }
                 }
         }
@@ -1082,7 +1082,7 @@ struct SettingsView: View {
 
     private var divider: some View {
         Rectangle()
-            .fill(EjaTheme.hairline)
+            .fill(ejaTheme.hairline)
             .frame(height: 1)
     }
 
@@ -1209,11 +1209,11 @@ private struct CardField: ViewModifier {
             .padding(.vertical, 5.5)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(EjaTheme.canvas)
+                    .fill(ejaTheme.canvas)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(EjaTheme.hairline, lineWidth: 1)
+                    .stroke(ejaTheme.hairline, lineWidth: 1)
             )
     }
 }

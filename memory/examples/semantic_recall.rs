@@ -1,5 +1,5 @@
 //! Benchmark derived semantic recall over a synthetic subject journal.
-use eja_core::{Eja, Source};
+use eja_core::{eja, Source};
 use eja_memory::{MemoryIndex, OnnxEncoder};
 use std::{error::Error, path::PathBuf, time::Instant};
 
@@ -33,7 +33,7 @@ const PROBES: [(&str, &str); 6] = [
 ];
 
 fn load_encoder() -> AppResult<OnnxEncoder> {
-    let dir = std::env::var_os("EJA_ONNX_MODEL_DIR")
+    let dir = std::env::var_os("eja_ONNX_MODEL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -55,7 +55,7 @@ fn main() -> AppResult<()> {
     }
     let encoder = load_encoder()?;
     let dir = tempfile::tempdir()?;
-    let eja = Eja::open(dir.path().join("subject.db"))?;
+    let eja = eja::open(dir.path().join("subject.db"))?;
     let mem_path = dir.path().join("memory.db");
     let targets: Vec<usize> = (0..PROBES.len()).map(|i| 1 + i * (n / 8)).collect();
     let domains = [

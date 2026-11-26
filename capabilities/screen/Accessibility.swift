@@ -2,7 +2,7 @@ import ApplicationServices
 import AppKit
 import ScreenCaptureKit
 
-let accessibilityError = ScreenError(message: "请在「系统设置 → 隐私与安全性 → 辅助功能」授权 EJA，再调用此工具")
+let accessibilityError = ScreenError(message: "请在「系统设置 → 隐私与安全性 → 辅助功能」授权 eja，再调用此工具")
 
 private struct Control: Encodable {
     let role: String

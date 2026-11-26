@@ -508,7 +508,7 @@ fn register_dynamic_client(
     redirect_uri: &str,
 ) -> Result<(String, Option<String>), String> {
     let payload = json!({
-        "client_name": "EJA",
+        "client_name": "eja",
         "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
@@ -571,18 +571,18 @@ fn wait_for_loopback_code(
                 let params = parse_query_params(query);
                 if let Some(err) = params.get("error") {
                     let desc = params.get("error_description").unwrap_or(err);
-                    write_loopback_html(&mut stream, false, "授权未完成，请返回 EJA。");
+                    write_loopback_html(&mut stream, false, "授权未完成，请返回 eja。");
                     return Err(format!("OAuth 授权失败: {desc}"));
                 }
                 let Some(code) = params.get("code").filter(|s| !s.is_empty()).cloned() else {
-                    write_loopback_html(&mut stream, false, "缺少授权码，请返回 EJA 重试。");
+                    write_loopback_html(&mut stream, false, "缺少授权码，请返回 eja 重试。");
                     continue;
                 };
                 if params.get("state").map(String::as_str) != Some(expected_state) {
-                    write_loopback_html(&mut stream, false, "状态校验不一致，请返回 EJA 重试。");
+                    write_loopback_html(&mut stream, false, "状态校验不一致，请返回 eja 重试。");
                     return Err("OAuth state 校验不一致".into());
                 }
-                write_loopback_html(&mut stream, true, "授权完成，可关闭此页面返回 EJA。");
+                write_loopback_html(&mut stream, true, "授权完成，可关闭此页面返回 eja。");
                 return Ok(code);
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -602,7 +602,7 @@ fn write_loopback_html(stream: &mut impl Write, ok: bool, message: &str) {
         ""
     };
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>EJA</title></head>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>eja</title></head>\
         <body style=\"font-family:-apple-system,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:80vh;margin:0;color:#222;font-size:14px\">\
         {script}<p>{message}</p></body></html>"
     );

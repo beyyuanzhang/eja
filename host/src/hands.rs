@@ -4,7 +4,7 @@ use crate::oauth::OAuthToken;
 use crate::sandbox::{Sandbox, TrustedDir};
 use crate::state::watch::{self, WakeAlarm, WakeGuard};
 use crate::tool::{ToolExecution, ToolSpec, ToolTarget};
-use eja_core::{Call, Eja, Outcome};
+use eja_core::{Call, eja, Outcome};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -161,7 +161,7 @@ impl Hands {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string" },
-                        "file": { "type": "string", "description": "EJA 数据目录中的单个文件名" },
+                        "file": { "type": "string", "description": "eja 数据目录中的单个文件名" },
                         "equals": { "type": "string", "description": "可选：忽略文件末尾换行后须等于此文本" },
                         "contains": { "type": "string", "description": "可选：文件内容须包含此非空子串" },
                         "not_equals": { "type": "string", "description": "可选：忽略文件末尾换行后须不等于此文本（例如空串 \"\" 表示非空文件）" }
@@ -209,7 +209,7 @@ impl Hands {
         specs
     }
 
-    pub fn execute(&mut self, call: &Call, eja: &Eja) -> ToolExecution {
+    pub fn execute(&mut self, call: &Call, eja: &eja) -> ToolExecution {
         match call.capability.as_str() {
             "wake" => execute_wake(eja, call.id, &call.input).into(),
             "promote_tool" => {
@@ -249,7 +249,7 @@ impl Hands {
     }
 }
 
-fn execute_wake(eja: &Eja, call_id: eja_core::Id, input: &Value) -> Outcome {
+fn execute_wake(eja: &eja, call_id: eja_core::Id, input: &Value) -> Outcome {
     let result = (|| {
         let invalid = |message: &str| eja_core::Error::Invalid(message.into());
         let delay = input["delay_seconds"]
