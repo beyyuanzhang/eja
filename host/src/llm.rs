@@ -1194,6 +1194,7 @@ fn http_error_message(err: HttpError) -> String {
         HttpError::Wait(msg) => format!("等待 LLM 响应失败: {msg}"),
         HttpError::Transport { message, .. } => format!("网络请求失败: {message}"),
         HttpError::InvalidResponse(msg) => format!("无效 LLM 响应: {msg}"),
+        HttpError::Cancelled => "请求已中止".into(),
     }
 }
 

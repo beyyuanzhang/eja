@@ -324,6 +324,7 @@ impl HttpConnection {
                 }
             }
             HttpError::InvalidResponse(msg) => RequestError::Unknown(msg),
+            HttpError::Cancelled => RequestError::Unknown("MCP 请求已中止".into()),
         })?;
         let body = check_mcp_http_status(resp)?;
         let parsed = parse_http_jsonrpc(&body, id).map_err(RequestError::Unknown)?;

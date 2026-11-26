@@ -1,11 +1,10 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
@@ -23,6 +22,7 @@ pub enum HttpError {
         message: String,
     },
     InvalidResponse(String),
+    Cancelled,
 }
 
 pub fn get_bytes(
@@ -169,31 +169,14 @@ fn request_bytes(
             buf
         })
     });
-    let mut reader = BufReader::new(
-        child
-            .stdout
-            .take()
-            .ok_or_else(|| HttpError::Launch("无法获取 curl stdout".into()))?,
-    );
-    let pid = child.id() as libc::pid_t;
-    let finished = AtomicBool::new(false);
-    let raw = thread::scope(|scope| {
-        if let Some(cancel) = cancel {
-            let finished = &finished;
-            scope.spawn(move || {
-                while !finished.load(Ordering::Relaxed) {
-                    if cancel.load(Ordering::Relaxed) {
-                        unsafe { libc::kill(pid, libc::SIGKILL) };
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                }
-            });
-        }
-        let raw = read_response(&mut reader, on_line);
-        finished.store(true, Ordering::Relaxed);
-        raw
-    })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HttpError::Launch("无法获取 curl stdout".into()))?;
+    let raw = read_response(&mut stdout, cancel, on_line);
+    if raw.is_err() {
+        let _ = child.kill();
+    }
     let status = child
         .wait()
         .map_err(|err| HttpError::Wait(format!("等待 HTTP 响应失败: {err}")))?;
@@ -204,6 +187,7 @@ fn request_bytes(
     let stderr = stderr_handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
+    let raw = raw?;
     if !status.success() {
         return Err(HttpError::Transport {
             exit_code: status.code(),
@@ -214,51 +198,100 @@ fn request_bytes(
 }
 
 fn read_response(
-    reader: &mut impl BufRead,
+    stdout: &mut ChildStdout,
+    cancel: Option<&AtomicBool>,
     mut on_line: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String, HttpError> {
-    let (mut raw, mut line_buf, mut in_headers, mut status_code, mut is_sse) =
-        (String::new(), Vec::new(), true, 0u16, false);
+    let mut lines = ResponseLines::default();
+    let (mut pending, mut chunk) = (Vec::new(), [0u8; 8192]);
     loop {
-        line_buf.clear();
-        if reader
-            .read_until(b'\n', &mut line_buf)
-            .map_err(|err| HttpError::Wait(format!("等待 HTTP 响应失败: {err}")))?
-            == 0
-        {
+        if let Some(cancel) = cancel {
+            wait_readable(stdout.as_raw_fd(), cancel)?;
+        }
+        let read = match stdout.read(&mut chunk) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(HttpError::Wait(format!("等待 HTTP 响应失败: {err}"))),
+        };
+        if read == 0 {
             break;
         }
-        let line = String::from_utf8_lossy(&line_buf);
-        if in_headers {
-            raw.push_str(&line);
+        let mut from = pending.len();
+        pending.extend_from_slice(&chunk[..read]);
+        while let Some(offset) = pending[from..].iter().position(|&byte| byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=from + offset).collect();
+            lines.push(&String::from_utf8_lossy(&line), &mut on_line);
+            from = 0;
+        }
+    }
+    if !pending.is_empty() {
+        lines.push(&String::from_utf8_lossy(&pending), &mut on_line);
+    }
+    Ok(lines.raw)
+}
+
+fn wait_readable(fd: RawFd, cancel: &AtomicBool) -> Result<(), HttpError> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(HttpError::Cancelled);
+        }
+        match unsafe { libc::poll(&mut poll_fd, 1, 50) } {
+            0 => {}
+            ready if ready > 0 => return Ok(()),
+            _ => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(HttpError::Wait(format!("等待 HTTP 响应失败: {err}")));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResponseLines {
+    raw: String,
+    in_body: bool,
+    status_code: u16,
+    is_sse: bool,
+}
+
+impl ResponseLines {
+    fn push(&mut self, line: &str, on_line: &mut Option<&mut dyn FnMut(&str)>) {
+        if !self.in_body {
+            self.raw.push_str(line);
             if let Some(rest) = line.strip_prefix("HTTP/") {
-                status_code = rest
+                self.status_code = rest
                     .split_whitespace()
                     .nth(1)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
-                is_sse = false;
+                self.is_sse = false;
             } else if line.to_ascii_lowercase().starts_with("content-type:")
                 && line.to_ascii_lowercase().contains("text/event-stream")
             {
-                is_sse = true;
-            } else if (line == "\r\n" || line == "\n") && !(100..200).contains(&status_code) {
-                in_headers = false;
+                self.is_sse = true;
+            } else if (line == "\r\n" || line == "\n") && !(100..200).contains(&self.status_code) {
+                self.in_body = true;
             }
-        } else if (200..300).contains(&status_code) {
+        } else if (200..300).contains(&self.status_code) {
             if let Some(cb) = on_line.as_deref_mut() {
                 cb(line.trim_end_matches(['\r', '\n']));
-                if !is_sse {
-                    raw.push_str(&line);
+                if !self.is_sse {
+                    self.raw.push_str(line);
                 }
             } else {
-                raw.push_str(&line);
+                self.raw.push_str(line);
             }
         } else {
-            raw.push_str(&line);
+            self.raw.push_str(line);
         }
     }
-    Ok(raw)
 }
 
 fn format_curl_config(url: &str, headers: &[(String, String)]) -> Result<String, HttpError> {
@@ -361,6 +394,7 @@ pub fn truncate_utf8(input: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::time::Duration;
 
     #[test]
     fn curl_config_escapes_quotes_and_rejects_control_characters() {
@@ -437,21 +471,29 @@ mod tests {
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
             let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {}\n\n",
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {}\n\ndata: {\"par",
             );
             thread::sleep(Duration::from_secs(3));
         });
         let cancel = AtomicBool::new(false);
         let started = std::time::Instant::now();
-        let result = post_stream(
-            &format!("http://127.0.0.1:{port}/stream"),
-            &[],
-            b"{}",
-            30,
-            Some(&cancel),
-            |_| cancel.store(true, Ordering::Relaxed),
-        );
-        assert!(result.is_err());
+        let mut lines = Vec::new();
+        let result = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            post_stream(
+                &format!("http://127.0.0.1:{port}/stream"),
+                &[],
+                b"{}",
+                30,
+                Some(&cancel),
+                |line| lines.push(line.to_string()),
+            )
+        });
+        assert_eq!(result, Err(HttpError::Cancelled));
+        assert_eq!(lines, vec!["data: {}", ""]);
         assert!(started.elapsed() < Duration::from_secs(2));
         server.join().unwrap();
     }
