@@ -13,26 +13,19 @@ if [ "${1:-}" != "--skip-build" ]; then
     "${SCRIPT_DIR}/build-app.sh"
 fi
 
-STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/eja-dmg.XXXXXX")"
+DMGBUILD_ENV="${MACOS_DIR}/build/.dmg-build"
+if [ ! -x "${DMGBUILD_ENV}/bin/dmgbuild" ]; then
+    python3 -m venv "${DMGBUILD_ENV}"
+    "${DMGBUILD_ENV}/bin/python" -m pip install "dmgbuild==1.6.7"
+fi
+
+STAGE_DIR="$(mktemp -d "${MACOS_DIR}/build/.dmg.XXXXXX")"
 trap 'rm -rf "${STAGE_DIR}"' EXIT
 
-cp -R "${APP_DIR}" "${STAGE_DIR}/Eja.app"
-ln -s /Applications "${STAGE_DIR}/Applications"
-
-for attempt in 1 2 3; do
-    rm -f "${DMG_PATH}"
-    if hdiutil create \
-        -volname "EJA" \
-        -srcfolder "${STAGE_DIR}" \
-        -ov \
-        -format UDZO \
-        "${DMG_PATH}"; then
-        break
-    fi
-    if [ "${attempt}" -eq 3 ]; then
-        exit 1
-    fi
-    sleep 2
-done
+"${DMGBUILD_ENV}/bin/dmgbuild" -s "${SCRIPT_DIR}/dmg-layout.py" \
+    -D "app=${APP_DIR}" -D "background=${MACOS_DIR}/Resources/DmgBackground.tiff" \
+    "EJA" "${STAGE_DIR}/Eja.dmg"
+hdiutil verify "${STAGE_DIR}/Eja.dmg"
+mv "${STAGE_DIR}/Eja.dmg" "${DMG_PATH}"
 
 echo "Done: ${DMG_PATH}"

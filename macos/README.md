@@ -21,6 +21,8 @@ open macos/build/Eja.app
 ./macos/scripts/build-dmg.sh
 ```
 
+打包脚本使用 Python 3，在 `macos/build/` 下的虚拟环境中安装 Finder 布局工具。
+
 在仓库根目录运行以下命令，用 SwiftPM 测试并启动开发版：
 
 ```sh
