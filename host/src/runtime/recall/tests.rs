@@ -249,18 +249,23 @@ fn independent_receipt_rejects_a_draft_route_and_commits_the_shared_route() {
         rt.search_turn("ROOT", &provider, 4096, None).unwrap()
     );
     assert!(receipts(&result).any(|id| id == new));
-    assert_eq!(active(&rt, "ROOT").unwrap().1, change);
+    let (version, current) = active(&rt, "ROOT").unwrap();
+    assert_eq!(current, change);
+    assert_eq!(key("ROOT"), key(" root？"));
+    assert!(trace.stale.contains(&(key("ROOT"), version)));
+    rt.recall.settle(&rt.eja, &trace).unwrap();
+    assert!(active(&rt, "ROOT").is_none());
 }
 
 #[test]
-#[ignore = "requires EJA_RECALL_LEARNING=1 and a live model configured by EJA_EVAL_CONFIG"]
+#[ignore = "requires a live model configured by EJA_EVAL_CONFIG"]
 fn search_live_rsi_from_identity() {
-    assert_eq!(std::env::var("EJA_RECALL_LEARNING").as_deref(), Ok("1"));
     let path = std::env::var_os("EJA_EVAL_CONFIG").expect("set EJA_EVAL_CONFIG");
     let mut config: HostConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     config.capabilities.clear();
     config.window_max_bytes = Some(8192);
     config.max_steps = Some(8);
+    config.recall_learning = Some(true);
     println!("model={}", config.resolve_judge().unwrap().1);
     run_rsi_lineage(Some(&config));
 }

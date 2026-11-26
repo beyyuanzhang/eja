@@ -18,6 +18,7 @@ pub(super) struct SearchTurn {
     policy_head: Id,
     pub batch: usize,
     visits: Vec<Visit>,
+    stale: BTreeSet<(String, Id)>,
 }
 
 impl SearchTurn {
@@ -26,6 +27,7 @@ impl SearchTurn {
             policy_head,
             batch: 0,
             visits: Vec::new(),
+            stale: BTreeSet::new(),
         }
     }
 
@@ -82,8 +84,19 @@ impl Case {
     }
 }
 
+/// Route key shared by queries that differ only in case, whitespace, or punctuation.
 fn key(query: &str) -> String {
-    format!("recall:{:x}", Sha256::digest(query.to_ascii_lowercase()))
+    let folded: String = query
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let basis = if folded.is_empty() {
+        query.trim().to_lowercase()
+    } else {
+        folded
+    };
+    format!("recall:{:x}", Sha256::digest(basis))
 }
 
 fn evidence_text(entry: &Entry) -> Option<&str> {
@@ -190,7 +203,8 @@ impl Recall {
         let Some(trace) = trace.filter(|_| !query.is_empty() && query.len() <= 256) else {
             return self.search_packet(eja, query, query, through, provider, budget);
         };
-        let route = route_at(eja, &key(query), trace.policy_head)?;
+        let key = key(query);
+        let route = route_at(eja, &key, trace.policy_head)?;
         let version = route.map(|(id, _)| id);
         let effective = match route {
             Some((_, cue)) => cue_text(eja, cue)?,
@@ -198,6 +212,11 @@ impl Recall {
         };
         let result = self.search_packet(eja, query, &effective, through, provider, budget)?;
         if result["matches"].is_array() {
+            if let Some(version) =
+                version.filter(|_| effective != query && result.get("used_cue").is_none())
+            {
+                trace.stale.insert((key, version));
+            }
             trace.visits.push(Visit {
                 requested: query.to_owned(),
                 effective: result["used_cue"].as_str().unwrap_or(query).to_owned(),
@@ -212,6 +231,28 @@ impl Recall {
             });
         }
         Ok(result)
+    }
+
+    /// Retire routes whose learned cue no longer kept this turn's original receipts.
+    /// Runs after the turn so the turn's policy snapshot never changes mid-turn.
+    pub(super) fn settle(&self, eja: &Eja, trace: &SearchTurn) -> Result<()> {
+        for (key, version) in &trace.stale {
+            eja.transaction(|tx| {
+                let mut policy = read_policy(tx.get_meta(key)?.as_deref())?;
+                if policy.active != Some(*version) {
+                    return Ok(());
+                }
+                let Fact::Acted { input, .. } = tx.evidence(*version)?.entry.fact else {
+                    return Err(Error::Invalid("无效的检索版本".into()));
+                };
+                let route: Route = serde_json::from_value(input)?;
+                let call = tx.act(CHANGE, json!({"key": key, "retired": version}))?;
+                tx.finish(call.id, Outcome::Observed(String::new()))?;
+                policy.active = route.parent;
+                tx.set_meta(key, &serde_json::to_string(&policy)?)
+            })?;
+        }
+        Ok(())
     }
 
     fn pack_search(

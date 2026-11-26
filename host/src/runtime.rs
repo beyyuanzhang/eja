@@ -481,7 +481,8 @@ impl HostRuntime {
         let has_model_update = patch.providers.is_some()
             || patch.judge.is_some()
             || patch.window_max_bytes.is_some()
-            || patch.max_steps.is_some();
+            || patch.max_steps.is_some()
+            || patch.recall_learning.is_some();
         if has_model_update {
             let mut updated = self.config.clone();
             if let Some(providers) = patch.providers {
@@ -492,6 +493,7 @@ impl HostRuntime {
             }
             updated.window_max_bytes = patch.window_max_bytes.or(updated.window_max_bytes);
             updated.max_steps = patch.max_steps.or(updated.max_steps);
+            updated.recall_learning = patch.recall_learning.or(updated.recall_learning);
             updated.preserve_api_keys(&self.config);
             if updated != self.config {
                 updated
@@ -757,9 +759,8 @@ impl HostRuntime {
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
         let mut recoverable = false;
-        let mut search_turn = (!proactive
-            && std::env::var_os("EJA_RECALL_LEARNING").is_some_and(|value| value == "1"))
-        .then(|| recall::SearchTurn::new(policy_head));
+        let mut search_turn = (!proactive && self.config.recall_learning())
+            .then(|| recall::SearchTurn::new(policy_head));
         for _ in 0..max_steps {
             self.drain_turn_commands();
             if self.cancelled() {
@@ -855,6 +856,11 @@ impl HostRuntime {
             }
         }
 
+        if let Some(trace) = &search_turn {
+            if let Err(err) = self.recall.settle(&self.eja, trace) {
+                self.emit_error(format!("更新检索策略失败: {err}"));
+            }
+        }
         if completed {
             self.clear_retry();
         } else if self.cancelled() {
@@ -1378,6 +1384,7 @@ mod tests {
             capabilities: HostConfig::normalize_capabilities(capabilities).unwrap(),
             window_max_bytes: None,
             max_steps: None,
+            recall_learning: None,
         }
     }
 
@@ -2023,6 +2030,7 @@ for line in sys.stdin:
             capabilities: Vec::new(),
             window_max_bytes: None,
             max_steps: None,
+            recall_learning: None,
         });
         watch::schedule_wakes(
             &rt.eja,

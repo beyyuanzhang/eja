@@ -34,6 +34,6 @@ cargo run -p eja-core --example loop
 
 ```sh
 cargo test -p eja-host search_replay_rsi_from_identity -- --nocapture
-EJA_RECALL_LEARNING=1 EJA_EVAL_CONFIG=/path/to/config.json cargo test -p eja-host search_live_rsi_from_identity -- --ignored --nocapture
+EJA_EVAL_CONFIG=/path/to/config.json cargo test -p eja-host search_live_rsi_from_identity -- --ignored --nocapture
 ```
 
