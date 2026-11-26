@@ -202,55 +202,23 @@ fn fact_text(fact: &Fact) -> Option<String> {
     }
 }
 
-fn is_cjk(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
-    )
-}
-
 fn tokenize_cue(cue: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    for part in cue
+    let mut words: Vec<String> = cue
         .split(|ch: char| ch.is_whitespace() || DELIMITERS.contains(ch))
         .filter(|part| !part.is_empty())
-    {
-        let lower = part.to_ascii_lowercase();
-        let chars: Vec<char> = lower.chars().collect();
-        let mut start = 0;
-        while start < chars.len() {
-            let cjk = is_cjk(chars[start]);
-            let mut end = start + 1;
-            while end < chars.len() && is_cjk(chars[end]) == cjk {
-                end += 1;
-            }
-            if cjk && end - start >= 3 {
-                for pair in chars[start..end].windows(2) {
-                    let gram: String = pair.iter().collect();
-                    if !tokens.contains(&gram) {
-                        tokens.push(gram);
-                    }
-                }
-            } else {
-                let seg: String = chars[start..end].iter().collect();
-                if !tokens.contains(&seg) {
-                    tokens.push(seg);
-                }
-            }
-            start = end;
-        }
+        .map(str::to_lowercase)
+        .collect();
+    if words.is_empty() {
+        words.push(cue.trim().to_lowercase());
     }
-    if tokens.is_empty() {
-        tokens.push(cue.trim().to_ascii_lowercase());
-    }
-    tokens
+    words
 }
 
 fn lexical_ratio(text: &str, tokens: &[String]) -> f64 {
     if tokens.is_empty() {
         return 0.0;
     }
-    let lower = text.to_ascii_lowercase();
+    let lower = text.to_lowercase();
     let hits = tokens
         .iter()
         .filter(|token| lower.contains(token.as_str()))

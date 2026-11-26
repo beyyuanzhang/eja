@@ -206,13 +206,13 @@ fn reused_cache_checks_the_full_indexed_journal_prefix() -> TestResult {
 }
 
 #[test]
-fn keyword_search_handles_unspaced_cjk_queries_and_hybrid_boosts_exact_symbols() -> TestResult {
+fn keyword_search_folds_case_in_any_script_and_hybrid_boosts_exact_symbols() -> TestResult {
     let dir = tempfile::tempdir()?;
     let eja = Eja::open(dir.path().join("subject.db"))?;
-    let port_fact = eja.notice(Source::World, "服务监听端口 9421 启动报错 ERR_BIND_9421")?;
+    let port_fact = eja.notice(Source::World, "服务监听端口 9421 Ошибка ERR_BIND_9421")?;
     let tea_fact = eja.notice(Source::Person, "日常偏好喝绿茶")?;
 
-    let kw_hits = MemoryIndex::keyword().search(&eja, "帮我查一下监听端口报错")?;
+    let kw_hits = MemoryIndex::keyword().search(&eja, "ОШИБКА")?;
     assert_eq!(kw_hits[0].evidence.entry.id, port_fact);
 
     let mut memory = MemoryIndex::open(
