@@ -7,7 +7,6 @@ final class ContentUIState: ObservableObject {
     @Published var showSettingsSheet: Bool = false
     @Published var baselineId: Int64 = -1
     @Published var sendHovered: Bool = false
-    @Published var expandedEvents: Set<Int64> = []
     @Published var showAgenda: Bool = false
 
     func captureBaselineIfNeeded(isReady: Bool, dataDir: String, from stream: [StreamItemDTO]) {
@@ -39,11 +38,13 @@ struct ContentView: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 18) {
                             if canLoadEarlier {
-                                Button("加载更早", action: loadEarlier)
-                                    .buttonStyle(.plain)
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(ejaTheme.inkMuted)
-                                    .frame(maxWidth: .infinity)
+                                Button(action: loadEarlier) {
+                                    Image(systemName: "chevron.up")
+                                }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 12))
+                                .foregroundStyle(ejaTheme.inkMuted)
+                                .frame(maxWidth: .infinity)
                             }
                             ForEach(visibleItems) { item in
                                 streamRow(item)
@@ -93,28 +94,20 @@ struct ContentView: View {
 
                 VStack(spacing: 8) {
                     if let err = client.errorBanner {
-                        HStack(spacing: 8) {
-                            Text(err)
-                                .font(.system(size: 12))
+                        Button { client.errorBanner = nil } label: {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .font(.system(size: 14))
                                 .foregroundStyle(ejaTheme.danger)
-                                .textSelection(.enabled)
-                            Spacer(minLength: 8)
-                            Button { client.errorBanner = nil } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 10, weight: .medium))
-                            }
-                            .buttonStyle(ejaIconButtonStyle(size: 20))
+                                .symbolEffect(.bounce, value: err)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(
-                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .fill(ejaTheme.dangerTint)
-                        )
-                        .transition(.opacity.combined(with: .offset(y: 4)))
+                        .buttonStyle(.plain)
+                        .help(err)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .transition(.opacity)
                     }
 
-                    if !client.concerns.isEmpty || !client.wakes.isEmpty {
+                    if !client.wakes.isEmpty {
                         agenda
                     }
 
@@ -130,6 +123,7 @@ struct ContentView: View {
             Button(action: showSettings) {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 13, weight: .regular))
+                    .symbolEffect(.pulse, isActive: client.isReady && !client.isConfigured)
             }
             .buttonStyle(ejaIconButtonStyle(size: 28))
             .accessibilityLabel("设置")
@@ -202,7 +196,7 @@ struct ContentView: View {
 
     private var visibleItems: [StreamItemDTO] {
         guard ui.baselineId >= 0 else { return [] }
-        return client.stream.filter { $0.id > ui.baselineId }
+        return client.stream.filter { $0.id > ui.baselineId && $0.kind != "event" }
     }
 
     private var canLoadEarlier: Bool {
@@ -219,18 +213,14 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 5) {
             Button { ui.showAgenda.toggle() } label: {
                 HStack(spacing: 4) {
-                    Text(verbatim: "挂念 \(client.concerns.count) · 唤醒 \(client.wakes.count)")
+                    Image(systemName: "alarm")
+                    Text(verbatim: "\(client.wakes.count)")
                     Image(systemName: ui.showAgenda ? "chevron.down" : "chevron.right")
                         .font(.system(size: 9))
                 }
             }
             .buttonStyle(.plain)
             if ui.showAgenda {
-                ForEach(client.concerns) { concern in
-                    Text(verbatim: "· \(concern.text)")
-                        .lineLimit(2)
-                        .textSelection(.enabled)
-                }
                 ForEach(client.wakes) { wake in
                     HStack(spacing: 6) {
                         Text(verbatim: "\(wake.fireAtDisplay) · \(wake.reason)")
@@ -241,7 +231,6 @@ struct ContentView: View {
                                 .font(.system(size: 9, weight: .medium))
                         }
                         .buttonStyle(ejaIconButtonStyle(size: 18))
-                        .help("取消此唤醒")
                     }
                 }
             }
@@ -262,16 +251,11 @@ struct ContentView: View {
         if !preview.isEmpty {
             ejaTextRow(preview)
         } else {
-            HStack(spacing: 7) {
-                ProgressView()
-                    .controlSize(.small)
-                if !client.statusDetail.isEmpty {
-                    Text(client.statusDetail)
-                        .font(.system(size: 12))
-                        .foregroundStyle(ejaTheme.inkMuted)
-                }
-            }
-            .padding(.leading, 4)
+            Image(systemName: "circle.fill")
+                .font(.system(size: 7))
+                .foregroundStyle(ejaTheme.inkMuted)
+                .symbolEffect(.pulse)
+                .padding(.leading, 4)
         }
     }
 
@@ -296,8 +280,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private func streamRow(_ item: StreamItemDTO) -> some View {
-        switch item.kind {
-        case "person":
+        if item.kind == "person" {
             HStack {
                 Spacer(minLength: 48)
                 Text(item.text)
@@ -310,53 +293,9 @@ struct ContentView: View {
                     .background(ejaTheme.surfaceSubtle)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
-        case "event":
-            eventRow(item)
-        default:
+        } else {
             ejaTextRow(item.text)
         }
-    }
-
-    private func eventRow(_ item: StreamItemDTO) -> some View {
-        let summary: String
-        if let status = item.outcomeStatus {
-            let label = switch status {
-            case "observed": "已观测"
-            case "failed": "失败"
-            case "unknown": "未知"
-            default: "等待回执"
-            }
-            let reference = item.receiptID.map { "回执 #\($0)" } ?? "工具"
-            summary = "\(reference) · \(label) · \(item.text)"
-        } else {
-            summary = item.text
-        }
-        let expanded = ui.expandedEvents.contains(item.id)
-        return VStack(alignment: .leading, spacing: 4) {
-            if let detail = item.detail {
-                Button {
-                    if expanded { ui.expandedEvents.remove(item.id) } else { ui.expandedEvents.insert(item.id) }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(verbatim: summary)
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 9))
-                    }
-                }
-                .buttonStyle(.plain)
-                if expanded {
-                    Text(verbatim: detail)
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(ejaTheme.inkMuted)
-                        .textSelection(.enabled)
-                }
-            } else {
-                Text(verbatim: summary)
-                    .textSelection(.enabled)
-            }
-        }
-        .font(.system(size: 12))
-        .foregroundStyle(ejaTheme.inkSecondary)
     }
 
     private func ejaTextRow(_ text: String) -> some View {
