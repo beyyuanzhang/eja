@@ -138,7 +138,7 @@ impl MemoryIndex {
         self.search_at(eja, cue, eja.revision()?)
     }
 
-    /// Rank observations using only facts available at the given revision.
+    /// Rank observations at the given revision. Use keywords if vectors are unavailable.
     pub fn search_at(&mut self, eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
         if cue.trim().is_empty() || cue.len() > FACT_BYTES {
             return Err(Error::Invalid(
@@ -148,8 +148,12 @@ impl MemoryIndex {
         if head <= 0 {
             return Ok(Vec::new());
         }
-        if let Some(semantic) = &mut self.semantic {
-            return semantic.search(eja, cue, head);
+        if let Some(hits) = self
+            .semantic
+            .as_mut()
+            .and_then(|index| index.search(eja, cue, head).ok())
+        {
+            return Ok(hits);
         }
         keyword_search_at(eja, cue, head)
     }

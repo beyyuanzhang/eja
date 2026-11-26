@@ -5,8 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MACOS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="$(cd "${MACOS_DIR}/.." && pwd)"
 APP_DIR="${MACOS_DIR}/build/Eja.app"
+MODEL_DIR="${MACOS_DIR}/build/memory-model"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "${REPO_DIR}/Cargo.toml" | head -n 1)"
 : "${VERSION:?Failed to read version from Cargo.toml}"
+
+"${REPO_DIR}/memory/scripts/install-memory-model.sh" "${MODEL_DIR}"
 
 echo "[1/3] Building eja-host (Rust release)..."
 (cd "${REPO_DIR}" && MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release -p eja-host)
@@ -22,6 +25,10 @@ HOST_BIN="${REPO_DIR}/target/release/eja-host"
 echo "[3/3] Assembling ${APP_DIR}..."
 rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources/ui-template"
+MODEL_RESOURCES="${APP_DIR}/Contents/Resources/memory-model"
+mkdir -p "${MODEL_RESOURCES}"
+install -m 644 "${MODEL_DIR}"/{config.json,encoder.json,model_quantized.onnx,special_tokens_map.json,tokenizer.json,tokenizer_config.json} \
+    "${REPO_DIR}/memory/scripts/multilingual-e5.LICENSE" "${MODEL_RESOURCES}/"
 cp "${APP_BIN}" "${APP_DIR}/Contents/MacOS/EjaApp"
 cp "${UI_DYLIB}" "${APP_DIR}/Contents/MacOS/libEjaUI.dylib"
 cp "${HOST_BIN}" "${APP_DIR}/Contents/MacOS/eja-host"

@@ -30,9 +30,10 @@ cargo test -p eja-core --all-targets
 cargo run -p eja-core --example loop
 ```
 
-用指定模型从原始查询开始，验证同一检索连续两次自动更新。留出问题从同一份日志分叉，比较原始回执首次可见的模型请求。
+长程验证覆盖四代检索更新和逐代重启。离线回放还验证了退化候选的拒绝与历史增长后的召回上限。实测在同一日志上对比继承版本与原查询，记录留出回执首次出现的请求、模型调用次数和答案正确性。
 
 ```sh
-EJA_EVAL_CONFIG=/path/to/config.json cargo test -p eja-host search_live_rsi_from_identity -- --ignored --nocapture
+cargo test -p eja-host search_replay_rsi_from_identity -- --nocapture
+EJA_RECALL_LEARNING=1 EJA_EVAL_CONFIG=/path/to/config.json cargo test -p eja-host search_live_rsi_from_identity -- --ignored --nocapture
 ```
 

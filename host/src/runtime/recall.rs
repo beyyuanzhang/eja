@@ -1,5 +1,8 @@
 use super::HostRuntime;
-use crate::{config::ProviderKind, llm::cap_tool_result};
+use crate::{
+    config::ProviderKind,
+    llm::{cap_tool_result, result_fits},
+};
 use eja_core::{Eja, Entry, Error, Fact, Id, Outcome, Result, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,7 +28,7 @@ struct Visit {
     budget: usize,
     batch: usize,
     seen: Vec<Id>,
-    receipts: Vec<Id>,
+    receipts: BTreeSet<Id>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -55,7 +58,7 @@ struct Case {
     provider: ProviderKind,
     witness: Id,
     action: Id,
-    retained: Vec<Id>,
+    retained: BTreeSet<Id>,
 }
 
 fn key(query: &str) -> String {
@@ -88,17 +91,10 @@ fn read_policy(stored: Option<&str>) -> Result<Policy> {
 }
 
 fn receipt_id(entry: &Value) -> Option<Id> {
+    let id = entry["id"].as_i64()?;
     let outcome = &entry["fact"]["outcome"];
-    if entry["fact"]["kind"] == "returned"
-        && outcome["status"] == "observed"
-        && outcome["detail"]
-            .as_str()
-            .is_some_and(|text| !text.trim().is_empty())
-    {
-        entry["id"].as_i64()
-    } else {
-        None
-    }
+    let text = outcome["detail"].as_str()?;
+    (outcome["status"] == "observed" && !text.trim().is_empty()).then_some(id)
 }
 
 fn found(result: &Value) -> impl Iterator<Item = &Value> {
@@ -109,40 +105,40 @@ fn found(result: &Value) -> impl Iterator<Item = &Value> {
         .flat_map(|hit| [hit, &hit["latest"]])
 }
 
+fn receipts(result: &Value) -> impl Iterator<Item = Id> + '_ {
+    found(result).filter_map(receipt_id)
+}
+
 impl HostRuntime {
     pub(super) fn search_turn(
         &mut self,
         query: &str,
         provider: &ProviderKind,
         budget: usize,
-        trace: &mut SearchTurn,
+        trace: Option<&mut SearchTurn>,
     ) -> Result<Value> {
-        let learnable = !query.is_empty() && query.len() <= 256 && budget > 0;
-        let version = if learnable {
-            read_policy(self.eja.get_meta(&key(query))?.as_deref())?.active
-        } else {
-            None
-        };
+        if budget == 0 {
+            return Ok(Value::Null);
+        }
         let through = self.eja.revision()?;
-        let mut effective = query.to_owned();
-        if let Some(id) = version {
-            let Fact::Acted { capability, input } = self.eja.read(id)?.fact else {
-                return Err(Error::Invalid("无效的检索版本".into()));
-            };
-            if capability != CHANGE {
-                return Err(Error::Invalid("无效的检索版本".into()));
-            }
-            effective = cue_text(&self.eja, serde_json::from_value(input["cue"].clone())?)?;
-        }
-        let mut result = self.search_packet(query, &effective, through, provider, budget)?;
-        if effective != query && (found(&result).next().is_none()) {
-            effective = query.to_owned();
-            result = self.search_packet(query, query, through, provider, budget)?;
-        }
-        if learnable && result["matches"].is_array() {
+        let Some(trace) = trace.filter(|_| !query.is_empty() && query.len() <= 256) else {
+            return self.search_packet(query, query, through, provider, budget);
+        };
+        let version = read_policy(self.eja.get_meta(&key(query))?.as_deref())?.active;
+        let effective = match version {
+            Some(id) => match self.eja.read(id)?.fact {
+                Fact::Acted { capability, input } if capability == CHANGE => {
+                    cue_text(&self.eja, serde_json::from_value(input["cue"].clone())?)?
+                }
+                _ => return Err(Error::Invalid("无效的检索版本".into())),
+            },
+            None => query.to_owned(),
+        };
+        let result = self.search_packet(query, &effective, through, provider, budget)?;
+        if result["matches"].is_array() {
             trace.visits.push(Visit {
                 requested: query.to_owned(),
-                effective,
+                effective: result["used_cue"].as_str().unwrap_or(query).to_owned(),
                 version,
                 through,
                 budget,
@@ -150,11 +146,7 @@ impl HostRuntime {
                 seen: found(&result)
                     .filter_map(|entry| entry["id"].as_i64())
                     .collect(),
-                receipts: found(&result)
-                    .filter_map(receipt_id)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
+                receipts: receipts(&result).collect(),
             });
         }
         Ok(result)
@@ -163,23 +155,51 @@ impl HostRuntime {
     fn search_packet(
         &mut self,
         query: &str,
-        effective: &str,
+        cue: &str,
         through: Id,
         provider: &ProviderKind,
         budget: usize,
     ) -> Result<Value> {
-        let matches = self
-            .memory
-            .search_at(&self.eja, effective, through)
-            .map_err(|err| match err {
-                eja_memory::Error::Invalid(text) => Error::Invalid(text),
-                err => Error::Storage(err.to_string()),
-            })?;
-        let mut result = json!({"cue": query, "matches": matches});
-        if effective != query {
-            result["used_cue"] = json!(effective);
+        let mut pack = |effective| -> Result<Value> {
+            let matches = self
+                .memory
+                .search_at(&self.eja, effective, through)
+                .map_err(|err| match err {
+                    eja_memory::Error::Invalid(text) => Error::Invalid(text),
+                    err => Error::Storage(err.to_string()),
+                })?;
+            let mut packed = json!({"cue": query, "matches": []});
+            if effective != query {
+                packed["used_cue"] = json!(effective);
+            }
+            let mut result = packed.clone();
+            result["matches"] = json!(matches);
+            if result_fits(&result.to_string(), provider, budget) {
+                return Ok(result);
+            }
+            packed["truncated"] = json!(true);
+            for hit in result["matches"].as_array().unwrap() {
+                packed["matches"].as_array_mut().unwrap().push(hit.clone());
+                if !result_fits(&packed.to_string(), provider, budget) {
+                    packed["matches"].as_array_mut().unwrap().pop();
+                }
+            }
+            if found(&packed).next().is_some() {
+                return Ok(packed);
+            }
+            Ok(cap_tool_result(provider, result, budget))
+        };
+        let original = pack(query)?;
+        if cue == query {
+            return Ok(original);
         }
-        Ok(cap_tool_result(provider, result, budget))
+        let learned = pack(cue)?;
+        if found(&learned).next().is_some()
+            && receipts(&original).all(|id| receipts(&learned).any(|learned_id| learned_id == id))
+        {
+            return Ok(learned);
+        }
+        Ok(original)
     }
 
     pub(super) fn learn_search(
@@ -192,29 +212,20 @@ impl HostRuntime {
         let Some(root) = trace.visits.first() else {
             return Ok(());
         };
+        let follows = |visit: &Visit, id| visit.batch > root.batch && visit.receipts.contains(&id);
         let mut witnesses = answer
             .split("[#")
             .skip(1)
             .filter_map(|part| part.split_once(']')?.0.parse::<Id>().ok())
             .filter(|id| *id <= root.through && !root.seen.contains(id))
-            .filter_map(|id| {
-                trace
-                    .visits
-                    .iter()
-                    .find(|visit| visit.batch > root.batch && visit.receipts.contains(&id))
-                    .map(|visit| (id, visit))
-            });
-        let Some((witness, followup)) = witnesses.next() else {
+            .filter(|&id| trace.visits.iter().any(|visit| follows(visit, id)));
+        let Some(witness) = witnesses.next() else {
             return Ok(());
         };
-        if witnesses.any(|(id, _)| id != witness) {
+        if witnesses.any(|id| id != witness) {
             return Ok(());
         }
-        let Fact::Returned {
-            action,
-            outcome: Outcome::Observed(_),
-        } = self.eja.read(witness)?.fact
-        else {
+        let Fact::Returned { action, .. } = self.eja.read(witness)?.fact else {
             return Ok(());
         };
         let case = Case {
@@ -233,6 +244,7 @@ impl HostRuntime {
         if policy.active != root.version {
             return Ok(());
         }
+        let had_pending = policy.pending.is_some();
         if let Some(candidate) = policy.pending.take() {
             if candidate.case.action == action || candidate.case.trigger >= trigger {
                 return Ok(());
@@ -261,11 +273,16 @@ impl HostRuntime {
             .iter()
             .map(|&id| self.eja.read(id))
             .collect::<Result<Vec<_>>>()?;
-        let followup = followup.effective.as_str();
-        let mut terms: Vec<_> = std::iter::once(followup)
-            .chain(
-                followup.split(|ch: char| ch.is_whitespace() || ",，、。:：；「」\"".contains(ch)),
-            )
+        let mut terms: Vec<_> = trace
+            .visits
+            .iter()
+            .filter(|visit| follows(visit, witness))
+            .flat_map(|visit| {
+                let cue = visit.effective.as_str();
+                std::iter::once(cue).chain(
+                    cue.split(|ch: char| ch.is_whitespace() || ",，、。:：；「」\"".contains(ch)),
+                )
+            })
             .filter(|term| {
                 *term != root.effective
                     && term.chars().count() >= 2
@@ -295,24 +312,20 @@ impl HostRuntime {
                 break;
             }
         }
-        let value = serde_json::to_string(&policy)?;
-        if stored.as_deref() == Some(&value) || (stored.is_none() && policy.pending.is_none()) {
+        if !had_pending && policy.pending.is_none() {
             return Ok(());
         }
         self.eja.transaction(|tx| {
             if tx.get_meta(&key)? == stored {
-                tx.set_meta(&key, &value)?;
+                tx.set_meta(&key, &serde_json::to_string(&policy)?)?;
             }
             Ok(())
         })
     }
 
     fn reaches(&mut self, query: &str, cue: &str, case: &Case) -> Result<bool> {
-        let result = self.search_packet(query, cue, case.through, &case.provider, case.budget)?;
-        let receipts: Vec<_> = found(&result).filter_map(receipt_id).collect();
-        Ok(
-            receipts.contains(&case.witness)
-                && case.retained.iter().all(|id| receipts.contains(id)),
-        )
+        let packet = self.search_packet(query, cue, case.through, &case.provider, case.budget)?;
+        let seen: BTreeSet<_> = receipts(&packet).collect();
+        Ok(seen.contains(&case.witness) && case.retained.is_subset(&seen))
     }
 }

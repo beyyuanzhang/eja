@@ -109,7 +109,6 @@ impl Brain for HttpBrain {
 
 pub enum ToolOutput {
     Value(Value),
-    Packed(Value),
     Read(Evidence, usize),
     Images(Value, Vec<ModelImage>),
 }
@@ -196,7 +195,6 @@ pub fn tool_messages(
                 format_read_result(provider, &evidence, offset, per_call)
             }
             ToolOutput::Value(v) => cap_tool_result(provider, v, per_call),
-            ToolOutput::Packed(v) => v,
             ToolOutput::Images(value, images) => {
                 let metadata = json!({"images_omitted": images.len()});
                 let text_budget = per_call.saturating_sub(json_bytes(&metadata) + 2);
@@ -469,7 +467,7 @@ fn fit_utf8_prefix(text: &str, max_prefix: usize, mut fits: impl FnMut(&str) -> 
 }
 
 // Anthropic nests the serialized result in a JSON string inside a content block.
-fn result_fits(serialized: &str, provider: &ProviderKind, budget: usize) -> bool {
+pub(crate) fn result_fits(serialized: &str, provider: &ProviderKind, budget: usize) -> bool {
     serialized.len() <= budget
         && (*provider == ProviderKind::OpenAi
             || serde_json::to_string(serialized).unwrap().len() - 2 <= budget)

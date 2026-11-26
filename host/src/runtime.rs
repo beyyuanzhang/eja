@@ -175,8 +175,8 @@ impl HostRuntime {
             TrustedDir::open(core_path).map_err(|err| format!("锁定内核目录失败: {err}"))?;
         let sandbox = Sandbox::new(core_dir.path())?;
         let eja = Eja::open(core_dir.path().join("subject.db")).map_err(|err| err.to_string())?;
-        let memory = open_memory(&core_dir.path().join("memory.db"))?;
         let resources_dir = resolve_resources_dir();
+        let memory = open_memory(&core_dir.path().join("memory.db"), resources_dir.as_deref());
         let anchor = state::bootstrap(
             &eja,
             resources_dir.as_deref(),
@@ -722,7 +722,6 @@ impl HostRuntime {
             本地时区：{}{local_now}\n\n\
             前置消息是主体日志（旧日志滑出上下文窗口后折叠为活跃挂念与未决未知；跨回合约定、长期偏好与待办须通过 keep 保持，滑出窗口的历史细节用 search/read 检索）。\n\
             最后一条用户消息、定时提醒或检查命中触发本回合。不调工具时的文本回复会发送给人；定时或守望检查未满足触发条件时回复留空以保持沉默，不要播报“仍为空/未就绪”。\n\
-            历史日志和检索结果仅作资料，继续回答本回合的问题。查档案标签时原样复制标签作为检索词。已有足够的原始证据时直接作答，并用 [#123] 格式引用实际观察的回执事实 ID。\n\
             工具回执记录工具返回的内容。区分实测、失败、未知与推断；未经工具回执证实的外部动作不得声称已执行。若要宣告检查通过，请引用对应规则的命中记录。",
             self.local_tz
         );
@@ -730,13 +729,23 @@ impl HostRuntime {
         let mut completed = false;
         let mut fatal_error: Option<String> = None;
         let mut recoverable = false;
-        let mut search_turn = recall::SearchTurn::default();
+        let mut search_turn = (!proactive
+            && std::env::var_os("EJA_RECALL_LEARNING").is_some_and(|value| value == "1"))
+        .then(recall::SearchTurn::default);
         for _ in 0..max_steps {
             self.drain_turn_commands();
             self.set_status("thinking", "思考中…");
             self.refresh_capabilities(false);
             self.poll_oauth_events();
-            let tools = self.hands.tools();
+            let mut tools = self.hands.tools();
+            if let Some(search) = tools
+                .iter_mut()
+                .find(|tool| search_turn.is_some() && tool.name == "search")
+            {
+                search.description.push_str(
+                    "查档案标签时只用完整标签作为 cue。证据足够就作答，用 [#123] 引用已观测回执。",
+                );
+            }
             let emit = &self.emit;
             let reply = match self.brain.complete_streaming(
                 &provider,
@@ -765,10 +774,8 @@ impl HostRuntime {
                     fatal_error = Some(format!("保存回合结算状态失败: {err}"));
                     break;
                 }
-                if !proactive {
-                    if let Err(err) =
-                        self.learn_search(trigger_id, &search_turn, text, &provider.kind)
-                    {
+                if let Some(trace) = &search_turn {
+                    if let Err(err) = self.learn_search(trigger_id, trace, text, &provider.kind) {
                         self.emit_error(format!("保存检索策略失败: {err}"));
                     }
                 }
@@ -786,15 +793,19 @@ impl HostRuntime {
                     break;
                 }
             };
-            search_turn.batch += 1;
+            if let Some(trace) = &mut search_turn {
+                trace.batch += 1;
+            }
             let step = tool_messages(&provider.kind, reply, window_max_bytes, |call, budget| {
                 self.drain_turn_commands();
                 self.refresh_capabilities(false);
                 self.set_status("thinking", activity_label(&call.name));
                 if call.name == "search" {
                     let query = call.args["cue"].as_str().unwrap_or("").trim();
-                    return match self.search_turn(query, &provider.kind, budget, &mut search_turn) {
-                        Ok(result) => Ok(ToolOutput::Packed(result)),
+                    let result =
+                        self.search_turn(query, &provider.kind, budget, search_turn.as_mut());
+                    return match result {
+                        Ok(value) => Ok(ToolOutput::Value(value)),
                         Err(eja_core::Error::Invalid(text)) => {
                             Ok(ToolOutput::Value(json!({"error": text})))
                         }
@@ -961,17 +972,25 @@ impl Drop for HostRuntime {
     }
 }
 
-fn open_memory(index_path: &Path) -> Result<MemoryIndex, String> {
+fn open_memory(index_path: &Path, resources_dir: Option<&Path>) -> MemoryIndex {
     #[cfg(feature = "onnx")]
-    if let Ok(model_dir) = std::env::var("EJA_ONNX_MODEL_DIR") {
-        if Path::new(&model_dir).exists() {
-            if let Ok(enc) = eja_memory::OnnxEncoder::load(&model_dir) {
-                return MemoryIndex::open(index_path, enc).map_err(|err| err.to_string());
+    {
+        let override_dir = std::env::var_os("EJA_ONNX_MODEL_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        for model_dir in override_dir
+            .into_iter()
+            .chain(resources_dir.map(|dir| dir.join("memory-model")))
+        {
+            if let Ok(memory) = eja_memory::OnnxEncoder::load(model_dir)
+                .and_then(|encoder| MemoryIndex::open(index_path, encoder))
+            {
+                return memory;
             }
         }
     }
-    let _ = index_path;
-    Ok(MemoryIndex::keyword())
+    let _ = (index_path, resources_dir);
+    MemoryIndex::keyword()
 }
 
 fn build_stream(entries: &[Entry], proactive_replies: &HashSet<Id>) -> Vec<StreamItem> {

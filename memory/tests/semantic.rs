@@ -1,5 +1,5 @@
 use eja_core::{Eja, Fact, Outcome, Source, Timestamp};
-use eja_memory::{Encoder, Error, InputKind, MemoryIndex};
+use eja_memory::{Encoder, InputKind, MemoryIndex};
 use serde_json::json;
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -143,11 +143,11 @@ fn switching_encoder_rebuilds_derived_index_without_touching_journal() -> TestRe
 }
 
 #[test]
-fn stale_connection_rejects_search_and_indexing_after_encoder_switch() -> TestResult {
+fn stale_vector_cache_falls_back_to_keywords_at_the_same_revision() -> TestResult {
     let dir = tempfile::tempdir()?;
     let eja = Eja::open(dir.path().join("subject.db"))?;
     let mem_path = dir.path().join("memory.db");
-    eja.notice(Source::Person, "喜欢喝绿茶")?;
+    let old = eja.notice(Source::Person, "喜欢喝绿茶")?;
 
     let mut stale = MemoryIndex::open(
         &mem_path,
@@ -156,7 +156,9 @@ fn stale_connection_rejects_search_and_indexing_after_encoder_switch() -> TestRe
             dims: 4,
         },
     )?;
-    assert_eq!(stale.search(&eja, "饮品")?.len(), 1);
+    let hits = stale.search(&eja, "饮品")?;
+    assert_eq!(hits[0].evidence.entry.id, old);
+    assert!(MemoryIndex::keyword().search(&eja, "饮品")?.is_empty());
 
     let mut fresh = MemoryIndex::open(
         &mem_path,
@@ -165,9 +167,13 @@ fn stale_connection_rejects_search_and_indexing_after_encoder_switch() -> TestRe
             dims: 8,
         },
     )?;
-    eja.notice(Source::Person, "备用钥匙放在抽屉里")?;
+    let new = eja.notice(Source::Person, "备用钥匙放在抽屉里")?;
     assert_eq!(fresh.search(&eja, "钥匙")?.len(), 2);
-    assert!(matches!(stale.search(&eja, "钥匙"), Err(Error::Conflict)));
+    let hits = stale.search(&eja, "钥匙")?;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].evidence.entry.id, new);
+    assert!(stale.search_at(&eja, "钥匙", old)?.is_empty());
+    assert_eq!(fresh.search(&eja, "钥匙")?.len(), 2);
     Ok(())
 }
 

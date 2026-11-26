@@ -21,7 +21,9 @@ eja-host --data-dir "<data_dir>"
 - `wake({delay_seconds, reason, guard_tool, max_checks})` 可按间隔复查指定规则，默认最多 60 次。相同 `reason` 或相同 `guard_tool` 会覆盖旧预约；`delay_seconds: 0` 取消匹配预约。文件缺失或尚未匹配时，复查不写主体事实、不调用模型。读取出错时停止守望并报告错误。省略 `guard_tool` 时仍是普通提醒。
 - `keep({text, checker})` 可绑定检查规则。绑定后，`release({concern, witness_fact_id})` 要求引用当前挂念版本之后的同一规则命中记录，并在该规则不再被其他活跃挂念引用时自动清理其剩余守望。
 - 模型回合至少需要 256 字节的上下文窗口。设置低于下限时，宿主保留待处理请求，并在设置恢复后继续处理。
-- `search` 从原查询起步。若一次后续检索引用了首查未提供的原始已观测回执，宿主可从首查实际返回的原始事实中摘取候选线索。候选在两个不同回合和执行的原始快照及预算下都能提前召回目标、保留首查原已观测回执时，EJA 用 `eja.recall` 的 `Acted/Returned` 记录一次策略更新。随后相同检索词会应用该版本，工具结果用 `used_cue` 标出实际线索。
+- `search` 与相关学习回放共用本地向量检索。macOS 包自带默认模型，`EJA_ONNX_MODEL_DIR` 可指定首选模型目录。模型、索引或向量查询不可用时使用关键词检索。
+- 以 `EJA_RECALL_LEARNING=1` 启动宿主可启用实验性检索学习。候选线索必须来自首查事实，在两份独立回执的原快照和预算下提前召回目标，并保留首查的已观测回执。宿主用 `eja.recall` 的 `Acted/Returned` 提交更新。之后相同查询仅在学到的线索能保留原查询可见的已观测回执时采用它，并以 `used_cue` 标出线索。
+- 检索结果超出工具预算时按排序保留装得下的完整事实，并标记 `truncated`。检索仍受返回条数与字节预算限制，日志增长会改变同一线索的可见结果。
 - `capabilities.json` 保存统一能力数组（内嵌默认常驻的 `builtin` `shell` 能力、自由实现的 `exec` 本地插件能力，以及 `stdio` / `http` MCP 能力），文件变更在运行期自动热加载。`exec` 插件通过 `stdin` 接收参数 JSON、向 `stdout` 输出结果文本（退出码 `0` 为 `Observed`，非 `0` 为 `Failed`），零协议框架绑定。HTTP 能力支持标准 MCP OAuth 2.1（RFC 9728 / RFC 8414 元数据发现、RFC 7591 动态客户端注册 + PKCE 本地回环回调，以及 RFC 8628 设备码授权流；要求预注册 Client ID 的服务可在能力键值中提供 `X-OAuth-Client-Id`）；OAuth Token 保存在内核目录 `oauth.json` 并由宿主自动注入与刷新，`capabilities.json` 无需保存明文 Token。
 - `ui/` 保存用户空间前端源码。运行 `ui/apply.sh` 会生成 `ui/libEjaUI.dylib`。EJA 空闲时沿用当前数据目录重启，启动器加载新的动态库。已安装的应用包保持原样。加载失败或启动时按住 Option 键会使用包内出厂界面。
 
@@ -42,7 +44,7 @@ eja-host --data-dir "<data_dir>"
 
 ## 输出事件（Host -> Frontend，每行一条 JSON）
 
-- 状态快照 `{"event":"state","protocol_version":2,"kernel_version":"1.0.0","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"capability_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
+- 状态快照 `{"event":"state","protocol_version":2,"kernel_version":"1.0.1","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"capability_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
   `config.providers[].api_key` 始终为空字符串，`has_api_key` 表示是否已保存密钥。`stream[]` 可附带 `outcome_status` 与 `truncated`。`wakes[]` 可附带 `guard`，其中 `checker` 为规则名，`remaining` 为剩余检查次数。
 - 回合内活动 `{"event":"activity","status_detail":"执行 Shell"}`。回合开始和结束仍发送状态快照。
 - 流式文本增量 `{"event":"delta","text":"..."}`。用户回合中模型生成文本时实时推送增量，转入工具调用（`activity`）或回合结算（`state`）时收束。

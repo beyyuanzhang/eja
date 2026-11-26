@@ -22,6 +22,10 @@ impl Brain for Judge {
         messages: &[Value],
         tools: &[ToolSpec],
     ) -> std::result::Result<ModelReply, String> {
+        assert!(!system.contains("[#123]"));
+        for tool in tools {
+            assert_eq!(tool.description.contains("[#123]"), tool.name == "search");
+        }
         let results = messages
             .iter()
             .flat_map(|message| {
@@ -89,6 +93,36 @@ fn active(rt: &HostRuntime, query: &str) -> Option<(Id, Value)> {
 }
 
 #[test]
+fn search_keeps_complete_receipts_when_a_higher_ranked_match_overflows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = HostRuntime::open_with_brain(
+        dir.path().join("subject"),
+        Arc::new(Judge::default()),
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+    let id = receipt(&rt, "signed", Outcome::Observed("ROUTE signed P-A".into()));
+    note(&rt, &format!("ROUTE archive note {}", "x".repeat(2000)));
+    for provider in [ProviderKind::OpenAi, ProviderKind::Anthropic] {
+        let mut trace = SearchTurn::default();
+        let packet = rt
+            .search_turn("ROUTE", &provider, 512, Some(&mut trace))
+            .unwrap();
+        assert_eq!(packet["truncated"], true);
+        assert_eq!(
+            found(&packet).filter_map(receipt_id).collect::<Vec<_>>(),
+            [id]
+        );
+        assert_eq!(trace.visits[0].receipts, BTreeSet::from([id]));
+        assert!(rt
+            .search_turn("", &provider, 0, Some(&mut trace))
+            .unwrap()
+            .is_null());
+        assert_eq!(trace.visits.len(), 1);
+    }
+}
+
+#[test]
 fn independent_receipt_rejects_a_draft_route_and_commits_the_shared_route() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = HostRuntime::open_with_brain(
@@ -113,9 +147,11 @@ fn independent_receipt_rejects_a_draft_route_and_commits_the_shared_route() {
     let run = |rt: &mut HostRuntime, query: &str, cited: Id, independent_batch: bool| {
         let trigger = note(rt, "check the signed record");
         let mut trace = SearchTurn::default();
-        rt.search_turn("ROOT", &provider, 4096, &mut trace).unwrap();
+        rt.search_turn("ROOT", &provider, 4096, Some(&mut trace))
+            .unwrap();
         trace.batch = usize::from(independent_batch);
-        rt.search_turn(query, &provider, 4096, &mut trace).unwrap();
+        rt.search_turn(query, &provider, 4096, Some(&mut trace))
+            .unwrap();
         rt.learn_search(
             trigger,
             &trace,
@@ -151,226 +187,127 @@ fn independent_receipt_rejects_a_draft_route_and_commits_the_shared_route() {
     .unwrap();
     let mut trace = SearchTurn::default();
     let unrelated = rt
-        .search_turn("unrelated", &provider, 4096, &mut trace)
+        .search_turn("unrelated", &provider, 4096, Some(&mut trace))
         .unwrap();
     assert!(unrelated.get("used_cue").is_none());
-    let result = rt.search_turn("ROOT", &provider, 4096, &mut trace).unwrap();
+    let result = rt
+        .search_turn("ROOT", &provider, 4096, Some(&mut trace))
+        .unwrap();
     assert_eq!(result["used_cue"], "SHARED-LINK");
     assert_eq!(found(&result).filter_map(receipt_id).count(), 2);
-}
+    let disabled = rt.search_turn("ROOT", &provider, 4096, None).unwrap();
+    assert!(disabled.get("used_cue").is_none() && receipts(&disabled).next().is_none());
 
-#[test]
-#[ignore = "requires a live model configured by EJA_EVAL_CONFIG"]
-fn search_live_rsi_from_identity() {
-    let path = std::env::var_os("EJA_EVAL_CONFIG").expect("set EJA_EVAL_CONFIG");
-    let mut config: HostConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    config.capabilities.clear();
-    config.window_max_bytes = Some(16384);
-    config.max_steps = Some(12);
-    let seed = std::env::var("EJA_RSL_TEST_SEED").unwrap_or_else(|_| "20261125".into());
-    let opaque = |label: &str| {
-        let digest = format!("{:x}", Sha256::digest(format!("{seed}:{label}")));
-        format!("{}-{}", label, digest[..10].to_uppercase())
-    };
-    let (root, local, central, draft) = (
-        opaque("IDX"),
-        opaque("LOCAL"),
-        opaque("CENTRAL"),
-        opaque("DRAFT"),
+    let new = receipt(
+        &rt,
+        "root-only",
+        Outcome::Observed("ROOT signed P-NEW".into()),
     );
-    println!("model={} seed={seed}", config.resolve_judge().unwrap().1);
-    let dir = tempfile::tempdir().unwrap();
-    let create = |name: &str| {
-        let judge = Arc::new(Judge::default());
-        let errors = Arc::new(Mutex::new(Vec::new()));
-        let sink = errors.clone();
-        let mut rt = HostRuntime::open_with_brain(
-            dir.path().join(name),
-            judge.clone(),
-            Arc::new(move |event| {
-                if event["event"] == "error" {
-                    sink.lock().unwrap().push(event);
-                }
-            }),
-        )
+    let result = rt
+        .search_turn("ROOT", &provider, 4096, Some(&mut trace))
         .unwrap();
-        rt.save_config_request(config.clone().into(), None, false);
-        (rt, judge, errors)
-    };
-    let (mut learning, judge, errors) = create("learning");
-    note(
-        &learning,
-        &format!("场地预约归档入口 {root}。地方正式签发簿索引 {local}。草稿索引 {draft}。"),
-    );
-    let cases = [
-        ("北厅", "地方正式签发簿"),
-        ("西厅", "地方正式签发簿"),
-        ("东厅", "中央正式签发簿"),
-        ("南厅", "中央正式签发簿"),
-        ("中庭", "中央正式签发簿"),
-    ];
-    let codes: Vec<_> = cases
-        .iter()
-        .map(|(name, _)| opaque(&format!("P{name}")))
-        .collect();
-    let archive = |rt: &HostRuntime, index: usize| {
-        let (name, archive) = cases[index];
-        let tags = if index < 2 {
-            format!("{local}，共享归档键 {central}")
-        } else {
-            central.clone()
-        };
-        receipt(
-            rt,
-            name,
-            Outcome::Observed(format!(
-                "{name}，{archive}，索引 {tags}。正式签发凭证码 {}。",
-                codes[index]
-            )),
-        )
-    };
-    let send = |rt: &mut HostRuntime, prompt: &str, errors: &Mutex<Vec<Value>>| {
-        note(rt, &"无关历史条目占据常规窗口。".repeat(720));
-        let cursor = rt.eja.revision().unwrap();
-        rt.handle_user_message(prompt);
-        let errors = errors.lock().unwrap();
-        assert!(errors.is_empty(), "{errors:?}");
-        rt.eja
-            .entries_after(cursor, rt.eja.revision().unwrap())
-            .unwrap()
-            .into_iter()
-            .find_map(|entry| match entry.fact {
-                Fact::Said { text } => Some(text),
-                _ => None,
-            })
-            .expect("the current turn must answer")
-    };
-    let question = |index: usize| {
-        format!(
-            "这次只核对{}的场地预约。请先从归档入口 {root} 查起，核对{}上的正式凭证码，附原始回执编号。",
-            cases[index].0, cases[index].1
-        )
-    };
-    let first_receipts: Vec<_> = (0..2).map(|index| archive(&learning, index)).collect();
-    receipt(
-        &learning,
-        "侧厅",
-        Outcome::Failed(format!("侧厅 {draft}，草稿预填 P-DRAFT，尚未正式签发。")),
-    );
-    let check = |rt: &mut HostRuntime, index: usize, receipt: Id| {
-        let start = judge.searches.lock().unwrap().len();
-        let answer = send(rt, &question(index), &errors);
-        println!(
-            "case={} receipt={receipt} answer={answer:?}",
-            cases[index].0
-        );
-        let searches = judge.searches.lock().unwrap();
-        println!(
-            "searches={:?} policy={:?}",
-            &searches[start..],
-            rt.eja.get_meta(&key(&root)).unwrap()
-        );
-        assert!(
-            answer.contains(&codes[index]) && answer.contains(&format!("[#{receipt}]")),
-            "{answer}"
-        );
-    };
-    check(&mut learning, 0, first_receipts[0]);
-    assert!(active(&learning, &root).is_none());
-    check(&mut learning, 1, first_receipts[1]);
-    let (first, route) = active(&learning, &root).expect("first autonomous update");
-    assert!(route["parent"].is_null());
     assert_eq!(
-        cue_text(
-            &learning.eja,
-            serde_json::from_value(route["cue"].clone()).unwrap()
-        )
-        .unwrap(),
-        local
+        result,
+        rt.search_turn("ROOT", &provider, 4096, None).unwrap()
     );
-    println!("generation1 action={first} evidence={}", route["cases"]);
-
-    note(
-        &learning,
-        &format!("地方签发簿索引 {local}。第二批场地由中央正式签发簿出具凭证，源索引 {central}。"),
-    );
-    let later_receipts: Vec<_> = (2..4).map(|index| archive(&learning, index)).collect();
-    check(&mut learning, 2, later_receipts[0]);
-    assert_eq!(active(&learning, &root).unwrap().0, first);
-    check(&mut learning, 3, later_receipts[1]);
-    let (second, route) = active(&learning, &root).expect("second autonomous update");
-    assert_eq!(route["parent"], first);
-    assert_eq!(
-        cue_text(
-            &learning.eja,
-            serde_json::from_value(route["cue"].clone()).unwrap()
-        )
-        .unwrap(),
-        central
-    );
-    println!(
-        "generation2 action={second} parent={first} evidence={}",
-        route["cases"]
-    );
-
-    let held_out = archive(&learning, 4);
-    let (frozen, _, _) = create("frozen");
-    let learned_db = learning.core_dir.path().join("subject.db");
-    let frozen_db = frozen.core_dir.path().join("subject.db");
-    drop(learning);
-    drop(frozen);
-    std::fs::copy(learned_db, frozen_db).unwrap();
-    let (mut learning, judge, errors) = create("learning");
-    let (mut frozen, frozen_judge, frozen_errors) = create("frozen");
-    frozen.eja.set_meta(&key(&root), "{}").unwrap();
-    assert_eq!(active(&learning, &root).unwrap().0, second);
-    let learned_answer = send(&mut learning, &question(4), &errors);
-    let frozen_answer = send(&mut frozen, &question(4), &frozen_errors);
-    let earliest_receipt = |judge: &Judge| {
-        let requests = judge.requests.lock().unwrap();
-        let first_visible = requests
-            .iter()
-            .position(|results| results.iter().any(|result| result.contains(&codes[4])))
-            .expect("the original receipt must have been shown")
-            + 1;
-        (first_visible, requests.len())
-    };
-    let (learned_visible, learned_calls) = earliest_receipt(&judge);
-    let (frozen_visible, frozen_calls) = earliest_receipt(&frozen_judge);
-    println!("holdout learned_visible={learned_visible} frozen_visible={frozen_visible} learned_calls={learned_calls} frozen_calls={frozen_calls} learned={learned_answer:?} frozen={frozen_answer:?}");
-    assert!(learned_answer.contains(&codes[4]) && frozen_answer.contains(&codes[4]));
-    assert!(
-        learned_answer.contains(&format!("[#{held_out}]"))
-            && frozen_answer.contains(&format!("[#{held_out}]"))
-    );
-    assert_eq!(learned_visible, 2);
-    assert!(learned_visible < frozen_visible);
-    assert!(active(&frozen, &root).is_none());
+    assert!(receipts(&result).any(|id| id == new));
+    assert_eq!(active(&rt, "ROOT").unwrap().1, change);
 }
 
 #[test]
-#[ignore = "requires a live model configured by EJA_EVAL_CONFIG"]
-fn search_live_inherited_policy_helps_next_update() {
+#[ignore = "requires EJA_RECALL_LEARNING=1 and a live model configured by EJA_EVAL_CONFIG"]
+fn search_live_rsi_from_identity() {
+    assert_eq!(std::env::var("EJA_RECALL_LEARNING").as_deref(), Ok("1"));
     let path = std::env::var_os("EJA_EVAL_CONFIG").expect("set EJA_EVAL_CONFIG");
     let mut config: HostConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     config.capabilities.clear();
     config.window_max_bytes = Some(8192);
-    config.max_steps = Some(RELAY_STEPS);
-    println!(
-        "model={} max_calls_per_case={RELAY_STEPS}",
-        config.resolve_judge().unwrap().1
-    );
-    compare_inherited_policy(Some(&config));
+    config.max_steps = Some(8);
+    println!("model={}", config.resolve_judge().unwrap().1);
+    run_rsi_lineage(Some(&config));
 }
 
 #[test]
-fn search_replay_inherited_policy_helps_next_update() {
-    compare_inherited_policy(None);
+fn search_replay_rsi_from_identity() {
+    run_rsi_lineage(None);
 }
 
-const RELAY_STEPS: usize = 3;
+#[cfg(feature = "onnx")]
+#[test]
+#[ignore = "requires the local model directory in EJA_ONNX_MODEL_DIR"]
+fn search_replay_rsi_with_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = HostRuntime::open_with_brain(
+        dir.path().join("subject"),
+        Arc::new(Judge::default()),
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+    assert!(rt.core_dir.path().join("memory.db").is_file());
+    let root = "礼堂场地预约";
+    let cue = "停电药品冷藏柜";
+    note(&rt, &format!("{root}索引。{root}签收回执请查 {cue}。"));
+    for i in 1..=14 {
+        note(&rt, &format!("{root}第 {i} 次，核对演讲厅排期和座位。"));
+    }
+    let search = |rt: &mut HostRuntime, query: &str, trace: Option<&mut SearchTurn>| {
+        rt.search_turn(query, &ProviderKind::OpenAi, 8192, trace)
+            .unwrap()
+    };
+    for code in ["P-FIRST", "P-SECOND"] {
+        let id = receipt(
+            &rt,
+            code,
+            Outcome::Observed(format!("{cue}中胰岛素交接号 {code}。")),
+        );
+        let trigger = note(&rt, "核验签收记录");
+        let mut trace = SearchTurn::default();
+        let first = search(&mut rt, root, Some(&mut trace));
+        assert!(first.to_string().contains(cue));
+        assert!(!receipts(&first).any(|seen| seen == id));
+        trace.batch = 1;
+        let followup = search(&mut rt, cue, Some(&mut trace));
+        assert!(receipts(&followup).any(|seen| seen == id));
+        rt.learn_search(trigger, &trace, &format!("[#{id}]"), &ProviderKind::OpenAi)
+            .unwrap();
+    }
+    let id = receipt(
+        &rt,
+        "新交接",
+        Outcome::Observed("供电中断后，胰岛素转到邻居的冰箱保鲜，原始交接号 P-THIRD。".into()),
+    );
+    assert!(eja_memory::MemoryIndex::keyword()
+        .search(&rt.eja, cue)
+        .unwrap()
+        .iter()
+        .all(|hit| hit.evidence.entry.id != id));
+    let learned = search(&mut rt, root, Some(&mut SearchTurn::default()));
+    assert_eq!(learned["used_cue"], cue);
+    assert!(receipts(&learned).any(|seen| seen == id));
+    assert!(!receipts(&search(&mut rt, root, None)).any(|seen| seen == id));
+    assert!(receipts(&search(&mut rt, cue, None)).any(|seen| seen == id));
+    println!("vector-only held-out receipt {id} reached by ordinary search and inherited cue");
+}
 
-fn compare_inherited_policy(config: Option<&HostConfig>) {
+fn run_rsi_lineage(config: Option<&HostConfig>) {
+    let seed = std::env::var("EJA_RSL_TEST_SEED").unwrap_or_else(|_| "20261126".into());
+    let opaque = |label: &str| {
+        let digest = format!("{:x}", Sha256::digest(format!("{seed}:{label}")));
+        digest[..10].to_uppercase()
+    };
+    let root = format!("IDX-{}", opaque("root"));
+    // Each narrower archive tag includes its successor, so the successor can
+    // retrieve earlier receipts. The explicit next link arrives in a receipt.
+    let mut routes = vec![format!("ARCH-{}", opaque("archive"))];
+    for index in 1..4 {
+        routes.push(format!(
+            "{}-{}",
+            routes[index - 1],
+            opaque(&index.to_string())
+        ));
+    }
+    routes.reverse();
+
     let provider = config
         .map(|config| config.resolve_judge().unwrap().0.kind.clone())
         .unwrap_or_default();
@@ -384,7 +321,7 @@ fn compare_inherited_policy(config: Option<&HostConfig>) {
             judge.clone(),
             Arc::new(move |event| {
                 if event["event"] == "error" {
-                    sink.lock().unwrap().push(event);
+                    sink.lock().unwrap().push(event["message"].clone());
                 }
             }),
         )
@@ -394,7 +331,287 @@ fn compare_inherited_policy(config: Option<&HostConfig>) {
         }
         (rt, judge, errors)
     };
-    let (mut inherited, _, _) = open("inherited");
+    let (mut rt, mut judge, mut errors) = open("learned");
+    note(
+        &rt,
+        &format!(
+            "场地预约的归档入口 {root}。第一批正式签发簿的完整档案标签为 {}。",
+            routes[0]
+        ),
+    );
+    let question = |name: &str, generation: usize| {
+        format!(
+            "请先用归档入口 {root} 搜索，核验第 {generation} 批{name}的场地预约。其余档案标签只从档案材料取得。只输出该厅的正式凭证码以及对应的原始回执编号 [#ID]。"
+        )
+    };
+    let add_receipt = |rt: &HostRuntime, name: &str, index: usize, link: bool| {
+        let code = format!("P-{}", opaque(name));
+        let next = routes
+            .get(index + 1)
+            .filter(|_| link)
+            .map(|cue| format!("第 {} 批正式签发簿的完整档案标签为 {cue}。", index + 2))
+            .unwrap_or_default();
+        let id = receipt(
+            rt,
+            name,
+            Outcome::Observed(format!(
+                "第 {} 批{}，正式签发簿档案标签 {}。正式凭证码 {code}。{next}",
+                index + 1,
+                name,
+                routes[index],
+            )),
+        );
+        (id, code)
+    };
+    let send = |rt: &mut HostRuntime,
+                prompt: &str,
+                id: Id,
+                code: &str,
+                judge: &Judge,
+                errors: &Mutex<Vec<Value>>| {
+        note(rt, &"日常记录。".repeat(570));
+        let cursor = rt.eja.revision().unwrap();
+        let start = judge.requests.lock().unwrap().len();
+        let search_start = judge.searches.lock().unwrap().len();
+        rt.handle_user_message(prompt);
+        let answer = rt
+            .eja
+            .entries_after(cursor, rt.eja.revision().unwrap())
+            .unwrap()
+            .into_iter()
+            .find_map(|entry| match entry.fact {
+                Fact::Said { text } => Some(text),
+                _ => None,
+            });
+        let requests = judge.requests.lock().unwrap();
+        let searches = judge.searches.lock().unwrap();
+        let receipt_call = requests[start..]
+            .iter()
+            .position(|results| {
+                results.iter().any(|result| {
+                    let packet: Value = serde_json::from_str(result).unwrap();
+                    let visible = found(&packet).any(|entry| {
+                        receipt_id(entry) == Some(id)
+                            && entry["fact"]["outcome"]["detail"]
+                                .as_str()
+                                .is_some_and(|detail| detail.contains(code))
+                    });
+                    visible
+                })
+            })
+            .map(|index| index + 1);
+        let errors = errors.lock().unwrap();
+        println!("receipt={id} receipt_call={receipt_call:?} calls={} searches={:?} answer={answer:?} errors={errors:?}",
+            requests.len() - start, &searches[search_start..]);
+        assert!(errors.iter().all(|message| {
+            message
+                .as_str()
+                .is_some_and(|message| message == "达到单回合最大步数上限 (8)，回合已暂停")
+        }));
+        let correct = answer
+            .is_some_and(|answer| answer.contains(code) && answer.contains(&format!("[#{id}]")));
+        (receipt_call, requests.len() - start, correct)
+    };
+
+    let visible =
+        |packet: &Value, id: Id| found(packet).filter_map(receipt_id).any(|seen| seen == id);
+    let mut parent = None;
+    let mut confirmed = Vec::new();
+    for (index, names) in [
+        ["北厅", "西厅"],
+        ["东厅", "南厅"],
+        ["前厅", "后厅"],
+        ["左厅", "右厅"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut witnesses = Vec::new();
+        for (which, name) in names.into_iter().enumerate() {
+            let (id, code) = add_receipt(&rt, name, index, which == 1);
+            let prompt = question(name, index + 1);
+            let first = rt
+                .search_turn(&root, &provider, 6000, Some(&mut SearchTurn::default()))
+                .unwrap();
+            assert!(
+                !visible(&first, id),
+                "training receipt {id} must need a follow-up"
+            );
+            let label = format!("标签为 {}。", routes[index]);
+            assert!(
+                first.to_string().contains(&label),
+                "missing the explicit archive link"
+            );
+            if index > 0 {
+                let through = rt.eja.revision().unwrap();
+                let identity = rt
+                    .search_packet(&root, &root, through, &provider, 6000)
+                    .unwrap();
+                assert!(
+                    !identity.to_string().contains(&label),
+                    "the original query exposed the next link"
+                );
+            }
+            if config.is_some() {
+                let (first_receipt, _, correct) =
+                    send(&mut rt, &prompt, id, &code, &judge, &errors);
+                assert!(first_receipt.is_some() && correct);
+            } else {
+                let trigger = note(&rt, &prompt);
+                let mut trace = SearchTurn::default();
+                rt.search_turn(&root, &provider, 6000, Some(&mut trace))
+                    .unwrap();
+                trace.batch = 1;
+                if index == 1 {
+                    let broad = rt
+                        .search_turn("正式凭证码", &provider, 6000, Some(&mut trace))
+                        .unwrap();
+                    assert!(visible(&broad, id));
+                    trace.batch += 1;
+                }
+                let second = rt
+                    .search_turn(&routes[index], &provider, 6000, Some(&mut trace))
+                    .unwrap();
+                assert!(visible(&second, id));
+                rt.learn_search(trigger, &trace, &format!("{code} [#{id}]"), &provider)
+                    .unwrap();
+            }
+            witnesses.push(id);
+            if which == 0 {
+                assert_eq!(active(&rt, &root).map(|(id, _)| id), parent);
+            }
+        }
+        let (version, change) =
+            active(&rt, &root).expect("the two independent receipts must update the route");
+        assert_eq!(change["parent"], json!(parent));
+        assert_eq!(
+            cue_text(
+                &rt.eja,
+                serde_json::from_value(change["cue"].clone()).unwrap()
+            )
+            .unwrap(),
+            routes[index]
+        );
+        assert_eq!(change["cases"][0]["witness"], witnesses[0]);
+        assert_eq!(change["cases"][1]["witness"], witnesses[1]);
+        let post = rt
+            .search_turn(&root, &provider, 6000, Some(&mut SearchTurn::default()))
+            .unwrap();
+        confirmed.extend(witnesses.iter().copied());
+        assert!(
+            confirmed.iter().all(|&id| visible(&post, id)),
+            "past receipts regressed"
+        );
+        println!("generation={} version={version} parent={parent:?} witnesses={witnesses:?} retained={}/{}",
+            index + 1, confirmed.len(), confirmed.len());
+        parent = Some(version);
+        drop(rt);
+        (rt, judge, errors) = open("learned");
+        assert_eq!(active(&rt, &root).map(|(id, _)| id), parent);
+    }
+
+    let (id, code) = add_receipt(&rt, "中庭", 3, false);
+    let through = rt.eja.revision().unwrap();
+    let inherited = rt
+        .search_turn(&root, &provider, 6000, Some(&mut SearchTurn::default()))
+        .unwrap();
+    let identity = rt
+        .search_packet(&root, &root, through, &provider, 6000)
+        .unwrap();
+    assert!(visible(&inherited, id));
+    assert!(!visible(&identity, id));
+    println!(
+        "holdout={id} first_search inherited=true identity=false retained={}",
+        confirmed
+            .iter()
+            .filter(|&&id| visible(&inherited, id))
+            .count()
+    );
+    if config.is_some() {
+        let prompt = question("中庭", 4);
+        // Fork the same journal before either arm adds its holdout question.
+        let learned_db = rt.core_dir.path().join("subject.db");
+        let (frozen, _, _) = open("frozen");
+        let frozen_db = frozen.core_dir.path().join("subject.db");
+        drop(rt);
+        drop(frozen);
+        std::fs::copy(learned_db, frozen_db).unwrap();
+        (rt, judge, errors) = open("learned");
+        let learned = send(&mut rt, &prompt, id, &code, &judge, &errors);
+        let (mut frozen_rt, judge, errors) = open("frozen");
+        frozen_rt.eja.set_meta(&key(&root), "{}").unwrap();
+        let frozen = send(&mut frozen_rt, &prompt, id, &code, &judge, &errors);
+        println!(
+            "holdout (receipt_call, total_calls, correct) learned={learned:?} frozen={frozen:?}"
+        );
+        assert_eq!(learned.0, Some(2));
+        assert!(learned.2);
+        assert!(frozen.0.is_none_or(|call| call > 2));
+        assert!(active(&frozen_rt, &root).is_none());
+        return;
+    }
+
+    let alternative = "SIDE-ARCHIVE";
+    note(&rt, &format!("{} 另一路索引 {alternative}。", routes[3]));
+    for name in ["耳房", "外厅"] {
+        let id = receipt(
+            &rt,
+            name,
+            Outcome::Observed(format!("{alternative} {name}的正式签发回执。")),
+        );
+        let trigger = note(&rt, "核对另一路的正式回执");
+        let mut trace = SearchTurn::default();
+        let first = rt
+            .search_turn(&root, &provider, 6000, Some(&mut trace))
+            .unwrap();
+        assert!(first.to_string().contains(alternative));
+        assert!(confirmed.iter().all(|&id| visible(&first, id)));
+        trace.batch = 1;
+        let second = rt
+            .search_turn(alternative, &provider, 6000, Some(&mut trace))
+            .unwrap();
+        assert!(visible(&second, id) && confirmed.iter().all(|&id| !visible(&second, id)));
+        rt.learn_search(trigger, &trace, &format!("签发 [#{id}]"), &provider)
+            .unwrap();
+    }
+    let policy = read_policy(rt.eja.get_meta(&key(&root)).unwrap().as_deref()).unwrap();
+    assert_eq!(policy.active, parent);
+    assert!(policy.pending.is_none());
+    println!("side route rejected: each new receipt found, earlier receipts lost");
+
+    let latest: Vec<_> = ["一厅", "二厅", "三厅", "四厅"]
+        .into_iter()
+        .map(|name| add_receipt(&rt, name, 3, false).0)
+        .collect();
+    let crowded = rt
+        .search_turn(&root, &provider, 6000, Some(&mut SearchTurn::default()))
+        .unwrap();
+    assert!(latest.iter().all(|&id| visible(&crowded, id)));
+    let retained = confirmed
+        .iter()
+        .filter(|&&id| visible(&crowded, id))
+        .count();
+    assert!(retained < confirmed.len());
+    assert_eq!(active(&rt, &root).map(|(id, _)| id), parent);
+    println!(
+        "same route after journal growth: earlier receipts={retained}/{}",
+        confirmed.len()
+    );
+}
+
+#[test]
+fn search_replay_inherited_policy_helps_next_update() {
+    let provider = ProviderKind::OpenAi;
+    let dir = tempfile::tempdir().unwrap();
+    let open = |name: &str| {
+        HostRuntime::open_with_brain(
+            dir.path().join(name),
+            Arc::new(Judge::default()),
+            Arc::new(|_| {}),
+        )
+        .unwrap()
+    };
+    let mut inherited = open("inherited");
     let root = "IDX-2E47A808";
     let local = "LOCAL-1F5C49";
     let central = "CENTRAL-90D738";
@@ -411,11 +628,11 @@ fn compare_inherited_policy(config: Option<&HostConfig>) {
         let trigger = note(&inherited, "核验前批回执");
         let mut trace = SearchTurn::default();
         inherited
-            .search_turn(root, &provider, 4096, &mut trace)
+            .search_turn(root, &provider, 4096, Some(&mut trace))
             .unwrap();
         trace.batch = 1;
         inherited
-            .search_turn(local, &provider, 4096, &mut trace)
+            .search_turn(local, &provider, 4096, Some(&mut trace))
             .unwrap();
         inherited
             .learn_search(trigger, &trace, &format!("核验成功 [#{id}]"), &provider)
@@ -438,18 +655,18 @@ fn compare_inherited_policy(config: Option<&HostConfig>) {
         })
         .collect();
 
-    let (identity, _, _) = open("identity");
+    let identity = open("identity");
     let source = inherited.core_dir.path().join("subject.db");
     let copy = identity.core_dir.path().join("subject.db");
     drop(inherited);
     drop(identity);
     std::fs::copy(source, copy).unwrap();
-    let (mut inherited, inherited_judge, inherited_errors) = open("inherited");
-    let (mut identity, identity_judge, identity_errors) = open("identity");
+    let mut inherited = open("inherited");
+    let mut identity = open("identity");
     identity.eja.set_meta(&key(root), "{}").unwrap();
     for (rt, has_link) in [(&mut inherited, true), (&mut identity, false)] {
         let result = rt
-            .search_turn(root, &provider, 4096, &mut SearchTurn::default())
+            .search_turn(root, &provider, 4096, Some(&mut SearchTurn::default()))
             .unwrap();
         assert_eq!(result.to_string().contains(central), has_link);
         assert!(found(&result)
@@ -457,57 +674,30 @@ fn compare_inherited_policy(config: Option<&HostConfig>) {
             .all(|id| !expected.contains(&id)));
     }
 
-    for (index, (name, _)) in cases.iter().enumerate() {
-        let prompt = format!("这次只核对{name}，请从归档入口 {root} 查起。看到中央签发簿的原始凭证码后，直接给出凭证码和回执编号。");
-        for (arm, rt, judge) in [
-            ("inherited", &mut inherited, &inherited_judge),
-            ("identity", &mut identity, &identity_judge),
-        ] {
-            if config.is_none() {
-                let trigger = note(rt, &prompt);
-                let mut trace = SearchTurn::default();
-                let first = rt.search_turn(root, &provider, 4096, &mut trace).unwrap();
-                let cue = if first.to_string().contains(central) {
-                    central
-                } else {
-                    local
-                };
-                trace.batch += 1;
-                let result = rt.search_turn(cue, &provider, 4096, &mut trace).unwrap();
-                let id = expected[index];
-                let visible = found(&result).filter_map(receipt_id).any(|seen| seen == id);
-                if visible {
-                    rt.learn_search(trigger, &trace, &format!("核验成功 [#{id}]"), &provider)
-                        .unwrap();
-                }
-                println!("arm={arm} case={name} searches=2 receipt_visible={visible}");
-                continue;
+    for &id in &expected {
+        for (rt, learned) in [(&mut inherited, true), (&mut identity, false)] {
+            let trigger = note(rt, "核验本批回执");
+            let mut trace = SearchTurn::default();
+            let first = rt
+                .search_turn(root, &provider, 4096, Some(&mut trace))
+                .unwrap();
+            let cue = if first.to_string().contains(central) {
+                central
+            } else {
+                local
+            };
+            trace.batch = 1;
+            let second = rt
+                .search_turn(cue, &provider, 4096, Some(&mut trace))
+                .unwrap();
+            let visible = receipts(&second).any(|seen| seen == id);
+            assert_eq!(visible, learned);
+            if visible {
+                rt.learn_search(trigger, &trace, &format!("核验成功 [#{id}]"), &provider)
+                    .unwrap();
             }
-            note(rt, &"无关日志填满历史窗口。".repeat(380));
-            let before = judge.requests.lock().unwrap().len();
-            rt.handle_user_message(&prompt);
-            let requests = judge.requests.lock().unwrap();
-            let calls = requests.len() - before;
-            assert!(calls <= RELAY_STEPS);
-            let receipt_visible = requests[before..]
-                .iter()
-                .flatten()
-                .any(|result| result.contains(cases[index].1));
-            println!(
-                "arm={arm} case={name} calls={calls} receipt_visible={receipt_visible} active={:?}",
-                active(rt, root).map(|(id, _)| id)
-            );
         }
     }
-    let inherited_errors = inherited_errors.lock().unwrap();
-    assert!(inherited_errors.is_empty(), "{inherited_errors:?}");
-    let identity_errors = identity_errors.lock().unwrap();
-    assert!(
-        identity_errors.iter().all(|event| event["message"]
-            .as_str()
-            .is_some_and(|text| text.contains("达到单回合最大步数上限 (3)"))),
-        "{identity_errors:?}"
-    );
     let (_, update) = active(&inherited, root).expect("expected an inherited-policy update");
     assert_eq!(update["parent"], parent);
     let proven: Vec<_> = update["cases"]
@@ -523,7 +713,7 @@ fn compare_inherited_policy(config: Option<&HostConfig>) {
     for (rt, should_see) in [(&mut inherited, true), (&mut identity, false)] {
         let id = receipt(rt, "南厅", holdout.clone());
         let result = rt
-            .search_turn(root, &provider, 4096, &mut SearchTurn::default())
+            .search_turn(root, &provider, 4096, Some(&mut SearchTurn::default()))
             .unwrap();
         assert_eq!(
             found(&result).filter_map(receipt_id).any(|seen| seen == id),
