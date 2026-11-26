@@ -7,6 +7,7 @@ mod oauth;
 mod runtime;
 mod sandbox;
 mod state;
+mod tool;
 
 use runtime::{EventSink, HostCommand, HostRuntime, OpenError};
 use serde_json::{json, Value};

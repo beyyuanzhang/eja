@@ -1,7 +1,7 @@
 use crate::config::{ProviderConfig, ProviderKind};
-use crate::hands::ToolSpec;
 use crate::http::{get_bytes, post_stream, truncate_utf8, HttpError};
 use crate::state::entries_for_turn;
+use crate::tool::{ModelImage, ToolSpec};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use eja_core::{Eja, Entry, Evidence, Fact, Id, Outcome};
 use serde_json::{json, Value};
@@ -11,7 +11,6 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 
 pub const WINDOW_MAX_BYTES: usize = 256 * 1024;
-pub const MAX_TOOL_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 const TOOL_IMAGE_CONTEXT: &str = "图像来自工具调用 ";
 
 #[derive(Debug, Clone)]
@@ -113,46 +112,17 @@ pub enum ToolOutput {
     Images(Value, Vec<ModelImage>),
 }
 
-pub struct ModelImage {
-    pub media_type: &'static str,
-    pub bytes: Vec<u8>,
-}
-
-impl ModelImage {
-    pub fn receipt(&self) -> String {
-        format!(
-            "工具返回图像（{}，{} 字节）",
-            self.media_type,
-            self.bytes.len()
-        )
-    }
-
-    pub fn media_type(bytes: &[u8]) -> Option<&'static str> {
-        if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-            Some("image/jpeg")
-        } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            Some("image/png")
-        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-            Some("image/gif")
-        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-            Some("image/webp")
-        } else {
-            None
-        }
-    }
-
-    fn into_content_part(self, provider: &ProviderKind) -> Value {
-        let data = STANDARD.encode(self.bytes);
-        match provider {
-            ProviderKind::OpenAi => json!({
-                "type": "image_url",
-                "image_url": { "url": format!("data:{};base64,{data}", self.media_type) }
-            }),
-            ProviderKind::Anthropic => json!({
-                "type": "image",
-                "source": { "type": "base64", "media_type": self.media_type, "data": data }
-            }),
-        }
+fn image_content_part(image: ModelImage, provider: &ProviderKind) -> Value {
+    let data = STANDARD.encode(image.bytes);
+    match provider {
+        ProviderKind::OpenAi => json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:{};base64,{data}", image.media_type) }
+        }),
+        ProviderKind::Anthropic => json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": image.media_type, "data": data }
+        }),
     }
 }
 
@@ -235,7 +205,7 @@ pub fn tool_messages(
             if image.bytes.len().div_ceil(3) * 4 >= remaining {
                 continue;
             }
-            let part = image.into_content_part(provider);
+            let part = image_content_part(image, provider);
             let size = json_bytes(&part) + 1;
             if size <= remaining {
                 remaining -= size;

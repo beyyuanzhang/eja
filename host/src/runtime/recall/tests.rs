@@ -1,10 +1,11 @@
 use super::*;
 use crate::{
     config::{HostConfig, ProviderConfig},
-    hands::{ToolSpec, ANSWER_WITH_RECEIPT},
+    hands::ANSWER_WITH_RECEIPT,
     llm::{Brain, HttpBrain, ModelReply},
     runtime::HostRuntime,
     state,
+    tool::ToolSpec,
 };
 use std::sync::{Arc, Mutex};
 

@@ -2,9 +2,7 @@ use crate::config::{
     write_json_atomic, CapabilityConfig, CapabilityTransport, ConfigPatch, HostConfig,
     ProviderConfig, ProviderKind,
 };
-use crate::hands::{
-    activity_label, format_local_unix, Hands, ToolSpec, ToolTarget, ANSWER_WITH_RECEIPT,
-};
+use crate::hands::{activity_label, format_local_unix, Hands, ANSWER_WITH_RECEIPT};
 use crate::http::truncate_utf8;
 use crate::llm::{
     apply_tool_exchange, expire_tool_images, list_models, project_window_through, tool_messages,
@@ -17,6 +15,7 @@ use crate::state::{
     self, concern,
     watch::{self, WakeAlarm},
 };
+use crate::tool::{ToolSpec, ToolTarget};
 use eja_core::{Eja, Entry, Fact, Id, Outcome, Source, Timestamp};
 use eja_memory::MemoryIndex;
 use serde::{Deserialize, Serialize};

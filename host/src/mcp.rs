@@ -1,9 +1,11 @@
+mod process;
+
+use self::process::{execute_shell, run_process, ProcessInput};
 use crate::config::{CapabilityConfig, CapabilityTransport};
-use crate::hands::{execute_shell, run_process, ProcessInput, ToolExecution};
 use crate::http::{post_bytes, truncate_utf8, HttpError, HttpResponse};
-use crate::llm::{ModelImage, MAX_TOOL_IMAGE_BYTES};
 use crate::oauth::{is_auth_error, OAuthStore, OAuthToken};
 use crate::sandbox::{kill_process_tree, write_process_input, Sandbox, TrustedDir};
+use crate::tool::{ModelImage, ToolExecution, MAX_TOOL_IMAGE_BYTES};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use eja_core::Outcome;
 use serde::Serialize;
