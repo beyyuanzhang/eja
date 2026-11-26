@@ -210,4 +210,31 @@ for line in sys.stdin:
         #expect(client.streamingText == "")
         #expect(client.stream.last?.text == "最终回复")
     }
+
+    @Test
+    @MainActor
+    func historyPagesPrependAndStateKeepsLoadedItems() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = HostClient(hostExecutableURL: URL(fileURLWithPath: "/bin/cat"), dataDir: dir)
+        defer { client.shutdown() }
+
+        client.handleEventLine(
+            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":5,"kind":"event","text":"shell: ls","detail":"ok","outcome_status":"observed"}],"concerns":[{"id":2,"text":"挂念"}],"wakes":[{"id":"w-1","fire_at_unix":9,"fire_at_display":"09:00","reason":"喝水"}]}"#.utf8)
+        )
+        #expect(client.stream.first?.detail == "ok")
+        #expect(client.concerns.first?.text == "挂念")
+        #expect(client.wakes.first?.reason == "喝水")
+        #expect(client.canLoadEarlier)
+
+        client.handleEventLine(Data(#"{"event":"history","items":[{"id":3,"kind":"event","text":"定时唤醒：喝水"}],"more":false}"#.utf8))
+        #expect(client.stream.map(\.id) == [3, 5])
+        #expect(!client.canLoadEarlier)
+
+        client.handleEventLine(
+            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":5,"kind":"event","text":"shell: ls"},{"id":6,"kind":"person","text":"嗨"}],"concerns":[],"wakes":[]}"#.utf8)
+        )
+        #expect(client.stream.map(\.id) == [3, 5, 6])
+        #expect(client.wakes.isEmpty)
+    }
 }

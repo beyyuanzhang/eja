@@ -75,6 +75,13 @@ pub enum HostCommand {
     },
     ReloadCapabilities,
     Cancel,
+    History {
+        before: Id,
+        limit: Option<usize>,
+    },
+    DismissWake {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +311,8 @@ impl HostRuntime {
                 Ok(HostCommand::OauthCapability { id }) => self.oauth_capability(id),
                 Ok(HostCommand::ReloadCapabilities) => self.reload_capabilities(),
                 Ok(HostCommand::Cancel) => self.cancel.store(false, Ordering::Relaxed),
+                Ok(HostCommand::History { before, limit }) => self.emit_history(before, limit),
+                Ok(HostCommand::DismissWake { id }) => self.dismiss_wake(&id),
                 Err(err) => self.emit_error(err),
             }
         }
@@ -322,6 +331,8 @@ impl HostRuntime {
                 }
                 Ok(HostCommand::ReloadCapabilities) => self.reload_capabilities(),
                 Ok(HostCommand::Cancel) => {}
+                Ok(HostCommand::History { before, limit }) => self.emit_history(before, limit),
+                Ok(HostCommand::DismissWake { id }) => self.dismiss_wake(&id),
                 command => self.deferred.push_back(command),
             }
         }
@@ -444,6 +455,28 @@ impl HostRuntime {
             }
             payload["event"] = Value::String("state".into());
             (self.emit)(payload);
+        }
+    }
+
+    fn emit_history(&self, before: Id, limit: Option<usize>) {
+        let limit = limit.unwrap_or(80).clamp(1, 200) as Id;
+        let end = before.saturating_sub(1).max(0);
+        let start = end.saturating_sub(limit).max(0);
+        let through = self.eja.revision().unwrap_or(end).min(end + limit);
+        match self.eja.entries_after(start, through) {
+            Ok(entries) => {
+                let mut items = build_stream(&entries, &state::proactive_reply_ids(&self.eja));
+                items.retain(|item| item.id < before);
+                (self.emit)(json!({ "event": "history", "items": items, "more": start > 0 }));
+            }
+            Err(err) => self.emit_error(err.to_string()),
+        }
+    }
+
+    fn dismiss_wake(&self, id: &str) {
+        match watch::dismiss_wake(&self.eja, id) {
+            Ok(_) => self.emit_state(None),
+            Err(err) => self.emit_error(err.to_string()),
         }
     }
 
@@ -1426,6 +1459,70 @@ mod tests {
         rt.handle_user_message("第 2 轮");
         rt.handle_user_message("第 3 轮");
         assert_eq!(brain.judge_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn history_pages_older_items_with_receipts_and_dismiss_wake_records_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let sink = events.clone();
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "chat",
+        });
+        let rt = HostRuntime::open_with_brain(
+            dir.path().join("Eja"),
+            brain,
+            Arc::new(move |ev| sink.lock().unwrap().push(ev)),
+        )
+        .unwrap();
+        let notice = rt.eja.notice(Source::World, "旧通知").unwrap();
+        let call = rt
+            .eja
+            .act(notice, "shell", json!({"command": "ls"}))
+            .unwrap();
+        let receipt = rt
+            .eja
+            .finish(call.id, Outcome::Observed("ok".into()))
+            .unwrap();
+
+        rt.emit_history(receipt.id, Some(1));
+        rt.emit_history(call.id, None);
+        {
+            let events = events.lock().unwrap();
+            let pages: Vec<&Value> = events
+                .iter()
+                .filter(|ev| ev["event"] == "history")
+                .collect();
+            assert_eq!(pages[0]["items"].as_array().unwrap().len(), 1);
+            assert_eq!(pages[0]["items"][0]["id"], call.id);
+            assert_eq!(pages[0]["items"][0]["outcome_status"], "observed");
+            assert_eq!(pages[0]["more"], true);
+            assert_eq!(pages[1]["items"][0]["id"], notice);
+            assert_eq!(pages[1]["items"][0]["kind"], "event");
+            assert_eq!(pages[1]["more"], false);
+        }
+
+        watch::schedule_wakes(
+            &rt.eja,
+            &[WakeAlarm {
+                id: "w-1".into(),
+                fire_at_unix: i64::MAX,
+                fire_at_display: "later".into(),
+                reason: "喝水提醒".into(),
+                guard: None,
+            }],
+        )
+        .unwrap();
+        rt.dismiss_wake("w-1");
+        assert!(watch::pending_wakes(&rt.eja).unwrap().is_empty());
+        let head = rt.eja.read(rt.eja.revision().unwrap()).unwrap();
+        assert!(matches!(
+            head.fact,
+            Fact::Noticed { source: Source::World, ref text } if text == "用户取消了定时唤醒：喝水提醒"
+        ));
+        assert!(!rt.has_pending_trigger());
+        assert!(events.lock().unwrap().last().unwrap()["event"] == "state");
     }
 
     #[test]

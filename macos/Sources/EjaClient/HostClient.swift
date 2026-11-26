@@ -210,13 +210,30 @@ public struct StreamItemDTO: Codable, Equatable, Identifiable, Sendable {
     public var id: Int64
     public var kind: String
     public var text: String
+    public var detail: String?
     public var outcomeStatus: String?
     public var receiptID: Int64?
 
     enum CodingKeys: String, CodingKey {
-        case id, kind, text
+        case id, kind, text, detail
         case outcomeStatus = "outcome_status"
         case receiptID = "receipt_id"
+    }
+}
+
+public struct ConcernDTO: Codable, Equatable, Identifiable, Sendable {
+    public var id: Int64
+    public var text: String
+}
+
+public struct WakeDTO: Codable, Equatable, Identifiable, Sendable {
+    public var id: String
+    public var fireAtDisplay: String
+    public var reason: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, reason
+        case fireAtDisplay = "fire_at_display"
     }
 }
 
@@ -233,15 +250,22 @@ private struct StateEventDTO: Decodable {
     let config: HostConfigDTO
     let capabilityStatuses: [CapabilityStatusDTO]
     let stream: [StreamItemDTO]
+    let concerns: [ConcernDTO]?
+    let wakes: [WakeDTO]?
     let saveId: String?
 
     enum CodingKeys: String, CodingKey {
-        case status, config, stream, configured
+        case status, config, stream, configured, concerns, wakes
         case statusDetail = "status_detail"
         case dataDir = "data_dir"
         case capabilityStatuses = "capability_statuses"
         case saveId = "save_id"
     }
+}
+
+private struct HistoryEventDTO: Decodable {
+    let items: [StreamItemDTO]
+    let more: Bool
 }
 
 @MainActor
@@ -259,6 +283,9 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var config: HostConfigDTO = HostConfigDTO()
     @Published public private(set) var capabilityStatuses: [CapabilityStatusDTO] = []
     @Published public private(set) var stream: [StreamItemDTO] = []
+    @Published public private(set) var concerns: [ConcernDTO] = []
+    @Published public private(set) var wakes: [WakeDTO] = []
+    @Published public private(set) var historyExhausted = false
     @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
 
@@ -293,6 +320,19 @@ public final class HostClient: ObservableObject {
 
     public func cancelTurn() {
         sendCommand(["cmd": "cancel"])
+    }
+
+    public var canLoadEarlier: Bool {
+        !historyExhausted && (stream.first?.id ?? 0) > 1
+    }
+
+    public func loadHistory() {
+        guard let first = stream.first?.id else { return }
+        sendCommand(["cmd": "history", "before": first])
+    }
+
+    public func dismissWake(id: String) {
+        sendCommand(["cmd": "dismiss_wake", "id": id])
     }
 
     public func saveConfig(
@@ -463,11 +503,19 @@ public final class HostClient: ObservableObject {
             isConfigured = state.configured
             config = state.config
             capabilityStatuses = state.capabilityStatuses
-            stream = state.stream
+            let windowStart = state.stream.first?.id ?? .max
+            stream = stream.filter { $0.id < windowStart } + state.stream
+            concerns = state.concerns ?? []
+            wakes = state.wakes ?? []
             isReady = true
             if let id = state.saveId {
                 configSaves.removeValue(forKey: id)?(config)
             }
+        case "history":
+            guard let page = try? decoder.decode(HistoryEventDTO.self, from: data) else { return }
+            let loadedStart = stream.first?.id ?? .max
+            stream = page.items.filter { $0.id < loadedStart } + stream
+            historyExhausted = !page.more
         case "activity":
             if let detail = json["status_detail"] as? String {
                 statusDetail = detail

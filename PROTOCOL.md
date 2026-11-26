@@ -43,11 +43,14 @@ eja-host --data-dir "<data_dir>"
 - 获取模型列表 `{"cmd":"list_models","id":"请求标识","provider":{...}}`。由宿主按当前数据目录和 Provider 配置请求。
 - 发起 HTTP 能力 OAuth 授权 `{"cmd":"oauth_capability","id":"github"}`
 - 立即重载能力 `{"cmd":"reload_capabilities"}`
+- 加载更早历史 `{"cmd":"history","before":120,"limit":80}`。返回 ID 小于 `before` 的流条目，`limit` 默认 80、上限 200。
+- 取消定时唤醒 `{"cmd":"dismiss_wake","id":"w-1"}`。宿主删除该唤醒并记录一条 `world` 通知，不触发回合，随后推送状态快照。
 
 ## 输出事件（Host -> Frontend，每行一条 JSON）
 
 - 状态快照 `{"event":"state","protocol_version":2,"kernel_version":"1.0.2","resources_dir":"...","status":"idle","status_detail":"在线","data_dir":"...","configured":true,"config":{...},"capability_statuses":[...],"stream":[...],"concerns":[...],"wakes":[...]}`
   `config.providers[].api_key` 始终为空字符串，`has_api_key` 表示是否已保存密钥。工具事件可附带 `outcome_status`、原始回执 ID `receipt_id` 与 `truncated`，这些字段由事实日志生成。`wakes[]` 可附带 `guard`，其中 `checker` 为规则名，`remaining` 为剩余检查次数。
+- 历史分页 `{"event":"history","items":[...],"more":true}`。`items` 与 `stream` 条目格式相同，`more` 表示是否还有更早的日志。
 - 回合内活动 `{"event":"activity","status_detail":"执行 Shell"}`。回合开始和结束仍发送状态快照。
 - 流式文本增量 `{"event":"delta","text":"..."}`。用户回合中模型生成文本时实时推送增量，转入工具调用（`activity`）或回合结算（`state`）时收束。
 - 单实例冲突 `{"event":"already_running","ui_pid":12345}`（同一数据目录已有运行中的 `eja-host` 时立即发出并退出，前端可激活已有实例后退出自身）

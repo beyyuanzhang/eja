@@ -7,6 +7,8 @@ final class ContentUIState: ObservableObject {
     @Published var showSettingsSheet: Bool = false
     @Published var baselineId: Int64 = -1
     @Published var sendHovered: Bool = false
+    @Published var expandedEvents: Set<Int64> = []
+    @Published var showAgenda: Bool = false
 
     func captureBaselineIfNeeded(isReady: Bool, dataDir: String, from stream: [StreamItemDTO]) {
         guard isReady, baselineId < 0 else { return }
@@ -36,6 +38,13 @@ struct ContentView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 18) {
+                            if canLoadEarlier {
+                                Button("加载更早", action: loadEarlier)
+                                    .buttonStyle(.plain)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(EjaTheme.inkMuted)
+                                    .frame(maxWidth: .infinity)
+                            }
                             ForEach(visibleItems) { item in
                                 streamRow(item)
                                     .id(item.id)
@@ -103,6 +112,10 @@ struct ContentView: View {
                                 .fill(EjaTheme.dangerTint)
                         )
                         .transition(.opacity.combined(with: .offset(y: 4)))
+                    }
+
+                    if !client.concerns.isEmpty || !client.wakes.isEmpty {
+                        agenda
                     }
 
                     composer
@@ -185,9 +198,54 @@ struct ContentView: View {
 
     private var visibleItems: [StreamItemDTO] {
         guard ui.baselineId >= 0 else { return [] }
-        return client.stream.filter { item in
-            item.id > ui.baselineId && (item.kind == "person" || item.kind == "eja" || item.outcomeStatus != nil)
+        return client.stream.filter { $0.id > ui.baselineId }
+    }
+
+    private var canLoadEarlier: Bool {
+        ui.baselineId >= 0 && (client.stream.contains { $0.id <= ui.baselineId } || client.canLoadEarlier)
+    }
+
+    private func loadEarlier() {
+        let hidden = client.stream.contains { $0.id <= ui.baselineId }
+        ui.baselineId = 0
+        if !hidden { client.loadHistory() }
+    }
+
+    private var agenda: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Button { ui.showAgenda.toggle() } label: {
+                HStack(spacing: 4) {
+                    Text(verbatim: "挂念 \(client.concerns.count) · 唤醒 \(client.wakes.count)")
+                    Image(systemName: ui.showAgenda ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9))
+                }
+            }
+            .buttonStyle(.plain)
+            if ui.showAgenda {
+                ForEach(client.concerns) { concern in
+                    Text(verbatim: "· \(concern.text)")
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+                ForEach(client.wakes) { wake in
+                    HStack(spacing: 6) {
+                        Text(verbatim: "\(wake.fireAtDisplay) · \(wake.reason)")
+                            .lineLimit(1)
+                        Spacer(minLength: 8)
+                        Button { client.dismissWake(id: wake.id) } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .medium))
+                        }
+                        .buttonStyle(EjaIconButtonStyle(size: 18))
+                        .help("取消此唤醒")
+                    }
+                }
+            }
         }
+        .font(.system(size: 12))
+        .foregroundStyle(EjaTheme.inkSecondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
     }
 
     private var streamingPreview: String {
@@ -249,22 +307,52 @@ struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
         case "event":
-            if let status = item.outcomeStatus {
-                let label = switch status {
-                case "observed": "已观测"
-                case "failed": "失败"
-                case "unknown": "未知"
-                default: "等待回执"
-                }
-                let reference = item.receiptID.map { "回执 #\($0)" } ?? "工具"
-                Text(verbatim: "\(reference) · \(label) · \(item.text)")
-                    .font(.system(size: 12))
-                    .foregroundStyle(EjaTheme.inkSecondary)
-                    .textSelection(.enabled)
-            }
+            eventRow(item)
         default:
             ejaTextRow(item.text)
         }
+    }
+
+    private func eventRow(_ item: StreamItemDTO) -> some View {
+        let summary: String
+        if let status = item.outcomeStatus {
+            let label = switch status {
+            case "observed": "已观测"
+            case "failed": "失败"
+            case "unknown": "未知"
+            default: "等待回执"
+            }
+            let reference = item.receiptID.map { "回执 #\($0)" } ?? "工具"
+            summary = "\(reference) · \(label) · \(item.text)"
+        } else {
+            summary = item.text
+        }
+        let expanded = ui.expandedEvents.contains(item.id)
+        return VStack(alignment: .leading, spacing: 4) {
+            if let detail = item.detail {
+                Button {
+                    if expanded { ui.expandedEvents.remove(item.id) } else { ui.expandedEvents.insert(item.id) }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(verbatim: summary)
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9))
+                    }
+                }
+                .buttonStyle(.plain)
+                if expanded {
+                    Text(verbatim: detail)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(EjaTheme.inkMuted)
+                        .textSelection(.enabled)
+                }
+            } else {
+                Text(verbatim: summary)
+                    .textSelection(.enabled)
+            }
+        }
+        .font(.system(size: 12))
+        .foregroundStyle(EjaTheme.inkSecondary)
     }
 
     private func ejaTextRow(_ text: String) -> some View {

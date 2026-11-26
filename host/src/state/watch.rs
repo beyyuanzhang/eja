@@ -189,6 +189,20 @@ pub fn pending_wakes(eja: &Eja) -> Result<Vec<WakeAlarm>> {
     decode_meta(eja.get_meta(META_WAKES)?)
 }
 
+pub fn dismiss_wake(eja: &Eja, id: &str) -> Result<bool> {
+    update_wakes(eja, |tx, wakes| {
+        let Some(index) = wakes.iter().position(|alarm| alarm.id == id) else {
+            return Ok(false);
+        };
+        let alarm = wakes.remove(index);
+        tx.notice(
+            Source::World,
+            format!("用户取消了{}", wake_notice_text(&alarm.reason)),
+        )?;
+        Ok(true)
+    })
+}
+
 pub fn next_wake_at(eja: &Eja) -> Result<Option<i64>> {
     Ok(pending_wakes(eja)?.first().map(|alarm| alarm.fire_at_unix))
 }
