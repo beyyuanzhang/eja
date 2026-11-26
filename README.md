@@ -1,14 +1,14 @@
 # eja
 
-**eja: an identity.**
+**eja is an open-source, sessionless harness for a continuously growing AI identity—one each person can shape for themselves.**
 
-A single, continuing AI identity, carried across conversations.
+The harness provides continuity; each person chooses how their eja remembers, what it can do, and how it works. Its history and tools can be extended over time, so the same identity grows through use instead of starting over with each session.
 
 ## 中文
 
-**eja：一个身份。**
+**eja 是一个开源、无 session 的 harness：让 AI 身份持续成长，并由每个人按自己的方式定制。**
 
-同一个 AI 主体，跨越一次次对话，持续存在。
+Harness 提供连续性；每个人都可以决定自己的 eja 如何记忆、能做什么、怎样工作。它的经历和能力可以随使用不断扩展，让同一个身份持续成长，而不是每次从新 session 开始。
 
 ## Install / 安装
 
