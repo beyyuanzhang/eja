@@ -4,7 +4,7 @@ use crate::oauth::OAuthToken;
 use crate::sandbox::{Sandbox, TrustedDir};
 use crate::state::watch::{self, WakeAlarm, WakeGuard};
 use crate::tool::{ToolExecution, ToolSpec, ToolTarget};
-use eja_core::{Call, eja, Outcome};
+use eja_core::{eja, Call, Outcome};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 

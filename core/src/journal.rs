@@ -1,5 +1,5 @@
 use crate::{
-    Call, Concern, eja, Entry, Error, Evidence, Fact, Id, Outcome, Result, Source, Timestamp,
+    eja, Call, Concern, Entry, Error, Evidence, Fact, Id, Outcome, Result, Source, Timestamp,
     FACT_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};

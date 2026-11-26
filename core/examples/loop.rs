@@ -1,5 +1,5 @@
 //! Offline application: a scripted judge and one host-owned file capability.
-use eja_core::{Call, eja, Fact, Outcome, Source};
+use eja_core::{eja, Call, Fact, Outcome, Source};
 use serde_json::Value;
 use std::{error::Error, fs, path::Path};
 
