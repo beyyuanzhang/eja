@@ -1,42 +1,46 @@
 # eja
 
-住在你 Mac 上的单一连续主体。不是一堆用完即弃的对话窗口，而是一个共享同一条时间线、能记住发生过的事、能定时醒来做事、也能自己改写界面的本地应用。
+**EJA is a personal AI assistant for your Mac that remembers what matters and helps you follow through.**
 
-## 安装
+It can remember useful details across conversations, keep track of things you care about, and remind you when something needs attention. You choose which tools it can use, and its history stays on your Mac.
 
-从 [Releases](https://github.com/beyyuanzhang/eja/releases/latest) 下载 `eja-<version>.dmg`（macOS 14+，Apple Silicon），把 `eja.app` 拖进 `/Applications`。
+EJA is designed to feel like one ongoing assistant, rather than a series of unrelated chat sessions. Under the hood, it uses an append-only history to carry context across conversations and keep a record of actions and their outcomes.
 
-首次打开如果被 macOS 拦截：
+## Install
+
+Download `eja-<version>.dmg` from [Releases](https://github.com/beyyuanzhang/eja/releases/latest) (macOS 14+, Apple Silicon), then drag `eja.app` into `/Applications`.
+
+If macOS blocks the app the first time you open it:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/eja.app
 ```
 
-有新版本时，应用会在右上角给出轻量提示，可直接在本地校验并更新重启；按住 `Option` 启动可进入出厂安全模式。
+When an update is available, the app shows a small notice in the upper-right corner. You can verify and install it locally, then restart. Hold `Option` while launching to enter the factory safe mode.
 
-## 数据放在哪里
+## Where your data lives
 
-应用本身（`eja.app`）只读、整体替换，数据分两处存放：
+The app (`eja.app`) is read-only and replaced as a whole during updates. Its data lives in two locations:
 
-- `~/Library/Application Support/ai.eja.kernel/`：内核数据（`subject.db` 事实日志、`config.json`、`oauth.json`、`memory.db` 向量缓存），由 macOS Seatbelt 隔离保护。
-- `~/Library/Application Support/eja/`：用户与 eja 共同拥有的空间——`capabilities.json`（Shell、本地 `exec` 插件、`stdio`/`http` MCP）与 `ui/`（eja 可自行修改的原生 SwiftUI 源码）。应用更新时会自动同步底层客户端并重编 `ui/`，不覆盖用户演化出的界面。
+- `~/Library/Application Support/ai.eja.kernel/`: kernel data, including the `subject.db` event log, `config.json`, `oauth.json`, and the `memory.db` vector cache. macOS Seatbelt isolates this directory.
+- `~/Library/Application Support/eja/`: shared space for you and EJA. It contains `capabilities.json` (Shell, local `exec` plugins, and `stdio`/`http` MCP) and `ui/` (native SwiftUI source that EJA can modify). App updates sync the underlying client and rebuild `ui/` without overwriting the interface you have evolved.
 
-## 仓库结构
+## Repository layout
 
-- `core/`：只追加事实日志、单调时间与行动回执内核（见 [core/README.md](core/README.md)）
-- `memory/`：基于本地向量模型与关键词的只读历史检索
-- `host/`：Rust 运行宿主、模型回合驱动、守望唤醒与能力沙箱
-- `macos/`：原生 SwiftUI 外壳、动态加载启动器与内置更新（见 [macos/README.md](macos/README.md)）
-- `PROTOCOL.md`：前端与 `eja-host` 的 stdio JSON 协议
+- `core/`: append-only event log, monotonic time, and action receipts ([core/README.md](core/README.md))
+- `memory/`: read-only history search using a local embedding model and keywords
+- `host/`: Rust runtime, model-turn orchestration, scheduled wakeups, and capability sandbox
+- `macos/`: native SwiftUI shell, dynamic launcher, and built-in updater ([macos/README.md](macos/README.md))
+- `PROTOCOL.md`: stdio JSON protocol between the UI and `eja-host`
 
-## 从源码构建
+## Build from source
 
 ```sh
 ./macos/scripts/build-app.sh
 open macos/build/eja.app
 ```
 
-运行校验：
+Run checks:
 
 ```sh
 cargo fmt --all -- --check
