@@ -171,6 +171,10 @@ impl Recall {
         Self { memory }
     }
 
+    pub(super) fn warm(&mut self, eja: &Eja) {
+        let _ = self.memory.warm(eja);
+    }
+
     pub(super) fn search(
         &mut self,
         eja: &Eja,

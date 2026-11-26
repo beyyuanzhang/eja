@@ -249,6 +249,7 @@ impl HostRuntime {
         self.connect_external_capabilities();
         self.drain_turn_commands();
         self.process_pending_turn();
+        self.recall.warm(&self.eja);
         loop {
             let delay = self.next_timer_delay()?;
             if delay.is_some_and(|delay| delay.is_zero()) {
@@ -827,6 +828,9 @@ impl HostRuntime {
             self.emit_error(format!("达到单回合最大步数上限 ({max_steps})，回合已暂停"));
         }
         self.set_status("idle", "在线");
+        if completed {
+            self.recall.warm(&self.eja);
+        }
         completed
     }
 

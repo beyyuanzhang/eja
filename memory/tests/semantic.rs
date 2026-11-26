@@ -204,3 +204,35 @@ fn reused_cache_checks_the_full_indexed_journal_prefix() -> TestResult {
     assert!(reopened.search(&first, "茶")?[0].similarity > 0.99);
     Ok(())
 }
+
+#[test]
+fn keyword_search_handles_unspaced_cjk_queries_and_hybrid_boosts_exact_symbols() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let eja = Eja::open(dir.path().join("subject.db"))?;
+    let port_fact = eja.notice(Source::World, "服务监听端口 9421 启动报错 ERR_BIND_9421")?;
+    let tea_fact = eja.notice(Source::Person, "日常偏好喝绿茶")?;
+
+    let kw_hits = MemoryIndex::keyword().search(&eja, "帮我查一下监听端口报错")?;
+    assert_eq!(kw_hits[0].evidence.entry.id, port_fact);
+
+    let mut memory = MemoryIndex::open(
+        dir.path().join("memory.db"),
+        ToyEncoder {
+            id: "toy-v1",
+            dims: 4,
+        },
+    )?;
+    assert!(memory.warm(&eja)?);
+    assert!(!memory.warm(&eja)?);
+
+    let hits = memory.search(&eja, "ERR_BIND_9421")?;
+    assert_eq!(hits[0].evidence.entry.id, port_fact);
+    assert!(
+        hits[0].similarity
+            > hits
+                .iter()
+                .find(|h| h.evidence.entry.id == tea_fact)
+                .map_or(0.0, |h| h.similarity)
+    );
+    Ok(())
+}

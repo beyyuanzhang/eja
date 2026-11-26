@@ -138,6 +138,19 @@ impl MemoryIndex {
         self.search_at(eja, cue, eja.revision()?)
     }
 
+    /// Incrementally index up to one batch of new journal entries into the derived cache.
+    /// Returns `Ok(true)` when a batch was processed and more entries may still remain.
+    pub fn warm(&mut self, eja: &Eja) -> Result<bool> {
+        let Some(index) = self.semantic.as_mut() else {
+            return Ok(false);
+        };
+        let head = eja.revision()?;
+        if head <= 0 {
+            return Ok(false);
+        }
+        index.catch_up_step(eja, head)
+    }
+
     /// Rank observations at the given revision. Use keywords if vectors are unavailable.
     pub fn search_at(&mut self, eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
         if cue.trim().is_empty() || cue.len() > FACT_BYTES {
@@ -189,16 +202,66 @@ fn fact_text(fact: &Fact) -> Option<String> {
     }
 }
 
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
+    )
+}
+
 fn tokenize_cue(cue: &str) -> Vec<String> {
-    let mut words: Vec<String> = cue
+    let mut tokens = Vec::new();
+    for part in cue
         .split(|ch: char| ch.is_whitespace() || DELIMITERS.contains(ch))
         .filter(|part| !part.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect();
-    if words.is_empty() {
-        words.push(cue.trim().to_ascii_lowercase());
+    {
+        let lower = part.to_ascii_lowercase();
+        let chars: Vec<char> = lower.chars().collect();
+        let mut start = 0;
+        while start < chars.len() {
+            let cjk = is_cjk(chars[start]);
+            let mut end = start + 1;
+            while end < chars.len() && is_cjk(chars[end]) == cjk {
+                end += 1;
+            }
+            if cjk && end - start >= 3 {
+                for pair in chars[start..end].windows(2) {
+                    let gram: String = pair.iter().collect();
+                    if !tokens.contains(&gram) {
+                        tokens.push(gram);
+                    }
+                }
+            } else {
+                let seg: String = chars[start..end].iter().collect();
+                if !tokens.contains(&seg) {
+                    tokens.push(seg);
+                }
+            }
+            start = end;
+        }
     }
-    words
+    if tokens.is_empty() {
+        tokens.push(cue.trim().to_ascii_lowercase());
+    }
+    tokens
+}
+
+fn lexical_ratio(text: &str, tokens: &[String]) -> f64 {
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let lower = text.to_ascii_lowercase();
+    let hits = tokens
+        .iter()
+        .filter(|token| lower.contains(token.as_str()))
+        .count();
+    hits as f64 / tokens.len() as f64
+}
+
+fn fuse_scores(vector: f64, lexical: f64) -> f64 {
+    let v = vector.clamp(0.0, 1.0);
+    let l = lexical.clamp(0.0, 1.0);
+    1.0 - (1.0 - v) * (1.0 - 0.5 * l)
 }
 
 fn rank_matches(eja: &Eja, head: Id, mut scored: Vec<(Id, f64)>) -> Result<Vec<Match>> {
@@ -219,7 +282,6 @@ fn rank_matches(eja: &Eja, head: Id, mut scored: Vec<(Id, f64)>) -> Result<Vec<M
 
 fn keyword_search_at(eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
     let words = tokenize_cue(cue);
-    let term_count = words.len() as f64;
     let mut scored = Vec::new();
     let mut cursor = 0;
     while cursor < head {
@@ -228,10 +290,9 @@ fn keyword_search_at(eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
             let Some(text) = fact_text(&entry.fact) else {
                 continue;
             };
-            let lower = text.to_ascii_lowercase();
-            let hits = words.iter().filter(|w| lower.contains(w.as_str())).count();
-            if hits > 0 {
-                scored.push((entry.id, hits as f64 / term_count));
+            let ratio = lexical_ratio(&text, &words);
+            if ratio > 0.0 {
+                scored.push((entry.id, ratio));
             }
         }
         cursor = end;
@@ -379,7 +440,7 @@ impl SemanticIndex {
         Ok(proof)
     }
 
-    fn catch_up(&mut self, eja: &Eja, through: Id) -> Result<Checkpoint> {
+    fn catch_up_step(&mut self, eja: &Eja, through: Id) -> Result<bool> {
         loop {
             let cached = self.checkpoint(&self.db)?;
             let cursor = cached.through;
@@ -399,7 +460,7 @@ impl SemanticIndex {
                 continue;
             }
             if cursor >= through {
-                return Ok(cached);
+                return Ok(false);
             }
             let batch_end = cursor.saturating_add(BATCH as Id).min(through);
             let entries = eja.entries_after(cursor, batch_end)?;
@@ -463,15 +524,23 @@ impl SemanticIndex {
             )?;
             tx.commit()?;
             self.verified = Some((eja.instance_id(), updated));
+            return Ok(true);
         }
+    }
+
+    fn catch_up(&mut self, eja: &Eja, through: Id) -> Result<Checkpoint> {
+        while self.catch_up_step(eja, through)? {}
+        self.checkpoint(&self.db)
     }
 
     fn search(&mut self, eja: &Eja, cue: &str, head: Id) -> Result<Vec<Match>> {
         let verified = self.catch_up(eja, head)?;
         let chunks = passages(cue);
         let queries = self.encode(InputKind::Query, &chunks)?;
+        let tokens = tokenize_cue(cue);
         let limit = (TOP * 32).min(256);
-        let mut scores: BTreeMap<Id, f64> = BTreeMap::new();
+        let mut vector_scores: BTreeMap<Id, f64> = BTreeMap::new();
+        let mut lexical_scores: BTreeMap<Id, f64> = BTreeMap::new();
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Deferred)?;
         if self.checkpoint(&tx)? != verified {
             return Err(Error::Conflict);
@@ -493,14 +562,40 @@ impl SemanticIndex {
                     let (key, distance) = row?;
                     let score = 1.0 - distance;
                     let id: Id = origin.query_row(params![key, head], |row| row.get(0))?;
-                    scores
+                    vector_scores
                         .entry(id)
                         .and_modify(|best| *best = best.max(score))
                         .or_insert(score);
                 }
             }
+            let mut scan = tx.prepare_cached(
+                "SELECT k.id, k.passage FROM memory_keys k
+                 WHERE EXISTS(SELECT 1 FROM memory_refs r WHERE r.key=k.id AND r.fact<=?1)",
+            )?;
+            let rows = scan.query_map([head], |row| {
+                Ok((row.get::<_, Id>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (key, passage) = row?;
+                let ratio = lexical_ratio(&passage, &tokens);
+                if ratio > 0.0 {
+                    let id: Id = origin.query_row(params![key, head], |row| row.get(0))?;
+                    lexical_scores
+                        .entry(id)
+                        .and_modify(|best| *best = best.max(ratio))
+                        .or_insert(ratio);
+                }
+            }
         }
         drop(tx);
-        rank_matches(eja, head, scores.into_iter().collect())
+        let mut combined: BTreeMap<Id, f64> = BTreeMap::new();
+        for (id, vec_score) in vector_scores {
+            let lex = lexical_scores.remove(&id).unwrap_or(0.0);
+            combined.insert(id, fuse_scores(vec_score, lex));
+        }
+        for (id, lex) in lexical_scores {
+            combined.insert(id, fuse_scores(0.0, lex));
+        }
+        rank_matches(eja, head, combined.into_iter().collect())
     }
 }
