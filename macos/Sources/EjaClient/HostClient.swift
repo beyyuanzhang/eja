@@ -271,6 +271,7 @@ private struct HistoryEventDTO: Decodable {
 @MainActor
 public final class HostClient: ObservableObject {
     private static let protocolVersion = 2
+    private static let maxStreamItems = 1000
 
     @Published public private(set) var isReady: Bool = false
     @Published public private(set) var alreadyRunning: Bool = false
@@ -504,7 +505,9 @@ public final class HostClient: ObservableObject {
             config = state.config
             capabilityStatuses = state.capabilityStatuses
             let windowStart = state.stream.first?.id ?? .max
-            stream = stream.filter { $0.id < windowStart } + state.stream
+            let merged = stream.filter { $0.id < windowStart } + state.stream
+            if merged.count > Self.maxStreamItems { historyExhausted = false }
+            stream = Array(merged.suffix(Self.maxStreamItems))
             concerns = state.concerns ?? []
             wakes = state.wakes ?? []
             isReady = true

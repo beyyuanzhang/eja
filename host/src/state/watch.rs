@@ -195,9 +195,10 @@ pub fn dismiss_wake(eja: &Eja, id: &str) -> Result<bool> {
             return Ok(false);
         };
         let alarm = wakes.remove(index);
+        let reason = &alarm.reason[..alarm.reason.floor_char_boundary(1024)];
         tx.notice(
             Source::World,
-            format!("用户取消了{}", wake_notice_text(&alarm.reason)),
+            format!("用户取消了{}", wake_notice_text(reason)),
         )?;
         Ok(true)
     })
@@ -335,5 +336,21 @@ mod tests {
         ));
         let (fired_again, _, _) = collect_due_wakes(&eja).unwrap();
         assert!(!fired_again);
+    }
+
+    #[test]
+    fn dismissing_a_wake_with_a_maximal_reason_still_fits_the_notice() {
+        let eja = Eja::open(":memory:").unwrap();
+        let alarm = WakeAlarm {
+            id: "w-big".into(),
+            fire_at_unix: 100,
+            fire_at_display: "later".into(),
+            reason: "长".repeat((FACT_BYTES - 64) / 3),
+            guard: None,
+        };
+        schedule_wakes(&eja, &[alarm]).unwrap();
+        assert!(dismiss_wake(&eja, "w-big").unwrap());
+        assert!(pending_wakes(&eja).unwrap().is_empty());
+        assert!(!dismiss_wake(&eja, "w-big").unwrap());
     }
 }

@@ -459,18 +459,24 @@ impl HostRuntime {
     }
 
     fn emit_history(&self, before: Id, limit: Option<usize>) {
-        let limit = limit.unwrap_or(80).clamp(1, 200) as Id;
+        let limit = limit.unwrap_or(80).clamp(1, 200);
         let end = before.saturating_sub(1).max(0);
-        let start = end.saturating_sub(limit).max(0);
-        let through = self.eja.revision().unwrap_or(end).min(end + limit);
-        match self.eja.entries_after(start, through) {
-            Ok(entries) => {
-                let mut items = build_stream(&entries, &state::proactive_reply_ids(&self.eja));
-                items.retain(|item| item.id < before);
-                (self.emit)(json!({ "event": "history", "items": items, "more": start > 0 }));
+        let through = self.eja.revision().unwrap_or(end).min(end + limit as Id);
+        let proactive = state::proactive_reply_ids(&self.eja);
+        let (mut start, mut span, mut items) = (end, limit as Id, Vec::new());
+        while start > 0 && items.len() < limit {
+            start = start.saturating_sub(span).max(0);
+            span = span.saturating_mul(2);
+            match self.eja.entries_after(start, through) {
+                Ok(entries) => items = build_stream(&entries, &proactive),
+                Err(err) => return self.emit_error(err.to_string()),
             }
-            Err(err) => self.emit_error(err.to_string()),
+            items.retain(|item| item.id < before);
         }
+        let excess = items.len().saturating_sub(limit);
+        items.drain(..excess);
+        let more = start > 0 || excess > 0;
+        (self.emit)(json!({ "event": "history", "items": items, "more": more }));
     }
 
     fn dismiss_wake(&self, id: &str) {
@@ -1414,9 +1420,13 @@ mod tests {
         )
         .unwrap();
         let notice = rt.eja.notice(Source::World, "旧通知").unwrap();
+        for index in 0..5 {
+            rt.eja.keep(None, format!("挂念 {index}")).unwrap();
+        }
+        let notice_head = rt.eja.revision().unwrap();
         let call = rt
             .eja
-            .act(notice, "shell", json!({"command": "ls"}))
+            .act(notice_head, "shell", json!({"command": "ls"}))
             .unwrap();
         let receipt = rt
             .eja
@@ -1424,7 +1434,7 @@ mod tests {
             .unwrap();
 
         rt.emit_history(receipt.id, Some(1));
-        rt.emit_history(call.id, None);
+        rt.emit_history(call.id, Some(1));
         {
             let events = events.lock().unwrap();
             let pages: Vec<&Value> = events

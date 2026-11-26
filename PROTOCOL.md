@@ -43,7 +43,7 @@ eja-host --data-dir "<data_dir>"
 - 获取模型列表 `{"cmd":"list_models","id":"请求标识","provider":{...}}`。由宿主按当前数据目录和 Provider 配置请求。
 - 发起 HTTP 能力 OAuth 授权 `{"cmd":"oauth_capability","id":"github"}`
 - 立即重载能力 `{"cmd":"reload_capabilities"}`
-- 加载更早历史 `{"cmd":"history","before":120,"limit":80}`。返回 ID 小于 `before` 的流条目，`limit` 默认 80、上限 200。
+- 加载更早历史 `{"cmd":"history","before":120,"limit":80}`。返回 ID 小于 `before` 的至多 `limit` 条流条目，`limit` 默认 80、上限 200。
 - 取消定时唤醒 `{"cmd":"dismiss_wake","id":"w-1"}`。宿主删除该唤醒并记录一条 `world` 通知，不触发回合，随后推送状态快照。
 
 ## 输出事件（Host -> Frontend，每行一条 JSON）
