@@ -28,7 +28,7 @@ xattr -dr com.apple.quarantine /Applications/eja.app
 
 ```sh
 ./macos/scripts/build-app.sh
-open macos/build/eja.app
+open /Applications/eja.app
 ```
 
 See [core/README.md](core/README.md) for the identity log and core API, and [macos/README.md](macos/README.md) for macOS development details.

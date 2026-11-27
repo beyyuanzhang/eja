@@ -22,7 +22,7 @@ pub(super) enum ProcessInput<'a> {
 pub(super) fn execute_shell(
     sandbox: &Sandbox,
     data_dir: &TrustedDir,
-    call_id: eja_core::Id,
+    output_tag: &str,
     input: &Value,
 ) -> Outcome {
     let command = input
@@ -54,7 +54,7 @@ pub(super) fn execute_shell(
         &cwd,
         timeout,
         data_dir,
-        call_id,
+        output_tag,
     )
     .outcome
 }
@@ -99,7 +99,7 @@ fn shell_output(
     (mut stdout, out_len): (tempfile::SpooledTempFile, u64),
     (mut stderr, err_len): (tempfile::SpooledTempFile, u64),
     data_dir: &TrustedDir,
-    call_id: eja_core::Id,
+    output_tag: &str,
 ) -> io::Result<String> {
     let preview = |stream: &mut tempfile::SpooledTempFile| -> io::Result<String> {
         let mut bytes = Vec::new();
@@ -129,7 +129,7 @@ fn shell_output(
     stdout.rewind()?;
     stderr.rewind()?;
     let stream = stdout.chain(separator.as_bytes()).chain(stderr);
-    match data_dir.write_new_file_in_subdir("outputs", &format!("shell-{call_id}.log"), stream) {
+    match data_dir.write_new_file_in_subdir("outputs", &format!("{output_tag}.log"), stream) {
         Ok(path) => Ok(format!(
             "{preview}\n[output truncated at {MAX_SHELL_BYTES} bytes; full {total} bytes saved to {}]",
             path.display()
@@ -148,7 +148,7 @@ pub(super) fn run_process(
     cwd: &Path,
     timeout: Duration,
     data_dir: &TrustedDir,
-    call_id: eja_core::Id,
+    output_tag: &str,
 ) -> ToolExecution {
     let resolved = if program.contains('/') && Path::new(program).is_relative() {
         cwd.join(program).to_string_lossy().into_owned()
@@ -229,7 +229,7 @@ pub(super) fn run_process(
                 }
                 _ => (tempfile::spooled_tempfile(MAX_SHELL_BYTES), 0),
             };
-            shell_output(text, stderr, data_dir, call_id)
+            shell_output(text, stderr, data_dir, output_tag)
         }
         (Ok(Err(err)), _) | (_, Ok(Err(err))) => Err(err),
         _ => Err(io::Error::other("输出读取线程中断")),
@@ -269,6 +269,7 @@ mod tests {
         data_dir: &TrustedDir,
         call_id: eja_core::Id,
     ) -> Outcome {
+        let tag = format!("shell-{call_id}");
         run_process(
             sandbox,
             "/bin/sh",
@@ -278,7 +279,7 @@ mod tests {
             cwd,
             timeout,
             data_dir,
-            call_id,
+            &tag,
         )
         .outcome
     }
@@ -352,7 +353,7 @@ mod tests {
         assert!(out.0.is_rolled());
         let err = capture_shell_stream(stderr.as_slice()).unwrap();
         assert!(!err.0.is_rolled());
-        let preview = shell_output(out, err, &root, 12).unwrap();
+        let preview = shell_output(out, err, &root, "shell-12").unwrap();
         assert!(preview.starts_with(&stdout[..90]));
         assert!(preview.contains("saved to"));
         assert!(preview.len() < MAX_SHELL_BYTES + 512);
@@ -404,7 +405,7 @@ mod tests {
             dir.path(),
             Duration::from_millis(150),
             &data,
-            1,
+            "exec-1",
         );
         assert!(matches!(result.outcome, Outcome::Unknown(ref msg) if msg.contains("命令超时")));
         assert!(started.elapsed() < Duration::from_secs(3));

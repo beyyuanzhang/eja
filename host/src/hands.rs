@@ -44,7 +44,7 @@ impl Hands {
         capabilities: &[CapabilityConfig],
     ) -> Self {
         let mut pool = CapabilityPool::with_core_dir(sandbox, core_dir);
-        pool.register_local(capabilities);
+        pool.register_local(capabilities, &data_dir);
         Self {
             data_dir,
             capabilities: pool,
@@ -52,7 +52,8 @@ impl Hands {
     }
 
     pub fn reload(&mut self, capabilities: &[CapabilityConfig], force: bool) {
-        self.capabilities.reload(capabilities, force);
+        self.capabilities
+            .reload(capabilities, force, &self.data_dir);
     }
 
     pub fn disconnect_dead(&mut self) -> bool {
@@ -79,12 +80,30 @@ impl Hands {
         capabilities: &[CapabilityConfig],
     ) -> Result<(), String> {
         self.capabilities.save_oauth_token(id, token)?;
-        self.capabilities.reload(capabilities, false);
+        self.capabilities
+            .reload(capabilities, false, &self.data_dir);
         Ok(())
     }
 
     pub fn capability_statuses(&self) -> Vec<CapabilityStatus> {
         self.capabilities.statuses()
+    }
+
+    pub fn capability_owner(&self, capability: &str) -> Option<String> {
+        self.capabilities.owner_id(capability)
+    }
+
+    pub fn call_capability(
+        &mut self,
+        capability: &str,
+        output_tag: &str,
+        input: &Value,
+    ) -> (Option<String>, ToolExecution) {
+        let owner = self.capabilities.owner_id(capability);
+        let execution = self
+            .capabilities
+            .call(capability, output_tag, input, &self.data_dir);
+        (owner, execution)
     }
 
     pub fn tools(&self, receipt_answer: bool) -> Vec<ToolSpec> {
@@ -242,9 +261,12 @@ impl Hands {
                 }
                 .into()
             }
-            other => self
-                .capabilities
-                .call(other, call.id, &call.input, &self.data_dir),
+            other => self.capabilities.call(
+                other,
+                &format!("shell-{}", call.id),
+                &call.input,
+                &self.data_dir,
+            ),
         }
     }
 }

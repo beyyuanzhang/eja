@@ -624,15 +624,21 @@ impl CapabilityPool {
         Ok(())
     }
 
-    pub fn register_local(&mut self, configs: &[CapabilityConfig]) {
-        self.reconcile(configs, false, false);
+    pub fn register_local(&mut self, configs: &[CapabilityConfig], data_dir: &TrustedDir) {
+        self.reconcile(configs, false, false, data_dir);
     }
 
-    pub fn reload(&mut self, configs: &[CapabilityConfig], force: bool) {
-        self.reconcile(configs, force, true);
+    pub fn reload(&mut self, configs: &[CapabilityConfig], force: bool, data_dir: &TrustedDir) {
+        self.reconcile(configs, force, true, data_dir);
     }
 
-    fn reconcile(&mut self, configs: &[CapabilityConfig], force: bool, connect_mcp: bool) {
+    fn reconcile(
+        &mut self,
+        configs: &[CapabilityConfig],
+        force: bool,
+        connect_mcp: bool,
+        data_dir: &TrustedDir,
+    ) {
         let mut previous: HashMap<_, _> = std::mem::take(&mut self.entries)
             .into_iter()
             .map(|entry| (entry.config.id.clone(), entry))
@@ -665,17 +671,18 @@ impl CapabilityPool {
                 && (connect_mcp || !config.transport.is_mcp())
                 && !matches!(entry.connection, Ok(Some(_)))
             {
-                entry.connection = connect_and_list(&self.sandbox, &mut self.oauth, config).map(
-                    |(connection, tools)| {
-                        let generation = self.next_generation;
-                        self.next_generation += 1;
-                        Some(ConnectedCapability {
-                            connection,
-                            tools,
-                            generation,
-                        })
-                    },
-                );
+                entry.connection =
+                    connect_and_list(&self.sandbox, &mut self.oauth, config, data_dir).map(
+                        |(connection, tools)| {
+                            let generation = self.next_generation;
+                            self.next_generation += 1;
+                            Some(ConnectedCapability {
+                                connection,
+                                tools,
+                                generation,
+                            })
+                        },
+                    );
             }
             self.entries.push(entry);
         }
@@ -733,10 +740,21 @@ impl CapabilityPool {
             .any(|(tool, current)| current == generation && tool.capability == capability)
     }
 
+    pub fn owner_id(&self, capability: &str) -> Option<String> {
+        self.entries.iter().find_map(|entry| {
+            let active = entry.connection.as_ref().ok()?.as_ref()?;
+            active
+                .tools
+                .iter()
+                .any(|tool| tool.capability == capability)
+                .then(|| entry.config.id.clone())
+        })
+    }
+
     pub fn call(
         &mut self,
         capability: &str,
-        call_id: eja_core::Id,
+        output_tag: &str,
         input: &Value,
         data_dir: &TrustedDir,
     ) -> ToolExecution {
@@ -748,6 +766,15 @@ impl CapabilityPool {
                 .find(|tool| tool.capability == capability)?;
             Some((&entry.config, &mut active.connection, tool))
         }) else {
+            if let Some(entry) = self.entries.iter().find(|entry| {
+                if entry.config.enabled {
+                    return false;
+                }
+                let prefix = format!("cap.{}", route_component(&entry.config.id));
+                capability == prefix || capability.starts_with(&format!("{prefix}."))
+            }) {
+                return Outcome::Failed(format!("能力已关闭: {}", entry.config.id)).into();
+            }
             return Outcome::Failed(format!("未知能力: {capability}")).into();
         };
         let args = if input.is_object() {
@@ -757,24 +784,28 @@ impl CapabilityPool {
         };
         match &connection {
             ActiveConnection::Builtin => {
-                return execute_shell(&self.sandbox, data_dir, call_id, input).into();
+                return execute_shell(&self.sandbox, data_dir, output_tag, input).into();
             }
             ActiveConnection::Exec {
                 command,
                 args: cmd_args,
                 env,
             } => {
+                let exec_env = match capability_env(config, env, data_dir) {
+                    Ok(env) => env,
+                    Err(err) => return Outcome::Failed(err).into(),
+                };
                 let stdin_bytes = serde_json::to_vec(&args).unwrap_or_else(|_| b"{}".to_vec());
                 return run_process(
                     &self.sandbox,
                     command,
                     cmd_args,
-                    env,
+                    &exec_env,
                     ProcessInput::Exec(&stdin_bytes),
                     data_dir.path(),
                     TOOL_TIMEOUT,
                     data_dir,
-                    call_id,
+                    output_tag,
                 );
             }
             ActiveConnection::Stdio(_) | ActiveConnection::Http(_) => {}
@@ -808,10 +839,29 @@ impl CapabilityPool {
     }
 }
 
+fn capability_env(
+    cfg: &CapabilityConfig,
+    base_env: &BTreeMap<String, String>,
+    data_dir: &TrustedDir,
+) -> Result<BTreeMap<String, String>, String> {
+    let cap_data_dir = data_dir
+        .ensure_nested_dir(&["capabilities", &route_component(&cfg.id), "data"])
+        .map_err(|err| format!("创建能力数据目录失败 ({}): {err}", cfg.id))?;
+    let mut env = base_env.clone();
+    env.insert("eja_DATA_DIR".into(), data_dir.path().display().to_string());
+    env.insert("EJA_CAPABILITY_ID".into(), cfg.id.clone());
+    env.insert(
+        "EJA_CAPABILITY_DATA_DIR".into(),
+        cap_data_dir.display().to_string(),
+    );
+    Ok(env)
+}
+
 fn connect_and_list(
     sandbox: &Sandbox,
     oauth: &mut OAuthStore,
     cfg: &CapabilityConfig,
+    data_dir: &TrustedDir,
 ) -> Result<(ActiveConnection, Vec<CapabilityTool>), String> {
     let mut conn = match &cfg.transport {
         CapabilityTransport::Builtin => {
@@ -870,7 +920,9 @@ fn connect_and_list(
             ));
         }
         CapabilityTransport::Stdio { command, args, env } => {
-            StdioConnection::connect(sandbox, command, args, env).map(ActiveConnection::Stdio)?
+            let stdio_env = capability_env(cfg, env, data_dir)?;
+            StdioConnection::connect(sandbox, command, args, &stdio_env)
+                .map(ActiveConnection::Stdio)?
         }
         CapabilityTransport::Http { url, headers } => {
             let mut http = HttpConnection::new(url, headers);
@@ -1082,14 +1134,18 @@ mod tests {
         let core = dir.path().join("private");
         std::fs::create_dir(&core).unwrap();
         let mut pool = CapabilityPool::new(Sandbox::new(&core).unwrap());
-        pool.reload(&[config("a.b", "first"), config("a_b", "second")], false);
+        pool.reload(
+            &[config("a.b", "first"), config("a_b", "second")],
+            false,
+            &data,
+        );
         let routes: Vec<_> = pool
             .tools()
             .map(|(tool, _)| tool.capability.clone())
             .collect();
         assert_ne!(routes[0], routes[1]);
         assert_eq!(
-            pool.call(&routes[1], 1, &json!({}), &data).outcome,
+            pool.call(&routes[1], "shell-1", &json!({}), &data).outcome,
             Outcome::Observed("second".into())
         );
         assert_ne!(route_component("a.b"), route_component("a%2Eb"));
@@ -1197,29 +1253,40 @@ for line in sys.stdin:
                 },
             }],
             false,
+            &data_dir,
         );
 
         let names: Vec<_> = pool.tools().map(|(tool, _)| tool.name.as_str()).collect();
         assert_eq!(names, ["op", "z"]);
         for mode in ["null", "bad_flag", "bad_block", "input_required"] {
             assert!(matches!(
-                pool.call("cap.flaky.op", 1, &json!({"mode":mode}), &data_dir)
+                pool.call("cap.flaky.op", "shell-1", &json!({"mode":mode}), &data_dir)
                     .outcome,
                 Outcome::Unknown(_)
             ));
         }
         assert!(matches!(
-            pool.call("cap.flaky.op", 1, &json!({"mode":"empty"}), &data_dir)
-                .outcome,
+            pool.call(
+                "cap.flaky.op",
+                "shell-1",
+                &json!({"mode":"empty"}),
+                &data_dir
+            )
+            .outcome,
             Outcome::Observed(_)
         ));
         assert_eq!(
-            pool.call("cap.flaky.op", 1, &json!({ "mode": "err" }), &data_dir)
-                .outcome,
+            pool.call(
+                "cap.flaky.op",
+                "shell-1",
+                &json!({ "mode": "err" }),
+                &data_dir
+            )
+            .outcome,
             Outcome::Failed("rejected".into())
         );
         assert!(matches!(
-            pool.call("cap.flaky.op", 1, &json!({ "mode": "drop" }), &data_dir).outcome,
+            pool.call("cap.flaky.op", "shell-1", &json!({ "mode": "drop" }), &data_dir).outcome,
             Outcome::Unknown(ref msg) if msg.contains("MCP 响应超时或进程退出")
         ));
     }
@@ -1265,41 +1332,46 @@ for line in sys.stdin:
         let mut pool = CapabilityPool::new(Sandbox::new(&core_dir).unwrap());
         let first = make_cfg("a", "A", true);
         let second = make_cfg("b", "B", true);
-        pool.reload(std::slice::from_ref(&first), false);
-        let Outcome::Observed(pid_before) =
-            pool.call("cap.a.pid", 1, &json!({}), &data_dir).outcome
+        pool.reload(std::slice::from_ref(&first), false, &data_dir);
+        let Outcome::Observed(pid_before) = pool
+            .call("cap.a.pid", "shell-1", &json!({}), &data_dir)
+            .outcome
         else {
             panic!("expected observed pid");
         };
 
         let mut renamed_first = first.clone();
         renamed_first.name = "A Renamed".into();
-        pool.reload(&[renamed_first.clone(), second.clone()], false);
+        pool.reload(&[renamed_first.clone(), second.clone()], false, &data_dir);
         assert_eq!(
-            pool.call("cap.a.pid", 1, &json!({}), &data_dir).outcome,
+            pool.call("cap.a.pid", "shell-1", &json!({}), &data_dir)
+                .outcome,
             Outcome::Observed(pid_before.clone())
         );
         assert!(matches!(
-            pool.call("cap.b.pid", 1, &json!({}), &data_dir).outcome,
+            pool.call("cap.b.pid", "shell-1", &json!({}), &data_dir)
+                .outcome,
             Outcome::Observed(_)
         ));
 
-        pool.reload(std::slice::from_ref(&renamed_first), true);
-        let Outcome::Observed(pid_after_force) =
-            pool.call("cap.a.pid", 1, &json!({}), &data_dir).outcome
+        pool.reload(std::slice::from_ref(&renamed_first), true, &data_dir);
+        let Outcome::Observed(pid_after_force) = pool
+            .call("cap.a.pid", "shell-1", &json!({}), &data_dir)
+            .outcome
         else {
             panic!("expected observed pid after force reload");
         };
         assert_ne!(pid_after_force, pid_before);
 
         assert!(matches!(
-            pool.call("cap.a.pid", 1, &json!({ "exit": true }), &data_dir)
+            pool.call("cap.a.pid", "shell-1", &json!({ "exit": true }), &data_dir)
                 .outcome,
             Outcome::Unknown(_)
         ));
-        pool.reload(std::slice::from_ref(&renamed_first), false);
-        let Outcome::Observed(pid_after_crash) =
-            pool.call("cap.a.pid", 1, &json!({}), &data_dir).outcome
+        pool.reload(std::slice::from_ref(&renamed_first), false, &data_dir);
+        let Outcome::Observed(pid_after_crash) = pool
+            .call("cap.a.pid", "shell-1", &json!({}), &data_dir)
+            .outcome
         else {
             panic!("expected observed pid after dead process reload");
         };
@@ -1349,14 +1421,14 @@ for line in sys.stdin:
         };
 
         let mut pool = CapabilityPool::new(Sandbox::new(&core_dir).unwrap());
-        pool.reload(&[make_cfg("old_id")], false);
+        pool.reload(&[make_cfg("old_id")], false, &data_dir);
         assert_eq!(
-            pool.call("cap.old_id.ping", 1, &json!({}), &data_dir)
+            pool.call("cap.old_id.ping", "shell-1", &json!({}), &data_dir)
                 .outcome,
             Outcome::Observed("ok".into())
         );
 
-        pool.reload(&[make_cfg("new_id")], false);
+        pool.reload(&[make_cfg("new_id")], false, &data_dir);
         let statuses = pool.statuses();
         assert_eq!(statuses.len(), 1);
         assert!(
@@ -1365,7 +1437,7 @@ for line in sys.stdin:
             statuses[0].error
         );
         assert_eq!(
-            pool.call("cap.new_id.ping", 1, &json!({}), &data_dir)
+            pool.call("cap.new_id.ping", "shell-1", &json!({}), &data_dir)
                 .outcome,
             Outcome::Observed("ok".into())
         );

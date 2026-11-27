@@ -207,6 +207,53 @@ impl TrustedDir {
         }
     }
 
+    pub fn ensure_nested_dir(&self, segments: &[&str]) -> io::Result<PathBuf> {
+        let mut validated = Vec::with_capacity(segments.len());
+        for segment in segments {
+            validated.push(validate_single_name(segment)?);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut current_owned: Option<fs::File> = None;
+            let mut current_fd = self.dir.as_raw_fd();
+            for c_seg in &validated {
+                if unsafe { mkdirat(current_fd, c_seg.as_ptr(), 0o755) } < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(err);
+                    }
+                }
+                let next = openat_file(
+                    current_fd,
+                    c_seg,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                    None,
+                )?;
+                current_fd = next.as_raw_fd();
+                current_owned = Some(next);
+            }
+            drop(current_owned);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = &validated;
+            require_real_dir(&self.path, "root is not a real directory")?;
+            let mut cur = self.path.clone();
+            for segment in segments {
+                cur.push(segment);
+                match fs::create_dir(&cur) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(err) => return Err(err),
+                }
+                require_real_dir(&cur, "nested dir is not a real directory")?;
+            }
+        }
+        Ok(segments
+            .iter()
+            .fold(self.path.clone(), |acc, s| acc.join(s)))
+    }
+
     pub fn write_file_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         let c_name = validate_single_name(name)?;
         let pid = std::process::id();
@@ -847,5 +894,28 @@ mod tests {
             fs::read_to_string(moved.join("outputs/shell-4.log")).unwrap(),
             "pinned"
         );
+    }
+
+    #[test]
+    fn ensure_nested_dir_creates_real_dirs_and_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("eja");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&data_dir).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let root = TrustedDir::open(&data_dir).unwrap();
+
+        let created = root
+            .ensure_nested_dir(&["capabilities", "desk", "data"])
+            .unwrap();
+        assert_eq!(created, data_dir.join("capabilities/desk/data"));
+        assert!(created.is_dir());
+
+        symlink(&outside, data_dir.join("capabilities/evil")).unwrap();
+        assert!(root
+            .ensure_nested_dir(&["capabilities", "evil", "data"])
+            .is_err());
+        assert!(!outside.join("data").exists());
     }
 }

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import UserNotifications
 
@@ -185,6 +186,28 @@ public struct CapabilityToolSummaryDTO: Codable, Equatable, Identifiable, Sendab
     public var capability: String
 }
 
+public struct CapabilityCallResult: Equatable, Sendable {
+    public let ok: Bool
+    public let output: String?
+    public let error: String?
+
+    public init(ok: Bool, output: String? = nil, error: String? = nil) {
+        self.ok = ok
+        self.output = output
+        self.error = error
+    }
+}
+
+public struct CapabilityChangeEvent: Equatable, Sendable {
+    public let id: String
+    public let capability: String
+
+    public init(id: String, capability: String) {
+        self.id = id
+        self.capability = capability
+    }
+}
+
 public struct CapabilityStatusDTO: Codable, Equatable, Identifiable, Sendable {
     public var id: String
     public var name: String
@@ -266,7 +289,7 @@ private struct HistoryEventDTO: Decodable {
 
 @MainActor
 public final class HostClient: ObservableObject {
-    private static let protocolVersion = 2
+    private static let protocolVersion = 3
     private static let maxStreamItems = 1000
 
     @Published public private(set) var isReady: Bool = false
@@ -285,12 +308,14 @@ public final class HostClient: ObservableObject {
     @Published public private(set) var historyExhausted = false
     @Published public var providerTestResults: [String: ProviderTestResult] = [:]
     @Published public var errorBanner: String?
+    public let capabilityChanged = PassthroughSubject<CapabilityChangeEvent, Never>()
 
     private var process: Process?
     private var stdinHandle: FileHandle?
     private let decoder = JSONDecoder()
     private var configSaves: [String: (HostConfigDTO) -> Void] = [:]
     private var modelLists: [String: ([String]?) -> Void] = [:]
+    private var capabilityCalls: [String: (CapabilityCallResult) -> Void] = [:]
 
     public init(hostExecutableURL: URL? = nil, dataDir: URL? = nil) {
         if Bundle.main.bundleURL.pathExtension == "app" {
@@ -387,6 +412,28 @@ public final class HostClient: ObservableObject {
         sendCommand(["cmd": "oauth_capability", "id": id])
     }
 
+    public func isCapabilityEnabled(_ id: String) -> Bool {
+        capabilityStatuses.first(where: { $0.id == id })?.enabled == true
+    }
+
+    public func callCapability(
+        _ capability: String,
+        input: [String: Any] = [:],
+        completion: @escaping (CapabilityCallResult) -> Void
+    ) {
+        let id = UUID().uuidString
+        if sendCommand([
+            "cmd": "call_capability",
+            "id": id,
+            "capability": capability,
+            "input": input,
+        ]) {
+            capabilityCalls[id] = completion
+        } else {
+            completion(CapabilityCallResult(ok: false, error: "无法向 eja-host 发送能力调用指令"))
+        }
+    }
+
     private func startHost(executableURL: URL?, dataDir: URL?) {
         guard let executableURL else {
             errorBanner = "找不到 eja-host，请先运行 ./macos/scripts/build-app.sh"
@@ -448,10 +495,15 @@ public final class HostClient: ObservableObject {
         streamingText = ""
         let saves = configSaves
         let lists = modelLists
+        let calls = capabilityCalls
         configSaves.removeAll()
         modelLists.removeAll()
+        capabilityCalls.removeAll()
         for saved in saves.values { saved(config) }
         for listed in lists.values { listed(nil) }
+        for called in calls.values {
+            called(CapabilityCallResult(ok: false, error: "eja-host 已退出"))
+        }
         if !alreadyRunning && errorBanner == nil {
             errorBanner = "eja-host 已退出（退出码 \(exitCode)）"
         }
@@ -532,6 +584,21 @@ public final class HostClient: ObservableObject {
             if let id = json["id"] as? String, let listed = modelLists.removeValue(forKey: id) {
                 if let error = json["error"] as? String { errorBanner = error }
                 listed(json["models"] as? [String])
+            }
+        case "capability_result":
+            if let id = json["id"] as? String,
+               let ok = json["ok"] as? Bool,
+               let called = capabilityCalls.removeValue(forKey: id) {
+                called(CapabilityCallResult(
+                    ok: ok,
+                    output: json["output"] as? String,
+                    error: json["error"] as? String
+                ))
+            }
+        case "capability_changed":
+            if let id = json["id"] as? String,
+               let capability = json["capability"] as? String {
+                capabilityChanged.send(CapabilityChangeEvent(id: id, capability: capability))
             }
         case "notify":
             if Bundle.main.bundleURL.pathExtension == "app",

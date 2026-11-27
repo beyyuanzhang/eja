@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 mod recall;
 
 pub type EventSink = Arc<dyn Fn(Value) + Send + Sync>;
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RETRY_ATTEMPTS: u8 = 3;
 
@@ -74,6 +74,12 @@ pub enum HostCommand {
         id: String,
     },
     ReloadCapabilities,
+    CallCapability {
+        id: String,
+        capability: String,
+        #[serde(default)]
+        input: Value,
+    },
     Cancel,
     History {
         before: Id,
@@ -134,6 +140,7 @@ pub struct HostRuntime {
     config: HostConfig,
     capabilities_bytes: Option<Vec<u8>>,
     hands: Hands,
+    next_capability_call: u64,
     oauth_tx: Sender<OAuthEvent>,
     oauth_rx: Receiver<OAuthEvent>,
     oauth_cancels: HashMap<String, Arc<AtomicBool>>,
@@ -214,11 +221,7 @@ impl HostRuntime {
                 (emit)(json!({"event":"error", "message":err}));
                 vec![CapabilityConfig::builtin_shell()]
             });
-        let status = if config.capabilities.iter().any(needs_mcp_connection) {
-            ("connecting".into(), "连接能力…".into())
-        } else {
-            ("idle".into(), "在线".into())
-        };
+        let status = ("idle".into(), "在线".into());
         let cancel = Arc::clone(sandbox.cancel_flag());
         let hands = Hands::open(
             data_dir.clone(),
@@ -237,6 +240,7 @@ impl HostRuntime {
             config,
             capabilities_bytes,
             hands,
+            next_capability_call: 0,
             oauth_tx,
             oauth_rx,
             oauth_cancels: HashMap::new(),
@@ -265,7 +269,7 @@ impl HostRuntime {
     pub fn connect_external_capabilities(&mut self) {
         if self.config.capabilities.iter().any(needs_mcp_connection) {
             self.hands.reload(&self.config.capabilities, false);
-            self.set_status("idle", "在线");
+            self.emit_state(None);
         }
     }
 
@@ -316,6 +320,11 @@ impl HostRuntime {
                 }
                 Ok(HostCommand::OauthCapability { id }) => self.oauth_capability(id),
                 Ok(HostCommand::ReloadCapabilities) => self.reload_capabilities(),
+                Ok(HostCommand::CallCapability {
+                    id,
+                    capability,
+                    input,
+                }) => self.call_capability(id, capability, input),
                 Ok(HostCommand::Cancel) => self.cancel.store(false, Ordering::Relaxed),
                 Ok(HostCommand::History { before, limit }) => self.emit_history(before, limit),
                 Ok(HostCommand::DismissWake { id }) => self.dismiss_wake(&id),
@@ -551,6 +560,36 @@ impl HostRuntime {
     pub fn reload_capabilities(&mut self) {
         self.refresh_capabilities(true);
         self.emit_state(None);
+    }
+
+    pub fn call_capability(&mut self, request_id: String, capability: String, input: Value) {
+        self.refresh_capabilities(false);
+        self.next_capability_call += 1;
+        let tag = format!("cap-{}", self.next_capability_call);
+        let (_owner, execution) = self.hands.call_capability(&capability, &tag, &input);
+        if self.hands.disconnect_dead() {
+            self.emit_state(None);
+        }
+        match execution.outcome {
+            Outcome::Observed(output) => {
+                (self.emit)(json!({
+                    "event": "capability_result",
+                    "id": request_id,
+                    "capability": capability,
+                    "ok": true,
+                    "output": output,
+                }));
+            }
+            Outcome::Failed(err) | Outcome::Unknown(err) => {
+                (self.emit)(json!({
+                    "event": "capability_result",
+                    "id": request_id,
+                    "capability": capability,
+                    "ok": false,
+                    "error": err,
+                }));
+            }
+        }
     }
 
     pub fn oauth_capability(&mut self, id: String) {
@@ -791,7 +830,7 @@ impl HostRuntime {
             "你是 eja，一个持续存在的自我同一性主体。\n\
             内核版本：{KERNEL_VERSION}（协议 v{PROTOCOL_VERSION}）{resources_line}\n\
             数据目录：{data_dir_str}\n\
-            能力配置：{data_dir_str}/capabilities.json（支持 exec 本地插件、stdio 与 http MCP，变更自动热加载）\n\
+            能力配置：{data_dir_str}/capabilities.json（支持 exec 本地插件、stdio 与 http MCP，变更自动热加载；宿主为每个能力注入 EJA_CAPABILITY_ID 与私有目录 EJA_CAPABILITY_DATA_DIR，前端通过 HostClient 的 callCapability / capabilityChanged / isCapabilityEnabled 经宿主网关消费能力，不得绕开宿主直读能力私有数据文件）\n\
             本地时区：{}{local_now}\n\n\
             前置消息是主体日志（旧日志滑出上下文窗口后折叠为活跃挂念与未决未知；跨回合约定、长期偏好与待办须通过 keep 保持，滑出窗口的历史细节用 search/read 检索）。\n\
             最后一条用户消息、定时提醒或检查命中触发本回合。不调工具时的文本回复会发送给人；定时或守望检查未满足触发条件时回复留空以保持沉默，不要播报“仍为空/未就绪”。\n\
@@ -1032,6 +1071,7 @@ impl HostRuntime {
                 let acted =
                     self.eja
                         .act(self.eja.revision()?, &spec.capability, call.args.clone())?;
+                let owner = self.hands.capability_owner(&spec.capability);
                 let execution = self.hands.execute(&acted, &self.eja);
                 let receipt = self.eja.finish(acted.id, execution.outcome)?;
                 if self.hands.disconnect_dead() {
@@ -1040,6 +1080,15 @@ impl HostRuntime {
                 let Fact::Returned { outcome, .. } = receipt.fact else {
                     unreachable!()
                 };
+                if matches!(outcome, Outcome::Observed(_)) {
+                    if let Some(cap_id) = owner.filter(|id| id != "shell") {
+                        (self.emit)(json!({
+                            "event": "capability_changed",
+                            "id": cap_id,
+                            "capability": spec.capability,
+                        }));
+                    }
+                }
                 let value = json!({ "id": receipt.id, "action": acted.id, "outcome": outcome });
                 Ok(if execution.images.is_empty() {
                     ToolOutput::Value(value)
@@ -3330,5 +3379,96 @@ for line in sys.stdin:
         watch::schedule_wakes(&eja, &alarms[64..]).unwrap();
         assert_eq!(watch::pending_wakes(&eja).unwrap().len(), 64);
         assert!(watch::registered_check(&eja, "check0").is_ok());
+    }
+
+    #[test]
+    fn frontend_call_capability_enforces_enabled_gate_injects_scoped_dir_and_emits_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec_script = dir.path().join("desk_cap.py");
+        fs::write(
+            &exec_script,
+            r#"import json, os, pathlib, sys
+args = json.load(sys.stdin)
+cap_id = os.environ["EJA_CAPABILITY_ID"]
+cap_dir = pathlib.Path(os.environ["EJA_CAPABILITY_DATA_DIR"])
+state_file = cap_dir / "state.json"
+if args.get("action") == "write":
+    state_file.write_text(json.dumps({"value": args["value"]}), encoding="utf-8")
+    print(json.dumps({"id": cap_id, "saved": args["value"]}))
+elif args.get("action") == "read":
+    data = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+    print(json.dumps({"id": cap_id, "value": data.get("value")}))
+"#,
+        )
+        .unwrap();
+
+        let brain = Arc::new(MockBrain {
+            judge_calls: AtomicUsize::new(0),
+            mode: "simple",
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let data_dir = dir.path().join("eja");
+        let mut rt = HostRuntime::open_with_brain(
+            data_dir.clone(),
+            brain,
+            Arc::new(move |event| sink.lock().unwrap().push(event)),
+        )
+        .unwrap();
+
+        let make_desk = |enabled: bool| CapabilityConfig {
+            id: "desk".into(),
+            name: "Desk".into(),
+            enabled,
+            transport: CapabilityTransport::Exec {
+                command: "/usr/bin/python3".into(),
+                args: vec![exec_script.display().to_string()],
+                env: BTreeMap::new(),
+                description: "Desk capability".into(),
+                schema: None,
+            },
+        };
+
+        rt.save_config(configured(vec![make_desk(true)]));
+        events.lock().unwrap().clear();
+        let revision_before = rt.eja.revision().unwrap();
+
+        rt.call_capability(
+            "req-1".into(),
+            "cap.desk".into(),
+            json!({ "action": "write", "value": "briefing" }),
+        );
+        {
+            let log = events.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            assert_eq!(log[0]["event"], "capability_result");
+            assert_eq!(log[0]["id"], "req-1");
+            assert_eq!(log[0]["ok"], true);
+            let out: Value = serde_json::from_str(log[0]["output"].as_str().unwrap()).unwrap();
+            assert_eq!(out["id"], "desk");
+            assert_eq!(out["saved"], "briefing");
+        }
+        assert_eq!(rt.eja.revision().unwrap(), revision_before);
+        assert!(data_dir.join("capabilities/desk/data/state.json").is_file());
+
+        rt.save_config(configured(vec![make_desk(false)]));
+        events.lock().unwrap().clear();
+
+        rt.call_capability(
+            "req-2".into(),
+            "cap.desk".into(),
+            json!({ "action": "read" }),
+        );
+        {
+            let log = events.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            assert_eq!(log[0]["event"], "capability_result");
+            assert_eq!(log[0]["id"], "req-2");
+            assert_eq!(log[0]["ok"], false);
+            assert!(log[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("能力已关闭: desk"));
+        }
     }
 }

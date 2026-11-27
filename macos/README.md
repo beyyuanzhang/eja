@@ -12,7 +12,7 @@ Build the app bundle, then open it (system notifications are supported):
 
 ```sh
 ./macos/scripts/build-app.sh
-open macos/build/eja.app
+open /Applications/eja.app
 ```
 
 To create a `.dmg` installer:

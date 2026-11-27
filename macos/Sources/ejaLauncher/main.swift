@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import CryptoKit
 import Darwin
@@ -65,6 +66,56 @@ private func syncFactoryFiles(from templateDir: URL, into uiDir: URL, fm: FileMa
     )
 }
 
+private func collectRegularFiles(under root: URL, fm: FileManager) -> [String: URL]? {
+    guard fm.fileExists(atPath: root.path),
+          let enumerator = fm.enumerator(
+              at: root,
+              includingPropertiesForKeys: [.isRegularFileKey],
+              options: [.skipsHiddenFiles]
+          ) else {
+        return nil
+    }
+    let basePath = root.standardizedFileURL.path
+    var files: [String: URL] = [:]
+    for case let url as URL in enumerator {
+        guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+            continue
+        }
+        let fullPath = url.standardizedFileURL.path
+        let rel = fullPath.hasPrefix(basePath + "/")
+            ? String(fullPath.dropFirst(basePath.count + 1))
+            : url.lastPathComponent
+        files[rel] = url
+    }
+    return files
+}
+
+private func hasCustomizedApp(uiDir: URL, templateDir: URL?, fm: FileManager) -> Bool {
+    let userApp = uiDir.appendingPathComponent("Sources/ejaApp", isDirectory: true)
+    guard let userFiles = collectRegularFiles(under: userApp, fm: fm), !userFiles.isEmpty else {
+        return false
+    }
+    guard let templateDir,
+          let factoryFiles = collectRegularFiles(
+              under: templateDir.appendingPathComponent("Sources/ejaApp", isDirectory: true),
+              fm: fm
+          ) else {
+        return true
+    }
+    if Set(userFiles.keys) != Set(factoryFiles.keys) {
+        return true
+    }
+    for (rel, userURL) in userFiles {
+        guard let factoryURL = factoryFiles[rel],
+              let userData = try? Data(contentsOf: userURL),
+              let factoryData = try? Data(contentsOf: factoryURL),
+              userData == factoryData else {
+            return true
+        }
+    }
+    return false
+}
+
 private func rebuildEvolvedUI(applyScript: URL, fm: FileManager) -> String? {
     guard fm.isExecutableFile(atPath: applyScript.path) else {
         return "未找到可执行的 ui/apply.sh。"
@@ -128,48 +179,56 @@ let templateDir = Bundle.main.resourceURL?
 let safeMode = isSafeModeRequested()
 setenv("eja_SAFE_MODE", safeMode ? "1" : "0", 1)
 if safeMode {
-    try? fm.removeItem(at: evolvedDylib)
     try? fm.removeItem(at: bootMarker)
 }
 let factoryDigest = binaryDigest(at: factoryDylib)
+let evolvedDigest = binaryDigest(at: evolvedDylib)
 var canLoadEvolved = !safeMode
-if canLoadEvolved && fm.fileExists(atPath: bootMarker.path) {
+if canLoadEvolved, let previousBoot = try? String(contentsOf: bootMarker, encoding: .utf8) {
     try? fm.removeItem(at: bootMarker)
-    try? fm.removeItem(at: evolvedDylib)
-    setFallbackReason("上次加载自定义界面时异常退出，已回退到出厂界面。请检查 ui/Sources/ejaApp 后重新运行 ui/apply.sh。")
-    canLoadEvolved = false
+    if let evolvedDigest, previousBoot == "launching:\(evolvedDigest)" {
+        setFallbackReason("上次启动自定义界面时异常退出，本次使用出厂界面。")
+        canLoadEvolved = false
+    }
 }
 
 if let factoryDigest {
     let recorded = (try? String(contentsOf: stampFile, encoding: .utf8))?
         .trimmingCharacters(in: .whitespacesAndNewlines)
-    if recorded != factoryDigest {
-        if canLoadEvolved && fm.fileExists(atPath: evolvedDylib.path) {
-            if let templateDir {
-                syncFactoryFiles(from: templateDir, into: uiDir, fm: fm)
-            }
-            if let failureMessage = rebuildEvolvedUI(applyScript: applyScript, fm: fm) {
-                try? fm.removeItem(at: evolvedDylib)
-                try? factoryDigest.write(to: stampFile, atomically: true, encoding: .utf8)
-                setFallbackReason(failureMessage)
-                canLoadEvolved = false
-            } else {
-                try? factoryDigest.write(to: stampFile, atomically: true, encoding: .utf8)
-            }
-        } else {
+    let customized = hasCustomizedApp(uiDir: uiDir, templateDir: templateDir, fm: fm)
+    let needsSync = recorded != factoryDigest
+    let needsRebuild = canLoadEvolved && customized && (needsSync || !fm.fileExists(atPath: evolvedDylib.path))
+    if needsRebuild {
+        if let templateDir {
+            syncFactoryFiles(from: templateDir, into: uiDir, fm: fm)
+        }
+        if let failureMessage = rebuildEvolvedUI(applyScript: applyScript, fm: fm) {
             try? fm.removeItem(at: evolvedDylib)
-            if !fm.fileExists(atPath: evolvedDylib.path) {
-                try? fm.createDirectory(at: uiDir, withIntermediateDirectories: true)
-                try? factoryDigest.write(to: stampFile, atomically: true, encoding: .utf8)
-            }
+            try? factoryDigest.write(to: stampFile, atomically: true, encoding: .utf8)
+            setFallbackReason(failureMessage)
+            canLoadEvolved = false
+        } else {
+            try? factoryDigest.write(to: stampFile, atomically: true, encoding: .utf8)
+        }
+    } else if canLoadEvolved && needsSync {
+        try? fm.removeItem(at: evolvedDylib)
+        if fm.fileExists(atPath: uiDir.path) {
+            try? factoryDigest.write(to: stampFile, atomically: true, encoding: .utf8)
         }
     }
 
     if canLoadEvolved, let digest = binaryDigest(at: evolvedDylib) {
-        try? fm.createDirectory(at: uiDir, withIntermediateDirectories: true)
-        try? digest.write(to: bootMarker, atomically: true, encoding: .utf8)
-        if loadAndRun(dylibURL: evolvedDylib, digest: digest) { exit(0) }
+        try? "launching:\(digest)".write(to: bootMarker, atomically: true, encoding: .utf8)
+        let notifications = NotificationCenter.default
+        let bootObserver = notifications.addObserver(
+            forName: NSApplication.didFinishLaunchingNotification, object: nil, queue: nil
+        ) { _ in
+            try? FileManager.default.removeItem(at: bootMarker)
+        }
+        let loaded = loadAndRun(dylibURL: evolvedDylib, digest: digest)
+        notifications.removeObserver(bootObserver)
         try? fm.removeItem(at: bootMarker)
+        if loaded { exit(0) }
         try? fm.removeItem(at: evolvedDylib)
         setFallbackReason("加载 ui/libejaUI.dylib 失败，已回退到出厂界面。请检查 ui/ 后重新运行 ui/apply.sh。")
     }

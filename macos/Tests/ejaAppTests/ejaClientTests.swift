@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import Testing
 @testable import ejaClient
@@ -169,7 +170,7 @@ for line in sys.stdin:
         defer { client.shutdown() }
 
         client.handleEventLine(
-            Data(#"{"event":"state","protocol_version":1,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
+            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
         )
 
         #expect(!client.isReady)
@@ -185,7 +186,7 @@ for line in sys.stdin:
         defer { client.shutdown() }
 
         client.handleEventLine(
-            Data(#"{"event":"state","protocol_version":2,"status":"thinking","status_detail":"思考中…","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
+            Data(#"{"event":"state","protocol_version":3,"status":"thinking","status_detail":"思考中…","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[]}"#.utf8)
         )
         #expect(client.status == "thinking")
         #expect(client.statusDetail == "思考中…")
@@ -203,7 +204,7 @@ for line in sys.stdin:
         #expect(client.streamingText == "最终回复")
 
         client.handleEventLine(
-            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":1,"kind":"eja","text":"最终回复"}]}"#.utf8)
+            Data(#"{"event":"state","protocol_version":3,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":1,"kind":"eja","text":"最终回复"}]}"#.utf8)
         )
         #expect(client.status == "idle")
         #expect(client.statusDetail == "在线")
@@ -220,7 +221,7 @@ for line in sys.stdin:
         defer { client.shutdown() }
 
         client.handleEventLine(
-            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":5,"kind":"event","text":"shell: ls","detail":"ok","outcome_status":"observed"}],"concerns":[{"id":2,"text":"挂念"}],"wakes":[{"id":"w-1","fire_at_unix":9,"fire_at_display":"09:00","reason":"喝水"}]}"#.utf8)
+            Data(#"{"event":"state","protocol_version":3,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":5,"kind":"event","text":"shell: ls","detail":"ok","outcome_status":"observed"}],"concerns":[{"id":2,"text":"挂念"}],"wakes":[{"id":"w-1","fire_at_unix":9,"fire_at_display":"09:00","reason":"喝水"}]}"#.utf8)
         )
         #expect(client.stream.first?.detail == "ok")
         #expect(client.concerns.first?.text == "挂念")
@@ -232,10 +233,88 @@ for line in sys.stdin:
         #expect(!client.canLoadEarlier)
 
         client.handleEventLine(
-            Data(#"{"event":"state","protocol_version":2,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":5,"kind":"event","text":"shell: ls"},{"id":6,"kind":"person","text":"嗨"}],"concerns":[],"wakes":[]}"#.utf8)
+            Data(#"{"event":"state","protocol_version":3,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[],"stream":[{"id":5,"kind":"event","text":"shell: ls"},{"id":6,"kind":"person","text":"嗨"}],"concerns":[],"wakes":[]}"#.utf8)
         )
         #expect(client.stream.map(\.id) == [3, 5, 6])
         #expect(client.wakes.isEmpty)
+    }
+
+    @Test
+    @MainActor
+    func capabilityGatewayTracksEnabledStateAndChangeEvents() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let client = HostClient(hostExecutableURL: URL(fileURLWithPath: "/bin/cat"), dataDir: dir)
+        defer { client.shutdown() }
+
+        client.handleEventLine(
+            Data(#"{"event":"state","protocol_version":3,"status":"idle","status_detail":"在线","data_dir":"/tmp/eja","configured":true,"config":{"providers":[],"judge":{"provider_id":"","model":""},"capabilities":[]},"capability_statuses":[{"id":"desk","name":"Desk","enabled":true,"connected":true,"auth_required":false,"tools":[{"name":"desk","description":"Desk","capability":"cap.desk"}]},{"id":"off","name":"Off","enabled":false,"connected":false,"auth_required":false,"tools":[]}],"stream":[]}"#.utf8)
+        )
+        #expect(client.isCapabilityEnabled("desk"))
+        #expect(!client.isCapabilityEnabled("off"))
+        #expect(!client.isCapabilityEnabled("missing"))
+
+        var receivedChanges: [CapabilityChangeEvent] = []
+        let cancellable = client.capabilityChanged.sink { event in
+            receivedChanges.append(event)
+        }
+        defer { cancellable.cancel() }
+
+        client.handleEventLine(
+            Data(#"{"event":"capability_changed","id":"desk","capability":"cap.desk"}"#.utf8)
+        )
+        #expect(receivedChanges == [CapabilityChangeEvent(id: "desk", capability: "cap.desk")])
+    }
+
+    @Test
+    @MainActor
+    func callCapabilityRoundtripsThroughHostAndEnforcesDisableSwitch() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let script = dir.appendingPathComponent("echo_cap.py")
+        try """
+        import json, os, sys
+        args = json.load(sys.stdin)
+        print(json.dumps({
+            "id": os.environ["EJA_CAPABILITY_ID"],
+            "dir": os.environ["EJA_CAPABILITY_DATA_DIR"],
+            "msg": args.get("msg", "")
+        }))
+        """.write(to: script, atomically: true, encoding: .utf8)
+
+        let client = HostClient(hostExecutableURL: resolveHostBinary(), dataDir: dir)
+        defer { client.shutdown() }
+        #expect(await waitUntil { client.isReady })
+
+        let makeCap: (Bool) -> CapabilityConfigDTO = { enabled in
+            CapabilityConfigDTO(
+                id: "desk",
+                name: "Desk",
+                enabled: enabled,
+                transport: .exec(command: "/usr/bin/python3", args: [script.path], description: "Desk")
+            )
+        }
+
+        var saved = false
+        client.saveConfig(capabilities: [makeCap(true)]) { _ in saved = true }
+        #expect(await waitUntil { saved && client.isCapabilityEnabled("desk") })
+
+        var firstResult: CapabilityCallResult?
+        client.callCapability("cap.desk", input: ["msg": "hi"]) { firstResult = $0 }
+        #expect(await waitUntil { firstResult != nil })
+        #expect(firstResult?.ok == true)
+        #expect(firstResult?.output?.contains("capabilities/desk/data") == true)
+        #expect(firstResult?.output?.contains("hi") == true)
+
+        saved = false
+        client.saveConfig(capabilities: [makeCap(false)]) { _ in saved = true }
+        #expect(await waitUntil { saved && !client.isCapabilityEnabled("desk") })
+
+        var disabledResult: CapabilityCallResult?
+        client.callCapability("cap.desk", input: ["msg": "blocked"]) { disabledResult = $0 }
+        #expect(await waitUntil { disabledResult != nil })
+        #expect(disabledResult?.ok == false)
+        #expect(disabledResult?.error?.contains("能力已关闭: desk") == true)
     }
 
     @Test

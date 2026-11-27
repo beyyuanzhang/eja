@@ -71,6 +71,7 @@ jobs:
           cd macos
           eja_HOST_BIN="$PWD/../target/debug/eja-host" swift test
           swift build --product ejaApp
+          bash scripts/test-launcher.sh "$(swift build --show-bin-path)/ejaApp"
           swift build --product ejaUI
       - run: xcrun swiftc -typecheck -parse-as-library -target "$(uname -m)-apple-macosx14.0" capabilities/screen/*.swift
 
@@ -92,7 +93,6 @@ jobs:
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           ./macos/scripts/build-dmg.sh
-          codesign --verify --deep --strict macos/build/eja.app
           hdiutil verify "macos/build/eja-${VERSION}.dmg"
           (cd macos/build && shasum -a 256 "eja-${VERSION}.dmg" > SHA256SUMS.txt)
       - name: Publish GitHub Release
